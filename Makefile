@@ -1,8 +1,16 @@
+ANTLR_JAR := tools/antlr-4.13.1-complete.jar
+
 run: build
 	./bin/vitaledge
 
 build:
 	go build -o bin/vitaledge ./cmd/vitaledge/main.go 
+
+generate-cypher-parser:
+	@test -f $(ANTLR_JAR) || curl -L --fail https://www.antlr.org/download/antlr-4.13.1-complete.jar -o $(ANTLR_JAR)
+	java -jar $(ANTLR_JAR) -Dlanguage=Go -visitor -listener -package cyphergen -Xexact-output-dir -o internal/cypher/grammar/generated internal/cypher/grammar/Cypher.g4
+
+generate: generate-cypher-parser
 
 test:
 	go test -v ./...

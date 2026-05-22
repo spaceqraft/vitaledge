@@ -1,7 +1,9 @@
 dist/
+tools/
 .vscode/settings.json
 .env.local
 coverage*.txt
+coverage*.html
 .idea/
 .claude/
 bin/

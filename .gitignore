@@ -1,0 +1,7 @@
+dist/
+.vscode/settings.json
+.env.local
+coverage*.txt
+.idea/
+.claude/
+bin/

@@ -55,3 +55,7 @@ func PropertyIndexKey(tenant, schema, property string, encodedValue []byte, enti
 func PropertyIndexPrefix(tenant, schema, property string) []byte {
 	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexPrefix, tenant, schema, property))
 }
+
+func PropertyIndexValuePrefix(tenant, schema, property string, encodedValue []byte) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexPrefix, tenant, schema, property, encodedValue))
+}

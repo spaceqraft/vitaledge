@@ -27,6 +27,7 @@ type Tx interface {
 
 	ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(*Edge) error) error
 	ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(*Edge) error) error
+	ScanPropertyIndex(ctx context.Context, tenant, schema, property string, encodedValue []byte, limit int, fn func(*PropertyIndexEntry) error) error
 
 	PutPropertyIndex(ctx context.Context, entry *PropertyIndexEntry) error
 	DeletePropertyIndex(ctx context.Context, entry *PropertyIndexEntry) error

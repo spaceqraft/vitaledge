@@ -1,0 +1,581 @@
+package executor
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/paegun/vitaledge/internal/cypher/indexschema"
+	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"github.com/paegun/vitaledge/internal/graph"
+	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
+)
+
+func TestExecuteMatchReturnIDs(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedGraph(t, ctx, store)
+
+	stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"srcID":  "u1",
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if len(res.Columns) != 1 || res.Columns[0] != "dstID" {
+		t.Fatalf("unexpected columns: %#v", res.Columns)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+	if res.Rows[0]["dstID"] != "g1" || res.Rows[1]["dstID"] != "g2" {
+		t.Fatalf("unexpected rows: %#v", res.Rows)
+	}
+}
+
+func TestExecuteMatchReturnLimitParam(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedGraph(t, ctx, store)
+
+	stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID LIMIT $max")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"srcID":  "u1",
+		"max":    1,
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+}
+
+func TestExecuteMatchUsesPropertyIndexPlanner(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "u-indexed",
+			Labels:     []string{"User"},
+			Properties: graph.PropertyMap{"email": []byte("alice@acme.io")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "g-indexed", Labels: []string{"Group"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-indexed", Type: "MEMBER_OF", SrcID: "u-indexed", DstID: "g-indexed"}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "User",
+			Property:    "email",
+			Value:       []byte("alice@acme.io"),
+			EntityID:    "u-indexed",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "email")
+	exec := New(store, Options{IndexCatalog: catalog})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["dstID"]; got != "g-indexed" {
+		t.Fatalf("unexpected row: %#v", got)
+	}
+}
+
+func TestExecuteMatchPropertyLookupWithoutIndexReportsUnsupported(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "u-indexed",
+			Labels:     []string{"User"},
+			Properties: graph.PropertyMap{"email": []byte("alice@acme.io")},
+		}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	recorder := &executorMetricsRecorder{}
+	exec := New(store, Options{Metrics: recorder})
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
+	if !graph.IsKind(err, graph.ErrKindUnsupported) {
+		t.Fatalf("expected unsupported error, got %v", err)
+	}
+	if len(recorder.indexCandidates) == 0 {
+		t.Fatalf("expected index candidate metric")
+	}
+	candidate := recorder.indexCandidates[0]
+	if candidate.schema != "User" || candidate.property != "email" || candidate.indexed {
+		t.Fatalf("unexpected index candidate metric: %#v", candidate)
+	}
+}
+
+func TestExecuteMatchIndexMetricsRecorded(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "u-indexed",
+			Labels:     []string{"User"},
+			Properties: graph.PropertyMap{"email": []byte("alice@acme.io")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "g-indexed", Labels: []string{"Group"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-indexed", Type: "MEMBER_OF", SrcID: "u-indexed", DstID: "g-indexed"}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "User",
+			Property:    "email",
+			Value:       []byte("alice@acme.io"),
+			EntityID:    "u-indexed",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "email")
+	recorder := &executorMetricsRecorder{}
+	exec := New(store, Options{IndexCatalog: catalog, Metrics: recorder})
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if len(recorder.indexCandidates) == 0 {
+		t.Fatalf("expected index candidate metrics")
+	}
+	if len(recorder.indexLookups) == 0 {
+		t.Fatalf("expected index lookup metrics")
+	}
+	if recorder.indexLookups[0].strategy != "property_index" || recorder.indexLookups[0].outcome != "hit" {
+		t.Fatalf("unexpected index lookup metric: %#v", recorder.indexLookups[0])
+	}
+}
+
+func TestExecuteMatchWhereFiltersRows(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedGraph(t, ctx, store)
+
+	stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) WHERE dst.id = 'g2' RETURN dst.id AS dstID")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"srcID":  "u1",
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["dstID"]; got != "g2" {
+		t.Fatalf("unexpected row: %#v", got)
+	}
+}
+
+func TestExecuteOptionalMatchPreservesRowWhenNoMatches(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedGraph(t, ctx, store)
+
+	stmt, err := parser.ParseStatement("OPTIONAL MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"srcID":  "u2",
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["dstID"]; got != nil {
+		t.Fatalf("expected nil dstID, got %#v", got)
+	}
+}
+
+func TestExecuteUnsupportedShape(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN DISTINCT dst.id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "srcID": "u1"})
+	if !graph.IsKind(err, graph.ErrKindUnsupported) {
+		t.Fatalf("expected unsupported error, got %v", err)
+	}
+}
+
+func TestExecuteCreateSetAndPersistVertex(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("CREATE (u { id: $id }) SET u.name = $name SET u.active = true")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "id": "u-create", "name": "Alice"}); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		v, err := tx.GetVertex(ctx, "acme", "u-create")
+		if err != nil {
+			return err
+		}
+		if v.ID != "u-create" {
+			return errUnexpected("unexpected vertex id")
+		}
+		if got := string(v.Properties["name"]); got != "Alice" {
+			return errUnexpected("unexpected vertex name")
+		}
+		if got := string(v.Properties["active"]); got != "true" {
+			return errUnexpected("unexpected vertex active flag")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("store verification failed: %v", err)
+	}
+}
+
+func TestExecuteMatchSetRemoveAndDelete(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedGraph(t, ctx, store)
+
+	setStmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) SET dst.active = $active REMOVE dst.active")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, setStmt, Params{"tenant": "acme", "srcID": "u1", "active": true}); err != nil {
+		t.Fatalf("execute set/remove failed: %v", err)
+	}
+
+	deleteStmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) DELETE dst")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, deleteStmt, Params{"tenant": "acme", "srcID": "u1"}); err != nil {
+		t.Fatalf("execute delete failed: %v", err)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		if _, err := tx.GetVertex(ctx, "acme", "g1"); !graph.IsKind(err, graph.ErrKindNotFound) {
+			return errUnexpected("expected g1 to be deleted")
+		}
+		if _, err := tx.GetVertex(ctx, "acme", "g2"); !graph.IsKind(err, graph.ErrKindNotFound) {
+			return errUnexpected("expected g2 to be deleted")
+		}
+		count := 0
+		if err := tx.ScanOutEdges(ctx, "acme", "u1", "", 10, func(edge *graph.Edge) error {
+			count++
+			return nil
+		}); err != nil {
+			return err
+		}
+		if count != 0 {
+			return errUnexpected("expected adjacency to be deleted with vertex")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("delete verification failed: %v", err)
+	}
+}
+
+func TestExecuteMergeIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("MERGE (u { id: $id }) SET u.name = $name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	for i := 0; i < 2; i++ {
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "id": "u-merge", "name": "Alice"}); err != nil {
+			t.Fatalf("merge execute %d failed: %v", i, err)
+		}
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		v, err := tx.GetVertex(ctx, "acme", "u-merge")
+		if err != nil {
+			return err
+		}
+		if got := string(v.Properties["name"]); got != "Alice" {
+			return errUnexpected("unexpected merge name")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("merge verification failed: %v", err)
+	}
+}
+
+func TestExecuteCreateEdgePattern(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("CREATE (src { id: $srcID })-[:MEMBER_OF]->(dst { id: $dstID })")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "srcID": "u-edge", "dstID": "g-edge"}); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		edge, err := tx.GetEdge(ctx, "acme", syntheticEdgeID("acme", "u-edge", "MEMBER_OF", "g-edge"))
+		if err != nil {
+			return err
+		}
+		if edge.SrcID != "u-edge" || edge.DstID != "g-edge" || edge.Type != "MEMBER_OF" {
+			return errUnexpected("unexpected created edge")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("edge verification failed: %v", err)
+	}
+}
+
+func TestExecuteUnwindWithReturnProjectsRows(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("UNWIND [1,2,3] AS n WITH n RETURN n AS value")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["value"]; got != 1 {
+		t.Fatalf("unexpected first row: %#v", got)
+	}
+	if got := res.Rows[1]["value"]; got != 2 {
+		t.Fatalf("unexpected second row: %#v", got)
+	}
+	if got := res.Rows[2]["value"]; got != 3 {
+		t.Fatalf("unexpected third row: %#v", got)
+	}
+}
+
+func TestExecuteUnwindCreateVertices(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("UNWIND ['u-unwind-1','u-unwind-2'] AS id CREATE (u { id: id }) WITH id RETURN id AS createdID")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		for _, id := range []string{"u-unwind-1", "u-unwind-2"} {
+			v, err := tx.GetVertex(ctx, "acme", id)
+			if err != nil {
+				return err
+			}
+			if v.ID != id {
+				return errUnexpected("unexpected created vertex")
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("vertex verification failed: %v", err)
+	}
+}
+
+func errUnexpected(message string) error {
+	return &testError{message: message}
+}
+
+type testError struct{ message string }
+
+func (e *testError) Error() string { return e.message }
+
+func openStore(t *testing.T) graph.GraphStore {
+	t.Helper()
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "graph.db")
+	if err := os.MkdirAll(dbPath, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+	store, err := pebblestore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store failed: %v", err)
+	}
+	return store
+}
+
+func seedGraph(t *testing.T, ctx context.Context, store graph.GraphStore) {
+	t.Helper()
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "g1", Labels: []string{"Group"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "g2", Labels: []string{"Group"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "MEMBER_OF", SrcID: "u1", DstID: "g1"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "MEMBER_OF", SrcID: "u1", DstID: "g2"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+}
+
+type indexCandidateMetric struct {
+	tenant   string
+	schema   string
+	property string
+	indexed  bool
+}
+
+type indexLookupMetric struct {
+	strategy string
+	outcome  string
+	matches  int
+}
+
+type executorMetricsRecorder struct {
+	indexCandidates []indexCandidateMetric
+	indexLookups    []indexLookupMetric
+}
+
+func (r *executorMetricsRecorder) ObserveStatement(_ ast.StatementKind, _ string, _ time.Duration) {}
+
+func (r *executorMetricsRecorder) ObserveRowsReturned(_ int) {}
+
+func (r *executorMetricsRecorder) ObserveIndexCandidate(tenant, schema, property string, indexed bool) {
+	r.indexCandidates = append(r.indexCandidates, indexCandidateMetric{tenant: tenant, schema: schema, property: property, indexed: indexed})
+}
+
+func (r *executorMetricsRecorder) ObserveIndexLookup(strategy, outcome string, matches int) {
+	r.indexLookups = append(r.indexLookups, indexLookupMetric{strategy: strategy, outcome: outcome, matches: matches})
+}

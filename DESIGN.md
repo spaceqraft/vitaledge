@@ -106,6 +106,51 @@ Design principles:
 - Threat/anomaly: high write ingest path optimized via LSM and batched writes.
 - Research workloads: flexible property indexing with scan-friendly key layout.
 
+## Index Management Decision
+
+### Question
+
+How should property indexes be declared and managed so planner behavior is predictable, operationally simple, and safe for edge deployments?
+
+### Options Considered
+
+1. No secondary property indexes.
+2. Extend Cypher with index DDL (for example `CREATE INDEX`).
+3. Fully automatic indexing by observing workload.
+4. Configuration-based index declarations (startup config/schema file).
+
+### Additional Viable Options
+
+5. External control-plane/API-managed catalog.
+   - Index definitions managed through an admin API/CLI (non-Cypher), persisted in metadata.
+   - Good fit when query language stability is prioritized over operational flexibility.
+6. Hybrid model: explicit baseline + adaptive candidate indexes.
+   - Operators define required indexes; system proposes or builds candidate indexes under policy guardrails.
+   - Balances determinism with performance adaptation.
+7. Materialized projection/index service.
+   - Maintain specialized denormalized projections for known query patterns, separate from generic property indexes.
+   - Useful for very hot ReBAC/detection paths where generic indexes are insufficient.
+8. Offline/maintenance-window index build pipeline.
+   - Indexes declared separately and built by a job process (bulk/backfill first, then enable planner usage).
+   - Reduces write-path disruption for ingest-heavy deployments.
+
+### Decision (Current Phase)
+
+Use configuration-based index declarations as the primary mechanism in Phase 1, backed by a runtime index catalog consumed by the planner.
+
+Rationale:
+
+- Keeps planner behavior deterministic and explainable.
+- Avoids immediate Cypher grammar/surface expansion while parser/executor are still maturing.
+- Preserves edge simplicity (single binary, no mandatory external control plane).
+- Creates a clean path to future Cypher DDL or API-based management without changing planner contracts.
+
+### Deferred Evolution
+
+- Add Cypher index DDL after core query surface stabilizes and migration semantics are defined.
+- Add optional adaptive indexing only with explicit policy controls, observability, and bounded resource usage.
+- Add planner explain output that reports whether a chosen index came from configured baseline or adaptive candidate path.
+
 ## Risks and Mitigations
 
 1. Risk: index explosion from over-indexing properties.

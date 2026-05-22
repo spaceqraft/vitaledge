@@ -33,3 +33,23 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Test command: `go test ./...`
 - Smoke benchmark: `make bench-smoke`
 - Graph store benchmark baseline: `make bench-graph-store`
+
+## Startup Index Schema Config
+
+The server can load configuration-based index DDL at startup:
+
+- flag: `--index-schema-config /path/to/indexes.json`
+- env: `VITALEDGE_INDEX_SCHEMA_CONFIG=/path/to/indexes.json`
+
+If both are provided, the flag value is used.
+
+Example config:
+
+```json
+{
+	"property_indexes": [
+		{ "tenant": "acme", "schema": "User", "property": "email" },
+		{ "tenant": "acme", "schema": "Device", "property": "serial" }
+	]
+}
+```

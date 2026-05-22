@@ -3,6 +3,7 @@ package pebblestore
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -320,6 +321,19 @@ func (t *tx) ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, li
 	return t.scanAdjacency(ctx, keyspace.InAdjacencyPrefix(tenant, dstID, edgeType), limit, tenant, fn)
 }
 
+func (t *tx) ScanPropertyIndex(ctx context.Context, tenant, schema, property string, encodedValue []byte, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_property_index", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || schema == "" || property == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, schema, property, and callback are required", nil)
+	}
+	return t.scanPropertyIndex(ctx, keyspace.PropertyIndexValuePrefix(tenant, schema, property, encodedValue), tenant, schema, property, limit, fn)
+}
+
 func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEntry) (err error) {
 	started := time.Now()
 	defer func() { t.observeOperation("put_property_index", err, started) }()
@@ -409,6 +423,39 @@ func (t *tx) scanAdjacency(ctx context.Context, prefix []byte, limit int, tenant
 	}
 	if err := iter.Error(); err != nil {
 		return graph.NewError(graph.ErrKindStorage, "scan adjacency", err)
+	}
+	return nil
+}
+
+func (t *tx) scanPropertyIndex(ctx context.Context, prefix []byte, tenant, schema, property string, limit int, fn func(*graph.PropertyIndexEntry) error) error {
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create property index iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		entry, err := propertyIndexEntryFromKey(iter.Key(), iter.Value(), tenant, schema, property)
+		if err != nil {
+			return err
+		}
+		if err := fn(entry); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan property index", err)
 	}
 	return nil
 }
@@ -503,6 +550,27 @@ func edgeIDFromAdjKey(key []byte) string {
 		return ""
 	}
 	return string(key[i+1:])
+}
+
+func propertyIndexEntryFromKey(key, value []byte, tenant, schema, property string) (*graph.PropertyIndexEntry, error) {
+	parts := bytes.Split(key, []byte{'/'})
+	if len(parts) < 6 {
+		return nil, graph.NewError(graph.ErrKindStorage, "malformed property index key", nil)
+	}
+	entityID := string(parts[len(parts)-1])
+	encodedValue := parts[len(parts)-2]
+	decodedValue, err := hex.DecodeString(string(encodedValue))
+	if err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "decode property index value", err)
+	}
+	return &graph.PropertyIndexEntry{
+		Tenant:      tenant,
+		Schema:      schema,
+		Property:    property,
+		Value:       decodedValue,
+		EntityID:    entityID,
+		EntityClass: string(value),
+	}, nil
 }
 
 func (s *Store) lockEdge(tenant, edgeID string) func() {

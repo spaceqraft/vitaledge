@@ -1,16 +1,23 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net"
+	"os"
+	"strings"
 
+	"github.com/paegun/vitaledge/internal/cypher/indexschema"
 	"github.com/paegun/vitaledge/internal/tcp"
 )
 
 const defaultListenAddress = ":6379"
+const indexSchemaConfigEnv = "VITALEDGE_INDEX_SCHEMA_CONFIG"
 
 type Config struct {
-	ListenAddress string
+	ListenAddress   string
+	IndexConfigPath string
+	IndexCatalog    *indexschema.Catalog
 }
 
 type Server struct {
@@ -20,6 +27,7 @@ type Server struct {
 	addPeerCh chan *tcp.Peer
 	quitCh    chan struct{}
 	msgCh     chan tcp.PeerMessage
+	indexDDL  *indexschema.Catalog
 }
 
 func NewServer(config Config) *Server {
@@ -33,6 +41,7 @@ func NewServer(config Config) *Server {
 		addPeerCh: make(chan *tcp.Peer),
 		quitCh:    make(chan struct{}),
 		msgCh:     make(chan tcp.PeerMessage),
+		indexDDL:  config.IndexCatalog,
 	}
 }
 
@@ -91,6 +100,39 @@ func (s *Server) handleMessage(msg tcp.PeerMessage) error {
 }
 
 func main() {
-	server := NewServer(Config{})
+	config, err := loadConfigFromStartup()
+	if err != nil {
+		log.Fatalf("startup config error: %v", err)
+	}
+
+	server := NewServer(config)
+	if config.IndexCatalog != nil {
+		log.Printf("Loaded index schema catalog")
+	}
 	server.Start()
+}
+
+func loadConfigFromStartup() (Config, error) {
+	var listenAddress string
+	var indexConfigPath string
+
+	flag.StringVar(&listenAddress, "listen", defaultListenAddress, "Listen address")
+	flag.StringVar(&indexConfigPath, "index-schema-config", "", "Path to index schema configuration JSON file")
+	flag.Parse()
+
+	if strings.TrimSpace(indexConfigPath) == "" {
+		indexConfigPath = strings.TrimSpace(os.Getenv(indexSchemaConfigEnv))
+	}
+
+	cfg := Config{ListenAddress: listenAddress, IndexConfigPath: indexConfigPath}
+	if strings.TrimSpace(indexConfigPath) == "" {
+		return cfg, nil
+	}
+
+	catalog, err := indexschema.LoadCatalogFromFile(indexConfigPath)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.IndexCatalog = catalog
+	return cfg, nil
 }

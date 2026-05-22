@@ -73,6 +73,9 @@ Current implementation status:
 - In progress: Pebble-backed GraphStore with transactional CRUD, adjacency indexes, and property-index write/delete.
 - Implemented: first integration tests for CRUD/adjacency, restart durability, and property-index round-trip.
 - Implemented: injected metrics hooks for tx and operation outcomes/durations (module does not register metrics directly).
+- In progress: initial executor package with GraphStore-backed MATCH/RETURN slice and execution tests.
+- Implemented: executor write-path support for CREATE, MERGE, SET, REMOVE, and DELETE on the Pebble store.
+- Implemented: executor support for WITH and UNWIND clause pipelines, including UNWIND-driven writes and RETURN projection.
 
 Milestones:
 
@@ -223,6 +226,8 @@ Quality gates:
 - Explain-plan coverage in integration tests.
 
 ### WS3: Indexing and Performance
+
+Reference: index management decision is documented in [DESIGN.md](DESIGN.md) under "Index Management Decision".
 
 Primary outputs:
 

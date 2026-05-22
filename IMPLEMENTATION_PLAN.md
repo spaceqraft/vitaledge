@@ -70,12 +70,26 @@ Objective: deliver local graph correctness with acceptable performance.
 
 Current implementation status:
 
-- In progress: Pebble-backed GraphStore with transactional CRUD, adjacency indexes, and property-index write/delete.
-- Implemented: first integration tests for CRUD/adjacency, restart durability, and property-index round-trip.
-- Implemented: injected metrics hooks for tx and operation outcomes/durations (module does not register metrics directly).
-- In progress: initial executor package with GraphStore-backed MATCH/RETURN slice and execution tests.
-- Implemented: executor write-path support for CREATE, MERGE, SET, REMOVE, and DELETE on the Pebble store.
-- Implemented: executor support for WITH and UNWIND clause pipelines, including UNWIND-driven writes and RETURN projection.
+- Implemented: Pebble-backed GraphStore with transactional CRUD, adjacency indexes, property-index write/delete, and property-index scan.
+- Implemented: durability and concurrency coverage for store operations (including restart durability and concurrent mutation stress).
+- Implemented: store metrics hooks for tx/operation outcomes and durations (registration/lifecycle owned externally).
+- Implemented: executor core clause pipeline for MATCH, OPTIONAL MATCH, WHERE, RETURN, CREATE, MERGE, SET, REMOVE, DELETE, WITH, and UNWIND.
+- Implemented: index-first anchored source lookup for configured property indexes, with fallback behavior and explicit missing-index errors for unsupported property lookup patterns.
+- Implemented: configuration-based index DDL loading into runtime index catalog.
+- Implemented: executor metrics for statement outcomes, rows returned, index candidates, and index lookup outcomes; concrete in-process collector plus top unindexed-candidate reporting.
+- Implemented: startup wiring for graph path, tenant defaults, index config loading, and metrics reporting.
+- Implemented: lightweight TCP integration tests for request parsing/execution/JSON response path.
+
+Phase 1 deliverable status:
+
+- Working single-node graph engine package: complete.
+- Integration tests covering mixed read/update query flows: complete for current supported clause surface.
+- Basic index DDL and index utilization in planner: complete via configuration-based index declarations and runtime index catalog consumption.
+
+Remaining Phase 1 gaps before close:
+
+- Quantitative performance exit criteria evidence is not yet recorded in this document (ReBAC p95 and structured ingest throughput targets).
+- Operability exit criteria currently includes metrics implementation and emission, but external metric sink/export wiring and acceptance evidence should be documented.
 
 Milestones:
 
@@ -107,6 +121,12 @@ Exit Criteria (must all pass):
   - Structured log ingest sustained >= 50k edges/min on reference hardware.
 - Operability:
   - Exposed metrics for reads/writes/compactions/txn conflicts.
+
+Current gate assessment:
+
+- Correctness: passing based on current automated test suite.
+- Performance: baseline benchmarking exists, but explicit pass/fail evidence against listed targets remains to be captured.
+- Operability: partially satisfied; internal metrics collectors and recommendation logs are implemented, but production export/integration evidence remains to be captured.
 
 ## Phase 2: Hardening and Optimization (Single-node)
 

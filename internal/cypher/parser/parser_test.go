@@ -94,6 +94,16 @@ func TestParseBatchCreateReturnSupported(t *testing.T) {
 	}
 }
 
+func TestParseBatchMatchLabelAlternation(t *testing.T) {
+	batch, err := ParseBatch("MATCH (n:Movie|Person) RETURN n")
+	if err != nil {
+		t.Fatalf("ParseBatch() unexpected error: %v", err)
+	}
+	if len(batch.Statements) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(batch.Statements))
+	}
+}
+
 func TestParseBatchSyntaxError(t *testing.T) {
 	_, err := ParseBatch("MATCH (n RETURN n")
 	if err == nil {

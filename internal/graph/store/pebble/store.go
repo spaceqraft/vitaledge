@@ -168,6 +168,50 @@ func (t *tx) GetVertex(ctx context.Context, tenant, vertexID string) (vertex *gr
 	return vertex, nil
 }
 
+func (t *tx) ScanVertices(ctx context.Context, tenant string, limit int, fn func(*graph.Vertex) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_vertices", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant and callback are required", nil)
+	}
+
+	prefix := keyspace.VertexPrefix(tenant)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create vertex iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		var v graph.Vertex
+		if err := json.Unmarshal(iter.Value(), &v); err != nil {
+			return graph.NewError(graph.ErrKindStorage, "decode vertex", err)
+		}
+		if err := fn(&v); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan vertices", err)
+	}
+	return nil
+}
+
 func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 	started := time.Now()
 	defer func() { t.observeOperation("put_vertex", err, started) }()

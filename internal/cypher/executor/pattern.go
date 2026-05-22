@@ -8,7 +8,8 @@ import (
 	"github.com/paegun/vitaledge/internal/graph"
 )
 
-var anchoredOutPatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)\]->\(([A-Za-z_][A-Za-z0-9_]*)\)$`)
+var anchoredOutPatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)\]->\(([A-Za-z_][A-Za-z0-9_]*)\)$`)
+var nodePatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 
 type anchoredOutPattern struct {
 	SourceVar           string
@@ -19,8 +20,15 @@ type anchoredOutPattern struct {
 	TargetVar           string
 }
 
+type nodePattern struct {
+	Var           string
+	AnyOfLabels   []string
+	AllOfLabels   []string
+	PropertiesRaw string
+}
+
 func parseAnchoredOutPattern(raw string) (anchoredOutPattern, error) {
-	normalized := strings.Join(strings.Fields(raw), "")
+	normalized := normalizeClauseBody(raw)
 	m := anchoredOutPatternRE.FindStringSubmatch(normalized)
 	if len(m) != 6 {
 		return anchoredOutPattern{}, graph.NewError(
@@ -47,4 +55,42 @@ func parseAnchoredOutPattern(raw string) (anchoredOutPattern, error) {
 		EdgeType:            m[4],
 		TargetVar:           m[5],
 	}, nil
+}
+
+func parseNodePattern(raw string) (nodePattern, error) {
+	normalized := normalizeClauseBody(raw)
+	m := nodePatternRE.FindStringSubmatch(normalized)
+	if len(m) != 4 {
+		return nodePattern{}, graph.NewError(
+			graph.ErrKindUnsupported,
+			fmt.Sprintf("pattern %q is not yet supported", raw),
+			nil,
+		)
+	}
+	labels := splitLabels(m[2])
+	pattern := nodePattern{
+		Var:           m[1],
+		PropertiesRaw: m[3],
+	}
+	if strings.Contains(m[2], "|") {
+		labels = splitPipeLabels(m[2])
+		pattern.AnyOfLabels = labels
+		return pattern, nil
+	}
+	pattern.AllOfLabels = labels
+	return pattern, nil
+}
+
+func splitPipeLabels(raw string) []string {
+	parts := strings.Split(raw, "|")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		part = strings.TrimPrefix(part, ":")
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
+	}
+	return out
 }

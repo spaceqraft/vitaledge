@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"unicode"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/graph"
@@ -15,11 +17,13 @@ import (
 
 var (
 	createVertexPatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-	createEdgePatternRE   = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)\]->\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+	createEdgePatternRE   = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)(?:\{([^{}]*)\})?\]->\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 	setClauseRE           = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)=(.+)$`)
 	removeClauseRE        = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$`)
 	deleteClauseRE        = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)$`)
 )
+
+var autoVertexIDSeq uint64
 
 func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QueryStatement, params Params) (_ *Result, err error) {
 	if stmt == nil {
@@ -93,6 +97,7 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 	}
 
 	result := &Result{Columns: resultColumns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}
+	result.Rows = normalizeResultRows(result.Rows)
 	return result, nil
 }
 
@@ -110,6 +115,9 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	spec, err := parseAnchoredMatchClauseRaw(clause.Raw)
 	if err != nil {
 		return nil, err
+	}
+	if node, err := parseNodePattern(spec.Pattern); err == nil {
+		return e.expandNodeMatch(ctx, tx, rows, spec, node, params)
 	}
 	return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
 }
@@ -281,6 +289,157 @@ func (e *Executor) resolveAnchoredSources(ctx context.Context, tx graph.Tx, tena
 	return []*graph.Vertex{vertex}, nil
 }
 
+func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern nodePattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		candidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, candidate := range candidates {
+			if candidate == nil {
+				continue
+			}
+			merged := cloneRow(row)
+			merged[pattern.Var] = candidate
+
+			if spec.Where != "" {
+				ok, err := evalWhereExpression(spec.Where, merged, params)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					continue
+				}
+			}
+
+			matched = true
+			out = append(out, merged)
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			merged[pattern.Var] = nil
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx, tenant string, row Row, pattern nodePattern, params Params) ([]*graph.Vertex, error) {
+	if binding, ok := row[pattern.Var]; ok {
+		switch typed := binding.(type) {
+		case *graph.Vertex:
+			if nodePatternMatches(typed, pattern, params, row) {
+				return []*graph.Vertex{typed}, nil
+			}
+			return nil, nil
+		case string:
+			vertex, err := tx.GetVertex(ctx, tenant, typed)
+			if err != nil {
+				if graph.IsKind(err, graph.ErrKindNotFound) {
+					return nil, nil
+				}
+				return nil, err
+			}
+			if nodePatternMatches(vertex, pattern, params, row) {
+				return []*graph.Vertex{vertex}, nil
+			}
+			return nil, nil
+		}
+	}
+
+	out := make([]*graph.Vertex, 0)
+	if err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+		if nodePatternMatches(vertex, pattern, params, row) {
+			out = append(out, vertex)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func nodePatternMatches(vertex *graph.Vertex, pattern nodePattern, params Params, row Row) bool {
+	if vertex == nil {
+		return false
+	}
+	if len(pattern.AnyOfLabels) > 0 {
+		matched := false
+		for _, want := range pattern.AnyOfLabels {
+			if vertexHasLabel(vertex, want) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	if len(pattern.AllOfLabels) > 0 {
+		for _, want := range pattern.AllOfLabels {
+			if !vertexHasLabel(vertex, want) {
+				return false
+			}
+		}
+	}
+
+	props := strings.TrimSpace(pattern.PropertiesRaw)
+	if props == "" {
+		return true
+	}
+
+	parsed, err := parsePropertyMap(props, params, row)
+	if err != nil {
+		return false
+	}
+	for key, value := range parsed {
+		if strings.EqualFold(key, "id") {
+			if vertex.ID != stringFromProperty(map[string]any{"id": value}, "id") {
+				return false
+			}
+			continue
+		}
+		if vertex.Properties == nil {
+			return false
+		}
+		current, ok := vertex.Properties[key]
+		if !ok {
+			return false
+		}
+		if !bytes.Equal(current, valueToBytes(value)) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func vertexHasLabel(vertex *graph.Vertex, label string) bool {
+	if vertex == nil || strings.TrimSpace(label) == "" {
+		return false
+	}
+	for _, current := range vertex.Labels {
+		if current == label {
+			return true
+		}
+	}
+	return false
+}
+
 func anchoredSourcePropertyEquality(pattern anchoredOutPattern, params Params, row Row) (string, any, bool) {
 	props := strings.TrimSpace(pattern.SourcePropertiesRaw)
 	if props == "" {
@@ -335,10 +494,29 @@ func (e *Executor) applyCreateClause(ctx context.Context, tx graph.Tx, rows []Ro
 		rows = []Row{{}}
 	}
 
+	parts := splitTopLevelCommaSeparated(raw)
+	out := rows
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out, err = e.applyCreatePattern(ctx, tx, out, part, params, tenant, merge)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(out) == 0 {
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("CREATE/MERGE pattern %q is not yet supported", raw), nil)
+	}
+	return out, nil
+}
+
+func (e *Executor) applyCreatePattern(ctx context.Context, tx graph.Tx, rows []Row, raw string, params Params, tenant string, merge bool) ([]Row, error) {
 	if m := createVertexPatternRE.FindStringSubmatch(raw); len(m) == 4 {
 		return e.applyCreateVertex(ctx, tx, rows, m, params, tenant, merge)
 	}
-	if m := createEdgePatternRE.FindStringSubmatch(raw); len(m) == 8 {
+	if m := createEdgePatternRE.FindStringSubmatch(raw); len(m) == 9 {
 		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge)
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("CREATE/MERGE pattern %q is not yet supported", raw), nil)
@@ -362,7 +540,10 @@ func (e *Executor) applyCreateVertex(ctx context.Context, tx graph.Tx, rows []Ro
 			}
 		}
 		if vertexID == "" {
-			return nil, graph.NewError(graph.ErrKindInvalidInput, "CREATE/MERGE vertex requires id", nil)
+			if merge {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "MERGE vertex requires id", nil)
+			}
+			vertexID = nextAutoVertexID(varName)
 		}
 
 		vertex := &graph.Vertex{Tenant: tenant, ID: vertexID, Labels: labels, Properties: normalizedProps}
@@ -385,8 +566,8 @@ func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row,
 	srcVar := m[1]
 	srcLabels := splitLabels(m[2])
 	edgeType := m[4]
-	dstVar := m[5]
-	dstLabels := splitLabels(m[6])
+	dstVar := m[6]
+	dstLabels := splitLabels(m[7])
 
 	out := make([]Row, 0, len(rows))
 	for _, row := range rows {
@@ -394,21 +575,25 @@ func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row,
 		if err != nil {
 			return nil, err
 		}
-		dstProps, err := parsePropertyMap(m[7], params, row)
+		edgeProps, err := parsePropertyMap(m[5], params, row)
 		if err != nil {
 			return nil, err
 		}
-		srcVertex, err := resolveOrCreateVertex(ctx, tx, tenant, row, srcVar, srcLabels, srcProps)
+		dstProps, err := parsePropertyMap(m[8], params, row)
 		if err != nil {
 			return nil, err
 		}
-		dstVertex, err := resolveOrCreateVertex(ctx, tx, tenant, row, dstVar, dstLabels, dstProps)
+		srcVertex, err := resolveOrCreateVertex(ctx, tx, tenant, row, srcVar, srcLabels, srcProps, merge)
+		if err != nil {
+			return nil, err
+		}
+		dstVertex, err := resolveOrCreateVertex(ctx, tx, tenant, row, dstVar, dstLabels, dstProps, merge)
 		if err != nil {
 			return nil, err
 		}
 
 		edgeID := syntheticEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
-		edge := &graph.Edge{Tenant: srcVertex.Tenant, ID: edgeID, Type: edgeType, SrcID: srcVertex.ID, DstID: dstVertex.ID}
+		edge := &graph.Edge{Tenant: srcVertex.Tenant, ID: edgeID, Type: edgeType, SrcID: srcVertex.ID, DstID: dstVertex.ID, Properties: normalizeEdgeProperties(edgeProps)}
 		if merge {
 			if existing, err := tx.GetEdge(ctx, edge.Tenant, edge.ID); err == nil {
 				edge = existing
@@ -606,9 +791,6 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		}
 	}
 
-	if len(rows) == 0 {
-		rows = []Row{{}}
-	}
 	for _, row := range rows {
 		projected := Row{}
 		for _, item := range items {
@@ -1018,7 +1200,7 @@ func resolvePatternSourceID(row Row, params Params, varName, paramName string) (
 	return requireStringParam(params, paramName)
 }
 
-func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row Row, varName string, labels []string, props map[string]any) (*graph.Vertex, error) {
+func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row Row, varName string, labels []string, props map[string]any, merge bool) (*graph.Vertex, error) {
 	if binding, ok := row[varName]; ok {
 		if v, ok := binding.(*graph.Vertex); ok {
 			return v, nil
@@ -1033,7 +1215,10 @@ func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row 
 
 	vertexID := stringFromProperty(props, "id")
 	if vertexID == "" {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("CREATE/MERGE vertex %q requires id", varName), nil)
+		if merge {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("MERGE vertex %q requires id", varName), nil)
+		}
+		vertexID = nextAutoVertexID(varName)
 	}
 
 	vertex, err := tx.GetVertex(ctx, tenant, vertexID)
@@ -1049,6 +1234,14 @@ func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row 
 		return nil, err
 	}
 	return vertex, nil
+}
+
+func nextAutoVertexID(varName string) string {
+	n := atomic.AddUint64(&autoVertexIDSeq, 1)
+	if strings.TrimSpace(varName) == "" {
+		return fmt.Sprintf("auto-v-%d", n)
+	}
+	return fmt.Sprintf("auto-%s-%d", varName, n)
 }
 
 func parsePropertyMap(raw string, params Params, row Row) (map[string]any, error) {
@@ -1148,6 +1341,17 @@ func normalizeVertexProperties(props map[string]any) graph.PropertyMap {
 	return out
 }
 
+func normalizeEdgeProperties(props map[string]any) graph.PropertyMap {
+	out := graph.PropertyMap{}
+	for k, v := range props {
+		if strings.EqualFold(k, "id") {
+			continue
+		}
+		out[k] = valueToBytes(v)
+	}
+	return out
+}
+
 func stringFromProperty(props map[string]any, key string) string {
 	v, ok := props[key]
 	if !ok {
@@ -1217,7 +1421,60 @@ func stripLeadingClauseKeyword(raw, keyword string) string {
 }
 
 func normalizeClauseBody(raw string) string {
-	return strings.Join(strings.Fields(raw), "")
+	if raw == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.Grow(len(raw))
+	inSingle := false
+	inDouble := false
+
+	for i := 0; i < len(raw); i++ {
+		r := raw[i]
+		if inSingle {
+			b.WriteByte(r)
+			if r == '\'' {
+				if i+1 < len(raw) && raw[i+1] == '\'' {
+					b.WriteByte(raw[i+1])
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+
+		if inDouble {
+			b.WriteByte(r)
+			if r == '\\' {
+				if i+1 < len(raw) {
+					b.WriteByte(raw[i+1])
+					i++
+				}
+				continue
+			}
+			if r == '"' {
+				inDouble = false
+			}
+			continue
+		}
+
+		if unicode.IsSpace(rune(r)) {
+			continue
+		}
+
+		b.WriteByte(r)
+		if r == '\'' {
+			inSingle = true
+			continue
+		}
+		if r == '"' {
+			inDouble = true
+		}
+	}
+
+	return b.String()
 }
 
 func cloneRow(in Row) Row {

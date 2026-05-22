@@ -141,16 +141,17 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 
 	rows := make([]Row, 0)
 	execErr := e.store.View(ctx, func(tx graph.Tx) error {
-		matchRows, err := e.expandAnchoredMatch(ctx, tx, []Row{{}}, anchoredMatchSpec{
-			Optional: match.Optional,
-			Pattern:  match.Pattern,
-			Where: func() string {
-				if match.Where != nil {
-					return match.Where.Raw
-				}
-				return ""
-			}(),
-		}, params)
+		kind := ast.ClauseKindMatch
+		clauseRaw := "MATCH " + match.Pattern
+		if match.Optional {
+			kind = ast.ClauseKindOptionalMatch
+			clauseRaw = "OPTIONAL MATCH " + match.Pattern
+		}
+		if match.Where != nil && strings.TrimSpace(match.Where.Raw) != "" {
+			clauseRaw += " WHERE " + strings.TrimSpace(match.Where.Raw)
+		}
+
+		matchRows, err := e.applyMatchClause(ctx, tx, []Row{{}}, ast.Clause{Kind: kind, Raw: clauseRaw}, params)
 		if err != nil {
 			return err
 		}
@@ -176,6 +177,7 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 			RowsReturned: len(rows),
 		},
 	}
+	result.Rows = normalizeResultRows(result.Rows)
 	return result, nil
 }
 
@@ -247,13 +249,13 @@ func evalVertexField(v *graph.Vertex, field string) (any, error) {
 		return append([]string(nil), v.Labels...), nil
 	default:
 		if v.Properties == nil {
-			return nil, graph.NewError(graph.ErrKindNotFound, fmt.Sprintf("vertex property %q not found", field), nil)
+			return nil, nil
 		}
 		val, ok := v.Properties[field]
 		if !ok {
-			return nil, graph.NewError(graph.ErrKindNotFound, fmt.Sprintf("vertex property %q not found", field), nil)
+			return nil, nil
 		}
-		return append([]byte(nil), val...), nil
+		return string(val), nil
 	}
 }
 
@@ -274,13 +276,13 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 		return e.DstID, nil
 	default:
 		if e.Properties == nil {
-			return nil, graph.NewError(graph.ErrKindNotFound, fmt.Sprintf("edge property %q not found", field), nil)
+			return nil, nil
 		}
 		val, ok := e.Properties[field]
 		if !ok {
-			return nil, graph.NewError(graph.ErrKindNotFound, fmt.Sprintf("edge property %q not found", field), nil)
+			return nil, nil
 		}
-		return append([]byte(nil), val...), nil
+		return string(val), nil
 	}
 }
 
@@ -373,7 +375,7 @@ func vertexToMap(v *graph.Vertex) map[string]any {
 	}
 	props := map[string]any{}
 	for k, val := range v.Properties {
-		props[k] = append([]byte(nil), val...)
+		props[k] = string(val)
 	}
 	return map[string]any{
 		"tenant":     v.Tenant,
@@ -389,7 +391,7 @@ func edgeToMap(e *graph.Edge) map[string]any {
 	}
 	props := map[string]any{}
 	for k, val := range e.Properties {
-		props[k] = append([]byte(nil), val...)
+		props[k] = string(val)
 	}
 	return map[string]any{
 		"tenant":     e.Tenant,
@@ -398,6 +400,52 @@ func edgeToMap(e *graph.Edge) map[string]any {
 		"src":        e.SrcID,
 		"dst":        e.DstID,
 		"properties": props,
+	}
+}
+
+func normalizeResultRows(rows []Row) []Row {
+	if len(rows) == 0 {
+		return rows
+	}
+	out := make([]Row, 0, len(rows))
+	for _, row := range rows {
+		normalized := Row{}
+		for key, value := range row {
+			normalized[key] = normalizeResultValue(value)
+		}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func normalizeResultValue(value any) any {
+	switch typed := value.(type) {
+	case *graph.Vertex:
+		return vertexToMap(typed)
+	case *graph.Edge:
+		return edgeToMap(typed)
+	case []byte:
+		return string(typed)
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = normalizeResultValue(item)
+		}
+		return out
+	case Row:
+		out := Row{}
+		for key, item := range typed {
+			out[key] = normalizeResultValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = normalizeResultValue(item)
+		}
+		return out
+	default:
+		return value
 	}
 }
 

@@ -18,6 +18,7 @@ type TxOptions struct {
 // Tx defines graph operations within a transactional boundary.
 type Tx interface {
 	GetVertex(ctx context.Context, tenant, vertexID string) (*Vertex, error)
+	ScanVertices(ctx context.Context, tenant string, limit int, fn func(*Vertex) error) error
 	PutVertex(ctx context.Context, vertex *Vertex) error
 	DeleteVertex(ctx context.Context, tenant, vertexID string) error
 

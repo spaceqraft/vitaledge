@@ -107,6 +107,45 @@ func TestVertexEdgeCRUDAndAdjacency(t *testing.T) {
 	}
 }
 
+func TestScanVertices(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v2", Labels: []string{"Group"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "other", ID: "v3", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		seen := map[string]bool{}
+		if err := tx.ScanVertices(ctx, "acme", 0, func(v *graph.Vertex) error {
+			seen[v.ID] = true
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(seen) != 2 || !seen["v1"] || !seen["v2"] {
+			return fmt.Errorf("unexpected scanned vertices: %#v", seen)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan vertices failed: %v", err)
+	}
+}
+
 func TestDurabilityAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()

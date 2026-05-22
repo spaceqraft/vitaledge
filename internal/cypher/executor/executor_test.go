@@ -436,6 +436,69 @@ func TestExecuteCreateEdgePattern(t *testing.T) {
 	}
 }
 
+func TestExecuteCreateMultiPatternWithRelationshipProperties(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	query := "CREATE (charlie:Person:Actor {name: 'Charlie Sheen'}),\r\n" +
+		"       (wallStreet:Movie {title: 'Wall Street'}),\r\n" +
+		"       (charlie)-[:ACTED_IN {role: 'Bud Fox'}]->(wallStreet)"
+	stmt, err := parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+
+	charlieRaw, ok := res.Rows[0]["charlie"]
+	if !ok {
+		t.Fatalf("expected charlie binding")
+	}
+	charlie, ok := charlieRaw.(map[string]any)
+	if !ok {
+		t.Fatalf("expected normalized charlie vertex map, got %T", charlieRaw)
+	}
+	charlieProps, ok := charlie["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected charlie properties map, got %T", charlie["properties"])
+	}
+	if got := charlieProps["name"]; got != "Charlie Sheen" {
+		t.Fatalf("unexpected charlie name: %q", got)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		targetRaw, ok := res.Rows[0]["wallStreet"]
+		if !ok {
+			return errUnexpected("expected wallStreet binding")
+		}
+		target, ok := targetRaw.(map[string]any)
+		if !ok {
+			return errUnexpected("expected wallStreet vertex binding")
+		}
+		charlieID, _ := charlie["id"].(string)
+		targetID, _ := target["id"].(string)
+
+		edge, err := tx.GetEdge(ctx, "acme", syntheticEdgeID("acme", charlieID, "ACTED_IN", targetID))
+		if err != nil {
+			return err
+		}
+		if got := string(edge.Properties["role"]); got != "Bud Fox" {
+			return errUnexpected("unexpected relationship role property")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verification failed: %v", err)
+	}
+}
+
 func TestExecuteUnwindWithReturnProjectsRows(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -462,6 +525,251 @@ func TestExecuteUnwindWithReturnProjectsRows(t *testing.T) {
 	}
 	if got := res.Rows[2]["value"]; got != 3 {
 		t.Fatalf("unexpected third row: %#v", got)
+	}
+}
+
+func TestExecuteMatchAllNodesReturnBinding(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedGraph(t, ctx, store)
+
+	stmt, err := parser.ParseStatement("MATCH (n) RETURN n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 4 {
+		t.Fatalf("expected 4 rows for seeded vertices, got %d", len(res.Rows))
+	}
+	for i, row := range res.Rows {
+		v, ok := row["n"].(map[string]any)
+		if !ok {
+			t.Fatalf("row %d expected map-shaped vertex projection, got %T", i, row["n"])
+		}
+		if _, ok := v["id"]; !ok {
+			t.Fatalf("row %d projected vertex missing id field", i)
+		}
+	}
+}
+
+func TestExecuteMatchByLabel(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedGraph(t, ctx, store)
+
+	stmt, err := parser.ParseStatement("MATCH (n:User) RETURN n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 User rows, got %d", len(res.Rows))
+	}
+}
+
+func TestExecuteMatchReturnBindingEmitsStringProperties(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "u-projected",
+			Labels:     []string{"User"},
+			Properties: graph.PropertyMap{"name": []byte("Alice")},
+		})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n) RETURN n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+
+	node, ok := res.Rows[0]["n"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected projected node map, got %T", res.Rows[0]["n"])
+	}
+	props, ok := node["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected projected node properties map, got %T", node["properties"])
+	}
+	if got, ok := props["name"].(string); !ok || got != "Alice" {
+		t.Fatalf("expected string property Alice, got %#v", props["name"])
+	}
+}
+
+func TestExecuteMatchMovieTitleProjection(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("The American President")}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (movie:Movie) RETURN movie.title AS title")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+	if res.Columns[0] != "title" {
+		t.Fatalf("expected title column, got %#v", res.Columns)
+	}
+}
+
+func TestExecuteMatchActorByNameWithSpaceNoIndex(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{
+			Tenant: "default",
+			ID:     "auto-charlie-1",
+			Labels: []string{"Person", "Actor"},
+			Properties: graph.PropertyMap{
+				"name": []byte("Charlie Sheen"),
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (actor:Actor { name: \"Charlie Sheen\" }) RETURN actor")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "default"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+
+	actor, ok := res.Rows[0]["actor"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected actor map, got %T", res.Rows[0]["actor"])
+	}
+	if got, _ := actor["id"].(string); got != "auto-charlie-1" {
+		t.Fatalf("unexpected actor id: %#v", actor["id"])
+	}
+	props, ok := actor["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected actor properties map, got %T", actor["properties"])
+	}
+	if got, _ := props["name"].(string); got != "Charlie Sheen" {
+		t.Fatalf("unexpected actor name: %#v", props["name"])
+	}
+}
+
+func TestExecuteMatchLabelAlternationProjection(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Charlie Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1", Labels: []string{"Device"}, Properties: graph.PropertyMap{"name": []byte("router")}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:Movie|Person) RETURN n.name AS name, n.title AS title")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows (Movie|Person), got %d", len(res.Rows))
+	}
+}
+
+func TestExecuteMatchProjectionNoRowsIsNotError(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("MATCH (movie:Movie) WITH movie RETURN movie.title AS title")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("expected no error for no-match projection, got: %v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("expected 0 rows, got %d", len(res.Rows))
+	}
+}
+
+func TestParseNodePatternBareAndLabel(t *testing.T) {
+	if _, err := parseNodePattern("(n)"); err != nil {
+		t.Fatalf("expected bare node pattern to parse: %v", err)
+	}
+	if _, err := parseNodePattern("(n:User)"); err != nil {
+		t.Fatalf("expected labeled node pattern to parse: %v", err)
 	}
 }
 

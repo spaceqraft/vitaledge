@@ -32,3 +32,4 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Parser generation target: `make generate-cypher-parser`
 - Test command: `go test ./...`
 - Smoke benchmark: `make bench-smoke`
+- Graph store benchmark baseline: `make bench-graph-store`

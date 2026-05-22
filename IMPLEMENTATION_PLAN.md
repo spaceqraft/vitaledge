@@ -68,6 +68,12 @@ Exit Criteria:
 
 Objective: deliver local graph correctness with acceptable performance.
 
+Current implementation status:
+
+- In progress: Pebble-backed GraphStore with transactional CRUD, adjacency indexes, and property-index write/delete.
+- Implemented: first integration tests for CRUD/adjacency, restart durability, and property-index round-trip.
+- Implemented: injected metrics hooks for tx and operation outcomes/durations (module does not register metrics directly).
+
 Milestones:
 
 1. Pebble-backed GraphStore implementation.

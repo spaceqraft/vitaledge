@@ -5,6 +5,7 @@ run: build
 
 build:
 	go build -o bin/vitaledge ./cmd/vitaledge/main.go 
+	go build -o bin/vitaledge-bench ./cmd/vitaledge-bench/main.go
 
 generate-cypher-parser:
 	@test -f $(ANTLR_JAR) || curl -L --fail https://www.antlr.org/download/antlr-4.13.1-complete.jar -o $(ANTLR_JAR)
@@ -14,6 +15,9 @@ generate: generate-cypher-parser
 
 test:
 	go test -v ./...
+
+bench-smoke:
+	bash benchmarks/smoke.sh
 
 cover:
 	go test -coverpkg=./... -covermode=atomic -coverprofile=coverage.txt -tags ci,memoryprotection -race -timeout 15m -count=1 ./...

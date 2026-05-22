@@ -16,6 +16,7 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 
 - [Property Graph Design](DESIGN.md)
 - [Property Graph Implementation Plan](IMPLEMENTATION_PLAN.md)
+- [Graph Keyspace Specification](GRAPH_KEYSPACE.md)
 
 ## Repository Layout
 
@@ -30,3 +31,4 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Grammar is pinned to openCypher M23 in source control.
 - Parser generation target: `make generate-cypher-parser`
 - Test command: `go test ./...`
+- Smoke benchmark: `make bench-smoke`

@@ -124,6 +124,8 @@ Design principles:
 ## Next Steps
 
 Execution detail is tracked in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+Key encoding details are tracked in [GRAPH_KEYSPACE.md](GRAPH_KEYSPACE.md).
+Benchmark dataset contracts are tracked in [benchmarks/DATASETS.md](benchmarks/DATASETS.md).
 
 1. Build a storage abstraction with Pebble-backed implementation (`GraphStore`).
 2. Implement vertex/edge CRUD plus adjacency indexes.

@@ -38,6 +38,13 @@ Out of scope for this plan version:
 
 Objective: lock interfaces and invariants before heavy implementation.
 
+Current implementation status:
+
+- Implemented: GraphStore and transaction contracts.
+- Implemented: keyspace encoding package and tests.
+- Implemented: error taxonomy scaffolding.
+- Implemented: benchmark harness skeleton and runnable smoke benchmark.
+
 Milestones:
 
 1. Define GraphStore interface and transaction boundaries.

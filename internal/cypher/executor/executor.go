@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -155,13 +156,11 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 		if err != nil {
 			return err
 		}
-		for _, row := range matchRows {
-			projected, err := evalReturnRow(stmt.Return.Items, row)
-			if err != nil {
-				return err
-			}
-			rows = append(rows, projected)
+		projectedRows, err := evalReturnRows(stmt.Return.Items, matchRows)
+		if err != nil {
+			return err
 		}
+		rows = append(rows, projectedRows...)
 		return nil
 	})
 	if execErr != nil {
@@ -197,10 +196,131 @@ func evalReturnRow(items []ast.ProjectionItem, binding map[string]any) (Row, err
 	return out, nil
 }
 
+func evalReturnRows(items []ast.ProjectionItem, matchRows []Row) ([]Row, error) {
+	hasAggregate := false
+	for _, item := range items {
+		if _, ok := parseCountExpression(item.Expression.Raw); ok {
+			hasAggregate = true
+			break
+		}
+	}
+	if !hasAggregate {
+		out := make([]Row, 0, len(matchRows))
+		for _, row := range matchRows {
+			projected, err := evalReturnRow(items, row)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, projected)
+		}
+		return out, nil
+	}
+
+	type groupedReturn struct {
+		projected Row
+		counts    map[int]int
+	}
+	nonAggregateCount := 0
+	for _, item := range items {
+		if _, ok := parseCountExpression(item.Expression.Raw); !ok {
+			nonAggregateCount++
+		}
+	}
+
+	groups := map[string]*groupedReturn{}
+	groupOrder := make([]string, 0)
+	for _, row := range matchRows {
+		projected := Row{}
+		keyValues := make([]any, 0, nonAggregateCount)
+		for _, item := range items {
+			if _, ok := parseCountExpression(item.Expression.Raw); ok {
+				continue
+			}
+			value, err := evalExpression(item.Expression.Raw, row)
+			if err != nil {
+				return nil, err
+			}
+			col := strings.TrimSpace(item.Alias)
+			if col == "" {
+				col = item.Expression.Raw
+			}
+			projected[col] = value
+			keyValues = append(keyValues, normalizeResultValue(value))
+		}
+
+		keyBytes, err := json.Marshal(keyValues)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindUnsupported, "aggregation key is not serializable", err)
+		}
+		groupKey := string(keyBytes)
+		group, ok := groups[groupKey]
+		if !ok {
+			group = &groupedReturn{projected: projected, counts: map[int]int{}}
+			groups[groupKey] = group
+			groupOrder = append(groupOrder, groupKey)
+		}
+
+		for idx, item := range items {
+			countArg, ok := parseCountExpression(item.Expression.Raw)
+			if !ok {
+				continue
+			}
+			if countArg == "*" {
+				group.counts[idx]++
+				continue
+			}
+			value, err := evalExpression(countArg, row)
+			if err != nil {
+				return nil, err
+			}
+			if value != nil {
+				group.counts[idx]++
+			}
+		}
+	}
+
+	if len(matchRows) == 0 && nonAggregateCount == 0 {
+		empty := Row{}
+		for _, item := range items {
+			col := strings.TrimSpace(item.Alias)
+			if col == "" {
+				col = item.Expression.Raw
+			}
+			if _, ok := parseCountExpression(item.Expression.Raw); ok {
+				empty[col] = 0
+			} else {
+				empty[col] = nil
+			}
+		}
+		return []Row{empty}, nil
+	}
+
+	out := make([]Row, 0, len(groupOrder))
+	for _, groupKey := range groupOrder {
+		group := groups[groupKey]
+		projected := cloneRow(group.projected)
+		for idx, item := range items {
+			if _, ok := parseCountExpression(item.Expression.Raw); !ok {
+				continue
+			}
+			col := strings.TrimSpace(item.Alias)
+			if col == "" {
+				col = item.Expression.Raw
+			}
+			projected[col] = group.counts[idx]
+		}
+		out = append(out, projected)
+	}
+	return out, nil
+}
+
 func evalExpression(raw string, binding map[string]any) (any, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty return expression", nil)
+	}
+	if arg, ok := parseFunctionCall(raw, "labels"); ok {
+		return evalLabelsFunction(arg, binding)
 	}
 	if v, ok := binding[raw]; ok {
 		switch typed := v.(type) {

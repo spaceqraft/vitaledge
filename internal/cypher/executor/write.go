@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -396,6 +397,13 @@ func nodePatternMatches(vertex *graph.Vertex, pattern nodePattern, params Params
 			}
 		}
 	}
+	if len(pattern.ExcludedLabels) > 0 {
+		for _, want := range pattern.ExcludedLabels {
+			if vertexHasLabel(vertex, want) {
+				return false
+			}
+		}
+	}
 
 	props := strings.TrimSpace(pattern.PropertiesRaw)
 	if props == "" {
@@ -783,17 +791,58 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 
 	out := make([]Row, 0, len(rows))
 	columns := make([]string, 0, len(items))
+	hasAggregate := false
 	for _, item := range items {
 		if item.Alias != "" {
 			columns = append(columns, item.Alias)
 		} else {
 			columns = append(columns, item.Expression)
 		}
+		if item.CountArg != "" {
+			hasAggregate = true
+		}
 	}
 
+	if !hasAggregate {
+		for _, row := range rows {
+			projected := Row{}
+			for _, item := range items {
+				value, err := evalExpressionWithScope(item.Expression, row, params)
+				if err != nil {
+					return nil, nil, err
+				}
+				key := item.Expression
+				if item.Alias != "" {
+					key = item.Alias
+				}
+				projected[key] = value
+			}
+			out = append(out, projected)
+		}
+		return out, columns, nil
+	}
+
+	type projectionGroup struct {
+		projected Row
+		counts    map[int]int
+	}
+
+	nonAggregateCount := 0
+	for _, item := range items {
+		if item.CountArg == "" {
+			nonAggregateCount++
+		}
+	}
+
+	groups := map[string]*projectionGroup{}
+	groupOrder := make([]string, 0)
 	for _, row := range rows {
 		projected := Row{}
+		keyValues := make([]any, 0, nonAggregateCount)
 		for _, item := range items {
+			if item.CountArg != "" {
+				continue
+			}
 			value, err := evalExpressionWithScope(item.Expression, row, params)
 			if err != nil {
 				return nil, nil, err
@@ -803,6 +852,68 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 				key = item.Alias
 			}
 			projected[key] = value
+			keyValues = append(keyValues, normalizeResultValue(value))
+		}
+
+		keyBytes, err := json.Marshal(keyValues)
+		if err != nil {
+			return nil, nil, graph.NewError(graph.ErrKindUnsupported, "aggregation key is not serializable", err)
+		}
+		groupKey := string(keyBytes)
+		group, ok := groups[groupKey]
+		if !ok {
+			group = &projectionGroup{projected: projected, counts: map[int]int{}}
+			groups[groupKey] = group
+			groupOrder = append(groupOrder, groupKey)
+		}
+
+		for idx, item := range items {
+			if item.CountArg == "" {
+				continue
+			}
+			if item.CountArg == "*" {
+				group.counts[idx]++
+				continue
+			}
+			value, err := evalExpressionWithScope(item.CountArg, row, params)
+			if err != nil {
+				return nil, nil, err
+			}
+			if value != nil {
+				group.counts[idx]++
+			}
+		}
+	}
+
+	if len(rows) == 0 && nonAggregateCount == 0 {
+		projected := Row{}
+		for _, item := range items {
+			key := item.Expression
+			if item.Alias != "" {
+				key = item.Alias
+			}
+			if item.CountArg != "" {
+				projected[key] = 0
+			} else {
+				projected[key] = nil
+			}
+		}
+		out = append(out, projected)
+		return out, columns, nil
+	}
+
+	for _, groupKey := range groupOrder {
+		group := groups[groupKey]
+		projected := cloneRow(group.projected)
+		for idx, item := range items {
+			if item.CountArg == "" {
+				continue
+			}
+			key := item.Expression
+			if item.Alias != "" {
+				key = item.Alias
+			}
+			projected[key] = group.counts[idx]
 		}
 		out = append(out, projected)
 	}
@@ -813,6 +924,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 type projectionSpec struct {
 	Expression string
 	Alias      string
+	CountArg   string
 }
 
 func parseProjectionItems(raw string) ([]projectionSpec, error) {
@@ -837,12 +949,39 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 			if expr == "" || alias == "" {
 				return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("projection item %q is not supported", part), nil)
 			}
-			items = append(items, projectionSpec{Expression: expr, Alias: alias})
+			countArg, _ := parseCountExpression(expr)
+			items = append(items, projectionSpec{Expression: expr, Alias: alias, CountArg: countArg})
 			continue
 		}
-		items = append(items, projectionSpec{Expression: part})
+		countArg, _ := parseCountExpression(part)
+		items = append(items, projectionSpec{Expression: part, CountArg: countArg})
 	}
 	return items, nil
+}
+
+func parseFunctionCall(raw string, name string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	name = strings.TrimSpace(name)
+	if raw == "" || name == "" {
+		return "", false
+	}
+	prefix := name + "("
+	if len(raw) <= len(prefix) || !strings.HasSuffix(raw, ")") {
+		return "", false
+	}
+	if !strings.EqualFold(raw[:len(prefix)], prefix) {
+		return "", false
+	}
+	arg := strings.TrimSpace(raw[len(prefix) : len(raw)-1])
+	return arg, true
+}
+
+func parseCountExpression(raw string) (string, bool) {
+	arg, ok := parseFunctionCall(raw, "count")
+	if !ok || arg == "" {
+		return "", false
+	}
+	return arg, true
 }
 
 func splitTopLevelCommaSeparated(raw string) []string {
@@ -887,6 +1026,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty expression", nil)
 	}
+	if arg, ok := parseFunctionCall(raw, "labels"); ok {
+		return evalLabelsFunction(arg, row)
+	}
 	if value, err := evalWriteValue(raw, params, row); err == nil {
 		return value, nil
 	}
@@ -914,6 +1056,38 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+}
+
+func evalLabelsFunction(arg string, binding map[string]any) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "labels() requires one argument", nil)
+	}
+	base, ok := binding[arg]
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", arg), nil)
+	}
+	if base == nil {
+		return nil, nil
+	}
+	switch typed := base.(type) {
+	case *graph.Vertex:
+		return append([]string(nil), typed.Labels...), nil
+	case map[string]any:
+		if labels, ok := typed["labels"]; ok {
+			switch l := labels.(type) {
+			case []string:
+				return append([]string(nil), l...), nil
+			case []any:
+				out := make([]string, 0, len(l))
+				for _, item := range l {
+					out = append(out, fmt.Sprint(item))
+				}
+				return out, nil
+			}
+		}
+	}
+	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("labels() is not supported on %T", base), nil)
 }
 
 func evalWhereExpression(raw string, row Row, params Params) (bool, error) {

@@ -744,6 +744,105 @@ func TestExecuteMatchLabelAlternationProjection(t *testing.T) {
 	}
 }
 
+func TestExecuteMatchNegatedLabelProjection(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1", Labels: []string{"Device"}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:!Movie) RETURN n.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows (!Movie), got %d", len(res.Rows))
+	}
+	ids := map[string]bool{}
+	for _, row := range res.Rows {
+		id, _ := row["id"].(string)
+		ids[id] = true
+	}
+	if !ids["p1"] || !ids["x1"] || ids["m1"] {
+		t.Fatalf("unexpected ids for !Movie: %#v", ids)
+	}
+}
+
+func TestExecuteMatchLabelsAndCountGrouping(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p2", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1", Labels: []string{"Device"}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:!Movie) RETURN labels(n) AS label, count(n) AS labelCount")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 grouped rows, got %d", len(res.Rows))
+	}
+
+	counts := map[string]int{}
+	for _, row := range res.Rows {
+		labels, ok := row["label"].([]string)
+		if !ok || len(labels) != 1 {
+			t.Fatalf("unexpected labels projection: %#v", row["label"])
+		}
+		count, ok := row["labelCount"].(int)
+		if !ok {
+			t.Fatalf("unexpected count projection type: %T", row["labelCount"])
+		}
+		counts[labels[0]] = count
+	}
+	if counts["Person"] != 2 || counts["Device"] != 1 || len(counts) != 2 {
+		t.Fatalf("unexpected grouped counts: %#v", counts)
+	}
+}
+
 func TestExecuteMatchProjectionNoRowsIsNotError(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

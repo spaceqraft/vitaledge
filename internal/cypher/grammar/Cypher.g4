@@ -255,7 +255,7 @@ oC_RelationshipTypes
                  :  ':' SP? oC_RelTypeName ( SP? '|' ':'? SP? oC_RelTypeName )* ;
 
 oC_NodeLabels
-          :  ':' SP? oC_LabelName ( SP? ( ':' | '|' ':'? ) SP? oC_LabelName )* ;
+          :  ':' SP? '!'? oC_LabelName ( SP? ( ':' | '|' ':'? ) SP? '!'? oC_LabelName )* ;
 
 oC_NodeLabel
          :  ':' SP? oC_LabelName ;

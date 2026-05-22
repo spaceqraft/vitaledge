@@ -8,8 +8,8 @@ import (
 	"github.com/paegun/vitaledge/internal/graph"
 )
 
-var anchoredOutPatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)\]->\(([A-Za-z_][A-Za-z0-9_]*)\)$`)
-var nodePatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var anchoredOutPatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)\]->\(([A-Za-z_][A-Za-z0-9_]*)\)$`)
+var nodePatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 
 type anchoredOutPattern struct {
 	SourceVar           string
@@ -21,10 +21,11 @@ type anchoredOutPattern struct {
 }
 
 type nodePattern struct {
-	Var           string
-	AnyOfLabels   []string
-	AllOfLabels   []string
-	PropertiesRaw string
+	Var            string
+	AnyOfLabels    []string
+	AllOfLabels    []string
+	ExcludedLabels []string
+	PropertiesRaw  string
 }
 
 func parseAnchoredOutPattern(raw string) (anchoredOutPattern, error) {
@@ -37,10 +38,10 @@ func parseAnchoredOutPattern(raw string) (anchoredOutPattern, error) {
 			nil,
 		)
 	}
-	labels := splitLabels(m[2])
+	allOf, _, _ := parseLabelFilters(m[2])
 	label := ""
-	if len(labels) > 0 {
-		label = labels[0]
+	if len(allOf) > 0 {
+		label = allOf[0]
 	}
 	props := m[3]
 	sourceIDParam := ""
@@ -67,30 +68,52 @@ func parseNodePattern(raw string) (nodePattern, error) {
 			nil,
 		)
 	}
-	labels := splitLabels(m[2])
+	allOf, anyOf, excluded := parseLabelFilters(m[2])
 	pattern := nodePattern{
-		Var:           m[1],
-		PropertiesRaw: m[3],
+		Var:            m[1],
+		AllOfLabels:    allOf,
+		AnyOfLabels:    anyOf,
+		ExcludedLabels: excluded,
+		PropertiesRaw:  m[3],
 	}
-	if strings.Contains(m[2], "|") {
-		labels = splitPipeLabels(m[2])
-		pattern.AnyOfLabels = labels
-		return pattern, nil
-	}
-	pattern.AllOfLabels = labels
 	return pattern, nil
 }
 
-func splitPipeLabels(raw string) []string {
-	parts := strings.Split(raw, "|")
-	out := make([]string, 0, len(parts))
+func parseLabelFilters(raw string) (allOf []string, anyOf []string, excluded []string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil, nil
+	}
+
+	if strings.Contains(raw, "|") {
+		parts := strings.Split(raw, "|")
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			part = strings.TrimPrefix(part, ":")
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if strings.HasPrefix(part, "!") {
+				excluded = append(excluded, strings.TrimPrefix(part, "!"))
+				continue
+			}
+			anyOf = append(anyOf, part)
+		}
+		return nil, anyOf, excluded
+	}
+
+	parts := strings.Split(raw, ":")
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		part = strings.TrimPrefix(part, ":")
 		if part == "" {
 			continue
 		}
-		out = append(out, part)
+		if strings.HasPrefix(part, "!") {
+			excluded = append(excluded, strings.TrimPrefix(part, "!"))
+			continue
+		}
+		allOf = append(allOf, part)
 	}
-	return out
+	return allOf, nil, excluded
 }

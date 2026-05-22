@@ -107,11 +107,9 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 	if stmt == nil {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "match query statement is required", nil)
 	}
-	if len(stmt.MatchClauses) != 1 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, "only single MATCH clause is currently supported", nil)
+	if len(stmt.MatchClauses) == 0 {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "at least one MATCH clause is required", nil)
 	}
-
-	match := stmt.MatchClauses[0]
 	if stmt.Return.IncludeAll || len(stmt.Return.Items) == 0 {
 		return nil, graph.NewError(graph.ErrKindUnsupported, "RETURN * is not yet supported", nil)
 	}
@@ -142,19 +140,23 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 
 	rows := make([]Row, 0)
 	execErr := e.store.View(ctx, func(tx graph.Tx) error {
-		kind := ast.ClauseKindMatch
-		clauseRaw := "MATCH " + match.Pattern
-		if match.Optional {
-			kind = ast.ClauseKindOptionalMatch
-			clauseRaw = "OPTIONAL MATCH " + match.Pattern
-		}
-		if match.Where != nil && strings.TrimSpace(match.Where.Raw) != "" {
-			clauseRaw += " WHERE " + strings.TrimSpace(match.Where.Raw)
-		}
+		matchRows := []Row{{}}
+		for _, match := range stmt.MatchClauses {
+			kind := ast.ClauseKindMatch
+			clauseRaw := "MATCH " + match.Pattern
+			if match.Optional {
+				kind = ast.ClauseKindOptionalMatch
+				clauseRaw = "OPTIONAL MATCH " + match.Pattern
+			}
+			if match.Where != nil && strings.TrimSpace(match.Where.Raw) != "" {
+				clauseRaw += " WHERE " + strings.TrimSpace(match.Where.Raw)
+			}
 
-		matchRows, err := e.applyMatchClause(ctx, tx, []Row{{}}, ast.Clause{Kind: kind, Raw: clauseRaw}, params)
-		if err != nil {
-			return err
+			nextRows, err := e.applyMatchClause(ctx, tx, matchRows, ast.Clause{Kind: kind, Raw: clauseRaw}, params)
+			if err != nil {
+				return err
+			}
+			matchRows = nextRows
 		}
 		projectedRows, err := evalReturnRows(stmt.Return.Items, matchRows)
 		if err != nil {
@@ -321,6 +323,9 @@ func evalExpression(raw string, binding map[string]any) (any, error) {
 	}
 	if arg, ok := parseFunctionCall(raw, "labels"); ok {
 		return evalLabelsFunction(arg, binding)
+	}
+	if arg, ok := parseFunctionCall(raw, "type"); ok {
+		return evalTypeFunction(arg, binding)
 	}
 	if v, ok := binding[raw]; ok {
 		switch typed := v.(type) {

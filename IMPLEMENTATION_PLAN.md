@@ -90,6 +90,7 @@ Remaining Phase 1 gaps before close:
 
 - Quantitative performance exit criteria evidence is not yet recorded in this document (ReBAC p95 and structured ingest throughput targets).
 - Operability exit criteria currently includes metrics implementation and emission, but external metric sink/export wiring and acceptance evidence should be documented.
+- Cypher compatibility backlog: path-variable capture and return (example: `MATCH path = ()-[:ACTED_IN]->(movie:Movie) RETURN path`) remains deferred.
 
 Milestones:
 

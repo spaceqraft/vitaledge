@@ -249,6 +249,60 @@ func TestExecuteMatchWhereFiltersRows(t *testing.T) {
 	}
 }
 
+func TestExecuteMatchWhereNotExistsSubquery(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-martin", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Martin Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-coppola", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Francis Ford Coppola")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-wall", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-apoc", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Apocalypse Now")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "ACTED_IN", SrcID: "p-martin", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "ACTED_IN", SrcID: "p-martin", DstID: "m-apoc"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e4", Type: "DIRECTED", SrcID: "p-coppola", DstID: "m-apoc"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (martin:Person)-[:ACTED_IN]->(movie:Movie) WHERE martin.name = 'Martin Sheen' AND NOT EXISTS { MATCH (movie)<-[:DIRECTED]-(director:Person {name: 'Oliver Stone'}) } RETURN movie.title AS movieTitle")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["movieTitle"]; got != "Apocalypse Now" {
+		t.Fatalf("unexpected movieTitle: %#v", got)
+	}
+}
+
 func TestExecuteOptionalMatchPreservesRowWhenNoMatches(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -744,6 +798,57 @@ func TestExecuteMatchLabelAlternationProjection(t *testing.T) {
 	}
 }
 
+func TestExecuteChainedMatchClauses(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-martin", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Martin Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-wall", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-apoc", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Apocalypse Now")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "ACTED_IN", SrcID: "p-martin", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "ACTED_IN", SrcID: "p-martin", DstID: "m-apoc"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m-wall"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (:Person {name: 'Martin Sheen'})-[:ACTED_IN]->(movie:Movie) MATCH (director:Person)-[:DIRECTED]->(movie) RETURN director.name AS director, movie.title AS movieTitle")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["director"]; got != "Oliver Stone" {
+		t.Fatalf("unexpected director: %#v", got)
+	}
+	if got := res.Rows[0]["movieTitle"]; got != "Wall Street" {
+		t.Fatalf("unexpected movieTitle: %#v", got)
+	}
+}
+
 func TestExecuteMatchNegatedLabelProjection(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -843,6 +948,451 @@ func TestExecuteMatchLabelsAndCountGrouping(t *testing.T) {
 	}
 }
 
+func TestExecuteMatchUndirectedAdjacentAnonymousLeft(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-other", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Someone Else")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "d1", Labels: []string{"Device"}, Properties: graph.PropertyMap{"name": []byte("camera")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1", Labels: []string{"City"}, Properties: graph.PropertyMap{"name": []byte("LA")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m1"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "LOCATED_IN", SrcID: "d1", DstID: "p-oliver"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "CONNECTED", SrcID: "p-other", DstID: "x1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (:Person {name: 'Oliver Stone'})--(n) RETURN n AS connectedNodes")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 connected nodes, got %d", len(res.Rows))
+	}
+
+	ids := map[string]bool{}
+	for _, row := range res.Rows {
+		node, ok := row["connectedNodes"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected connectedNodes map, got %T", row["connectedNodes"])
+		}
+		id, _ := node["id"].(string)
+		ids[id] = true
+	}
+	if !ids["m1"] || !ids["d1"] || len(ids) != 2 {
+		t.Fatalf("unexpected connected node ids: %#v", ids)
+	}
+}
+
+func TestExecuteMatchUndirectedAdjacentBoundLeft(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "d1", Labels: []string{"Device"}, Properties: graph.PropertyMap{"name": []byte("camera")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m1"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "LOCATED_IN", SrcID: "d1", DstID: "p-oliver"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (person:Person {name: 'Oliver Stone'})--(n) RETURN n AS connectedNodes")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 connected nodes, got %d", len(res.Rows))
+	}
+}
+
+func TestExecuteMatchDirectedAdjacentAnonymousLeft(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-out", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-in", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Platoon")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "d-out", Labels: []string{"Device"}, Properties: graph.PropertyMap{"name": []byte("camera")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m-out"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "MENTIONED_IN", SrcID: "m-in", DstID: "p-oliver"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "USES", SrcID: "p-oliver", DstID: "d-out"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (:Person {name: 'Oliver Stone'})-->(movie:Movie) RETURN movie.title AS movieTitle")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 movie row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["movieTitle"]; got != "Wall Street" {
+		t.Fatalf("unexpected movie title: %#v", got)
+	}
+}
+
+func TestExecuteMatchReverseDirectedAdjacentBoundLeft(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-out", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-in", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Platoon")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m-out"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "MENTIONED_IN", SrcID: "m-in", DstID: "p-oliver"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (movie:Movie)<--(:Person {name: 'Oliver Stone'}) RETURN movie.title AS movieTitle")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 movie row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["movieTitle"]; got != "Wall Street" {
+		t.Fatalf("unexpected movie title: %#v", got)
+	}
+}
+
+func TestExecuteMatchRelationshipVarAndTypeFunction(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "d1", Labels: []string{"Device"}, Properties: graph.PropertyMap{"name": []byte("camera")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m1"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "USES", SrcID: "p-oliver", DstID: "d1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (:Person {name: 'Oliver Stone'})-[r]->() RETURN type(r) AS relType")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 relationship rows, got %d", len(res.Rows))
+	}
+
+	types := map[string]bool{}
+	for _, row := range res.Rows {
+		relType, _ := row["relType"].(string)
+		types[relType] = true
+	}
+	if !types["DIRECTED"] || !types["USES"] || len(types) != 2 {
+		t.Fatalf("unexpected relationship types: %#v", types)
+	}
+}
+
+func TestExecuteMatchReverseRelationshipVarAndTypeFunction(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Platoon")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m1"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "MENTIONED_IN", SrcID: "m2", DstID: "p-oliver"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH ()<-[r]-(:Person {name: 'Oliver Stone'}) RETURN type(r) AS relType")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 relationship row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["relType"]; got != "DIRECTED" {
+		t.Fatalf("unexpected relationship type: %#v", got)
+	}
+}
+
+func TestExecuteMatchUndirectedRelationshipWithEdgeProperties(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-charlie", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Charlie Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-wall", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-platoon", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Platoon")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "ACTED_IN", SrcID: "p-charlie", DstID: "m-wall", Properties: graph.PropertyMap{"role": []byte("Bud Fox")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "ACTED_IN", SrcID: "p-charlie", DstID: "m-platoon", Properties: graph.PropertyMap{"role": []byte("Chris Taylor")}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "DIRECTED", SrcID: "p-charlie", DstID: "m-wall"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)-[:ACTED_IN {role: 'Bud Fox'}]-(b) RETURN a, b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 matched rows for undirected binding, got %d", len(res.Rows))
+	}
+
+	pairCounts := map[string]int{}
+	for _, row := range res.Rows {
+		a, ok := row["a"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected a to be a node map, got %T", row["a"])
+		}
+		b, ok := row["b"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected b to be a node map, got %T", row["b"])
+		}
+		aID, _ := a["id"].(string)
+		bID, _ := b["id"].(string)
+		pairCounts[aID+"->"+bID]++
+	}
+	if pairCounts["p-charlie->m-wall"] != 1 || pairCounts["m-wall->p-charlie"] != 1 || len(pairCounts) != 2 {
+		t.Fatalf("unexpected undirected bindings: %#v", pairCounts)
+	}
+}
+
+func TestExecuteMatchReverseRelationshipEdgeTypeAlternation(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-wall", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-charlie", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Charlie Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-marty", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Martin Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "ACTED_IN", SrcID: "p-charlie", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "PRODUCED", SrcID: "p-marty", DstID: "m-wall"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (:Movie {title: 'Wall Street'})<-[:ACTED_IN|DIRECTED]-(person:Person) RETURN person.name AS person")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 matched people, got %d", len(res.Rows))
+	}
+
+	names := map[string]bool{}
+	for _, row := range res.Rows {
+		name, _ := row["person"].(string)
+		names[name] = true
+	}
+	if !names["Charlie Sheen"] || !names["Oliver Stone"] || names["Martin Sheen"] || len(names) != 2 {
+		t.Fatalf("unexpected people set: %#v", names)
+	}
+}
+
+func TestExecuteMatchTwoHopDirectedChain(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-charlie", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Charlie Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-oliver", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Oliver Stone")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-marty", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Martin Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-wall", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "ACTED_IN", SrcID: "p-charlie", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "DIRECTED", SrcID: "p-oliver", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "ACTED_IN", SrcID: "p-marty", DstID: "m-wall"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (:Person {name: 'Charlie Sheen'})-[:ACTED_IN]->(movie:Movie)<-[:DIRECTED]-(director:Person) RETURN movie.title AS movieTitle, director.name AS director")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["movieTitle"]; got != "Wall Street" {
+		t.Fatalf("unexpected movieTitle: %#v", got)
+	}
+	if got := res.Rows[0]["director"]; got != "Oliver Stone" {
+		t.Fatalf("unexpected director: %#v", got)
+	}
+}
+
 func TestExecuteMatchProjectionNoRowsIsNotError(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -860,6 +1410,72 @@ func TestExecuteMatchProjectionNoRowsIsNotError(t *testing.T) {
 	}
 	if len(res.Rows) != 0 {
 		t.Fatalf("expected 0 rows, got %d", len(res.Rows))
+	}
+}
+
+func TestExecuteWithCountAliasOrderByLimitThenCollect(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Actor One")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p2", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Actor Two")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Movie A")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Movie B")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "ACTED_IN", SrcID: "p1", DstID: "m1"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "ACTED_IN", SrcID: "p1", DstID: "m2"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "ACTED_IN", SrcID: "p2", DstID: "m1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	query := "MATCH (actors:Person)-[:ACTED_IN]->(movies:Movie) WITH actors, count(movies) AS movieCount ORDER BY movieCount DESC LIMIT 1 MATCH (actors)-[:ACTED_IN]->(movies) RETURN actors.name AS actor, movieCount, collect(movies.title) AS movies"
+	stmt, err := parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["actor"]; got != "Actor One" {
+		t.Fatalf("unexpected actor: %#v", got)
+	}
+	if got := res.Rows[0]["movieCount"]; got != 2 {
+		t.Fatalf("unexpected movieCount: %#v", got)
+	}
+	movies, ok := res.Rows[0]["movies"].([]any)
+	if !ok {
+		t.Fatalf("expected movies to be []any, got %T", res.Rows[0]["movies"])
+	}
+	if len(movies) != 2 {
+		t.Fatalf("expected 2 movies, got %d", len(movies))
+	}
+	seen := map[string]bool{}
+	for _, item := range movies {
+		seen[item.(string)] = true
+	}
+	if !seen["Movie A"] || !seen["Movie B"] {
+		t.Fatalf("unexpected movies: %#v", movies)
 	}
 }
 

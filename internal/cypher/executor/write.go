@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -120,7 +121,51 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	if node, err := parseNodePattern(spec.Pattern); err == nil {
 		return e.expandNodeMatch(ctx, tx, rows, spec, node, params)
 	}
+	if anchored, err := parseAnchoredOutPattern(spec.Pattern); err == nil {
+		if shouldUseAnchoredOutPath(rows, anchored) {
+			return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
+		}
+	}
+	if directed, err := parseDirectedAdjacentPattern(spec.Pattern); err == nil {
+		return e.expandDirectedAdjacentMatch(ctx, tx, rows, spec, directed, params)
+	}
+	if reverseDirected, err := parseReverseDirectedAdjacentPattern(spec.Pattern); err == nil {
+		return e.expandReverseDirectedAdjacentMatch(ctx, tx, rows, spec, reverseDirected, params)
+	}
+	if undirected, err := parseUndirectedAdjacentPattern(spec.Pattern); err == nil {
+		return e.expandUndirectedAdjacentMatch(ctx, tx, rows, spec, undirected, params)
+	}
+	if rel, err := parseDirectedRelationshipPattern(spec.Pattern); err == nil {
+		return e.expandDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+	}
+	if rel, err := parseReverseDirectedRelationshipPattern(spec.Pattern); err == nil {
+		return e.expandReverseDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+	}
+	if rel, err := parseUndirectedRelationshipPattern(spec.Pattern); err == nil {
+		return e.expandUndirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+	}
+	if chain, err := parseTwoHopDirectedChainPattern(spec.Pattern); err == nil {
+		return e.expandTwoHopDirectedChainMatch(ctx, tx, rows, spec, chain, params)
+	}
 	return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
+}
+
+func shouldUseAnchoredOutPath(rows []Row, pattern anchoredOutPattern) bool {
+	if strings.TrimSpace(pattern.SourcePropertiesRaw) != "" {
+		return true
+	}
+	if strings.TrimSpace(pattern.SourceIDParam) != "" {
+		return true
+	}
+	if strings.TrimSpace(pattern.SourceVar) == "" {
+		return false
+	}
+	for _, row := range rows {
+		if _, ok := row[pattern.SourceVar]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 type anchoredMatchSpec struct {
@@ -207,7 +252,7 @@ func (e *Executor) expandAnchoredMatch(ctx context.Context, tx graph.Tx, rows []
 				merged["edge"] = edge
 
 				if spec.Where != "" {
-					ok, err := evalWhereExpression(spec.Where, merged, params)
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
 					if err != nil {
 						return err
 					}
@@ -316,7 +361,7 @@ func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row,
 			merged[pattern.Var] = candidate
 
 			if spec.Where != "" {
-				ok, err := evalWhereExpression(spec.Where, merged, params)
+				ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
 				if err != nil {
 					return nil, err
 				}
@@ -337,6 +382,737 @@ func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row,
 	}
 
 	return out, nil
+}
+
+func (e *Executor) expandUndirectedAdjacentMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern undirectedAdjacentPattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, left := range leftCandidates {
+			if left == nil {
+				continue
+			}
+
+			handleAdjacent := func(otherID string) error {
+				neighbor, err := tx.GetVertex(ctx, tenant, otherID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+				if !nodePatternMatches(neighbor, pattern.Right, params, row) {
+					return nil
+				}
+
+				merged := cloneRow(row)
+				if pattern.Left.Var != "" {
+					merged[pattern.Left.Var] = left
+				}
+				if pattern.Right.Var != "" {
+					merged[pattern.Right.Var] = neighbor
+				}
+
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return nil
+					}
+				}
+
+				matched = true
+				out = append(out, merged)
+				return nil
+			}
+
+			if err := tx.ScanOutEdges(ctx, tenant, left.ID, "", 0, func(edge *graph.Edge) error {
+				return handleAdjacent(edge.DstID)
+			}); err != nil {
+				return nil, err
+			}
+			if err := tx.ScanInEdges(ctx, tenant, left.ID, "", 0, func(edge *graph.Edge) error {
+				return handleAdjacent(edge.SrcID)
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = nil
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = nil
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+func (e *Executor) expandDirectedAdjacentMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern directedAdjacentPattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, left := range leftCandidates {
+			if left == nil {
+				continue
+			}
+
+			if err := tx.ScanOutEdges(ctx, tenant, left.ID, "", 0, func(edge *graph.Edge) error {
+				neighbor, err := tx.GetVertex(ctx, tenant, edge.DstID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+				if !nodePatternMatches(neighbor, pattern.Right, params, row) {
+					return nil
+				}
+
+				merged := cloneRow(row)
+				if pattern.Left.Var != "" {
+					merged[pattern.Left.Var] = left
+				}
+				if pattern.Right.Var != "" {
+					merged[pattern.Right.Var] = neighbor
+				}
+
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return nil
+					}
+				}
+
+				matched = true
+				out = append(out, merged)
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = nil
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = nil
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+func (e *Executor) expandReverseDirectedAdjacentMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern reverseDirectedAdjacentPattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		rightCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Right, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, right := range rightCandidates {
+			if right == nil {
+				continue
+			}
+
+			if err := tx.ScanOutEdges(ctx, tenant, right.ID, "", 0, func(edge *graph.Edge) error {
+				left, err := tx.GetVertex(ctx, tenant, edge.DstID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+				if !nodePatternMatches(left, pattern.Left, params, row) {
+					return nil
+				}
+
+				merged := cloneRow(row)
+				if pattern.Left.Var != "" {
+					merged[pattern.Left.Var] = left
+				}
+				if pattern.Right.Var != "" {
+					merged[pattern.Right.Var] = right
+				}
+
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return nil
+					}
+				}
+
+				matched = true
+				out = append(out, merged)
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = nil
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = nil
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern directedRelationshipPattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, left := range leftCandidates {
+			if left == nil {
+				continue
+			}
+
+			scanType := pattern.EdgeType
+			if len(pattern.EdgeAnyOf) > 0 {
+				scanType = ""
+			}
+			if err := tx.ScanOutEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
+				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
+					return nil
+				}
+				if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
+					return nil
+				}
+				neighbor, err := tx.GetVertex(ctx, tenant, edge.DstID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+				if !nodePatternMatches(neighbor, pattern.Right, params, row) {
+					return nil
+				}
+
+				merged := cloneRow(row)
+				if pattern.Left.Var != "" {
+					merged[pattern.Left.Var] = left
+				}
+				if pattern.Right.Var != "" {
+					merged[pattern.Right.Var] = neighbor
+				}
+				if pattern.EdgeVar != "" {
+					merged[pattern.EdgeVar] = edge
+				}
+
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return nil
+					}
+				}
+
+				matched = true
+				out = append(out, merged)
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = nil
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = nil
+			}
+			if pattern.EdgeVar != "" {
+				merged[pattern.EdgeVar] = nil
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+func (e *Executor) expandReverseDirectedRelationshipMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern reverseDirectedRelationshipPattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		rightCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Right, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, right := range rightCandidates {
+			if right == nil {
+				continue
+			}
+
+			scanType := pattern.EdgeType
+			if len(pattern.EdgeAnyOf) > 0 {
+				scanType = ""
+			}
+			if err := tx.ScanOutEdges(ctx, tenant, right.ID, scanType, 0, func(edge *graph.Edge) error {
+				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
+					return nil
+				}
+				if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
+					return nil
+				}
+				left, err := tx.GetVertex(ctx, tenant, edge.DstID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+				if !nodePatternMatches(left, pattern.Left, params, row) {
+					return nil
+				}
+
+				merged := cloneRow(row)
+				if pattern.Left.Var != "" {
+					merged[pattern.Left.Var] = left
+				}
+				if pattern.Right.Var != "" {
+					merged[pattern.Right.Var] = right
+				}
+				if pattern.EdgeVar != "" {
+					merged[pattern.EdgeVar] = edge
+				}
+
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return nil
+					}
+				}
+
+				matched = true
+				out = append(out, merged)
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = nil
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = nil
+			}
+			if pattern.EdgeVar != "" {
+				merged[pattern.EdgeVar] = nil
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+func (e *Executor) expandUndirectedRelationshipMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern undirectedRelationshipPattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, left := range leftCandidates {
+			if left == nil {
+				continue
+			}
+
+			handle := func(edge *graph.Edge, otherID string) error {
+				if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
+					return nil
+				}
+				neighbor, err := tx.GetVertex(ctx, tenant, otherID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+				if !nodePatternMatches(neighbor, pattern.Right, params, row) {
+					return nil
+				}
+
+				merged := cloneRow(row)
+				if pattern.Left.Var != "" {
+					merged[pattern.Left.Var] = left
+				}
+				if pattern.Right.Var != "" {
+					merged[pattern.Right.Var] = neighbor
+				}
+				if pattern.EdgeVar != "" {
+					merged[pattern.EdgeVar] = edge
+				}
+
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return nil
+					}
+				}
+
+				matched = true
+				out = append(out, merged)
+				return nil
+			}
+
+			scanType := pattern.EdgeType
+			if len(pattern.EdgeAnyOf) > 0 {
+				scanType = ""
+			}
+			if err := tx.ScanOutEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
+				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
+					return nil
+				}
+				return handle(edge, edge.DstID)
+			}); err != nil {
+				return nil, err
+			}
+			if err := tx.ScanInEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
+				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
+					return nil
+				}
+				return handle(edge, edge.SrcID)
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = nil
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = nil
+			}
+			if pattern.EdgeVar != "" {
+				merged[pattern.EdgeVar] = nil
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern twoHopDirectedChainPattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, left := range leftCandidates {
+			if left == nil {
+				continue
+			}
+
+			firstScanType := pattern.FirstEdgeType
+			if len(pattern.FirstEdgeAnyOf) > 0 {
+				firstScanType = ""
+			}
+
+			if err := tx.ScanOutEdges(ctx, tenant, left.ID, firstScanType, 0, func(edge1 *graph.Edge) error {
+				if !edgeTypeMatches(edge1, pattern.FirstEdgeType, pattern.FirstEdgeAnyOf) {
+					return nil
+				}
+				if !edgePatternMatches(edge1, pattern.FirstEdgeProps, params, row) {
+					return nil
+				}
+
+				mid, err := tx.GetVertex(ctx, tenant, edge1.DstID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+
+				mergedMid := cloneRow(row)
+				if pattern.Left.Var != "" {
+					mergedMid[pattern.Left.Var] = left
+				}
+				if !vertexBindingMatches(mergedMid, pattern.Mid.Var, mid) {
+					return nil
+				}
+				if pattern.Mid.Var != "" {
+					mergedMid[pattern.Mid.Var] = mid
+				}
+				if !nodePatternMatches(mid, pattern.Mid, params, mergedMid) {
+					return nil
+				}
+
+				secondScanType := pattern.SecondEdgeType
+				if len(pattern.SecondEdgeAnyOf) > 0 {
+					secondScanType = ""
+				}
+				if err := tx.ScanInEdges(ctx, tenant, mid.ID, secondScanType, 0, func(edge2 *graph.Edge) error {
+					if !edgeTypeMatches(edge2, pattern.SecondEdgeType, pattern.SecondEdgeAnyOf) {
+						return nil
+					}
+					if !edgePatternMatches(edge2, pattern.SecondEdgeProps, params, mergedMid) {
+						return nil
+					}
+
+					right, err := tx.GetVertex(ctx, tenant, edge2.SrcID)
+					if err != nil {
+						if graph.IsKind(err, graph.ErrKindNotFound) {
+							return nil
+						}
+						return err
+					}
+					if !vertexBindingMatches(mergedMid, pattern.Right.Var, right) {
+						return nil
+					}
+
+					merged := cloneRow(mergedMid)
+					if pattern.Right.Var != "" {
+						merged[pattern.Right.Var] = right
+					}
+					if !nodePatternMatches(right, pattern.Right, params, merged) {
+						return nil
+					}
+
+					if spec.Where != "" {
+						ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+						if err != nil {
+							return err
+						}
+						if !ok {
+							return nil
+						}
+					}
+
+					matched = true
+					out = append(out, merged)
+					return nil
+				}); err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = nil
+			}
+			if pattern.Mid.Var != "" {
+				merged[pattern.Mid.Var] = nil
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = nil
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+func vertexBindingMatches(row Row, varName string, candidate *graph.Vertex) bool {
+	if strings.TrimSpace(varName) == "" {
+		return true
+	}
+	binding, ok := row[varName]
+	if !ok {
+		return true
+	}
+	switch typed := binding.(type) {
+	case nil:
+		return candidate == nil
+	case *graph.Vertex:
+		return candidate != nil && typed.ID == candidate.ID
+	case string:
+		return candidate != nil && typed == candidate.ID
+	default:
+		return false
+	}
+}
+
+func edgePatternMatches(edge *graph.Edge, propsRaw string, params Params, row Row) bool {
+	if edge == nil {
+		return false
+	}
+	propsRaw = strings.TrimSpace(propsRaw)
+	if propsRaw == "" {
+		return true
+	}
+	parsed, err := parsePropertyMap(propsRaw, params, row)
+	if err != nil {
+		return false
+	}
+	for key, value := range parsed {
+		if strings.EqualFold(key, "id") {
+			if edge.ID != stringFromProperty(map[string]any{"id": value}, "id") {
+				return false
+			}
+			continue
+		}
+		if strings.EqualFold(key, "type") {
+			if edge.Type != stringFromProperty(map[string]any{"type": value}, "type") {
+				return false
+			}
+			continue
+		}
+		if edge.Properties == nil {
+			return false
+		}
+		current, ok := edge.Properties[key]
+		if !ok {
+			return false
+		}
+		if !bytes.Equal(current, valueToBytes(value)) {
+			return false
+		}
+	}
+	return true
+}
+
+func edgeTypeMatches(edge *graph.Edge, edgeType string, edgeAnyOf []string) bool {
+	if edge == nil {
+		return false
+	}
+	if len(edgeAnyOf) == 0 {
+		if edgeType == "" {
+			return true
+		}
+		return edge.Type == edgeType
+	}
+	for _, candidate := range edgeAnyOf {
+		if edge.Type == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx, tenant string, row Row, pattern nodePattern, params Params) ([]*graph.Vertex, error) {
@@ -376,6 +1152,9 @@ func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx
 
 func nodePatternMatches(vertex *graph.Vertex, pattern nodePattern, params Params, row Row) bool {
 	if vertex == nil {
+		return false
+	}
+	if !vertexBindingMatches(row, pattern.Var, vertex) {
 		return false
 	}
 	if len(pattern.AnyOfLabels) > 0 {
@@ -781,7 +1560,11 @@ func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Param
 
 func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params Params, final bool) ([]Row, []string, error) {
 	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
-	items, err := parseProjectionItems(raw)
+	projection, err := parseProjectionClauseSpec(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	items, err := parseProjectionItems(projection.ProjectionRaw)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -798,7 +1581,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		} else {
 			columns = append(columns, item.Expression)
 		}
-		if item.CountArg != "" {
+		if item.CountArg != "" || item.CollectArg != "" {
 			hasAggregate = true
 		}
 	}
@@ -819,17 +1602,22 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 			}
 			out = append(out, projected)
 		}
+		out, err = applyProjectionPostProcessing(out, projection, params)
+		if err != nil {
+			return nil, nil, err
+		}
 		return out, columns, nil
 	}
 
 	type projectionGroup struct {
 		projected Row
 		counts    map[int]int
+		collects  map[int][]any
 	}
 
 	nonAggregateCount := 0
 	for _, item := range items {
-		if item.CountArg == "" {
+		if item.CountArg == "" && item.CollectArg == "" {
 			nonAggregateCount++
 		}
 	}
@@ -840,7 +1628,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		projected := Row{}
 		keyValues := make([]any, 0, nonAggregateCount)
 		for _, item := range items {
-			if item.CountArg != "" {
+			if item.CountArg != "" || item.CollectArg != "" {
 				continue
 			}
 			value, err := evalExpressionWithScope(item.Expression, row, params)
@@ -862,25 +1650,32 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		groupKey := string(keyBytes)
 		group, ok := groups[groupKey]
 		if !ok {
-			group = &projectionGroup{projected: projected, counts: map[int]int{}}
+			group = &projectionGroup{projected: projected, counts: map[int]int{}, collects: map[int][]any{}}
 			groups[groupKey] = group
 			groupOrder = append(groupOrder, groupKey)
 		}
 
 		for idx, item := range items {
-			if item.CountArg == "" {
+			if item.CountArg != "" {
+				if item.CountArg == "*" {
+					group.counts[idx]++
+					continue
+				}
+				value, err := evalExpressionWithScope(item.CountArg, row, params)
+				if err != nil {
+					return nil, nil, err
+				}
+				if value != nil {
+					group.counts[idx]++
+				}
 				continue
 			}
-			if item.CountArg == "*" {
-				group.counts[idx]++
-				continue
-			}
-			value, err := evalExpressionWithScope(item.CountArg, row, params)
-			if err != nil {
-				return nil, nil, err
-			}
-			if value != nil {
-				group.counts[idx]++
+			if item.CollectArg != "" {
+				value, err := evalExpressionWithScope(item.CollectArg, row, params)
+				if err != nil {
+					return nil, nil, err
+				}
+				group.collects[idx] = append(group.collects[idx], value)
 			}
 		}
 	}
@@ -894,11 +1689,17 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 			}
 			if item.CountArg != "" {
 				projected[key] = 0
+			} else if item.CollectArg != "" {
+				projected[key] = []any{}
 			} else {
 				projected[key] = nil
 			}
 		}
 		out = append(out, projected)
+		out, err = applyProjectionPostProcessing(out, projection, params)
+		if err != nil {
+			return nil, nil, err
+		}
 		return out, columns, nil
 	}
 
@@ -906,18 +1707,28 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		group := groups[groupKey]
 		projected := cloneRow(group.projected)
 		for idx, item := range items {
-			if item.CountArg == "" {
-				continue
-			}
 			key := item.Expression
 			if item.Alias != "" {
 				key = item.Alias
 			}
-			projected[key] = group.counts[idx]
+			if item.CountArg != "" {
+				projected[key] = group.counts[idx]
+				continue
+			}
+			if item.CollectArg != "" {
+				if values, ok := group.collects[idx]; ok {
+					projected[key] = append([]any(nil), values...)
+				} else {
+					projected[key] = []any{}
+				}
+			}
 		}
 		out = append(out, projected)
 	}
-
+	out, err = applyProjectionPostProcessing(out, projection, params)
+	if err != nil {
+		return nil, nil, err
+	}
 	return out, columns, nil
 }
 
@@ -925,6 +1736,272 @@ type projectionSpec struct {
 	Expression string
 	Alias      string
 	CountArg   string
+	CollectArg string
+}
+
+type projectionClauseSpec struct {
+	ProjectionRaw string
+	OrderBy       []projectionOrderBySpec
+	SkipRaw       string
+	LimitRaw      string
+}
+
+type projectionOrderBySpec struct {
+	Expression string
+	Descending bool
+}
+
+func parseProjectionClauseSpec(raw string) (projectionClauseSpec, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return projectionClauseSpec{}, nil
+	}
+
+	orderByIdx := findTopLevelKeywordIndex(raw, "ORDERBY")
+	skipIdx := findTopLevelKeywordIndex(raw, "SKIP")
+	limitIdx := findTopLevelKeywordIndex(raw, "LIMIT")
+
+	firstTail := minPositiveIndex(orderByIdx, skipIdx, limitIdx)
+	projectionRaw := raw
+	if firstTail >= 0 {
+		projectionRaw = raw[:firstTail]
+	}
+
+	out := projectionClauseSpec{ProjectionRaw: strings.TrimSpace(projectionRaw)}
+
+	if orderByIdx >= 0 {
+		end := minPositiveIndex(greaterIndex(skipIdx, orderByIdx), greaterIndex(limitIdx, orderByIdx))
+		if end < 0 {
+			end = len(raw)
+		}
+		orderByRaw := strings.TrimSpace(raw[orderByIdx+len("ORDERBY") : end])
+		items, err := parseProjectionOrderBy(orderByRaw)
+		if err != nil {
+			return projectionClauseSpec{}, err
+		}
+		out.OrderBy = items
+	}
+
+	if skipIdx >= 0 {
+		end := greaterIndex(limitIdx, skipIdx)
+		if end < 0 {
+			end = len(raw)
+		}
+		out.SkipRaw = strings.TrimSpace(raw[skipIdx+len("SKIP") : end])
+	}
+
+	if limitIdx >= 0 {
+		out.LimitRaw = strings.TrimSpace(raw[limitIdx+len("LIMIT"):])
+	}
+
+	if out.ProjectionRaw == "" {
+		return projectionClauseSpec{}, graph.NewError(graph.ErrKindInvalidInput, "projection clause requires at least one item", nil)
+	}
+
+	return out, nil
+}
+
+func parseProjectionOrderBy(raw string) ([]projectionOrderBySpec, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "ORDER BY requires at least one expression", nil)
+	}
+
+	parts := splitTopLevelCommaSeparated(raw)
+	out := make([]projectionOrderBySpec, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		upper := strings.ToUpper(part)
+		spec := projectionOrderBySpec{}
+		switch {
+		case strings.HasSuffix(upper, "DESC"):
+			spec.Descending = true
+			spec.Expression = strings.TrimSpace(part[:len(part)-len("DESC")])
+		case strings.HasSuffix(upper, "ASC"):
+			spec.Expression = strings.TrimSpace(part[:len(part)-len("ASC")])
+		default:
+			spec.Expression = strings.TrimSpace(part)
+		}
+		if spec.Expression == "" {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("ORDER BY expression %q is invalid", part), nil)
+		}
+		out = append(out, spec)
+	}
+
+	if len(out) == 0 {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "ORDER BY requires at least one expression", nil)
+	}
+
+	return out, nil
+}
+
+func applyProjectionPostProcessing(rows []Row, clause projectionClauseSpec, params Params) ([]Row, error) {
+	if len(clause.OrderBy) > 0 {
+		sorted, err := sortProjectedRows(rows, clause.OrderBy, params)
+		if err != nil {
+			return nil, err
+		}
+		rows = sorted
+	}
+
+	skip, err := evalOptionalInt(rawExpression(clause.SkipRaw), params)
+	if err != nil {
+		return nil, err
+	}
+	limit, err := evalOptionalInt(rawExpression(clause.LimitRaw), params)
+	if err != nil {
+		return nil, err
+	}
+
+	return applySkipLimit(rows, skip, limit), nil
+}
+
+func sortProjectedRows(rows []Row, orderBy []projectionOrderBySpec, params Params) ([]Row, error) {
+	type sortRow struct {
+		row  Row
+		keys []any
+	}
+
+	indexed := make([]sortRow, 0, len(rows))
+	for _, row := range rows {
+		keys := make([]any, 0, len(orderBy))
+		for _, item := range orderBy {
+			value, err := evalExpressionWithScope(item.Expression, row, params)
+			if err != nil {
+				return nil, err
+			}
+			keys = append(keys, value)
+		}
+		indexed = append(indexed, sortRow{row: row, keys: keys})
+	}
+
+	sort.SliceStable(indexed, func(i, j int) bool {
+		for idx, item := range orderBy {
+			cmp := compareSortValues(indexed[i].keys[idx], indexed[j].keys[idx])
+			if cmp == 0 {
+				continue
+			}
+			if item.Descending {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+
+	out := make([]Row, 0, len(rows))
+	for _, item := range indexed {
+		out = append(out, item.row)
+	}
+
+	return out, nil
+}
+
+func compareSortValues(left, right any) int {
+	if left == nil && right == nil {
+		return 0
+	}
+	if left == nil {
+		return -1
+	}
+	if right == nil {
+		return 1
+	}
+
+	leftInt, leftIntErr := toInt(left)
+	rightInt, rightIntErr := toInt(right)
+	if leftIntErr == nil && rightIntErr == nil {
+		switch {
+		case leftInt < rightInt:
+			return -1
+		case leftInt > rightInt:
+			return 1
+		default:
+			return 0
+		}
+	}
+
+	leftBool, leftBoolOK := left.(bool)
+	rightBool, rightBoolOK := right.(bool)
+	if leftBoolOK && rightBoolOK {
+		switch {
+		case !leftBool && rightBool:
+			return -1
+		case leftBool && !rightBool:
+			return 1
+		default:
+			return 0
+		}
+	}
+
+	leftText := fmt.Sprint(left)
+	rightText := fmt.Sprint(right)
+	switch {
+	case leftText < rightText:
+		return -1
+	case leftText > rightText:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func rawExpression(raw string) *ast.Expression {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	return &ast.Expression{Raw: raw}
+}
+
+func greaterIndex(value int, floor int) int {
+	if value > floor {
+		return value
+	}
+	return -1
+}
+
+func minPositiveIndex(values ...int) int {
+	best := -1
+	for _, value := range values {
+		if value < 0 {
+			continue
+		}
+		if best == -1 || value < best {
+			best = value
+		}
+	}
+	return best
+}
+
+func findTopLevelKeywordIndex(raw, keyword string) int {
+	upper := strings.ToUpper(raw)
+	keyword = strings.ToUpper(strings.TrimSpace(keyword))
+	if keyword == "" || len(upper) < len(keyword) {
+		return -1
+	}
+
+	depth := 0
+	for i := 0; i <= len(upper)-len(keyword); i++ {
+		switch upper[i] {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth == 0 && strings.HasPrefix(upper[i:], keyword) {
+			return i
+		}
+	}
+
+	return -1
 }
 
 func parseProjectionItems(raw string) ([]projectionSpec, error) {
@@ -950,11 +2027,13 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 				return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("projection item %q is not supported", part), nil)
 			}
 			countArg, _ := parseCountExpression(expr)
-			items = append(items, projectionSpec{Expression: expr, Alias: alias, CountArg: countArg})
+			collectArg, _ := parseCollectExpression(expr)
+			items = append(items, projectionSpec{Expression: expr, Alias: alias, CountArg: countArg, CollectArg: collectArg})
 			continue
 		}
 		countArg, _ := parseCountExpression(part)
-		items = append(items, projectionSpec{Expression: part, CountArg: countArg})
+		collectArg, _ := parseCollectExpression(part)
+		items = append(items, projectionSpec{Expression: part, CountArg: countArg, CollectArg: collectArg})
 	}
 	return items, nil
 }
@@ -978,6 +2057,14 @@ func parseFunctionCall(raw string, name string) (string, bool) {
 
 func parseCountExpression(raw string) (string, bool) {
 	arg, ok := parseFunctionCall(raw, "count")
+	if !ok || arg == "" {
+		return "", false
+	}
+	return arg, true
+}
+
+func parseCollectExpression(raw string) (string, bool) {
+	arg, ok := parseFunctionCall(raw, "collect")
 	if !ok || arg == "" {
 		return "", false
 	}
@@ -1028,6 +2115,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	}
 	if arg, ok := parseFunctionCall(raw, "labels"); ok {
 		return evalLabelsFunction(arg, row)
+	}
+	if arg, ok := parseFunctionCall(raw, "type"); ok {
+		return evalTypeFunction(arg, row)
 	}
 	if value, err := evalWriteValue(raw, params, row); err == nil {
 		return value, nil
@@ -1090,37 +2180,63 @@ func evalLabelsFunction(arg string, binding map[string]any) (any, error) {
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("labels() is not supported on %T", base), nil)
 }
 
-func evalWhereExpression(raw string, row Row, params Params) (bool, error) {
+func evalTypeFunction(arg string, binding map[string]any) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "type() requires one argument", nil)
+	}
+	base, ok := binding[arg]
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", arg), nil)
+	}
+	if base == nil {
+		return nil, nil
+	}
+	switch typed := base.(type) {
+	case *graph.Edge:
+		return typed.Type, nil
+	case map[string]any:
+		if relType, ok := typed["type"]; ok {
+			return fmt.Sprint(relType), nil
+		}
+	}
+	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("type() is not supported on %T", base), nil)
+}
+
+func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (bool, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return false, graph.NewError(graph.ErrKindSemantic, "empty WHERE expression", nil)
 	}
+	if body, ok := parseExistsSubqueryBody(raw); ok {
+		return e.evalExistsSubquery(ctx, tx, body, row, params)
+	}
 
 	if left, right, ok := splitTopLevelKeyword(raw, "OR"); ok {
-		lhs, err := evalWhereExpression(left, row, params)
+		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
 		if err != nil {
 			return false, err
 		}
 		if lhs {
 			return true, nil
 		}
-		return evalWhereExpression(right, row, params)
+		return e.evalWhereExpression(ctx, tx, right, row, params)
 	}
 
 	if left, right, ok := splitTopLevelKeyword(raw, "AND"); ok {
-		lhs, err := evalWhereExpression(left, row, params)
+		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
 		if err != nil {
 			return false, err
 		}
 		if !lhs {
 			return false, nil
 		}
-		return evalWhereExpression(right, row, params)
+		return e.evalWhereExpression(ctx, tx, right, row, params)
 	}
 
 	upper := strings.ToUpper(raw)
 	if strings.HasPrefix(upper, "NOT") {
-		value, err := evalWhereExpression(strings.TrimSpace(raw[3:]), row, params)
+		value, err := e.evalWhereExpression(ctx, tx, strings.TrimSpace(raw[3:]), row, params)
 		if err != nil {
 			return false, err
 		}
@@ -1128,7 +2244,7 @@ func evalWhereExpression(raw string, row Row, params Params) (bool, error) {
 	}
 
 	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
-		return evalWhereExpression(raw[1:len(raw)-1], row, params)
+		return e.evalWhereExpression(ctx, tx, raw[1:len(raw)-1], row, params)
 	}
 
 	if left, right, op, ok := splitTopLevelComparison(raw); ok {
@@ -1148,6 +2264,60 @@ func evalWhereExpression(raw string, row Row, params Params) (bool, error) {
 		return false, err
 	}
 	return truthyWhereValue(value), nil
+}
+
+func parseExistsSubqueryBody(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < len("EXISTS{}") {
+		return "", false
+	}
+	if !strings.EqualFold(raw[:6], "EXISTS") {
+		return "", false
+	}
+	rest := strings.TrimSpace(raw[6:])
+	if len(rest) < 2 || !strings.HasPrefix(rest, "{") || !strings.HasSuffix(rest, "}") {
+		return "", false
+	}
+	if !bracesAreBalanced(rest[1 : len(rest)-1]) {
+		return "", false
+	}
+	body := strings.TrimSpace(rest[1 : len(rest)-1])
+	if body == "" {
+		return "", false
+	}
+	return body, true
+}
+
+func bracesAreBalanced(raw string) bool {
+	depth := 0
+	for _, r := range raw {
+		switch r {
+		case '{':
+			depth++
+		case '}':
+			if depth == 0 {
+				return false
+			}
+			depth--
+		}
+	}
+	return depth == 0
+}
+
+func (e *Executor) evalExistsSubquery(ctx context.Context, tx graph.Tx, body string, row Row, params Params) (bool, error) {
+	if tx == nil {
+		return false, graph.NewError(graph.ErrKindUnsupported, "EXISTS subquery requires transactional context", nil)
+	}
+	body = strings.TrimSpace(body)
+	if !strings.HasPrefix(strings.ToUpper(body), "MATCH") && !strings.HasPrefix(strings.ToUpper(body), "OPTIONALMATCH") {
+		return false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("EXISTS subquery %q is not yet supported", body), nil)
+	}
+
+	rows, err := e.applyMatchClause(ctx, tx, []Row{cloneRow(row)}, ast.Clause{Kind: ast.ClauseKindMatch, Raw: body}, params)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
 }
 
 func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {

@@ -43,6 +43,35 @@ The server can load configuration-based index DDL at startup:
 
 If both are provided, the flag value is used.
 
+Graph store and tenant defaults are configurable at startup:
+
+- flag: `--graph-path data/graph.db`
+- env: `VITALEDGE_GRAPH_PATH=data/graph.db`
+- flag: `--tenant default`
+- env: `VITALEDGE_DEFAULT_TENANT=default`
+
+Index recommendation metrics logging is enabled by default and configurable:
+
+- flag: `--metrics-report-interval 30s`
+- env: `VITALEDGE_METRICS_REPORT_INTERVAL=30s`
+
+If set to `0`, periodic recommendation logging is disabled.
+
+## TCP Query Execution
+
+TCP messages are treated as Cypher statements and executed by the server.
+Each response is emitted as one JSON line:
+
+```json
+{"ok":true,"columns":["dstID"],"rows":[{"dstID":"g1"}],"stats":{"rowsReturned":1,"durationMs":0}}
+```
+
+On errors:
+
+```json
+{"ok":false,"error":"..."}
+```
+
 Example config:
 
 ```json

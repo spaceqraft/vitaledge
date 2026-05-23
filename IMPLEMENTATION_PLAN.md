@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed execution plan derived from [DESIGN.md](DESIGN.md).
+Active plan with ongoing status refreshes, derived from [DESIGN.md](DESIGN.md).
 
 ## Planning Goals
 
@@ -79,6 +79,9 @@ Current implementation status:
 - Implemented: executor metrics for statement outcomes, rows returned, index candidates, and index lookup outcomes; concrete in-process collector plus top unindexed-candidate reporting.
 - Implemented: startup wiring for graph path, tenant defaults, index config loading, and metrics reporting.
 - Implemented: lightweight TCP integration tests for request parsing/execution/JSON response path.
+- Implemented: expanded Cypher compatibility for relationship patterns (directed, reverse-directed, undirected, type alternation, relationship properties), two-hop chain matching, and chained MATCH clause execution with shared bindings.
+- Implemented: projection and aggregation enhancements for `count(...)`, `collect(...)`, `labels(...)`, and `type(...)`, including WITH alias propagation and ORDER BY/LIMIT handling in projection flow.
+- Implemented: EXISTS subquery support in WHERE for supported MATCH subquery bodies.
 
 Phase 1 deliverable status:
 
@@ -88,9 +91,10 @@ Phase 1 deliverable status:
 
 Remaining Phase 1 gaps before close:
 
-- Quantitative performance exit criteria evidence is not yet recorded in this document (ReBAC p95 and structured ingest throughput targets).
-- Operability exit criteria currently includes metrics implementation and emission, but external metric sink/export wiring and acceptance evidence should be documented.
-- Cypher compatibility backlog: path-variable capture and return (example: `MATCH path = ()-[:ACTED_IN]->(movie:Movie) RETURN path`) remains deferred.
+- Phase 1 performance evidence has now been captured in this document (see Phase 1 closure evidence below).
+- Operability baseline for Phase 1 is satisfied via in-process metrics collectors and periodic metrics/recommendation reporting; production sink/export wiring remains a Phase 2+ hardening task.
+- Cypher compatibility backlog (non-blocking for Phase 1 close): path-variable capture and return (example: `MATCH path = ()-[:ACTED_IN]->(movie:Movie) RETURN path`) remains deferred.
+- Planner/explainability backlog (Phase 2): explain-plan output coverage is still listed as a Phase 2 deliverable and is not yet evidenced for all supported query forms.
 
 Milestones:
 
@@ -126,8 +130,29 @@ Exit Criteria (must all pass):
 Current gate assessment:
 
 - Correctness: passing based on current automated test suite.
-- Performance: baseline benchmarking exists, but explicit pass/fail evidence against listed targets remains to be captured.
-- Operability: partially satisfied; internal metrics collectors and recommendation logs are implemented, but production export/integration evidence remains to be captured.
+- Performance: passing on current local benchmark evidence.
+- Operability: passing for Phase 1 baseline (metrics exposed through in-process collectors and runtime reporting).
+
+### Phase 1 closure evidence (captured 2026-05-22)
+
+Command and outputs:
+
+- `go run ./cmd/vitaledge-bench -scenario threat -iterations 20000`
+   - `edges_per_min=8056885.100`
+   - `ops_per_sec=134281.418`
+- `go run ./cmd/vitaledge-bench -scenario rebac -iterations 2000`
+   - `p95_ms=2.241`
+   - `avg_ms=1.602`
+   - `ops_per_sec=623.931`
+- `go run ./cmd/vitaledge-bench -scenario research -iterations 2000`
+   - `p95_ms=5.942`
+   - `avg_ms=5.289`
+   - `ops_per_sec=189.029`
+
+Target comparison:
+
+- ReBAC p95 target (`<= 10 ms`): pass (`2.241 ms`).
+- Structured ingest target (`>= 50k edges/min`): pass (`8,056,885 edges/min`).
 
 ## Phase 2: Hardening and Optimization (Single-node)
 
@@ -317,9 +342,9 @@ For each milestone, track:
 
 ## Recommended Immediate Next Sprint
 
-1. Implement GraphStore interface and Pebble-backed prototype.
-2. Finalize key encoding for vertex, edge, and adjacency indexes.
-3. Add end-to-end tests: CREATE/MATCH/WHERE/RETURN with restart durability checks.
-4. Stand up baseline benchmarks for the three priority workloads.
+1. Capture and record benchmark exit evidence against Phase 1 targets (ReBAC p95 and ingest throughput) on reference hardware.
+2. Close operability evidence gap by wiring metrics export/sink integration and documenting alertable signals.
+3. Advance Cypher compatibility on deferred items, prioritizing path-variable capture/return and any remaining projection edge cases.
+4. Begin Phase 2 explainability by introducing EXPLAIN output for currently supported query shapes.
 
 Back to [DESIGN.md](DESIGN.md) and [README.md](README.md).

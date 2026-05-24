@@ -2747,19 +2747,19 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		return fmt.Sprint(value), nil
 	}
 	if arg, ok := parseFunctionCall(raw, "date.truncate"); ok {
-		return evalTemporalTruncateFunction(arg, row, params)
+		return evalTemporalTruncateFunction("date", arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "time.truncate"); ok {
-		return evalTemporalTruncateFunction(arg, row, params)
+		return evalTemporalTruncateFunction("time", arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "datetime.truncate"); ok {
-		return evalTemporalTruncateFunction(arg, row, params)
+		return evalTemporalTruncateFunction("datetime", arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "localtime.truncate"); ok {
-		return evalTemporalTruncateFunction(arg, row, params)
+		return evalTemporalTruncateFunction("localtime", arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "localdatetime.truncate"); ok {
-		return evalTemporalTruncateFunction(arg, row, params)
+		return evalTemporalTruncateFunction("localdatetime", arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "labels"); ok {
 		return evalLabelsFunction(arg, row)
@@ -3385,7 +3385,11 @@ func evalTemporalConstructor(name, arg string, params Params, row Row) (any, err
 	out := map[string]any{"__temporal_type": name}
 	switch typed := value.(type) {
 	case map[string]any:
-		for key, v := range typed {
+		normalized, normErr := normalizeTemporalConstructorMap(name, typed)
+		if normErr != nil {
+			return nil, normErr
+		}
+		for key, v := range normalized {
 			out[key] = v
 		}
 	case string:
@@ -3396,7 +3400,174 @@ func evalTemporalConstructor(name, arg string, params Params, row Row) (any, err
 	return out, nil
 }
 
-func evalTemporalTruncateFunction(argList string, row Row, params Params) (any, error) {
+func normalizeTemporalConstructorMap(name string, in map[string]any) (map[string]any, error) {
+	typeName := strings.ToLower(strings.TrimSpace(name))
+	out := map[string]any{}
+	for k, v := range in {
+		out[k] = v
+	}
+
+	if typeName == "duration" {
+		return out, nil
+	}
+
+	if typeName == "date" || typeName == "localdatetime" || typeName == "datetime" {
+		y, m, d, ok := resolveDateFromTemporalMap(in)
+		if ok {
+			out["year"] = y
+			out["month"] = m
+			out["day"] = d
+		}
+	}
+
+	if typeName == "localtime" || typeName == "time" || typeName == "localdatetime" || typeName == "datetime" {
+		hour, _ := mapInt(out, "hour")
+		minute, _ := mapInt(out, "minute")
+		second, _ := mapInt(out, "second")
+		nano := combineNanoseconds(out)
+		out["hour"] = hour
+		out["minute"] = minute
+		out["second"] = second
+		out["nanosecond"] = nano
+	}
+
+	if typeName == "time" || typeName == "datetime" {
+		tz := strings.TrimSpace(fmt.Sprint(out["timezone"]))
+		if tz == "" {
+			out["timezone"] = "Z"
+		}
+	}
+
+	return out, nil
+}
+
+func resolveDateFromTemporalMap(in map[string]any) (int, int, int, bool) {
+	if y, m, d, ok := directYMD(in); ok {
+		return y, m, d, true
+	}
+	if y, ord, ok := yearAndOrdinal(in); ok {
+		base := time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC)
+		resolved := base.AddDate(0, 0, ord-1)
+		return resolved.Year(), int(resolved.Month()), resolved.Day(), true
+	}
+	if y, q, doq, ok := yearQuarterDayOfQuarter(in); ok {
+		month := (q-1)*3 + 1
+		base := time.Date(y, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
+		resolved := base.AddDate(0, 0, doq-1)
+		return resolved.Year(), int(resolved.Month()), resolved.Day(), true
+	}
+	if week, ok := mapInt(in, "week"); ok {
+		weekYear, hasWeekYear := mapInt(in, "year")
+		baseDate, hasBaseDate := parseEmbeddedDate(in["date"])
+		if !hasWeekYear {
+			if hasBaseDate {
+				isoYear, _ := baseDate.ISOWeek()
+				weekYear = isoYear
+				hasWeekYear = true
+			}
+		}
+		if hasWeekYear {
+			dayOfWeek, hasDOW := mapInt(in, "dayOfWeek")
+			if !hasDOW {
+				if hasBaseDate {
+					wd := int(baseDate.Weekday())
+					if wd == 0 {
+						wd = 7
+					}
+					dayOfWeek = wd
+				} else {
+					dayOfWeek = 1
+				}
+			}
+			if resolved, ok := isoWeekDate(weekYear, week, dayOfWeek); ok {
+				return resolved.Year(), int(resolved.Month()), resolved.Day(), true
+			}
+		}
+	}
+	if y, ok := mapInt(in, "year"); ok {
+		return y, 1, 1, true
+	}
+	if embedded, ok := parseEmbeddedDate(in["date"]); ok {
+		return embedded.Year(), int(embedded.Month()), embedded.Day(), true
+	}
+	return 0, 0, 0, false
+}
+
+func directYMD(in map[string]any) (int, int, int, bool) {
+	y, yOK := mapInt(in, "year")
+	m, mOK := mapInt(in, "month")
+	if yOK && mOK {
+		d, dOK := mapInt(in, "day")
+		if !dOK {
+			d = 1
+		}
+		return y, m, d, true
+	}
+	return 0, 0, 0, false
+}
+
+func yearAndOrdinal(in map[string]any) (int, int, bool) {
+	y, yOK := mapInt(in, "year")
+	ord, ordOK := mapInt(in, "ordinalDay")
+	if !yOK || !ordOK {
+		return 0, 0, false
+	}
+	return y, ord, true
+}
+
+func yearQuarterDayOfQuarter(in map[string]any) (int, int, int, bool) {
+	y, yOK := mapInt(in, "year")
+	q, qOK := mapInt(in, "quarter")
+	if !yOK || !qOK {
+		return 0, 0, 0, false
+	}
+	doq, doqOK := mapInt(in, "dayOfQuarter")
+	if !doqOK {
+		doq = 1
+	}
+	return y, q, doq, true
+}
+
+func parseEmbeddedDate(raw any) (time.Time, bool) {
+	switch typed := raw.(type) {
+	case map[string]any:
+		if y, m, d, ok := resolveDateFromTemporalMap(typed); ok {
+			return time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC), true
+		}
+		if v, ok := typed["value"]; ok {
+			if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
+				if t, err := time.Parse("2006-01-02", s); err == nil {
+					return t, true
+				}
+			}
+		}
+	case string:
+		s := strings.TrimSpace(typed)
+		if s == "" {
+			return time.Time{}, false
+		}
+		if t, err := time.Parse("2006-01-02", s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func combineNanoseconds(in map[string]any) int {
+	nano, _ := mapInt(in, "nanosecond")
+	micro, _ := mapInt(in, "microsecond")
+	milli, _ := mapInt(in, "millisecond")
+	total := nano + micro*1_000 + milli*1_000_000
+	if total < 0 {
+		return 0
+	}
+	if total >= 1_000_000_000 {
+		total = total % 1_000_000_000
+	}
+	return total
+}
+
+func evalTemporalTruncateFunction(namespace string, argList string, row Row, params Params) (any, error) {
 	args := splitTopLevelCommaSeparated(argList)
 	if len(args) < 2 {
 		return nil, graph.NewError(graph.ErrKindSemantic, "truncate() requires at least 2 arguments", nil)
@@ -3421,7 +3592,26 @@ func evalTemporalTruncateFunction(argList string, row Row, params Params) (any, 
 		for key, value := range mapped {
 			out[key] = value
 		}
+		if namespace != "" {
+			out["__temporal_type"] = namespace
+		}
 		out["truncated"] = fmt.Sprint(unit)
+		if len(args) >= 3 {
+			overrideExpr := strings.TrimSpace(args[2])
+			overrideValue, err := evalExpressionWithScope(overrideExpr, row, params)
+			if err != nil {
+				overrideValue, err = evalWriteValue(overrideExpr, params, row)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if overrideValue == nil {
+				return nil, nil
+			}
+			if overrideMap, ok := overrideValue.(map[string]any); ok {
+				out["truncate_overrides"] = overrideMap
+			}
+		}
 		return out, nil
 	}
 	return target, nil
@@ -3450,7 +3640,7 @@ func evalTemporalNamespaceFunction(raw string, row Row, params Params) (any, boo
 
 	argsRaw := strings.TrimSpace(raw[idx+1 : len(raw)-1])
 	if strings.EqualFold(method, "truncate") {
-		value, err := evalTemporalTruncateFunction(argsRaw, row, params)
+		value, err := evalTemporalTruncateFunction(namespace, argsRaw, row, params)
 		return value, true, err
 	}
 
@@ -3809,7 +3999,8 @@ func formatDurationComponents(dur durationComponents) string {
 				if absNanos < 0 {
 					absNanos = -absNanos
 				}
-				b.WriteString(fmt.Sprintf("%s%d.%09dS", sign, absSec, absNanos))
+				frac := strings.TrimRight(fmt.Sprintf("%09d", absNanos), "0")
+				b.WriteString(fmt.Sprintf("%s%d.%sS", sign, absSec, frac))
 			}
 		}
 	}
@@ -3850,10 +4041,11 @@ func formatTimeString(t time.Time, includeZone bool) string {
 		hms += fmt.Sprintf(":%02d", sec)
 	}
 	if nanos != 0 {
-		frac = "." + fmt.Sprintf("%09d", nanos)
+		frac = "." + strings.TrimRight(fmt.Sprintf("%09d", nanos), "0")
 	}
 	if includeZone {
-		return hms + frac + t.Format("Z07:00")
+		_, off := t.Zone()
+		return hms + frac + formatOffsetString(off)
 	}
 	return hms + frac
 }
@@ -3866,17 +4058,27 @@ func formatDateTimeString(t time.Time, includeZone bool) string {
 		base += fmt.Sprintf(":%02d", sec)
 	}
 	if nanos != 0 {
-		base += "." + fmt.Sprintf("%09d", nanos)
+		base += "." + strings.TrimRight(fmt.Sprintf("%09d", nanos), "0")
 	}
 	if includeZone {
-		base += t.Format("Z07:00")
+		_, off := t.Zone()
+		base += formatOffsetString(off)
 	}
 	return base
 }
 
 func parseOffsetSeconds(raw string) (int, error) {
 	raw = strings.TrimSpace(raw)
-	if len(raw) != 6 || (raw[0] != '+' && raw[0] != '-') || raw[3] != ':' {
+	if raw == "Z" || raw == "z" {
+		return 0, nil
+	}
+	if len(raw) != 6 && len(raw) != 9 {
+		return 0, fmt.Errorf("invalid offset")
+	}
+	if raw[0] != '+' && raw[0] != '-' {
+		return 0, fmt.Errorf("invalid offset")
+	}
+	if raw[3] != ':' {
 		return 0, fmt.Errorf("invalid offset")
 	}
 	hours, err := strconv.Atoi(raw[1:3])
@@ -3887,14 +4089,42 @@ func parseOffsetSeconds(raw string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if hours > 18 || minutes > 59 {
+	seconds := 0
+	if len(raw) == 9 {
+		if raw[6] != ':' {
+			return 0, fmt.Errorf("invalid offset")
+		}
+		seconds, err = strconv.Atoi(raw[7:9])
+		if err != nil {
+			return 0, err
+		}
+	}
+	if hours > 18 || minutes > 59 || seconds > 59 {
 		return 0, fmt.Errorf("invalid offset")
 	}
-	total := hours*3600 + minutes*60
+	total := hours*3600 + minutes*60 + seconds
 	if raw[0] == '-' {
 		total = -total
 	}
 	return total, nil
+}
+
+func formatOffsetString(totalSeconds int) string {
+	if totalSeconds == 0 {
+		return "Z"
+	}
+	sign := "+"
+	if totalSeconds < 0 {
+		sign = "-"
+		totalSeconds = -totalSeconds
+	}
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	seconds := totalSeconds % 60
+	if seconds == 0 {
+		return fmt.Sprintf("%s%02d:%02d", sign, hours, minutes)
+	}
+	return fmt.Sprintf("%s%02d:%02d:%02d", sign, hours, minutes, seconds)
 }
 
 func unquoteCypherString(raw string) (string, error) {

@@ -877,23 +877,38 @@ func normalizeTemporalMapForRendering(typeName string, src map[string]any) map[s
 				if t, err := time.Parse("2006-01-02", dateText); err == nil {
 					baseDate = t
 					hasBaseDate = true
-					out["year"] = t.Year()
-					out["month"] = int(t.Month())
-					out["day"] = t.Day()
+					if _, ok := out["year"]; !ok {
+						out["year"] = t.Year()
+					}
+					if _, ok := out["month"]; !ok {
+						out["month"] = int(t.Month())
+					}
+					if _, ok := out["day"]; !ok {
+						out["day"] = t.Day()
+					}
 				}
 			}
 		case string:
 			if t, err := time.Parse("2006-01-02", strings.TrimSpace(typed)); err == nil {
 				baseDate = t
 				hasBaseDate = true
-				out["year"] = t.Year()
-				out["month"] = int(t.Month())
-				out["day"] = t.Day()
+				if _, ok := out["year"]; !ok {
+					out["year"] = t.Year()
+				}
+				if _, ok := out["month"]; !ok {
+					out["month"] = int(t.Month())
+				}
+				if _, ok := out["day"]; !ok {
+					out["day"] = t.Day()
+				}
 			}
 		}
 	}
 
-	if week, ok := mapInt(out, "week"); ok {
+	_, hasYear := out["year"]
+	_, hasMonth := out["month"]
+	_, hasDay := out["day"]
+	if week, ok := mapInt(out, "week"); ok && !(hasYear && hasMonth && hasDay) {
 		_, explicitYear := src["year"]
 		year, hasYear := mapInt(out, "year")
 		if !explicitYear {
@@ -1064,7 +1079,36 @@ func applyTemporalTruncation(typeName string, src map[string]any, unit string) m
 		truncateTimeFields(out, unit)
 	}
 
+	if rawOverrides, ok := out["truncate_overrides"]; ok {
+		if overrides, ok := rawOverrides.(map[string]any); ok {
+			for k, v := range overrides {
+				if k == "nanosecond" {
+					baseNanos, _ := mapInt(out, "nanosecond")
+					if addNanos, ok := toInt(v); ok == nil {
+						out[k] = baseNanos + addNanos
+						continue
+					}
+				}
+				out[k] = v
+			}
+			if unit == "week" {
+				if dow, ok := mapInt(overrides, "dayOfWeek"); ok {
+					if y, m, d, ok := dateParts(out); ok {
+						base := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+						if dow >= 1 && dow <= 7 {
+							base = base.AddDate(0, 0, dow-1)
+							out["year"] = base.Year()
+							out["month"] = int(base.Month())
+							out["day"] = base.Day()
+						}
+					}
+				}
+			}
+		}
+	}
+
 	delete(out, "truncated")
+	delete(out, "truncate_overrides")
 	return out
 }
 
@@ -1082,27 +1126,45 @@ func isoWeekDate(year, week, dayOfWeek int) (time.Time, bool) {
 }
 
 func formatTimeWithNamedTimezone(t time.Time, src map[string]any) string {
-	base := formatTimeString(t, true)
+	base := formatTimeString(t, false)
 	tz := strings.TrimSpace(fmt.Sprint(src["timezone"]))
-	if tz == "" || strings.HasPrefix(tz, "+") || strings.HasPrefix(tz, "-") {
-		return base
+	if tz == "" {
+		_, off := t.Zone()
+		return base + formatOffsetString(off)
+	}
+	if strings.HasPrefix(tz, "+") || strings.HasPrefix(tz, "-") || strings.EqualFold(tz, "z") {
+		if off, err := parseOffsetSeconds(tz); err == nil {
+			return base + formatOffsetString(off)
+		}
+		return base + tz
 	}
 	if strings.Contains(tz, "/") {
-		return base + "[" + tz + "]"
+		_, off := t.Zone()
+		return base + formatOffsetString(off) + "[" + tz + "]"
 	}
-	return base
+	_, off := t.Zone()
+	return base + formatOffsetString(off)
 }
 
 func formatDateTimeWithNamedTimezone(t time.Time, src map[string]any) string {
-	base := formatDateTimeString(t, true)
+	base := formatDateTimeString(t, false)
 	tz := strings.TrimSpace(fmt.Sprint(src["timezone"]))
-	if tz == "" || strings.HasPrefix(tz, "+") || strings.HasPrefix(tz, "-") {
-		return base
+	if tz == "" {
+		_, off := t.Zone()
+		return base + formatOffsetString(off)
+	}
+	if strings.HasPrefix(tz, "+") || strings.HasPrefix(tz, "-") || strings.EqualFold(tz, "z") {
+		if off, err := parseOffsetSeconds(tz); err == nil {
+			return base + formatOffsetString(off)
+		}
+		return base + tz
 	}
 	if strings.Contains(tz, "/") {
-		return base + "[" + tz + "]"
+		_, off := t.Zone()
+		return base + formatOffsetString(off) + "[" + tz + "]"
 	}
-	return base
+	_, off := t.Zone()
+	return base + formatOffsetString(off)
 }
 
 func outcomeFromError(err error) string {

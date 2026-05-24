@@ -49,6 +49,12 @@ type createChainNodePattern struct {
 	PropsRaw string
 }
 
+type createVertexPatternSpec struct {
+	Var      string
+	Labels   []string
+	PropsRaw string
+}
+
 type createChainRelPattern struct {
 	Var       string
 	Type      string
@@ -1428,6 +1434,9 @@ func (e *Executor) applyCreatePattern(ctx context.Context, tx graph.Tx, rows []R
 	if m := createVertexPatternRE.FindStringSubmatch(raw); len(m) == 4 {
 		return e.applyCreateVertex(ctx, tx, rows, m, params, tenant, merge)
 	}
+	if spec, ok := parseCreateVertexPatternSpec(raw); ok {
+		return e.applyCreateVertexSpec(ctx, tx, rows, spec, params, tenant, merge)
+	}
 	if isMissingRelationshipTypePattern(raw) {
 		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
 	}
@@ -1498,12 +1507,16 @@ func parseCreateChainRelToken(raw string) (createChainRelPattern, int, bool) {
 }
 
 func (e *Executor) applyCreateVertex(ctx context.Context, tx graph.Tx, rows []Row, m []string, params Params, tenant string, merge bool) ([]Row, error) {
-	varName := m[1]
-	labels := splitLabels(m[2])
+	return e.applyCreateVertexSpec(ctx, tx, rows, createVertexPatternSpec{Var: m[1], Labels: splitLabels(m[2]), PropsRaw: m[3]}, params, tenant, merge)
+}
+
+func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows []Row, spec createVertexPatternSpec, params Params, tenant string, merge bool) ([]Row, error) {
+	varName := spec.Var
+	labels := spec.Labels
 
 	out := make([]Row, 0, len(rows))
 	for _, row := range rows {
-		props, err := parsePropertyMap(m[3], params, row)
+		props, err := parsePropertyMap(spec.PropsRaw, params, row)
 		if err != nil {
 			return nil, err
 		}
@@ -1537,6 +1550,84 @@ func (e *Executor) applyCreateVertex(ctx context.Context, tx graph.Tx, rows []Ro
 		out = append(out, merged)
 	}
 	return out, nil
+}
+
+func parseCreateVertexPatternSpec(raw string) (createVertexPatternSpec, bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "(") || !strings.HasSuffix(raw, ")") {
+		return createVertexPatternSpec{}, false
+	}
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	if body == "" {
+		return createVertexPatternSpec{}, true
+	}
+
+	head := body
+	propsRaw := ""
+	if idx := strings.Index(body, "{"); idx >= 0 {
+		end, ok := findMatchingDelimiter(body, idx, '{', '}')
+		if !ok {
+			return createVertexPatternSpec{}, false
+		}
+		if strings.TrimSpace(body[end+1:]) != "" {
+			return createVertexPatternSpec{}, false
+		}
+		head = strings.TrimSpace(body[:idx])
+		propsRaw = strings.TrimSpace(body[idx+1 : end])
+	}
+
+	varName := ""
+	labelsRaw := ""
+	if strings.HasPrefix(head, ":") {
+		labelsRaw = strings.TrimPrefix(head, ":")
+	} else if strings.Contains(head, ":") {
+		parts := strings.SplitN(head, ":", 2)
+		varName = strings.TrimSpace(parts[0])
+		labelsRaw = strings.TrimSpace(parts[1])
+	} else {
+		varName = strings.TrimSpace(head)
+	}
+
+	if varName != "" && !identifierRE.MatchString(varName) {
+		return createVertexPatternSpec{}, false
+	}
+	return createVertexPatternSpec{Var: varName, Labels: splitLabels(labelsRaw), PropsRaw: propsRaw}, true
+}
+
+func findMatchingDelimiter(raw string, start int, open byte, close byte) (int, bool) {
+	if start < 0 || start >= len(raw) || raw[start] != open {
+		return -1, false
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := start; i < len(raw); i++ {
+		ch := raw[i]
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		if ch == open {
+			depth++
+			continue
+		}
+		if ch == close {
+			depth--
+			if depth == 0 {
+				return i, true
+			}
+		}
+	}
+	return -1, false
 }
 
 func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row, m []string, params Params, tenant string, merge bool, direction createEdgeDirection) ([]Row, error) {

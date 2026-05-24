@@ -31,6 +31,9 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Grammar is pinned to openCypher M23 in source control.
 - Parser generation target: `make generate-cypher-parser`
 - Test command: `go test ./...`
+- Compliance suite (official openCypher TCK via godog): `make cypher-compliance`
+- Compliance run + summarized gap report: `make cypher-compliance-report`
+- Summarize last compliance run log: `make cypher-compliance-summary`
 - Smoke benchmark: `make bench-smoke`
 - Graph store benchmark baseline: `make bench-graph-store`
 

@@ -1,0 +1,679 @@
+package compliance
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/cucumber/godog"
+	"github.com/paegun/vitaledge/internal/cypher/executor"
+	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"github.com/paegun/vitaledge/internal/graph"
+	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
+)
+
+const defaultTenant = "tck"
+
+var tckDirFlag = flag.String("tck-dir", "", "path to the openCypher TCK features directory")
+
+type graphSnapshot struct {
+	Nodes         int
+	Relationships int
+	Properties    int
+	Labels        int
+}
+
+func (g graphSnapshot) Delta(before graphSnapshot) graphSnapshot {
+	return graphSnapshot{
+		Nodes:         g.Nodes - before.Nodes,
+		Relationships: g.Relationships - before.Relationships,
+		Properties:    g.Properties - before.Properties,
+		Labels:        g.Labels - before.Labels,
+	}
+}
+
+type cypherTCKFeature struct {
+	ctx               context.Context
+	tempDir           string
+	store             *pebblestore.Store
+	exec              *executor.Executor
+	params            executor.Params
+	lastQuery         string
+	lastResult        *executor.Result
+	lastErr           error
+	beforeQueryCounts graphSnapshot
+	afterQueryCounts  graphSnapshot
+}
+
+func TestCypherCompliance(t *testing.T) {
+	tckDir := resolveTCKDir(t)
+	if tckDir == "" {
+		t.Skip("openCypher TCK not present; run make cypher-compliance to fetch and execute it")
+	}
+	if _, err := os.Stat(tckDir); err != nil {
+		t.Skipf("openCypher TCK directory unavailable: %v", err)
+	}
+
+	suite := godog.TestSuite{
+		Name:                "cypher-compliance",
+		ScenarioInitializer: InitializeScenario,
+		Options: &godog.Options{
+			Format:   "progress",
+			Paths:    []string{tckDir},
+			TestingT: t,
+			Strict:   true,
+		},
+	}
+
+	if suite.Run() != 0 {
+		t.Fail()
+	}
+}
+
+func InitializeScenario(sc *godog.ScenarioContext) {
+	feature := &cypherTCKFeature{}
+
+	sc.Before(func(ctx context.Context, _ *godog.Scenario) (context.Context, error) {
+		feature.ctx = ctx
+		feature.params = executor.Params{}
+		feature.lastQuery = ""
+		feature.lastResult = nil
+		feature.lastErr = nil
+		feature.beforeQueryCounts = graphSnapshot{}
+		feature.afterQueryCounts = graphSnapshot{}
+		return ctx, feature.resetStore()
+	})
+
+	sc.After(func(ctx context.Context, _ *godog.Scenario, _ error) (context.Context, error) {
+		return ctx, feature.closeStore()
+	})
+
+	sc.Step(`^an empty graph$`, feature.anEmptyGraph)
+	sc.Step(`^any graph$`, feature.anyGraph)
+	sc.Step(`^parameters are:$`, feature.parametersAre)
+	sc.Step(`^having executed:$`, feature.havingExecuted)
+	sc.Step(`^executing query:$`, feature.executingQuery)
+	sc.Step(`^the result should be empty$`, feature.resultShouldBeEmpty)
+	sc.Step(`^the result should be, in any order:$`, feature.resultShouldBeInAnyOrder)
+	sc.Step(`^the result should be, in order:$`, feature.resultShouldBeInOrder)
+	sc.Step(`^no side effects$`, feature.noSideEffects)
+	sc.Step(`^the side effects should be:$`, feature.sideEffectsShouldBe)
+	sc.Step(`^a ([A-Za-z]+) should be raised at (compile time|runtime): ([A-Za-z0-9]+)$`, feature.errorShouldBeRaised)
+}
+
+func resolveTCKDir(t *testing.T) string {
+	t.Helper()
+	if *tckDirFlag != "" {
+		return *tckDirFlag
+	}
+	if env := os.Getenv("VITALEDGE_CYPHER_TCK_DIR"); env != "" {
+		return env
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	root := filepath.Clean(filepath.Join(wd, "../../.."))
+	candidate := filepath.Join(root, ".cache", "opencypher", "tck", "features")
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+	return ""
+}
+
+func (f *cypherTCKFeature) anEmptyGraph() error {
+	return f.resetStore()
+}
+
+func (f *cypherTCKFeature) anyGraph() error {
+	return f.resetStore()
+}
+
+func (f *cypherTCKFeature) parametersAre(table *godog.Table) error {
+	headers, rows, err := readTable(table)
+	if err != nil {
+		return err
+	}
+	if len(headers) < 2 {
+		return fmt.Errorf("parameter table must contain at least two columns, got %d", len(headers))
+	}
+
+	params := executor.Params{}
+	for _, row := range rows {
+		if len(row) < 2 {
+			return fmt.Errorf("parameter row must contain at least two values")
+		}
+		value, err := f.evaluateLiteral(row[1])
+		if err != nil {
+			return fmt.Errorf("parse parameter %q: %w", row[0], err)
+		}
+		params[row[0]] = value
+	}
+	f.params = params
+	return nil
+}
+
+func (f *cypherTCKFeature) havingExecuted(doc *godog.DocString) error {
+	_, err := f.runBatch(strings.TrimSpace(doc.Content), f.params)
+	return err
+}
+
+func (f *cypherTCKFeature) executingQuery(doc *godog.DocString) error {
+	query := strings.TrimSpace(doc.Content)
+	f.lastQuery = query
+	f.lastResult = nil
+	f.lastErr = nil
+
+	before, err := f.snapshotGraph()
+	if err != nil {
+		return err
+	}
+	f.beforeQueryCounts = before
+
+	result, execErr := f.runBatch(query, f.params)
+	f.lastResult = result
+	f.lastErr = execErr
+
+	after, afterErr := f.snapshotGraph()
+	if afterErr != nil {
+		return afterErr
+	}
+	f.afterQueryCounts = after
+	return nil
+}
+
+func (f *cypherTCKFeature) resultShouldBeEmpty() error {
+	if f.lastErr != nil {
+		return fmt.Errorf("query returned error instead of an empty result: %w", f.lastErr)
+	}
+	if f.lastResult == nil {
+		return fmt.Errorf("no query result captured")
+	}
+	if len(f.lastResult.Rows) != 0 {
+		return fmt.Errorf("expected no rows, got %d", len(f.lastResult.Rows))
+	}
+	return nil
+}
+
+func (f *cypherTCKFeature) resultShouldBeInAnyOrder(table *godog.Table) error {
+	return f.assertResultTable(table, false)
+}
+
+func (f *cypherTCKFeature) resultShouldBeInOrder(table *godog.Table) error {
+	return f.assertResultTable(table, true)
+}
+
+func (f *cypherTCKFeature) noSideEffects() error {
+	delta := f.afterQueryCounts.Delta(f.beforeQueryCounts)
+	if delta != (graphSnapshot{}) {
+		return fmt.Errorf("expected no side effects, got %+v", delta)
+	}
+	return nil
+}
+
+func (f *cypherTCKFeature) sideEffectsShouldBe(table *godog.Table) error {
+	headers, rows, err := readTable(table)
+	if err != nil {
+		return err
+	}
+	if len(headers) < 2 {
+		return fmt.Errorf("side effect table must have two columns")
+	}
+
+	delta := f.afterQueryCounts.Delta(f.beforeQueryCounts)
+	actual := map[string]int{
+		"+nodes":         max(delta.Nodes, 0),
+		"-nodes":         max(-delta.Nodes, 0),
+		"+relationships": max(delta.Relationships, 0),
+		"-relationships": max(-delta.Relationships, 0),
+		"+properties":    max(delta.Properties, 0),
+		"-properties":    max(-delta.Properties, 0),
+		"+labels":        max(delta.Labels, 0),
+		"-labels":        max(-delta.Labels, 0),
+	}
+
+	expected := map[string]int{}
+	for _, row := range rows {
+		if len(row) < 2 {
+			return fmt.Errorf("side effect row must have two values")
+		}
+		count, err := strconv.Atoi(row[1])
+		if err != nil {
+			return fmt.Errorf("invalid side effect count %q: %w", row[1], err)
+		}
+		expected[row[0]] = count
+	}
+
+	for key, want := range expected {
+		if got := actual[key]; got != want {
+			return fmt.Errorf("expected %s=%d, got %d", key, want, got)
+		}
+	}
+	for key, got := range actual {
+		if got == 0 {
+			continue
+		}
+		if _, ok := expected[key]; !ok {
+			return fmt.Errorf("unexpected side effect %s=%d", key, got)
+		}
+	}
+	return nil
+}
+
+func (f *cypherTCKFeature) errorShouldBeRaised(category, phase, reason string) error {
+	if f.lastErr == nil {
+		return fmt.Errorf("expected %s at %s (%s), but query succeeded", category, phase, reason)
+	}
+
+	actualPhase, actualCategory := classifyError(f.lastErr)
+	if actualPhase != phase {
+		return fmt.Errorf("expected %s at %s (%s), got %s at %s: %v", category, phase, reason, actualCategory, actualPhase, f.lastErr)
+	}
+	if actualCategory != category {
+		return fmt.Errorf("expected %s at %s (%s), got %s: %v", category, phase, reason, actualCategory, f.lastErr)
+	}
+	return nil
+}
+
+func (f *cypherTCKFeature) assertResultTable(table *godog.Table, ordered bool) error {
+	if f.lastErr != nil {
+		return fmt.Errorf("query returned error instead of rows: %w", f.lastErr)
+	}
+	if f.lastResult == nil {
+		return fmt.Errorf("no query result captured")
+	}
+
+	headers, expectedRows, err := readTable(table)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(trimmedStrings(f.lastResult.Columns), headers) {
+		return fmt.Errorf("expected columns %v, got %v", headers, f.lastResult.Columns)
+	}
+
+	actualRows := make([][]string, 0, len(f.lastResult.Rows))
+	for _, row := range f.lastResult.Rows {
+		serialized := make([]string, 0, len(headers))
+		for _, header := range headers {
+			serialized = append(serialized, renderTCKValue(row[header]))
+		}
+		actualRows = append(actualRows, serialized)
+	}
+
+	for i := range expectedRows {
+		for j := range expectedRows[i] {
+			expectedRows[i][j] = normalizeExpectedCell(expectedRows[i][j])
+		}
+	}
+	for i := range actualRows {
+		for j := range actualRows[i] {
+			actualRows[i][j] = normalizeExpectedCell(actualRows[i][j])
+		}
+	}
+
+	if ordered {
+		if !reflect.DeepEqual(actualRows, expectedRows) {
+			return fmt.Errorf("expected rows %v, got %v", expectedRows, actualRows)
+		}
+		return nil
+	}
+
+	sort.Slice(actualRows, func(i, j int) bool {
+		return strings.Join(actualRows[i], "\x00") < strings.Join(actualRows[j], "\x00")
+	})
+	sort.Slice(expectedRows, func(i, j int) bool {
+		return strings.Join(expectedRows[i], "\x00") < strings.Join(expectedRows[j], "\x00")
+	})
+	if !reflect.DeepEqual(actualRows, expectedRows) {
+		return fmt.Errorf("expected rows %v, got %v", expectedRows, actualRows)
+	}
+	return nil
+}
+
+func (f *cypherTCKFeature) runBatch(query string, params executor.Params) (*executor.Result, error) {
+	batch, err := parser.ParseBatch(query)
+	if err != nil {
+		return nil, err
+	}
+	effectiveParams := withDefaultTenant(params)
+	var result *executor.Result
+	for _, stmt := range batch.Statements {
+		result, err = f.exec.ExecuteStatement(f.ctx, stmt, effectiveParams)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if result == nil {
+		result = &executor.Result{}
+	}
+	return result, nil
+}
+
+func (f *cypherTCKFeature) evaluateLiteral(raw string) (any, error) {
+	result, err := f.runBatch("RETURN "+strings.TrimSpace(raw)+" AS value", nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Rows) != 1 {
+		return nil, fmt.Errorf("expected one row when evaluating literal, got %d", len(result.Rows))
+	}
+	return result.Rows[0]["value"], nil
+}
+
+func (f *cypherTCKFeature) resetStore() error {
+	if err := f.closeStore(); err != nil {
+		return err
+	}
+	tempDir, err := os.MkdirTemp("", "vitaledge-cypher-tck-")
+	if err != nil {
+		return err
+	}
+	store, err := pebblestore.Open(tempDir)
+	if err != nil {
+		_ = os.RemoveAll(tempDir)
+		return err
+	}
+	f.tempDir = tempDir
+	f.store = store
+	f.exec = executor.New(store, executor.Options{})
+	f.params = executor.Params{}
+	f.lastQuery = ""
+	f.lastResult = nil
+	f.lastErr = nil
+	f.beforeQueryCounts = graphSnapshot{}
+	f.afterQueryCounts = graphSnapshot{}
+	return nil
+}
+
+func (f *cypherTCKFeature) closeStore() error {
+	var errs []error
+	if f.store != nil {
+		if err := f.store.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if f.tempDir != "" {
+		if err := os.RemoveAll(f.tempDir); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	f.store = nil
+	f.exec = nil
+	f.tempDir = ""
+	return errors.Join(errs...)
+}
+
+func (f *cypherTCKFeature) snapshotGraph() (graphSnapshot, error) {
+	stats := graphSnapshot{}
+	seenEdges := map[string]struct{}{}
+	err := f.store.View(f.ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(f.ctx, defaultTenant, 0, func(vertex *graph.Vertex) error {
+			stats.Nodes++
+			stats.Labels += len(vertex.Labels)
+			stats.Properties += len(vertex.Properties)
+			return tx.ScanOutEdges(f.ctx, defaultTenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+				if _, ok := seenEdges[edge.ID]; ok {
+					return nil
+				}
+				seenEdges[edge.ID] = struct{}{}
+				stats.Relationships++
+				stats.Properties += len(edge.Properties)
+				return nil
+			})
+		})
+	})
+	return stats, err
+}
+
+func classifyError(err error) (phase string, category string) {
+	var parseErr *parser.ParseError
+	if errors.As(err, &parseErr) {
+		switch parseErr.Kind {
+		case parser.ParseErrorSyntax:
+			return "compile time", "SyntaxError"
+		case parser.ParseErrorSemantic:
+			return "compile time", "SemanticError"
+		case parser.ParseErrorUnsupported:
+			return "compile time", "SyntaxError"
+		default:
+			return "compile time", "SyntaxError"
+		}
+	}
+
+	switch {
+	case graph.IsKind(err, graph.ErrKindNotFound):
+		return "runtime", "EntityNotFound"
+	case graph.IsKind(err, graph.ErrKindConflict):
+		return "runtime", "ConstraintVerificationFailed"
+	case graph.IsKind(err, graph.ErrKindSemantic):
+		return "runtime", "SemanticError"
+	case graph.IsKind(err, graph.ErrKindInvalidInput):
+		return "runtime", "ArgumentError"
+	case graph.IsKind(err, graph.ErrKindUnsupported):
+		return "runtime", "SyntaxError"
+	default:
+		return "runtime", "ExecutionError"
+	}
+}
+
+func readTable(table *godog.Table) ([]string, [][]string, error) {
+	if table == nil || len(table.Rows) == 0 {
+		return nil, nil, fmt.Errorf("table is empty")
+	}
+	headers := make([]string, 0, len(table.Rows[0].Cells))
+	for _, cell := range table.Rows[0].Cells {
+		headers = append(headers, strings.TrimSpace(cell.Value))
+	}
+	rows := make([][]string, 0, max(len(table.Rows)-1, 0))
+	for _, row := range table.Rows[1:] {
+		values := make([]string, 0, len(row.Cells))
+		for _, cell := range row.Cells {
+			values = append(values, strings.TrimSpace(cell.Value))
+		}
+		rows = append(rows, values)
+	}
+	return headers, rows, nil
+}
+
+func trimmedStrings(values []string) []string {
+	trimmed := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed = append(trimmed, strings.TrimSpace(value))
+	}
+	return trimmed
+}
+
+func renderTCKValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return quoteString(typed)
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case int:
+		return strconv.Itoa(typed)
+	case int64:
+		return strconv.FormatInt(typed, 10)
+	case int32:
+		return strconv.FormatInt(int64(typed), 10)
+	case uint:
+		return strconv.FormatUint(uint64(typed), 10)
+	case uint64:
+		return strconv.FormatUint(typed, 10)
+	case float64:
+		return strconv.FormatFloat(typed, 'g', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(typed), 'g', -1, 32)
+	case []string:
+		items := make([]string, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, quoteString(item))
+		}
+		return "[" + strings.Join(items, ", ") + "]"
+	case []any:
+		items := make([]string, 0, len(typed))
+		for _, item := range typed {
+			items = append(items, renderTCKValue(item))
+		}
+		return "[" + strings.Join(items, ", ") + "]"
+	case map[string]any:
+		if isNodeValue(typed) {
+			return renderNodeValue(typed)
+		}
+		if isRelationshipValue(typed) {
+			return renderRelationshipValue(typed)
+		}
+		keys := sortedKeys(typed)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			parts = append(parts, key+": "+renderTCKValue(typed[key]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	default:
+		return fmt.Sprintf("%v", typed)
+	}
+}
+
+func renderNodeValue(value map[string]any) string {
+	var b strings.Builder
+	b.WriteByte('(')
+	labels, _ := value["labels"].([]string)
+	labels = append([]string(nil), labels...)
+	sort.Strings(labels)
+	for _, label := range labels {
+		b.WriteByte(':')
+		b.WriteString(label)
+	}
+	props, _ := value["properties"].(map[string]any)
+	if len(props) > 0 {
+		if len(labels) > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(renderTCKValue(props))
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
+func renderRelationshipValue(value map[string]any) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	if relType, _ := value["type"].(string); relType != "" {
+		b.WriteByte(':')
+		b.WriteString(relType)
+	}
+	props, _ := value["properties"].(map[string]any)
+	if len(props) > 0 {
+		if relType, _ := value["type"].(string); relType != "" {
+			b.WriteByte(' ')
+		}
+		b.WriteString(renderTCKValue(props))
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+func isNodeValue(value map[string]any) bool {
+	_, hasLabels := value["labels"]
+	_, hasProps := value["properties"]
+	_, hasType := value["type"]
+	return hasLabels && hasProps && !hasType
+}
+
+func isRelationshipValue(value map[string]any) bool {
+	_, hasType := value["type"]
+	_, hasProps := value["properties"]
+	_, hasSrc := value["src"]
+	_, hasDst := value["dst"]
+	return hasType && hasProps && hasSrc && hasDst
+}
+
+func sortedKeys(value map[string]any) []string {
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func quoteString(value string) string {
+	replacer := strings.NewReplacer(`\\`, `\\\\`, `'`, `\\'`, "\n", `\\n`, "\t", `\\t`)
+	return "'" + replacer.Replace(value) + "'"
+}
+
+func normalizeExpectedCell(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	return collapseWhitespaceOutsideStrings(value)
+}
+
+func collapseWhitespaceOutsideStrings(value string) string {
+	var b strings.Builder
+	inString := false
+	prevSpace := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' && (i == 0 || value[i-1] != '\\') {
+			inString = !inString
+			b.WriteByte(ch)
+			prevSpace = false
+			continue
+		}
+		if inString {
+			b.WriteByte(ch)
+			continue
+		}
+		if ch == ' ' || ch == '\t' || ch == '\n' {
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		if strings.ContainsRune("[]{}(),:", rune(ch)) {
+			trimTrailingSpace(&b)
+			b.WriteByte(ch)
+			prevSpace = false
+			continue
+		}
+		b.WriteByte(ch)
+		prevSpace = false
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func trimTrailingSpace(b *strings.Builder) {
+	content := b.String()
+	if strings.HasSuffix(content, " ") {
+		b.Reset()
+		b.WriteString(strings.TrimRight(content, " "))
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func withDefaultTenant(params executor.Params) executor.Params {
+	merged := executor.Params{"tenant": defaultTenant}
+	for key, value := range params {
+		merged[key] = value
+	}
+	return merged
+}

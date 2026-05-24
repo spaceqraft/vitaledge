@@ -1,4 +1,11 @@
 ANTLR_JAR := tools/antlr-4.13.1-complete.jar
+TCK_VERSION := M23
+TCK_CACHE_DIR := .cache/opencypher
+TCK_ZIP := $(TCK_CACHE_DIR)/tck-$(TCK_VERSION).zip
+TCK_ROOT := $(TCK_CACHE_DIR)/tck
+TCK_FEATURES := $(TCK_ROOT)/features
+TCK_FEATURES_ABS := $(abspath $(TCK_FEATURES))
+CYPHER_COMPLIANCE_LOG := $(TCK_CACHE_DIR)/cypher-compliance.log
 
 run: build
 	./bin/vitaledge
@@ -38,3 +45,21 @@ verify-comprehension:
 		exit 1; \
 	fi; \
 	echo "Comprehension docs verified: Q=$$q_count A=$$a_count"
+
+cypher-compliance-fetch:
+	@mkdir -p $(TCK_CACHE_DIR)
+	@rm -rf $(TCK_ROOT)
+	@curl -L --fail https://s3.amazonaws.com/artifacts.opencypher.org/$(TCK_VERSION)/tck-$(TCK_VERSION).zip -o $(TCK_ZIP)
+	@unzip -oq $(TCK_ZIP) -d $(TCK_CACHE_DIR)
+
+cypher-compliance: cypher-compliance-fetch
+	@VITALEDGE_CYPHER_TCK_DIR=$(TCK_FEATURES_ABS) go test -v ./internal/cypher/compliance -run TestCypherCompliance -count=1
+
+cypher-compliance-report: cypher-compliance-fetch
+	@VITALEDGE_CYPHER_TCK_DIR=$(TCK_FEATURES_ABS) go test -v ./internal/cypher/compliance -run TestCypherCompliance -count=1 > $(CYPHER_COMPLIANCE_LOG) 2>&1; \
+	status=$$?; \
+	bash scripts/summarize_cypher_compliance.sh $(CYPHER_COMPLIANCE_LOG); \
+	exit $$status
+
+cypher-compliance-summary:
+	@bash scripts/summarize_cypher_compliance.sh $(CYPHER_COMPLIANCE_LOG)

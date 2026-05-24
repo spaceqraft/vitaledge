@@ -48,4 +48,32 @@ In practical terms, the parser accepts Cypher according to the imported grammar 
 - Increase semantic validation coverage while preserving strict error reporting.
 - Keep parser and execution layers cleanly separated.
 
+## Team Compliance Workflow
+
+The openCypher TCK integration is designed to be repeatable and team-friendly.
+
+Primary commands:
+
+- `make cypher-compliance`: fetch official TCK M23 and run full suite.
+- `make cypher-compliance-report`: run full suite, save run log, and print grouped failure summary.
+- `make cypher-compliance-summary`: summarize the most recent compliance log.
+
+Generated artifacts:
+
+- TCK cache and features: `.cache/opencypher/tck`
+- Last compliance log: `.cache/opencypher/cypher-compliance.log`
+
+Failure interpretation model:
+
+- `step is undefined`: TCK step phrase is not yet implemented in VitalEdge godog bindings.
+- `UNSUPPORTED: ...`: parser/executor explicitly rejects a language feature; this is a concrete implementation gap.
+- semantic category mismatches (for example expected compile-time vs runtime): error taxonomy mapping needs refinement.
+
+Team operating rhythm:
+
+1. Run `make cypher-compliance-report` before merging Cypher execution changes.
+2. Capture top categories from the summary output and map them to implementation work items.
+3. Re-run the same command after the change to confirm net reduction in failure categories.
+4. Keep unsupported behavior explicit; do not hide or skip failing TCK scenarios.
+
 Back to [README.md](README.md).

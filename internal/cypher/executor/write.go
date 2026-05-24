@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
@@ -2562,6 +2564,49 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty expression", nil)
 	}
+	if left, right, ok := splitTopLevelOperator(raw, ">="); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf >= rf, nil
+		}
+		return fmt.Sprint(lhs) >= fmt.Sprint(rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "<="); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf <= rf, nil
+		}
+		return fmt.Sprint(lhs) <= fmt.Sprint(rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "<>"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return !reflect.DeepEqual(lhs, rhs), nil
+	}
 	if left, right, ok := splitTopLevelOperator(raw, "="); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
 		if err != nil {
@@ -2608,6 +2653,85 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		ls := fmt.Sprint(lhs)
 		rs := fmt.Sprint(rhs)
 		return ls < rs, nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "+"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf + rf, nil
+		}
+		if value, ok := evalTemporalArithmetic(lhs, rhs, "+"); ok {
+			return value, nil
+		}
+		return fmt.Sprint(lhs) + fmt.Sprint(rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "-"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf - rf, nil
+		}
+		if value, ok := evalTemporalArithmetic(lhs, rhs, "-"); ok {
+			return value, nil
+		}
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "*"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf * rf, nil
+		}
+		if value, ok := evalTemporalArithmetic(lhs, rhs, "*"); ok {
+			return value, nil
+		}
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "/"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			if rf == 0 {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "division by zero", nil)
+			}
+			return lf / rf, nil
+		}
+		if value, ok := evalTemporalArithmetic(lhs, rhs, "/"); ok {
+			return value, nil
+		}
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
 	}
 	if value, ok, err := evalTemporalNamespaceFunction(raw, row, params); ok {
 		return value, err
@@ -2670,6 +2794,14 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 				return value, nil
 			}
 			return nil, nil
+		case string:
+			if mapped, ok := parseStoredMapString(typed); ok {
+				if value, ok := mapped[field]; ok {
+					return value, nil
+				}
+				return nil, nil
+			}
+			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("field access not supported on %T", base), nil)
 		default:
 			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("field access not supported on %T", base), nil)
 		}
@@ -3419,6 +3551,342 @@ func numericValue(v any) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func parseStoredMapString(raw string) (map[string]any, bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "map[") || !strings.HasSuffix(raw, "]") {
+		return nil, false
+	}
+	body := strings.TrimSpace(raw[len("map[") : len(raw)-1])
+	if body == "" {
+		return map[string]any{}, true
+	}
+	out := map[string]any{}
+	for _, part := range strings.Fields(body) {
+		pair := strings.SplitN(part, ":", 2)
+		if len(pair) != 2 {
+			continue
+		}
+		out[pair[0]] = pair[1]
+	}
+	return out, true
+}
+
+func evalTemporalArithmetic(lhs, rhs any, op string) (any, bool) {
+	leftMap, leftTemporal := temporalMapValue(lhs)
+	rightMap, rightTemporal := temporalMapValue(rhs)
+
+	if leftTemporal && rightTemporal {
+		leftType := strings.ToLower(fmt.Sprint(leftMap["__temporal_type"]))
+		rightType := strings.ToLower(fmt.Sprint(rightMap["__temporal_type"]))
+		if leftType == "duration" && rightType == "duration" {
+			leftDur := durationComponentsFromMap(leftMap)
+			rightDur := durationComponentsFromMap(rightMap)
+			switch op {
+			case "+":
+				return formatDurationComponents(leftDur.add(rightDur)), true
+			case "-":
+				return formatDurationComponents(leftDur.sub(rightDur)), true
+			}
+		}
+
+		if rightType == "duration" {
+			if value, ok := applyTemporalAndDuration(leftMap, durationComponentsFromMap(rightMap), op); ok {
+				return value, true
+			}
+		}
+	}
+
+	if leftTemporal {
+		leftType := strings.ToLower(fmt.Sprint(leftMap["__temporal_type"]))
+		if leftType == "duration" {
+			leftDur := durationComponentsFromMap(leftMap)
+			if factor, ok := numericValue(rhs); ok {
+				switch op {
+				case "*":
+					return formatDurationComponents(leftDur.scale(factor)), true
+				case "/":
+					if factor == 0 {
+						return nil, false
+					}
+					return formatDurationComponents(leftDur.scale(1 / factor)), true
+				}
+			}
+		}
+	}
+
+	if rightTemporal && op == "*" {
+		rightType := strings.ToLower(fmt.Sprint(rightMap["__temporal_type"]))
+		if rightType == "duration" {
+			if factor, ok := numericValue(lhs); ok {
+				return formatDurationComponents(durationComponentsFromMap(rightMap).scale(factor)), true
+			}
+		}
+	}
+
+	return nil, false
+}
+
+type durationComponents struct {
+	months  float64
+	days    float64
+	seconds float64
+}
+
+func (d durationComponents) add(other durationComponents) durationComponents {
+	return durationComponents{months: d.months + other.months, days: d.days + other.days, seconds: d.seconds + other.seconds}
+}
+
+func (d durationComponents) sub(other durationComponents) durationComponents {
+	return durationComponents{months: d.months - other.months, days: d.days - other.days, seconds: d.seconds - other.seconds}
+}
+
+func (d durationComponents) scale(factor float64) durationComponents {
+	return durationComponents{months: d.months * factor, days: d.days * factor, seconds: d.seconds * factor}
+}
+
+func temporalMapValue(v any) (map[string]any, bool) {
+	switch typed := v.(type) {
+	case map[string]any:
+		if _, ok := typed["__temporal_type"]; ok {
+			return typed, true
+		}
+	case string:
+		if mapped, ok := parseStoredMapString(typed); ok {
+			if _, hasTemporal := mapped["__temporal_type"]; hasTemporal {
+				return mapped, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func durationComponentsFromMap(value map[string]any) durationComponents {
+	return durationComponents{
+		months: 12*mapFloat(value, "years") + mapFloat(value, "months"),
+		days:   7*mapFloat(value, "weeks") + mapFloat(value, "days"),
+		seconds: 3600*mapFloat(value, "hours") + 60*mapFloat(value, "minutes") +
+			mapFloat(value, "seconds") + mapFloat(value, "milliseconds")/1000 + mapFloat(value, "microseconds")/1_000_000 + mapFloat(value, "nanoseconds")/1_000_000_000,
+	}
+}
+
+func mapFloat(value map[string]any, key string) float64 {
+	raw, ok := value[key]
+	if !ok {
+		return 0
+	}
+	if f, ok := numericValue(raw); ok {
+		return f
+	}
+	return 0
+}
+
+func applyTemporalAndDuration(temporal map[string]any, dur durationComponents, op string) (any, bool) {
+	if op != "+" && op != "-" {
+		return nil, false
+	}
+	if op == "-" {
+		dur = dur.scale(-1)
+	}
+
+	temporalType := strings.ToLower(fmt.Sprint(temporal["__temporal_type"]))
+	year, yOk := mapInt(temporal, "year")
+	month, mOk := mapInt(temporal, "month")
+	day, dOk := mapInt(temporal, "day")
+	hour, _ := mapInt(temporal, "hour")
+	minute, _ := mapInt(temporal, "minute")
+	second, _ := mapInt(temporal, "second")
+	nanosecond, _ := mapInt(temporal, "nanosecond")
+
+	loc := time.UTC
+	if tzRaw, ok := temporal["timezone"]; ok {
+		tz := strings.TrimSpace(fmt.Sprint(tzRaw))
+		if offset, err := parseOffsetSeconds(tz); err == nil {
+			loc = time.FixedZone("", offset)
+		}
+	}
+
+	baseYear, baseMonth, baseDay := 2000, 1, 1
+	if yOk {
+		baseYear = year
+	}
+	if mOk {
+		baseMonth = month
+	}
+	if dOk {
+		baseDay = day
+	}
+
+	base := time.Date(baseYear, time.Month(baseMonth), baseDay, hour, minute, second, nanosecond, loc)
+	addY, addM, addD, addSeconds := decomposeDuration(dur)
+	adjusted := base.AddDate(addY, addM, addD).Add(secondsToDuration(addSeconds))
+
+	switch temporalType {
+	case "date":
+		return adjusted.Format("2006-01-02"), true
+	case "localtime":
+		return formatTimeString(adjusted, false), true
+	case "time":
+		return formatTimeString(adjusted, true), true
+	case "localdatetime":
+		return formatDateTimeString(adjusted, false), true
+	case "datetime":
+		return formatDateTimeString(adjusted, true), true
+	default:
+		return nil, false
+	}
+}
+
+func decomposeDuration(dur durationComponents) (int, int, int, float64) {
+	totalMonths := dur.months
+	years := int(truncTowardZero(totalMonths / 12))
+	remainingMonths := totalMonths - float64(years*12)
+	months := int(truncTowardZero(remainingMonths))
+	fracMonths := remainingMonths - float64(months)
+
+	totalDays := dur.days + fracMonths*30
+	days := int(truncTowardZero(totalDays))
+	fracDays := totalDays - float64(days)
+
+	seconds := dur.seconds + fracDays*86400
+	return years, months, days, seconds
+}
+
+func formatDurationComponents(dur durationComponents) string {
+	years, months, days, seconds := decomposeDuration(dur)
+	hours := int(truncTowardZero(seconds / 3600))
+	seconds -= float64(hours * 3600)
+	minutes := int(truncTowardZero(seconds / 60))
+	seconds -= float64(minutes * 60)
+	secInt := int(truncTowardZero(seconds))
+	frac := seconds - float64(secInt)
+	nanos := int(math.Round(frac * 1_000_000_000))
+
+	if nanos >= 1_000_000_000 {
+		secInt++
+		nanos -= 1_000_000_000
+	}
+	if nanos <= -1_000_000_000 {
+		secInt--
+		nanos += 1_000_000_000
+	}
+
+	b := strings.Builder{}
+	b.WriteString("P")
+	if years != 0 {
+		b.WriteString(fmt.Sprintf("%dY", years))
+	}
+	if months != 0 {
+		b.WriteString(fmt.Sprintf("%dM", months))
+	}
+	if days != 0 {
+		b.WriteString(fmt.Sprintf("%dD", days))
+	}
+
+	hasTime := hours != 0 || minutes != 0 || secInt != 0 || nanos != 0
+	if hasTime || (years == 0 && months == 0 && days == 0) {
+		b.WriteString("T")
+		if hours != 0 {
+			b.WriteString(fmt.Sprintf("%dH", hours))
+		}
+		if minutes != 0 {
+			b.WriteString(fmt.Sprintf("%dM", minutes))
+		}
+		if secInt != 0 || nanos != 0 || (hours == 0 && minutes == 0) {
+			if nanos == 0 {
+				b.WriteString(fmt.Sprintf("%dS", secInt))
+			} else {
+				sign := ""
+				if secInt < 0 || (secInt == 0 && nanos < 0) {
+					sign = "-"
+				}
+				absSec := secInt
+				if absSec < 0 {
+					absSec = -absSec
+				}
+				absNanos := nanos
+				if absNanos < 0 {
+					absNanos = -absNanos
+				}
+				b.WriteString(fmt.Sprintf("%s%d.%09dS", sign, absSec, absNanos))
+			}
+		}
+	}
+	return b.String()
+}
+
+func truncTowardZero(v float64) float64 {
+	if v < 0 {
+		return math.Ceil(v)
+	}
+	return math.Floor(v)
+}
+
+func mapInt(value map[string]any, key string) (int, bool) {
+	raw, ok := value[key]
+	if !ok {
+		return 0, false
+	}
+	if iv, err := toInt(raw); err == nil {
+		return iv, true
+	}
+	if fv, ok := numericValue(raw); ok {
+		return int(truncTowardZero(fv)), true
+	}
+	return 0, false
+}
+
+func secondsToDuration(seconds float64) time.Duration {
+	return time.Duration(seconds * float64(time.Second))
+}
+
+func formatTimeString(t time.Time, includeZone bool) string {
+	hms := t.Format("15:04:05")
+	nanos := t.Nanosecond()
+	frac := ""
+	if nanos != 0 {
+		frac = "." + fmt.Sprintf("%09d", nanos)
+	}
+	if includeZone {
+		return hms + frac + t.Format("Z07:00")
+	}
+	return hms + frac
+}
+
+func formatDateTimeString(t time.Time, includeZone bool) string {
+	base := t.Format("2006-01-02T15:04:05")
+	nanos := t.Nanosecond()
+	if nanos != 0 {
+		base += "." + fmt.Sprintf("%09d", nanos)
+	}
+	if includeZone {
+		base += t.Format("Z07:00")
+	}
+	return base
+}
+
+func parseOffsetSeconds(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) != 6 || (raw[0] != '+' && raw[0] != '-') || raw[3] != ':' {
+		return 0, fmt.Errorf("invalid offset")
+	}
+	hours, err := strconv.Atoi(raw[1:3])
+	if err != nil {
+		return 0, err
+	}
+	minutes, err := strconv.Atoi(raw[4:6])
+	if err != nil {
+		return 0, err
+	}
+	if hours > 18 || minutes > 59 {
+		return 0, fmt.Errorf("invalid offset")
+	}
+	total := hours*3600 + minutes*60
+	if raw[0] == '-' {
+		total = -total
+	}
+	return total, nil
 }
 
 func unquoteCypherString(raw string) (string, error) {

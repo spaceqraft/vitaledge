@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -343,6 +344,184 @@ func evalExpression(raw string, binding map[string]any) (any, error) {
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty return expression", nil)
 	}
+	if left, right, ok := splitTopLevelOperator(raw, ">="); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf >= rf, nil
+		}
+		return fmt.Sprint(lhs) >= fmt.Sprint(rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "<="); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf <= rf, nil
+		}
+		return fmt.Sprint(lhs) <= fmt.Sprint(rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "<>"); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		return !reflect.DeepEqual(lhs, rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "="); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		return reflect.DeepEqual(lhs, rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, ">"); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf > rf, nil
+		}
+		return fmt.Sprint(lhs) > fmt.Sprint(rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "<"); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf < rf, nil
+		}
+		return fmt.Sprint(lhs) < fmt.Sprint(rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "+"); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf + rf, nil
+		}
+		if value, ok := evalTemporalArithmetic(lhs, rhs, "+"); ok {
+			return value, nil
+		}
+		return fmt.Sprint(lhs) + fmt.Sprint(rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "-"); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf - rf, nil
+		}
+		if value, ok := evalTemporalArithmetic(lhs, rhs, "-"); ok {
+			return value, nil
+		}
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "*"); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf * rf, nil
+		}
+		if value, ok := evalTemporalArithmetic(lhs, rhs, "*"); ok {
+			return value, nil
+		}
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "/"); ok {
+		lhs, err := evalExpression(left, binding)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpression(right, binding)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			if rf == 0 {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "division by zero", nil)
+			}
+			return lf / rf, nil
+		}
+		if value, ok := evalTemporalArithmetic(lhs, rhs, "/"); ok {
+			return value, nil
+		}
+	}
+	if raw == "true" || raw == "false" {
+		return raw == "true", nil
+	}
+	if n, err := strconv.Atoi(raw); err == nil {
+		return n, nil
+	}
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		return f, nil
+	}
+	if strings.HasPrefix(raw, "'") || strings.HasPrefix(raw, `"`) {
+		unquoted, err := unquoteCypherString(raw)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("string literal %q is not supported", raw), err)
+		}
+		return unquoted, nil
+	}
 	if arg, ok := parseFunctionCall(raw, "labels"); ok {
 		return evalLabelsFunction(arg, binding)
 	}
@@ -375,6 +554,19 @@ func evalExpression(raw string, binding map[string]any) (any, error) {
 			return evalVertexField(typed, field)
 		case *graph.Edge:
 			return evalEdgeField(typed, field)
+		case map[string]any:
+			if value, ok := typed[field]; ok {
+				return value, nil
+			}
+			return nil, nil
+		case string:
+			if mapped, ok := parseStoredMapString(typed); ok {
+				if value, ok := mapped[field]; ok {
+					return value, nil
+				}
+				return nil, nil
+			}
+			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("field access not supported on %T", base), nil)
 		default:
 			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("field access not supported on %T", base), nil)
 		}

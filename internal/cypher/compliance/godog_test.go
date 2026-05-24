@@ -45,6 +45,7 @@ type cypherTCKFeature struct {
 	tempDir           string
 	store             *pebblestore.Store
 	exec              *executor.Executor
+	procedures        map[string]string
 	params            executor.Params
 	lastQuery         string
 	lastResult        *executor.Result
@@ -52,6 +53,68 @@ type cypherTCKFeature struct {
 	beforeQueryCounts graphSnapshot
 	afterQueryCounts  graphSnapshot
 }
+
+const binaryTree1GraphCypher = `CREATE (a:A {name: 'a'}),
+	(b1:X {name: 'b1'}),
+	(b2:X {name: 'b2'}),
+	(b3:X {name: 'b3'}),
+	(b4:X {name: 'b4'}),
+	(c11:X {name: 'c11'}),
+	(c12:X {name: 'c12'}),
+	(c21:X {name: 'c21'}),
+	(c22:X {name: 'c22'}),
+	(c31:X {name: 'c31'}),
+	(c32:X {name: 'c32'}),
+	(c41:X {name: 'c41'}),
+	(c42:X {name: 'c42'})
+CREATE
+	(a)-[:KNOWS]->(b1),
+	(a)-[:KNOWS]->(b2),
+	(a)-[:FOLLOWS]->(b3),
+	(a)-[:FOLLOWS]->(b4)
+CREATE (b1)-[:FRIEND]->(c11),
+	(b1)-[:FRIEND]->(c12),
+	(b2)-[:FRIEND]->(c21),
+	(b2)-[:FRIEND]->(c22),
+	(b3)-[:FRIEND]->(c31),
+	(b3)-[:FRIEND]->(c32),
+	(b4)-[:FRIEND]->(c41),
+	(b4)-[:FRIEND]->(c42)
+CREATE (b1)-[:FRIEND]->(b2),
+	(b2)-[:FRIEND]->(b3),
+	(b3)-[:FRIEND]->(b4),
+	(b4)-[:FRIEND]->(b1)`
+
+const binaryTree2GraphCypher = `CREATE (a:A {name: 'a'}),
+	(b1:X {name: 'b1'}),
+	(b2:X {name: 'b2'}),
+	(b3:X {name: 'b3'}),
+	(b4:X {name: 'b4'}),
+	(c11:X {name: 'c11'}),
+	(c12:Y {name: 'c12'}),
+	(c21:X {name: 'c21'}),
+	(c22:Y {name: 'c22'}),
+	(c31:X {name: 'c31'}),
+	(c32:Y {name: 'c32'}),
+	(c41:X {name: 'c41'}),
+	(c42:Y {name: 'c42'})
+CREATE
+	(a)-[:KNOWS]->(b1),
+	(a)-[:KNOWS]->(b2),
+	(a)-[:FOLLOWS]->(b3),
+	(a)-[:FOLLOWS]->(b4)
+CREATE (b1)-[:FRIEND]->(c11),
+	(b1)-[:FRIEND]->(c12),
+	(b2)-[:FRIEND]->(c21),
+	(b2)-[:FRIEND]->(c22),
+	(b3)-[:FRIEND]->(c31),
+	(b3)-[:FRIEND]->(c32),
+	(b4)-[:FRIEND]->(c41),
+	(b4)-[:FRIEND]->(c42)
+CREATE (b1)-[:FRIEND]->(b2),
+	(b2)-[:FRIEND]->(b3),
+	(b3)-[:FRIEND]->(b4),
+	(b4)-[:FRIEND]->(b1)`
 
 func TestCypherCompliance(t *testing.T) {
 	tckDir := resolveTCKDir(t)
@@ -98,15 +161,23 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 
 	sc.Step(`^an empty graph$`, feature.anEmptyGraph)
 	sc.Step(`^any graph$`, feature.anyGraph)
+	sc.Step(`^the binary-tree-1 graph$`, feature.theBinaryTree1Graph)
+	sc.Step(`^the binary-tree-2 graph$`, feature.theBinaryTree2Graph)
 	sc.Step(`^parameters are:$`, feature.parametersAre)
 	sc.Step(`^having executed:$`, feature.havingExecuted)
 	sc.Step(`^executing query:$`, feature.executingQuery)
+	sc.Step(`^executing control query:$`, feature.executingControlQuery)
 	sc.Step(`^the result should be empty$`, feature.resultShouldBeEmpty)
 	sc.Step(`^the result should be, in any order:$`, feature.resultShouldBeInAnyOrder)
 	sc.Step(`^the result should be, in order:$`, feature.resultShouldBeInOrder)
+	sc.Step(`^the result should be \(ignoring element order for lists\):$`, feature.resultShouldBeInAnyOrderIgnoringListOrder)
+	sc.Step(`^the result should be, in order \(ignoring element order for lists\):$`, feature.resultShouldBeInOrderIgnoringListOrder)
 	sc.Step(`^no side effects$`, feature.noSideEffects)
 	sc.Step(`^the side effects should be:$`, feature.sideEffectsShouldBe)
 	sc.Step(`^a ([A-Za-z]+) should be raised at (compile time|runtime): ([A-Za-z0-9]+)$`, feature.errorShouldBeRaised)
+	sc.Step(`^a ([A-Za-z]+) should be raised at any time: (.+)$`, feature.errorShouldBeRaisedAnyTime)
+	sc.Step(`^there exists a procedure (.+):$`, feature.thereExistsAProcedureWithBody)
+	sc.Step(`^there exists a procedure (.+[^\s:])$`, feature.thereExistsAProcedure)
 }
 
 func resolveTCKDir(t *testing.T) string {
@@ -135,6 +206,22 @@ func (f *cypherTCKFeature) anEmptyGraph() error {
 
 func (f *cypherTCKFeature) anyGraph() error {
 	return f.resetStore()
+}
+
+func (f *cypherTCKFeature) theBinaryTree1Graph() error {
+	if err := f.resetStore(); err != nil {
+		return err
+	}
+	_, err := f.runBatch(binaryTree1GraphCypher, nil)
+	return err
+}
+
+func (f *cypherTCKFeature) theBinaryTree2Graph() error {
+	if err := f.resetStore(); err != nil {
+		return err
+	}
+	_, err := f.runBatch(binaryTree2GraphCypher, nil)
+	return err
 }
 
 func (f *cypherTCKFeature) parametersAre(table *godog.Table) error {
@@ -190,6 +277,10 @@ func (f *cypherTCKFeature) executingQuery(doc *godog.DocString) error {
 	return nil
 }
 
+func (f *cypherTCKFeature) executingControlQuery(doc *godog.DocString) error {
+	return f.executingQuery(doc)
+}
+
 func (f *cypherTCKFeature) resultShouldBeEmpty() error {
 	if f.lastErr != nil {
 		return fmt.Errorf("query returned error instead of an empty result: %w", f.lastErr)
@@ -209,6 +300,14 @@ func (f *cypherTCKFeature) resultShouldBeInAnyOrder(table *godog.Table) error {
 
 func (f *cypherTCKFeature) resultShouldBeInOrder(table *godog.Table) error {
 	return f.assertResultTable(table, true)
+}
+
+func (f *cypherTCKFeature) resultShouldBeInAnyOrderIgnoringListOrder(table *godog.Table) error {
+	return f.assertResultTableWithOptions(table, false, true)
+}
+
+func (f *cypherTCKFeature) resultShouldBeInOrderIgnoringListOrder(table *godog.Table) error {
+	return f.assertResultTableWithOptions(table, true, true)
 }
 
 func (f *cypherTCKFeature) noSideEffects() error {
@@ -283,7 +382,45 @@ func (f *cypherTCKFeature) errorShouldBeRaised(category, phase, reason string) e
 	return nil
 }
 
+func (f *cypherTCKFeature) errorShouldBeRaisedAnyTime(category, reason string) error {
+	if f.lastErr == nil {
+		return fmt.Errorf("expected %s at any time (%s), but query succeeded", category, reason)
+	}
+
+	_, actualCategory := classifyError(f.lastErr)
+	if actualCategory != category {
+		return fmt.Errorf("expected %s at any time (%s), got %s: %v", category, reason, actualCategory, f.lastErr)
+	}
+	return nil
+}
+
+func (f *cypherTCKFeature) thereExistsAProcedure(signature string) error {
+	if f.procedures == nil {
+		f.procedures = map[string]string{}
+	}
+	key := normalizeProcedureSignature(signature)
+	f.procedures[key] = ""
+	return nil
+}
+
+func (f *cypherTCKFeature) thereExistsAProcedureWithBody(signature string, doc *godog.DocString) error {
+	if f.procedures == nil {
+		f.procedures = map[string]string{}
+	}
+	key := normalizeProcedureSignature(signature)
+	if doc == nil {
+		f.procedures[key] = ""
+		return nil
+	}
+	f.procedures[key] = strings.TrimSpace(doc.Content)
+	return nil
+}
+
 func (f *cypherTCKFeature) assertResultTable(table *godog.Table, ordered bool) error {
+	return f.assertResultTableWithOptions(table, ordered, false)
+}
+
+func (f *cypherTCKFeature) assertResultTableWithOptions(table *godog.Table, ordered bool, ignoreListOrder bool) error {
 	if f.lastErr != nil {
 		return fmt.Errorf("query returned error instead of rows: %w", f.lastErr)
 	}
@@ -311,11 +448,17 @@ func (f *cypherTCKFeature) assertResultTable(table *godog.Table, ordered bool) e
 	for i := range expectedRows {
 		for j := range expectedRows[i] {
 			expectedRows[i][j] = normalizeExpectedCell(expectedRows[i][j])
+			if ignoreListOrder {
+				expectedRows[i][j] = canonicalizeListCellOrder(expectedRows[i][j])
+			}
 		}
 	}
 	for i := range actualRows {
 		for j := range actualRows[i] {
 			actualRows[i][j] = normalizeExpectedCell(actualRows[i][j])
+			if ignoreListOrder {
+				actualRows[i][j] = canonicalizeListCellOrder(actualRows[i][j])
+			}
 		}
 	}
 
@@ -336,6 +479,133 @@ func (f *cypherTCKFeature) assertResultTable(table *godog.Table, ordered bool) e
 		return fmt.Errorf("expected rows %v, got %v", expectedRows, actualRows)
 	}
 	return nil
+}
+
+func canonicalizeListCellOrder(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+		inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		if inner == "" {
+			return "[]"
+		}
+		elements := splitTopLevel(inner, ',')
+		canonical := make([]string, 0, len(elements))
+		for _, element := range elements {
+			canonical = append(canonical, canonicalizeListCellOrder(strings.TrimSpace(element)))
+		}
+		sort.Strings(canonical)
+		return "[" + strings.Join(canonical, ", ") + "]"
+	}
+	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+		inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+		if inner == "" {
+			return "{}"
+		}
+		entries := splitTopLevel(inner, ',')
+		canonical := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			key, val, ok := splitKeyValueTopLevel(entry)
+			if !ok {
+				canonical = append(canonical, strings.TrimSpace(entry))
+				continue
+			}
+			canonical = append(canonical, strings.TrimSpace(key)+": "+canonicalizeListCellOrder(strings.TrimSpace(val)))
+		}
+		sort.Strings(canonical)
+		return "{" + strings.Join(canonical, ", ") + "}"
+	}
+	return trimmed
+}
+
+func splitTopLevel(value string, sep byte) []string {
+	parts := []string{}
+	start := 0
+	depthSquare := 0
+	depthParen := 0
+	depthCurly := 0
+	inString := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' && (i == 0 || value[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch ch {
+		case '[':
+			depthSquare++
+		case ']':
+			if depthSquare > 0 {
+				depthSquare--
+			}
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '{':
+			depthCurly++
+		case '}':
+			if depthCurly > 0 {
+				depthCurly--
+			}
+		case sep:
+			if depthSquare == 0 && depthParen == 0 && depthCurly == 0 {
+				parts = append(parts, strings.TrimSpace(value[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, strings.TrimSpace(value[start:]))
+	return parts
+}
+
+func splitKeyValueTopLevel(value string) (string, string, bool) {
+	depthSquare := 0
+	depthParen := 0
+	depthCurly := 0
+	inString := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' && (i == 0 || value[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch ch {
+		case '[':
+			depthSquare++
+		case ']':
+			if depthSquare > 0 {
+				depthSquare--
+			}
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '{':
+			depthCurly++
+		case '}':
+			if depthCurly > 0 {
+				depthCurly--
+			}
+		case ':':
+			if depthSquare == 0 && depthParen == 0 && depthCurly == 0 {
+				return value[:i], value[i+1:], true
+			}
+		}
+	}
+	return "", "", false
 }
 
 func (f *cypherTCKFeature) runBatch(query string, params executor.Params) (*executor.Result, error) {
@@ -384,6 +654,7 @@ func (f *cypherTCKFeature) resetStore() error {
 	f.tempDir = tempDir
 	f.store = store
 	f.exec = executor.New(store, executor.Options{})
+	f.procedures = map[string]string{}
 	f.params = executor.Params{}
 	f.lastQuery = ""
 	f.lastResult = nil
@@ -676,4 +947,9 @@ func withDefaultTenant(params executor.Params) executor.Params {
 		merged[key] = value
 	}
 	return merged
+}
+
+func normalizeProcedureSignature(signature string) string {
+	s := strings.TrimSpace(signature)
+	return strings.Join(strings.Fields(s), " ")
 }

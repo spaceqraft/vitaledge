@@ -867,6 +867,18 @@ func normalizeTemporalMapForRendering(typeName string, src map[string]any) map[s
 		out[k] = v
 	}
 
+	if rawValue, ok := src["value"]; ok {
+		if literal := strings.TrimSpace(fmt.Sprint(rawValue)); literal != "" {
+			if parsed, ok := parseTemporalLiteralToMap(typeName, literal); ok {
+				for k, v := range parsed {
+					if _, exists := out[k]; !exists {
+						out[k] = v
+					}
+				}
+			}
+		}
+	}
+
 	baseDate := time.Time{}
 	hasBaseDate := false
 
@@ -1137,10 +1149,6 @@ func formatTimeWithNamedTimezone(t time.Time, src map[string]any) string {
 			return base + formatOffsetString(off)
 		}
 		return base + tz
-	}
-	if strings.Contains(tz, "/") {
-		_, off := t.Zone()
-		return base + formatOffsetString(off) + "[" + tz + "]"
 	}
 	_, off := t.Zone()
 	return base + formatOffsetString(off)

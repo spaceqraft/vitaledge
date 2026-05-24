@@ -151,6 +151,22 @@ Rationale:
 - Add optional adaptive indexing only with explicit policy controls, observability, and bounded resource usage.
 - Add planner explain output that reports whether a chosen index came from configured baseline or adaptive candidate path.
 
+## Networking Port Planning Note
+
+Keep a centralized port map as multi-node and production features are introduced.
+
+| purpose | port | mTLS |
+| --- | --- | --- |
+| client TCP | 6379 | NO |
+| gRPC API | 7443 | YES |
+| Prometheus metrics | 9464 | NO |
+| Otel OTLP | 4327 | NO |
+| RAFT control plane | 2380 | YES |
+| Cluster replication | 2381 | YES |
+| Admin UI | 8080 | NO |
+| Node health | 8081 | NO |
+
+
 ## Risks and Mitigations
 
 1. Risk: index explosion from over-indexing properties.

@@ -26,3 +26,15 @@ cover:
 	go test -coverpkg=./... -covermode=atomic -coverprofile=coverage.txt -tags ci,memoryprotection -race -timeout 15m -count=1 ./...
 	sed -i '/mock_.*.go/d' coverage.txt # remove mock_.*.go files from test coverage
 	go tool cover -html=coverage.txt -o coverage.html
+
+update-comprehension:
+	python3 scripts/update_comprehension_docs_llm.py
+
+verify-comprehension:
+	@q_count=$$(grep -c '^### Q-[0-9]\{3\}:' COMPREHENSION-Q.md); \
+	a_count=$$(grep -c '^### A-[0-9]\{3\}$$' COMPREHENSION-A.md); \
+	if [ "$$q_count" -ne "$$a_count" ]; then \
+		echo "ERROR: Q/A count mismatch (Q=$$q_count, A=$$a_count)"; \
+		exit 1; \
+	fi; \
+	echo "Comprehension docs verified: Q=$$q_count A=$$a_count"

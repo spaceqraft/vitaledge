@@ -14,16 +14,52 @@ import (
 	"unicode"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/paegun/vitaledge/internal/cypher/parser"
 	"github.com/paegun/vitaledge/internal/graph"
 )
 
 var (
-	createVertexPatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-	createEdgePatternRE   = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)(?:\{([^{}]*)\})?\]->\(([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-	setClauseRE           = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)=(.+)$`)
-	removeClauseRE        = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$`)
-	deleteClauseRE        = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)$`)
+	createVertexPatternRE         = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+	createEdgePatternRE           = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]->\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+	createEdgePatternReverseRE    = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+	createEdgePatternUndirectedRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+	createChainNodeTokenRE        = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)`)
+	createChainRelForwardTokenRE  = regexp.MustCompile(`^-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]->`)
+	createChainRelReverseTokenRE  = regexp.MustCompile(`^<-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-`)
+	createChainRelUndirTokenRE    = regexp.MustCompile(`^-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-`)
+	createMissingRelTypeForwardRE = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)--?>\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
+	createMissingRelTypeReverseRE = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)<--\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
+	createMissingRelTypeUndirRE   = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)--\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
+	setClauseRE                   = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)=(.+)$`)
+	removeClauseRE                = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$`)
+	deleteClauseRE                = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)$`)
 )
+
+type createEdgeDirection string
+
+const (
+	createEdgeDirectionForward    createEdgeDirection = "forward"
+	createEdgeDirectionReverse    createEdgeDirection = "reverse"
+	createEdgeDirectionUndirected createEdgeDirection = "undirected"
+)
+
+type createChainNodePattern struct {
+	Var      string
+	Labels   []string
+	PropsRaw string
+}
+
+type createChainRelPattern struct {
+	Var       string
+	Type      string
+	PropsRaw  string
+	Direction createEdgeDirection
+}
+
+type createChainPattern struct {
+	Nodes []createChainNodePattern
+	Rels  []createChainRelPattern
+}
 
 var autoVertexIDSeq uint64
 
@@ -118,6 +154,9 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	if err != nil {
 		return nil, err
 	}
+	if multi, ok := parseMultiNodeMatchPattern(spec.Pattern); ok {
+		return e.expandMultiNodeMatch(ctx, tx, rows, spec, multi, params)
+	}
 	if node, err := parseNodePattern(spec.Pattern); err == nil {
 		return e.expandNodeMatch(ctx, tx, rows, spec, node, params)
 	}
@@ -148,6 +187,92 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 		return e.expandTwoHopDirectedChainMatch(ctx, tx, rows, spec, chain, params)
 	}
 	return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
+}
+
+func parseMultiNodeMatchPattern(raw string) ([]nodePattern, bool) {
+	parts := splitTopLevelCommaSeparated(raw)
+	if len(parts) <= 1 {
+		return nil, false
+	}
+	out := make([]nodePattern, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, false
+		}
+		node, err := parseNodePattern(part)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, node)
+	}
+	return out, true
+}
+
+func (e *Executor) expandMultiNodeMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, patterns []nodePattern, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		partials := []Row{cloneRow(row)}
+		for _, pattern := range patterns {
+			next := make([]Row, 0)
+			for _, partial := range partials {
+				candidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, partial, pattern, params)
+				if err != nil {
+					return nil, err
+				}
+				if len(candidates) == 0 {
+					continue
+				}
+				for _, candidate := range candidates {
+					merged := cloneRow(partial)
+					if pattern.Var != "" {
+						merged[pattern.Var] = candidate
+					}
+					next = append(next, merged)
+				}
+			}
+			partials = next
+			if len(partials) == 0 {
+				break
+			}
+		}
+
+		if len(partials) == 0 {
+			if spec.Optional {
+				merged := cloneRow(row)
+				for _, pattern := range patterns {
+					if pattern.Var != "" {
+						merged[pattern.Var] = nil
+					}
+				}
+				out = append(out, merged)
+			}
+			continue
+		}
+
+		for _, partial := range partials {
+			if spec.Where != "" {
+				ok, err := e.evalWhereExpression(ctx, tx, spec.Where, partial, params)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					continue
+				}
+			}
+			out = append(out, partial)
+		}
+	}
+
+	return out, nil
 }
 
 func shouldUseAnchoredOutPath(rows []Row, pattern anchoredOutPattern) bool {
@@ -1303,10 +1428,73 @@ func (e *Executor) applyCreatePattern(ctx context.Context, tx graph.Tx, rows []R
 	if m := createVertexPatternRE.FindStringSubmatch(raw); len(m) == 4 {
 		return e.applyCreateVertex(ctx, tx, rows, m, params, tenant, merge)
 	}
-	if m := createEdgePatternRE.FindStringSubmatch(raw); len(m) == 9 {
-		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge)
+	if isMissingRelationshipTypePattern(raw) {
+		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
+	}
+	if m := createEdgePatternRE.FindStringSubmatch(raw); len(m) == 10 {
+		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge, createEdgeDirectionForward)
+	}
+	if m := createEdgePatternReverseRE.FindStringSubmatch(raw); len(m) == 10 {
+		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge, createEdgeDirectionReverse)
+	}
+	if m := createEdgePatternUndirectedRE.FindStringSubmatch(raw); len(m) == 10 {
+		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge, createEdgeDirectionUndirected)
+	}
+	if chain, ok := parseCreateChainPattern(raw); ok {
+		return e.applyCreateChainPattern(ctx, tx, rows, chain, params, tenant, merge)
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("CREATE/MERGE pattern %q is not yet supported", raw), nil)
+}
+
+func parseCreateChainPattern(raw string) (createChainPattern, bool) {
+	remaining := strings.TrimSpace(raw)
+	if remaining == "" {
+		return createChainPattern{}, false
+	}
+
+	nodeMatch := createChainNodeTokenRE.FindStringSubmatch(remaining)
+	if len(nodeMatch) != 4 {
+		return createChainPattern{}, false
+	}
+	pattern := createChainPattern{
+		Nodes: []createChainNodePattern{{Var: nodeMatch[1], Labels: splitLabels(nodeMatch[2]), PropsRaw: nodeMatch[3]}},
+		Rels:  make([]createChainRelPattern, 0),
+	}
+	remaining = strings.TrimSpace(remaining[len(nodeMatch[0]):])
+
+	for remaining != "" {
+		rel, consumed, ok := parseCreateChainRelToken(remaining)
+		if !ok {
+			return createChainPattern{}, false
+		}
+		pattern.Rels = append(pattern.Rels, rel)
+		remaining = strings.TrimSpace(remaining[consumed:])
+
+		nextNode := createChainNodeTokenRE.FindStringSubmatch(remaining)
+		if len(nextNode) != 4 {
+			return createChainPattern{}, false
+		}
+		pattern.Nodes = append(pattern.Nodes, createChainNodePattern{Var: nextNode[1], Labels: splitLabels(nextNode[2]), PropsRaw: nextNode[3]})
+		remaining = strings.TrimSpace(remaining[len(nextNode[0]):])
+	}
+
+	if len(pattern.Rels) == 0 || len(pattern.Nodes) != len(pattern.Rels)+1 {
+		return createChainPattern{}, false
+	}
+	return pattern, true
+}
+
+func parseCreateChainRelToken(raw string) (createChainRelPattern, int, bool) {
+	if m := createChainRelForwardTokenRE.FindStringSubmatch(raw); len(m) == 4 {
+		return createChainRelPattern{Var: m[1], Type: m[2], PropsRaw: m[3], Direction: createEdgeDirectionForward}, len(m[0]), true
+	}
+	if m := createChainRelReverseTokenRE.FindStringSubmatch(raw); len(m) == 4 {
+		return createChainRelPattern{Var: m[1], Type: m[2], PropsRaw: m[3], Direction: createEdgeDirectionReverse}, len(m[0]), true
+	}
+	if m := createChainRelUndirTokenRE.FindStringSubmatch(raw); len(m) == 4 {
+		return createChainRelPattern{Var: m[1], Type: m[2], PropsRaw: m[3], Direction: createEdgeDirectionUndirected}, len(m[0]), true
+	}
+	return createChainRelPattern{}, 0, false
 }
 
 func (e *Executor) applyCreateVertex(ctx context.Context, tx graph.Tx, rows []Row, m []string, params Params, tenant string, merge bool) ([]Row, error) {
@@ -1343,60 +1531,189 @@ func (e *Executor) applyCreateVertex(ctx context.Context, tx graph.Tx, rows []Ro
 			return nil, err
 		}
 		merged := cloneRow(row)
-		merged[varName] = vertex
+		if varName != "" {
+			merged[varName] = vertex
+		}
 		out = append(out, merged)
 	}
 	return out, nil
 }
 
-func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row, m []string, params Params, tenant string, merge bool) ([]Row, error) {
-	srcVar := m[1]
-	srcLabels := splitLabels(m[2])
-	edgeType := m[4]
-	dstVar := m[6]
-	dstLabels := splitLabels(m[7])
+func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row, m []string, params Params, tenant string, merge bool, direction createEdgeDirection) ([]Row, error) {
+	leftVar := m[1]
+	leftLabels := splitLabels(m[2])
+	edgeVar := m[4]
+	edgeType, err := normalizeCreateRelationshipType(m[5])
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(edgeType) == "" {
+		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
+	}
+	rightVar := m[7]
+	rightLabels := splitLabels(m[8])
 
 	out := make([]Row, 0, len(rows))
 	for _, row := range rows {
-		srcProps, err := parsePropertyMap(m[3], params, row)
+		leftProps, err := parsePropertyMap(m[3], params, row)
 		if err != nil {
 			return nil, err
 		}
-		edgeProps, err := parsePropertyMap(m[5], params, row)
+		edgeProps, err := parsePropertyMap(m[6], params, row)
 		if err != nil {
 			return nil, err
 		}
-		dstProps, err := parsePropertyMap(m[8], params, row)
+		rightProps, err := parsePropertyMap(m[9], params, row)
 		if err != nil {
 			return nil, err
 		}
-		srcVertex, err := resolveOrCreateVertex(ctx, tx, tenant, row, srcVar, srcLabels, srcProps, merge)
+		leftVertex, err := resolveOrCreateVertex(ctx, tx, tenant, row, leftVar, leftLabels, leftProps, merge)
 		if err != nil {
 			return nil, err
 		}
-		dstVertex, err := resolveOrCreateVertex(ctx, tx, tenant, row, dstVar, dstLabels, dstProps, merge)
+		rightVertex, err := resolveOrCreateVertex(ctx, tx, tenant, row, rightVar, rightLabels, rightProps, merge)
 		if err != nil {
 			return nil, err
 		}
 
-		edgeID := syntheticEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
-		edge := &graph.Edge{Tenant: srcVertex.Tenant, ID: edgeID, Type: edgeType, SrcID: srcVertex.ID, DstID: dstVertex.ID, Properties: normalizeEdgeProperties(edgeProps)}
-		if merge {
-			if existing, err := tx.GetEdge(ctx, edge.Tenant, edge.ID); err == nil {
-				edge = existing
-			}
-		}
-		if err := tx.PutEdge(ctx, edge); err != nil {
+		edge, err := createOrMergeEdge(ctx, tx, leftVertex, rightVertex, edgeType, edgeProps, merge, direction)
+		if err != nil {
 			return nil, err
 		}
 
 		merged := cloneRow(row)
-		merged[srcVar] = srcVertex
-		merged[dstVar] = dstVertex
-		merged["edge"] = edge
+		if leftVar != "" {
+			merged[leftVar] = leftVertex
+		}
+		if rightVar != "" {
+			merged[rightVar] = rightVertex
+		}
+		if edgeVar != "" {
+			merged[edgeVar] = edge
+		}
 		out = append(out, merged)
 	}
 	return out, nil
+}
+
+func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, rows []Row, pattern createChainPattern, params Params, tenant string, merge bool) ([]Row, error) {
+	out := make([]Row, 0, len(rows))
+	for _, row := range rows {
+		merged := cloneRow(row)
+		vertices := make([]*graph.Vertex, len(pattern.Nodes))
+
+		for i, node := range pattern.Nodes {
+			props, err := parsePropertyMap(node.PropsRaw, params, merged)
+			if err != nil {
+				return nil, err
+			}
+			vertex, err := resolveOrCreateVertex(ctx, tx, tenant, merged, node.Var, node.Labels, props, merge)
+			if err != nil {
+				return nil, err
+			}
+			vertices[i] = vertex
+			if node.Var != "" {
+				merged[node.Var] = vertex
+			}
+		}
+
+		for i, rel := range pattern.Rels {
+			relType, err := normalizeCreateRelationshipType(rel.Type)
+			if err != nil {
+				return nil, err
+			}
+			if strings.TrimSpace(relType) == "" {
+				return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
+			}
+			relProps, err := parsePropertyMap(rel.PropsRaw, params, merged)
+			if err != nil {
+				return nil, err
+			}
+			edge, err := createOrMergeEdge(ctx, tx, vertices[i], vertices[i+1], relType, relProps, merge, rel.Direction)
+			if err != nil {
+				return nil, err
+			}
+			if rel.Var != "" {
+				merged[rel.Var] = edge
+			}
+		}
+
+		out = append(out, merged)
+	}
+	return out, nil
+}
+
+func createOrMergeEdge(ctx context.Context, tx graph.Tx, leftVertex, rightVertex *graph.Vertex, edgeType string, edgeProps map[string]any, merge bool, direction createEdgeDirection) (*graph.Edge, error) {
+	srcVertex := leftVertex
+	dstVertex := rightVertex
+	switch direction {
+	case createEdgeDirectionReverse:
+		srcVertex = rightVertex
+		dstVertex = leftVertex
+	case createEdgeDirectionForward, createEdgeDirectionUndirected:
+		// Keep CREATE default direction left-to-right.
+	default:
+		return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown edge direction %q", direction), nil)
+	}
+
+	edgeID := syntheticEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
+	edge := &graph.Edge{Tenant: srcVertex.Tenant, ID: edgeID, Type: edgeType, SrcID: srcVertex.ID, DstID: dstVertex.ID, Properties: normalizeEdgeProperties(edgeProps)}
+	if merge {
+		if direction == createEdgeDirectionUndirected {
+			if existing, err := tx.GetEdge(ctx, edge.Tenant, edge.ID); err == nil {
+				edge = existing
+			} else if !graph.IsKind(err, graph.ErrKindNotFound) {
+				return nil, err
+			} else {
+				reverseID := syntheticEdgeID(rightVertex.Tenant, rightVertex.ID, edgeType, leftVertex.ID)
+				if existing, err := tx.GetEdge(ctx, edge.Tenant, reverseID); err == nil {
+					edge = existing
+				} else if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+					return nil, err
+				}
+			}
+		} else if existing, err := tx.GetEdge(ctx, edge.Tenant, edge.ID); err == nil {
+			edge = existing
+		} else if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil, err
+		}
+	}
+	if err := tx.PutEdge(ctx, edge); err != nil {
+		return nil, err
+	}
+	return edge, nil
+}
+
+func normalizeCreateRelationshipType(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	edgeType, edgeAnyOf, err := parseEdgeTypeFilter(strings.ReplaceAll(raw, ":", ""))
+	if err != nil {
+		return "", err
+	}
+	if len(edgeAnyOf) > 0 {
+		return "", &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
+	}
+	return edgeType, nil
+}
+
+func isMissingRelationshipTypePattern(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if strings.Contains(raw, "[") || strings.Contains(raw, "]") {
+		return false
+	}
+	if createMissingRelTypeForwardRE.MatchString(raw) {
+		return true
+	}
+	if createMissingRelTypeReverseRE.MatchString(raw) {
+		return true
+	}
+	if createMissingRelTypeUndirRE.MatchString(raw) {
+		return true
+	}
+	return false
 }
 
 func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
@@ -2040,7 +2357,7 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 		alias := ""
 		if idx := strings.LastIndex(strings.ToUpper(part), "AS"); idx > 0 {
 			expr := strings.TrimSpace(part[:idx])
-			alias = strings.TrimSpace(part[idx+2:])
+			alias = normalizeProjectionIdentifier(strings.TrimSpace(part[idx+2:]))
 			if expr == "" || alias == "" {
 				return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("projection item %q is not supported", part), nil)
 			}
@@ -2086,6 +2403,14 @@ func parseFunctionCall(raw string, name string) (string, bool) {
 	}
 	arg := strings.TrimSpace(raw[len(prefix) : len(raw)-1])
 	return arg, true
+}
+
+func normalizeProjectionIdentifier(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "`") && strings.HasSuffix(raw, "`") && len(raw) >= 2 {
+		return raw[1 : len(raw)-1]
+	}
+	return raw
 }
 
 func parseCountExpression(raw string) (string, bool) {

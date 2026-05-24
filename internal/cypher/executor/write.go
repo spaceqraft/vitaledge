@@ -2471,6 +2471,81 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty expression", nil)
 	}
+	if left, right, ok := splitTopLevelOperator(raw, "="); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return reflect.DeepEqual(lhs, rhs), nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, ">"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf > rf, nil
+		}
+		ls := fmt.Sprint(lhs)
+		rs := fmt.Sprint(rhs)
+		return ls > rs, nil
+	}
+	if left, right, ok := splitTopLevelOperator(raw, "<"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			return lf < rf, nil
+		}
+		ls := fmt.Sprint(lhs)
+		rs := fmt.Sprint(rhs)
+		return ls < rs, nil
+	}
+	if value, ok, err := evalTemporalNamespaceFunction(raw, row, params); ok {
+		return value, err
+	}
+	if arg, ok := parseFunctionCall(raw, "toString"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		return fmt.Sprint(value), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "date.truncate"); ok {
+		return evalTemporalTruncateFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "time.truncate"); ok {
+		return evalTemporalTruncateFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "datetime.truncate"); ok {
+		return evalTemporalTruncateFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "localtime.truncate"); ok {
+		return evalTemporalTruncateFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "localdatetime.truncate"); ok {
+		return evalTemporalTruncateFunction(arg, row, params)
+	}
 	if arg, ok := parseFunctionCall(raw, "labels"); ok {
 		return evalLabelsFunction(arg, row)
 	}
@@ -2499,6 +2574,11 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return evalVertexField(typed, field)
 		case *graph.Edge:
 			return evalEdgeField(typed, field)
+		case map[string]any:
+			if value, ok := typed[field]; ok {
+				return value, nil
+			}
+			return nil, nil
 		default:
 			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("field access not supported on %T", base), nil)
 		}
@@ -2952,7 +3032,7 @@ func parsePropertyMap(raw string, params Params, row Row) (map[string]any, error
 	if raw == "" {
 		return out, nil
 	}
-	for _, pair := range strings.Split(raw, ",") {
+	for _, pair := range splitTopLevelCommaSeparated(raw) {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
 			continue
@@ -2976,6 +3056,24 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 	if strings.EqualFold(raw, "null") {
 		return nil, nil
 	}
+	if arg, ok := parseFunctionCall(raw, "date"); ok {
+		return evalTemporalConstructor("date", arg, params, row)
+	}
+	if arg, ok := parseFunctionCall(raw, "time"); ok {
+		return evalTemporalConstructor("time", arg, params, row)
+	}
+	if arg, ok := parseFunctionCall(raw, "datetime"); ok {
+		return evalTemporalConstructor("datetime", arg, params, row)
+	}
+	if arg, ok := parseFunctionCall(raw, "localtime"); ok {
+		return evalTemporalConstructor("localtime", arg, params, row)
+	}
+	if arg, ok := parseFunctionCall(raw, "localdatetime"); ok {
+		return evalTemporalConstructor("localdatetime", arg, params, row)
+	}
+	if arg, ok := parseFunctionCall(raw, "duration"); ok {
+		return evalTemporalConstructor("duration", arg, params, row)
+	}
 	if strings.HasPrefix(raw, "$") {
 		name := strings.TrimPrefix(raw, "$")
 		v, ok := params[name]
@@ -2983,6 +3081,12 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("missing parameter %q", name), nil)
 		}
 		return v, nil
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		return parseListLiteral(raw, params, row)
+	}
+	if strings.HasPrefix(raw, "{") && strings.HasSuffix(raw, "}") {
+		return parseInlineMapLiteral(raw, params, row)
 	}
 	if row != nil {
 		if v, ok := row[raw]; ok {
@@ -3013,6 +3117,217 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 		return f, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("write value %q is not supported", raw), nil)
+}
+
+func parseListLiteral(raw string, params Params, row Row) ([]any, error) {
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	if body == "" {
+		return []any{}, nil
+	}
+	parts := splitTopLevelCommaSeparated(body)
+	out := make([]any, 0, len(parts))
+	for _, part := range parts {
+		value, err := evalWriteValue(part, params, row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, value)
+	}
+	return out, nil
+}
+
+func parseInlineMapLiteral(raw string, params Params, row Row) (map[string]any, error) {
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	if body == "" {
+		return map[string]any{}, nil
+	}
+	return parsePropertyMap(body, params, row)
+}
+
+func evalTemporalConstructor(name, arg string, params Params, row Row) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return map[string]any{"__temporal_type": name}, nil
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	out := map[string]any{"__temporal_type": name}
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, v := range typed {
+			out[key] = v
+		}
+	case string:
+		out["value"] = typed
+	default:
+		out["value"] = typed
+	}
+	return out, nil
+}
+
+func evalTemporalTruncateFunction(argList string, row Row, params Params) (any, error) {
+	args := splitTopLevelCommaSeparated(argList)
+	if len(args) < 2 {
+		return nil, graph.NewError(graph.ErrKindSemantic, "truncate() requires at least 2 arguments", nil)
+	}
+	unit, err := evalWriteValue(args[0], params, row)
+	if err != nil {
+		return nil, err
+	}
+	targetExpr := strings.TrimSpace(args[1])
+	target, err := evalExpressionWithScope(targetExpr, row, params)
+	if err != nil {
+		target, err = evalWriteValue(targetExpr, params, row)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if target == nil {
+		return nil, nil
+	}
+	if mapped, ok := target.(map[string]any); ok {
+		out := map[string]any{}
+		for key, value := range mapped {
+			out[key] = value
+		}
+		out["truncated"] = fmt.Sprint(unit)
+		return out, nil
+	}
+	return target, nil
+}
+
+func evalTemporalNamespaceFunction(raw string, row Row, params Params) (any, bool, error) {
+	idx := strings.Index(raw, "(")
+	if idx <= 0 || !strings.HasSuffix(raw, ")") {
+		return nil, false, nil
+	}
+	funcName := strings.TrimSpace(raw[:idx])
+	if !strings.Contains(funcName, ".") {
+		return nil, false, nil
+	}
+	parts := strings.SplitN(funcName, ".", 2)
+	if len(parts) != 2 {
+		return nil, false, nil
+	}
+	namespace := strings.ToLower(strings.TrimSpace(parts[0]))
+	method := strings.TrimSpace(parts[1])
+	switch namespace {
+	case "date", "time", "datetime", "localtime", "localdatetime", "duration":
+	default:
+		return nil, false, nil
+	}
+
+	argsRaw := strings.TrimSpace(raw[idx+1 : len(raw)-1])
+	if strings.EqualFold(method, "truncate") {
+		value, err := evalTemporalTruncateFunction(argsRaw, row, params)
+		return value, true, err
+	}
+
+	argExprs := []string{}
+	if argsRaw != "" {
+		argExprs = splitTopLevelCommaSeparated(argsRaw)
+	}
+	args := make([]any, 0, len(argExprs))
+	for _, argExpr := range argExprs {
+		argExpr = strings.TrimSpace(argExpr)
+		value, err := evalExpressionWithScope(argExpr, row, params)
+		if err != nil {
+			value, err = evalWriteValue(argExpr, params, row)
+			if err != nil {
+				return nil, true, err
+			}
+		}
+		args = append(args, value)
+	}
+
+	if namespace == "duration" && (strings.EqualFold(method, "indays") || strings.EqualFold(method, "inmonths") || strings.EqualFold(method, "inseconds") || strings.EqualFold(method, "between")) {
+		return map[string]any{"__temporal_type": "duration", "method": method, "args": args}, true, nil
+	}
+
+	return map[string]any{"__temporal_type": namespace, "method": method, "args": args}, true, nil
+}
+
+func splitTopLevelOperator(raw string, op string) (string, string, bool) {
+	if op == "" {
+		return "", "", false
+	}
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(raw[i:], op) {
+			left := strings.TrimSpace(raw[:i])
+			right := strings.TrimSpace(raw[i+len(op):])
+			if left == "" || right == "" {
+				return "", "", false
+			}
+			return left, right, true
+		}
+	}
+	return "", "", false
+}
+
+func numericValue(v any) (float64, bool) {
+	switch typed := v.(type) {
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		if err == nil {
+			return f, true
+		}
+	}
+	return 0, false
 }
 
 func unquoteCypherString(raw string) (string, error) {

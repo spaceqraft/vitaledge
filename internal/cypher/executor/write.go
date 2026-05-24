@@ -74,7 +74,7 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 				}
 				return nil
 			case ast.ClauseKindInQueryCall:
-				return graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("clause %s is not yet supported", clause.Kind), nil)
+				rows, stepErr = e.applyInQueryCallClause(rows, clause, params)
 			default:
 				return graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("clause %s is not yet supported", clause.Kind), nil)
 			}
@@ -1575,7 +1575,12 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 	out := make([]Row, 0, len(rows))
 	columns := make([]string, 0, len(items))
 	hasAggregate := false
+	hasStar := false
 	for _, item := range items {
+		if item.Expression == "*" {
+			hasStar = true
+			continue
+		}
 		if item.Alias != "" {
 			columns = append(columns, item.Alias)
 		} else {
@@ -1590,6 +1595,12 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		for _, row := range rows {
 			projected := Row{}
 			for _, item := range items {
+				if item.Expression == "*" {
+					for key, value := range row {
+						projected[key] = value
+					}
+					continue
+				}
 				value, err := evalExpressionWithScope(item.Expression, row, params)
 				if err != nil {
 					return nil, nil, err
@@ -1601,6 +1612,9 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 				projected[key] = value
 			}
 			out = append(out, projected)
+		}
+		if hasStar {
+			columns = inferProjectionColumns(out)
 		}
 		out, err = applyProjectionPostProcessing(out, projection, params)
 		if err != nil {
@@ -1724,6 +1738,9 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 			}
 		}
 		out = append(out, projected)
+	}
+	if hasStar {
+		columns = inferProjectionColumns(out)
 	}
 	out, err = applyProjectionPostProcessing(out, projection, params)
 	if err != nil {
@@ -2017,7 +2034,8 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 			continue
 		}
 		if part == "*" {
-			return nil, graph.NewError(graph.ErrKindUnsupported, "projection * is not yet supported", nil)
+			items = append(items, projectionSpec{Expression: "*"})
+			continue
 		}
 		alias := ""
 		if idx := strings.LastIndex(strings.ToUpper(part), "AS"); idx > 0 {
@@ -2036,6 +2054,21 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 		items = append(items, projectionSpec{Expression: part, CountArg: countArg, CollectArg: collectArg})
 	}
 	return items, nil
+}
+
+func inferProjectionColumns(rows []Row) []string {
+	keySet := map[string]struct{}{}
+	for _, row := range rows {
+		for key := range row {
+			keySet[key] = struct{}{}
+		}
+	}
+	columns := make([]string, 0, len(keySet))
+	for key := range keySet {
+		columns = append(columns, key)
+	}
+	sort.Strings(columns)
+	return columns
 }
 
 func parseFunctionCall(raw string, name string) (string, bool) {
@@ -2615,6 +2648,9 @@ func parsePropertyMap(raw string, params Params, row Row) (map[string]any, error
 
 func evalWriteValue(raw string, params Params, row Row) (any, error) {
 	raw = strings.TrimSpace(raw)
+	if strings.EqualFold(raw, "null") {
+		return nil, nil
+	}
 	if strings.HasPrefix(raw, "$") {
 		name := strings.TrimPrefix(raw, "$")
 		v, ok := params[name]
@@ -2647,6 +2683,9 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 	}
 	if n, err := strconv.Atoi(raw); err == nil {
 		return n, nil
+	}
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		return f, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("write value %q is not supported", raw), nil)
 }

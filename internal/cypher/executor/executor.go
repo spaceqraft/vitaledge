@@ -14,6 +14,21 @@ import (
 
 type Params map[string]any
 
+const ProcedureDeclsParam = "__tck_procedures"
+
+type ProcedureArg struct {
+	Name     string
+	Type     string
+	Nullable bool
+}
+
+type ProcedureDecl struct {
+	Name    string
+	Inputs  []ProcedureArg
+	Outputs []ProcedureArg
+	Rows    []map[string]any
+}
+
 type Row map[string]any
 
 type Result struct {
@@ -93,6 +108,13 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 		return res, nil
 	case *ast.QueryStatement:
 		res, execErr := e.executeQueryStatement(ctx, s, params)
+		if execErr != nil {
+			return nil, execErr
+		}
+		e.metrics.ObserveRowsReturned(len(res.Rows))
+		return res, nil
+	case *ast.StandaloneCallStatement:
+		res, execErr := e.executeStandaloneCallStatement(s, params)
 		if execErr != nil {
 			return nil, execErr
 		}

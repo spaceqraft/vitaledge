@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,8 @@ import (
 )
 
 const defaultTenant = "tck"
+
+var procedureSignatureRE = regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\(([^)]*)\)\s*::\s*\(([^)]*)\)\s*$`)
 
 var tckDirFlag = flag.String("tck-dir", "", "path to the openCypher TCK features directory")
 
@@ -45,7 +48,7 @@ type cypherTCKFeature struct {
 	tempDir           string
 	store             *pebblestore.Store
 	exec              *executor.Executor
-	procedures        map[string]string
+	procedures        map[string]executor.ProcedureDecl
 	params            executor.Params
 	lastQuery         string
 	lastResult        *executor.Result
@@ -225,24 +228,22 @@ func (f *cypherTCKFeature) theBinaryTree2Graph() error {
 }
 
 func (f *cypherTCKFeature) parametersAre(table *godog.Table) error {
-	headers, rows, err := readTable(table)
-	if err != nil {
-		return err
-	}
-	if len(headers) < 2 {
-		return fmt.Errorf("parameter table must contain at least two columns, got %d", len(headers))
+	if table == nil || len(table.Rows) == 0 {
+		return fmt.Errorf("parameter table is empty")
 	}
 
 	params := executor.Params{}
-	for _, row := range rows {
-		if len(row) < 2 {
+	for _, rawRow := range table.Rows {
+		if len(rawRow.Cells) < 2 {
 			return fmt.Errorf("parameter row must contain at least two values")
 		}
-		value, err := f.evaluateLiteral(row[1])
+		key := strings.TrimSpace(rawRow.Cells[0].Value)
+		valueRaw := strings.TrimSpace(rawRow.Cells[1].Value)
+		value, err := f.evaluateLiteral(valueRaw)
 		if err != nil {
-			return fmt.Errorf("parse parameter %q: %w", row[0], err)
+			return fmt.Errorf("parse parameter %q: %w", key, err)
 		}
-		params[row[0]] = value
+		params[key] = value
 	}
 	f.params = params
 	return nil
@@ -395,24 +396,31 @@ func (f *cypherTCKFeature) errorShouldBeRaisedAnyTime(category, reason string) e
 }
 
 func (f *cypherTCKFeature) thereExistsAProcedure(signature string) error {
-	if f.procedures == nil {
-		f.procedures = map[string]string{}
+	decl, err := parseProcedureSignature(signature)
+	if err != nil {
+		return err
 	}
-	key := normalizeProcedureSignature(signature)
-	f.procedures[key] = ""
+	if f.procedures == nil {
+		f.procedures = map[string]executor.ProcedureDecl{}
+	}
+	f.procedures[decl.Name] = decl
 	return nil
 }
 
-func (f *cypherTCKFeature) thereExistsAProcedureWithBody(signature string, doc *godog.DocString) error {
+func (f *cypherTCKFeature) thereExistsAProcedureWithBody(signature string, table *godog.Table) error {
+	decl, err := parseProcedureSignature(signature)
+	if err != nil {
+		return err
+	}
+	rows, err := f.parseProcedureRows(table)
+	if err != nil {
+		return err
+	}
+	decl.Rows = rows
 	if f.procedures == nil {
-		f.procedures = map[string]string{}
+		f.procedures = map[string]executor.ProcedureDecl{}
 	}
-	key := normalizeProcedureSignature(signature)
-	if doc == nil {
-		f.procedures[key] = ""
-		return nil
-	}
-	f.procedures[key] = strings.TrimSpace(doc.Content)
+	f.procedures[decl.Name] = decl
 	return nil
 }
 
@@ -614,6 +622,9 @@ func (f *cypherTCKFeature) runBatch(query string, params executor.Params) (*exec
 		return nil, err
 	}
 	effectiveParams := withDefaultTenant(params)
+	if len(f.procedures) > 0 {
+		effectiveParams[executor.ProcedureDeclsParam] = f.procedures
+	}
 	var result *executor.Result
 	for _, stmt := range batch.Statements {
 		result, err = f.exec.ExecuteStatement(f.ctx, stmt, effectiveParams)
@@ -654,7 +665,7 @@ func (f *cypherTCKFeature) resetStore() error {
 	f.tempDir = tempDir
 	f.store = store
 	f.exec = executor.New(store, executor.Options{})
-	f.procedures = map[string]string{}
+	f.procedures = map[string]executor.ProcedureDecl{}
 	f.params = executor.Params{}
 	f.lastQuery = ""
 	f.lastResult = nil
@@ -725,8 +736,23 @@ func classifyError(err error) (phase string, category string) {
 	case graph.IsKind(err, graph.ErrKindConflict):
 		return "runtime", "ConstraintVerificationFailed"
 	case graph.IsKind(err, graph.ErrKindSemantic):
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "procedure") && strings.Contains(message, "not found") {
+			return "compile time", "ProcedureError"
+		}
+		if strings.Contains(message, "invalid number of arguments") ||
+			strings.Contains(message, "invalid argument type") ||
+			strings.Contains(message, "invalid argument passing mode") ||
+			strings.Contains(message, "invalid aggregation") ||
+			strings.Contains(message, "must be yielded") ||
+			strings.Contains(message, "yield variable already bound") {
+			return "compile time", "SyntaxError"
+		}
 		return "runtime", "SemanticError"
 	case graph.IsKind(err, graph.ErrKindInvalidInput):
+		if strings.Contains(strings.ToLower(err.Error()), "missing parameter") {
+			return "compile time", "ParameterMissing"
+		}
 		return "runtime", "ArgumentError"
 	case graph.IsKind(err, graph.ErrKindUnsupported):
 		return "runtime", "SyntaxError"
@@ -949,7 +975,83 @@ func withDefaultTenant(params executor.Params) executor.Params {
 	return merged
 }
 
-func normalizeProcedureSignature(signature string) string {
-	s := strings.TrimSpace(signature)
-	return strings.Join(strings.Fields(s), " ")
+func parseProcedureSignature(signature string) (executor.ProcedureDecl, error) {
+	m := procedureSignatureRE.FindStringSubmatch(strings.TrimSpace(signature))
+	if len(m) != 4 {
+		return executor.ProcedureDecl{}, fmt.Errorf("invalid procedure signature %q", signature)
+	}
+	name := strings.TrimSpace(m[1])
+	inputRaw := strings.TrimSpace(m[2])
+	outputRaw := strings.TrimSpace(m[3])
+
+	inputs, err := parseProcedureArgList(inputRaw)
+	if err != nil {
+		return executor.ProcedureDecl{}, err
+	}
+	outputs, err := parseProcedureArgList(outputRaw)
+	if err != nil {
+		return executor.ProcedureDecl{}, err
+	}
+
+	return executor.ProcedureDecl{Name: name, Inputs: inputs, Outputs: outputs}, nil
+}
+
+func parseProcedureArgList(raw string) ([]executor.ProcedureArg, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []executor.ProcedureArg{}, nil
+	}
+	parts := splitTopLevel(raw, ',')
+	args := make([]executor.ProcedureArg, 0, len(parts))
+	for _, part := range parts {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		kv := strings.Split(p, "::")
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid procedure argument %q", p)
+		}
+		name := strings.TrimSpace(kv[0])
+		typ := strings.TrimSpace(kv[1])
+		nullable := strings.HasSuffix(typ, "?")
+		typ = strings.TrimSpace(strings.TrimSuffix(typ, "?"))
+		args = append(args, executor.ProcedureArg{Name: name, Type: strings.ToUpper(typ), Nullable: nullable})
+	}
+	return args, nil
+}
+
+func (f *cypherTCKFeature) parseProcedureRows(table *godog.Table) ([]map[string]any, error) {
+	if table == nil || len(table.Rows) == 0 {
+		return []map[string]any{}, nil
+	}
+	headers, rows, err := readTable(table)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		entry := map[string]any{}
+		for i, header := range headers {
+			value := ""
+			if i < len(row) {
+				value = row[i]
+			}
+			parsed, err := f.parseProcedureCell(value)
+			if err != nil {
+				return nil, err
+			}
+			entry[header] = parsed
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+func (f *cypherTCKFeature) parseProcedureCell(raw string) (any, error) {
+	trimmed := strings.TrimSpace(raw)
+	if strings.EqualFold(trimmed, "null") {
+		return nil, nil
+	}
+	return f.evaluateLiteral(trimmed)
 }

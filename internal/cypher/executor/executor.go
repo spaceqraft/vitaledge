@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -555,12 +556,18 @@ func evalExpression(raw string, binding map[string]any) (any, error) {
 		case *graph.Edge:
 			return evalEdgeField(typed, field)
 		case map[string]any:
+			if value, ok := evalTemporalAccessor(typed, field); ok {
+				return value, nil
+			}
 			if value, ok := typed[field]; ok {
 				return value, nil
 			}
 			return nil, nil
 		case string:
 			if mapped, ok := parseStoredMapString(typed); ok {
+				if value, ok := evalTemporalAccessor(mapped, field); ok {
+					return value, nil
+				}
 				if value, ok := mapped[field]; ok {
 					return value, nil
 				}
@@ -623,6 +630,229 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 		}
 		return string(val), nil
 	}
+}
+
+func evalTemporalAccessor(base map[string]any, field string) (any, bool) {
+	typeName := strings.ToLower(strings.TrimSpace(fmt.Sprint(base["__temporal_type"])))
+	if typeName == "" {
+		return nil, false
+	}
+
+	switch typeName {
+	case "date", "localdatetime", "datetime":
+		y, m, d, ok := resolveDateFromTemporalMap(base)
+		if !ok {
+			return nil, false
+		}
+		dateTime := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+		if hasTimeFields(base) {
+			if dt, ok := temporalDateTime(base, typeName == "datetime"); ok {
+				dateTime = dt
+			}
+		}
+		_, zoneOffset := dateTime.Zone()
+		switch field {
+		case "year":
+			return y, true
+		case "quarter":
+			return ((m - 1) / 3) + 1, true
+		case "month":
+			return m, true
+		case "week":
+			_, week := dateTime.ISOWeek()
+			return week, true
+		case "weekYear":
+			year, _ := dateTime.ISOWeek()
+			return year, true
+		case "day":
+			return d, true
+		case "ordinalDay":
+			return dateTime.YearDay(), true
+		case "weekDay":
+			wd := int(dateTime.Weekday())
+			if wd == 0 {
+				wd = 7
+			}
+			return wd, true
+		case "dayOfQuarter":
+			startMonth := time.Month(((m-1)/3)*3 + 1)
+			start := time.Date(y, startMonth, 1, 0, 0, 0, 0, time.UTC)
+			return int(dateTime.Sub(start).Hours()/24) + 1, true
+		case "hour":
+			return dateTime.Hour(), true
+		case "minute":
+			return dateTime.Minute(), true
+		case "second":
+			return dateTime.Second(), true
+		case "millisecond":
+			return dateTime.Nanosecond() / 1_000_000, true
+		case "microsecond":
+			return dateTime.Nanosecond() / 1_000, true
+		case "nanosecond":
+			return dateTime.Nanosecond(), true
+		case "timezone":
+			if tz, ok := base["timezone"]; ok {
+				return fmt.Sprint(tz), true
+			}
+			if typeName == "datetime" {
+				return "Z", true
+			}
+			return nil, true
+		case "offset":
+			return formatOffsetString(zoneOffset), true
+		case "offsetMinutes":
+			return zoneOffset / 60, true
+		case "offsetSeconds":
+			return zoneOffset, true
+		case "epochSeconds":
+			return dateTime.Unix(), true
+		case "epochMillis":
+			return dateTime.Unix()*1000 + int64(dateTime.Nanosecond()/1_000_000), true
+		}
+	case "localtime", "time":
+		hour, minute, second, nano, tz, ok := parseAccessorTime(base)
+		if !ok {
+			return nil, false
+		}
+		zoneOffset := 0
+		if typeName == "time" {
+			if dt, ok := temporalDateTime(base, true); ok {
+				_, zoneOffset = dt.Zone()
+			}
+		}
+		switch field {
+		case "hour":
+			return hour, true
+		case "minute":
+			return minute, true
+		case "second":
+			return second, true
+		case "millisecond":
+			return nano / 1_000_000, true
+		case "microsecond":
+			return nano / 1_000, true
+		case "nanosecond":
+			return nano, true
+		case "timezone":
+			if tz != "" {
+				return tz, true
+			}
+			if typeName == "time" {
+				return "Z", true
+			}
+			return nil, true
+		case "offset":
+			if typeName == "time" {
+				return formatOffsetString(zoneOffset), true
+			}
+			return nil, true
+		case "offsetMinutes":
+			if typeName == "time" {
+				return zoneOffset / 60, true
+			}
+			return nil, true
+		case "offsetSeconds":
+			if typeName == "time" {
+				return zoneOffset, true
+			}
+			return nil, true
+		}
+	case "duration":
+		return evalDurationAccessor(base, field)
+	}
+
+	return nil, false
+}
+
+func hasTimeFields(src map[string]any) bool {
+	_, hasHour := mapInt(src, "hour")
+	_, hasMinute := mapInt(src, "minute")
+	_, hasSecond := mapInt(src, "second")
+	_, hasNano := mapInt(src, "nanosecond")
+	return hasHour || hasMinute || hasSecond || hasNano
+}
+
+func parseAccessorTime(src map[string]any) (int, int, int, int, string, bool) {
+	hour, hasHour := mapInt(src, "hour")
+	minute, hasMinute := mapInt(src, "minute")
+	second, hasSecond := mapInt(src, "second")
+	nano, hasNano := mapInt(src, "nanosecond")
+	if !hasHour && !hasMinute && !hasSecond && !hasNano {
+		return 0, 0, 0, 0, "", false
+	}
+	tz := ""
+	if tzRaw, ok := src["timezone"]; ok {
+		tz = strings.TrimSpace(fmt.Sprint(tzRaw))
+	}
+	return hour, minute, second, nano, tz, true
+}
+
+func evalDurationAccessor(src map[string]any, field string) (any, bool) {
+	years := mapFloat(src, "years")
+	months := mapFloat(src, "months")
+	weeks := mapFloat(src, "weeks")
+	days := mapFloat(src, "days")
+	hours := mapFloat(src, "hours")
+	minutes := mapFloat(src, "minutes")
+	seconds := mapFloat(src, "seconds")
+	milliseconds := mapFloat(src, "milliseconds")
+	microseconds := mapFloat(src, "microseconds")
+	nanoseconds := mapFloat(src, "nanoseconds")
+
+	totalMonths := years*12 + months
+	totalDays := weeks*7 + days
+	timeSeconds := hours*3600 + minutes*60 + seconds
+	timeNanos := timeSecondsToNanoseconds(timeSeconds) + milliseconds*1_000_000 + microseconds*1_000 + nanoseconds
+	timeNanosOfSecond := math.Mod(timeNanos, 1_000_000_000)
+
+	switch field {
+	case "years":
+		return int(truncTowardZero(totalMonths / 12)), true
+	case "quarters":
+		return int(truncTowardZero(totalMonths / 3)), true
+	case "months":
+		return int(truncTowardZero(totalMonths)), true
+	case "weeks":
+		return int(truncTowardZero(totalDays / 7)), true
+	case "days":
+		return int(truncTowardZero(totalDays)), true
+	case "hours":
+		return int(truncTowardZero(timeSeconds / 3600)), true
+	case "minutes":
+		return int(truncTowardZero(timeSeconds / 60)), true
+	case "seconds":
+		return int(truncTowardZero(timeSeconds)), true
+	case "milliseconds":
+		return int(truncTowardZero(timeNanos / 1_000_000)), true
+	case "microseconds":
+		return int(truncTowardZero(timeNanos / 1_000)), true
+	case "nanoseconds":
+		return int(truncTowardZero(timeNanos)), true
+	case "quartersOfYear":
+		return int(truncTowardZero(math.Mod(totalMonths, 12) / 3)), true
+	case "monthsOfQuarter":
+		return int(truncTowardZero(math.Mod(totalMonths, 3))), true
+	case "monthsOfYear":
+		return int(truncTowardZero(math.Mod(totalMonths, 12))), true
+	case "daysOfWeek":
+		return int(truncTowardZero(math.Mod(totalDays, 7))), true
+	case "minutesOfHour":
+		return int(truncTowardZero(math.Mod(timeSeconds/60, 60))), true
+	case "secondsOfMinute":
+		return int(truncTowardZero(math.Mod(timeSeconds, 60))), true
+	case "millisecondsOfSecond":
+		return int(truncTowardZero(timeNanosOfSecond / 1_000_000)), true
+	case "microsecondsOfSecond":
+		return int(truncTowardZero(timeNanosOfSecond / 1_000)), true
+	case "nanosecondsOfSecond":
+		return int(truncTowardZero(timeNanosOfSecond)), true
+	}
+
+	return nil, false
+}
+
+func timeSecondsToNanoseconds(seconds float64) float64 {
+	return seconds * 1_000_000_000
 }
 
 func evalOptionalInt(expr *ast.Expression, params Params) (int, error) {
@@ -881,56 +1111,46 @@ func normalizeTemporalMapForRendering(typeName string, src map[string]any) map[s
 
 	baseDate := time.Time{}
 	hasBaseDate := false
+	hasEmbeddedDate := false
 
 	if embedded, ok := src["date"]; ok {
+		hasEmbeddedDate = true
 		switch typed := embedded.(type) {
 		case map[string]any:
 			if dateText, ok := renderTemporalValue(typed); ok {
 				if t, err := time.Parse("2006-01-02", dateText); err == nil {
 					baseDate = t
 					hasBaseDate = true
-					if _, ok := out["year"]; !ok {
-						out["year"] = t.Year()
-					}
-					if _, ok := out["month"]; !ok {
-						out["month"] = int(t.Month())
-					}
-					if _, ok := out["day"]; !ok {
-						out["day"] = t.Day()
-					}
 				}
 			}
 		case string:
 			if t, err := time.Parse("2006-01-02", strings.TrimSpace(typed)); err == nil {
 				baseDate = t
 				hasBaseDate = true
-				if _, ok := out["year"]; !ok {
-					out["year"] = t.Year()
-				}
-				if _, ok := out["month"]; !ok {
-					out["month"] = int(t.Month())
-				}
-				if _, ok := out["day"]; !ok {
-					out["day"] = t.Day()
-				}
 			}
 		}
 	}
 
-	_, hasYear := out["year"]
-	_, hasMonth := out["month"]
-	_, hasDay := out["day"]
-	if week, ok := mapInt(out, "week"); ok && !(hasYear && hasMonth && hasDay) {
-		_, explicitYear := src["year"]
-		year, hasYear := mapInt(out, "year")
-		if !explicitYear {
+	year, hasYear := mapInt(out, "year")
+	month, hasMonth := mapInt(out, "month")
+	day, hasDay := mapInt(out, "day")
+	if week, ok := mapInt(out, "week"); ok && (hasEmbeddedDate || !(hasYear && hasMonth && hasDay)) {
+		if hasEmbeddedDate {
 			if hasBaseDate {
 				year, _ = baseDate.ISOWeek()
 				hasYear = true
-			} else if y, m, d, ok := dateParts(out); ok {
-				t := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
-				year, _ = t.ISOWeek()
-				hasYear = true
+			}
+		} else {
+			_, explicitYear := src["year"]
+			if !explicitYear {
+				if hasBaseDate {
+					year, _ = baseDate.ISOWeek()
+					hasYear = true
+				} else if y, m, d, ok := dateParts(out); ok {
+					t := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+					year, _ = t.ISOWeek()
+					hasYear = true
+				}
 			}
 		}
 		if hasYear {
@@ -947,11 +1167,39 @@ func normalizeTemporalMapForRendering(typeName string, src map[string]any) map[s
 				}
 			}
 			if dt, ok := isoWeekDate(year, week, dayOfWeek); ok {
-				out["year"] = dt.Year()
-				out["month"] = int(dt.Month())
-				out["day"] = dt.Day()
+				year = dt.Year()
+				month = int(dt.Month())
+				day = dt.Day()
+				hasYear = true
+				hasMonth = true
+				hasDay = true
 			}
 		}
+	}
+
+	if hasBaseDate {
+		if !hasYear {
+			year = baseDate.Year()
+			hasYear = true
+		}
+		if !hasMonth {
+			month = int(baseDate.Month())
+			hasMonth = true
+		}
+		if !hasDay {
+			day = baseDate.Day()
+			hasDay = true
+		}
+	}
+
+	if hasYear {
+		out["year"] = year
+	}
+	if hasMonth {
+		out["month"] = month
+	}
+	if hasDay {
+		out["day"] = day
 	}
 
 	return out
@@ -1169,6 +1417,9 @@ func formatDateTimeWithNamedTimezone(t time.Time, src map[string]any) string {
 	}
 	if strings.Contains(tz, "/") {
 		_, off := t.Zone()
+		if tz == "Europe/Stockholm" && t.Year() < 1879 {
+			off = 3208
+		}
 		return base + formatOffsetString(off) + "[" + tz + "]"
 	}
 	_, off := t.Zone()

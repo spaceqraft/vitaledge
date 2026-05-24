@@ -2605,6 +2605,11 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if _, lok := temporalMapValue(lhs); lok {
+			if _, rok := temporalMapValue(rhs); rok {
+				return !reflect.DeepEqual(normalizeResultValue(lhs), normalizeResultValue(rhs)), nil
+			}
+		}
 		return !reflect.DeepEqual(lhs, rhs), nil
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "="); ok {
@@ -2615,6 +2620,11 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		rhs, err := evalExpressionWithScope(right, row, params)
 		if err != nil {
 			return nil, err
+		}
+		if _, lok := temporalMapValue(lhs); lok {
+			if _, rok := temporalMapValue(rhs); rok {
+				return reflect.DeepEqual(normalizeResultValue(lhs), normalizeResultValue(rhs)), nil
+			}
 		}
 		return reflect.DeepEqual(lhs, rhs), nil
 	}
@@ -2744,7 +2754,11 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if value == nil {
 			return nil, nil
 		}
-		return fmt.Sprint(value), nil
+		normalized := normalizeResultValue(value)
+		if rendered, ok := normalized.(string); ok {
+			return rendered, nil
+		}
+		return fmt.Sprint(normalized), nil
 	}
 	if arg, ok := parseFunctionCall(raw, "date.truncate"); ok {
 		return evalTemporalTruncateFunction("date", arg, row, params)
@@ -2790,12 +2804,18 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		case *graph.Edge:
 			return evalEdgeField(typed, field)
 		case map[string]any:
+			if value, ok := evalTemporalAccessor(typed, field); ok {
+				return value, nil
+			}
 			if value, ok := typed[field]; ok {
 				return value, nil
 			}
 			return nil, nil
 		case string:
 			if mapped, ok := parseStoredMapString(typed); ok {
+				if value, ok := evalTemporalAccessor(mapped, field); ok {
+					return value, nil
+				}
 				if value, ok := mapped[field]; ok {
 					return value, nil
 				}
@@ -3394,7 +3414,13 @@ func evalTemporalConstructor(name, arg string, params Params, row Row) (any, err
 		}
 		out["__temporal_type"] = name
 	case string:
-		out["value"] = typed
+		if parsed, ok := parseTemporalLiteralToMap(name, typed); ok {
+			for key, v := range parsed {
+				out[key] = v
+			}
+		} else {
+			out["value"] = typed
+		}
 	default:
 		out["value"] = typed
 	}
@@ -3877,7 +3903,13 @@ func temporalFromConstructedValue(name string, value any) (any, error) {
 			out[key] = v
 		}
 	case string:
-		out["value"] = typed
+		if parsed, ok := parseTemporalLiteralToMap(name, typed); ok {
+			for key, v := range parsed {
+				out[key] = v
+			}
+		} else {
+			out["value"] = typed
+		}
 	default:
 		out["value"] = typed
 	}
@@ -4283,22 +4315,141 @@ func parseTemporalLiteralToMap(typeName, raw string) (map[string]any, bool) {
 			tz = "Z"
 		}
 		return map[string]any{"year": y, "month": mo, "day": d, "hour": h, "minute": mi, "second": s, "nanosecond": n, "timezone": tz}, true
+	case "duration":
+		return parseDurationLiteralToMap(raw)
 	default:
 		return nil, false
 	}
 }
 
 func parseDateParts(raw string) (int, int, int, bool) {
-	parts := strings.Split(strings.TrimSpace(raw), "-")
-	if len(parts) < 3 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return 0, 0, 0, false
 	}
-	if strings.HasPrefix(strings.TrimSpace(raw), "-") {
-		parts = strings.Split(strings.TrimPrefix(strings.TrimSpace(raw), "-"), "-")
-		if len(parts) != 3 {
+	sign := 1
+	if strings.HasPrefix(raw, "+") {
+		raw = raw[1:]
+	} else if strings.HasPrefix(raw, "-") {
+		sign = -1
+		raw = raw[1:]
+	}
+	if idx := strings.IndexAny(raw, "Ww"); idx > 0 {
+		yearPart := strings.TrimSuffix(raw[:idx], "-")
+		rest := raw[idx+1:]
+		year, err := strconv.Atoi(yearPart)
+		if err != nil {
 			return 0, 0, 0, false
 		}
-		y, err := strconv.Atoi("-" + parts[0])
+		year *= sign
+		dayOfWeek := 1
+		if strings.HasPrefix(rest, "-") {
+			rest = rest[1:]
+		}
+		weekPart := rest
+		if dash := strings.Index(rest, "-"); dash >= 0 {
+			weekPart = rest[:dash]
+			if parsedDay, err := strconv.Atoi(rest[dash+1:]); err == nil {
+				dayOfWeek = parsedDay
+			}
+		} else if len(rest) > 2 {
+			weekPart = rest[:2]
+			if parsedDay, err := strconv.Atoi(rest[2:]); err == nil {
+				dayOfWeek = parsedDay
+			}
+		}
+		week, err := strconv.Atoi(weekPart)
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		if resolved, ok := isoWeekDate(year, week, dayOfWeek); ok {
+			return resolved.Year(), int(resolved.Month()), resolved.Day(), true
+		}
+		return 0, 0, 0, false
+	}
+	if strings.Contains(raw, "-") {
+		parts := strings.Split(raw, "-")
+		if len(parts) == 3 {
+			y, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return 0, 0, 0, false
+			}
+			m, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return 0, 0, 0, false
+			}
+			d, err := strconv.Atoi(parts[2])
+			if err != nil {
+				return 0, 0, 0, false
+			}
+			return sign * y, m, d, true
+		}
+		if len(parts) == 2 {
+			y, err := strconv.Atoi(parts[0])
+			if err != nil {
+				return 0, 0, 0, false
+			}
+			if len(parts[1]) == 3 {
+				ord, err := strconv.Atoi(parts[1])
+				if err != nil {
+					return 0, 0, 0, false
+				}
+				resolved := time.Date(sign*y, 1, ord, 0, 0, 0, 0, time.UTC)
+				return resolved.Year(), int(resolved.Month()), resolved.Day(), true
+			}
+			if m, err := strconv.Atoi(parts[1]); err == nil {
+				return sign * y, m, 1, true
+			}
+		}
+	}
+	if len(raw) == 8 {
+		y, err := strconv.Atoi(raw[:4])
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		m, err := strconv.Atoi(raw[4:6])
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		d, err := strconv.Atoi(raw[6:8])
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		return sign * y, m, d, true
+	}
+	if len(raw) == 7 {
+		y, err := strconv.Atoi(raw[:4])
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		ord, err := strconv.Atoi(raw[4:])
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		resolved := time.Date(sign*y, 1, ord, 0, 0, 0, 0, time.UTC)
+		return resolved.Year(), int(resolved.Month()), resolved.Day(), true
+	}
+	if len(raw) == 6 {
+		y, err := strconv.Atoi(raw[:4])
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		m, err := strconv.Atoi(raw[4:6])
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		return sign * y, m, 1, true
+	}
+	if len(raw) == 4 {
+		y, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, 0, 0, false
+		}
+		return sign * y, 1, 1, true
+	}
+	parts := strings.Split(raw, "-")
+	if len(parts) == 3 {
+		y, err := strconv.Atoi(parts[0])
 		if err != nil {
 			return 0, 0, 0, false
 		}
@@ -4310,24 +4461,9 @@ func parseDateParts(raw string) (int, int, int, bool) {
 		if err != nil {
 			return 0, 0, 0, false
 		}
-		return y, m, d, true
+		return sign * y, m, d, true
 	}
-	if len(parts) != 3 {
-		return 0, 0, 0, false
-	}
-	y, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, 0, 0, false
-	}
-	m, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, 0, 0, false
-	}
-	d, err := strconv.Atoi(parts[2])
-	if err != nil {
-		return 0, 0, 0, false
-	}
-	return y, m, d, true
+	return 0, 0, 0, false
 }
 
 func parseClockAndZone(raw string) (int, int, int, int, string, bool) {
@@ -4336,8 +4472,10 @@ func parseClockAndZone(raw string) (int, int, int, int, string, bool) {
 		return 0, 0, 0, 0, "", false
 	}
 	tz := ""
+	hasNamedZone := false
 	if idx := strings.LastIndex(raw, "["); idx > 0 && strings.HasSuffix(raw, "]") {
 		tz = strings.TrimSpace(raw[idx+1 : len(raw)-1])
+		hasNamedZone = tz != ""
 		raw = strings.TrimSpace(raw[:idx])
 	}
 
@@ -4355,29 +4493,57 @@ func parseClockAndZone(raw string) (int, int, int, int, string, bool) {
 		offset := raw[offsetIdx:]
 		norm, ok := normalizeOffsetToken(offset)
 		if ok {
-			tz = norm
+			if !hasNamedZone {
+				tz = norm
+			}
 			raw = raw[:offsetIdx]
 		}
 	}
 
 	clock := strings.SplitN(raw, ".", 2)
-	hms := strings.Split(clock[0], ":")
-	if len(hms) < 2 || len(hms) > 3 {
-		return 0, 0, 0, 0, "", false
-	}
-	h, err := strconv.Atoi(hms[0])
-	if err != nil {
-		return 0, 0, 0, 0, "", false
-	}
-	m, err := strconv.Atoi(hms[1])
-	if err != nil {
-		return 0, 0, 0, 0, "", false
-	}
+	h := 0
+	m := 0
 	s := 0
-	if len(hms) == 3 {
-		s, err = strconv.Atoi(hms[2])
+	var err error
+	if strings.Contains(clock[0], ":") {
+		hms := strings.Split(clock[0], ":")
+		if len(hms) < 2 || len(hms) > 3 {
+			return 0, 0, 0, 0, "", false
+		}
+		h, err = strconv.Atoi(hms[0])
 		if err != nil {
 			return 0, 0, 0, 0, "", false
+		}
+		m, err = strconv.Atoi(hms[1])
+		if err != nil {
+			return 0, 0, 0, 0, "", false
+		}
+		if len(hms) == 3 {
+			s, err = strconv.Atoi(hms[2])
+			if err != nil {
+				return 0, 0, 0, 0, "", false
+			}
+		}
+	} else {
+		digits := clock[0]
+		if len(digits) != 2 && len(digits) != 4 && len(digits) != 6 {
+			return 0, 0, 0, 0, "", false
+		}
+		h, err = strconv.Atoi(digits[:2])
+		if err != nil {
+			return 0, 0, 0, 0, "", false
+		}
+		if len(digits) >= 4 {
+			m, err = strconv.Atoi(digits[2:4])
+			if err != nil {
+				return 0, 0, 0, 0, "", false
+			}
+		}
+		if len(digits) == 6 {
+			s, err = strconv.Atoi(digits[4:6])
+			if err != nil {
+				return 0, 0, 0, 0, "", false
+			}
 		}
 	}
 	n := 0
@@ -4400,6 +4566,107 @@ func parseClockAndZone(raw string) (int, int, int, int, string, bool) {
 	return h, m, s, n, tz, true
 }
 
+func parseDurationLiteralToMap(raw string) (map[string]any, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !(strings.HasPrefix(raw, "P") || strings.HasPrefix(raw, "p")) {
+		return nil, false
+	}
+	raw = raw[1:]
+	out := map[string]any{}
+	hasValue := false
+	datePart := raw
+	timePart := ""
+	if idx := strings.IndexAny(raw, "Tt"); idx >= 0 {
+		datePart = raw[:idx]
+		timePart = raw[idx+1:]
+	}
+	if datePart != "" {
+		if strings.ContainsAny(datePart, "YyMmWwDd") {
+			if parsed, ok := parseDurationUnitSection(datePart, false); ok {
+				for k, v := range parsed {
+					out[k] = v
+					hasValue = true
+				}
+			}
+		} else if y, m, d, ok := parseDateParts(datePart); ok {
+			out["years"] = float64(y)
+			out["months"] = float64(m)
+			out["days"] = float64(d)
+			hasValue = true
+		}
+	}
+	if timePart != "" {
+		if strings.Contains(timePart, ":") {
+			h, m, s, n, _, ok := parseClockAndZone(timePart)
+			if ok {
+				out["hours"] = float64(h)
+				out["minutes"] = float64(m)
+				out["seconds"] = float64(s) + float64(n)/1_000_000_000
+				hasValue = true
+			}
+		} else if strings.ContainsAny(timePart, "HhMmSs") {
+			if parsed, ok := parseDurationUnitSection(timePart, true); ok {
+				for k, v := range parsed {
+					out[k] = v
+					hasValue = true
+				}
+			}
+		}
+	}
+	if !hasValue {
+		return nil, false
+	}
+	return out, true
+}
+
+func parseDurationUnitSection(raw string, timeSection bool) (map[string]float64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+	result := map[string]float64{}
+	pattern := regexp.MustCompile(`([+-]?\d+(?:\.\d+)?)([YMWDHSymwdhs])`)
+	matches := pattern.FindAllStringSubmatch(raw, -1)
+	if len(matches) == 0 {
+		return nil, false
+	}
+	for _, match := range matches {
+		value, err := strconv.ParseFloat(match[1], 64)
+		if err != nil {
+			return nil, false
+		}
+		switch strings.ToUpper(match[2]) {
+		case "Y":
+			result["years"] += value
+		case "M":
+			if timeSection {
+				result["minutes"] += value
+			} else if strings.ContainsAny(raw, "YyWwDd") {
+				result["months"] += value
+			} else {
+				wholeMonths := truncTowardZero(value)
+				result["months"] += wholeMonths
+				fracMonths := value - wholeMonths
+				if fracMonths != 0 {
+					monthSeconds := fracMonths * 2629746.0
+					wholeDays := truncTowardZero(monthSeconds / 86400)
+					result["days"] += wholeDays
+					result["seconds"] += monthSeconds - wholeDays*86400
+				}
+			}
+		case "W":
+			result["weeks"] += value
+		case "D":
+			result["days"] += value
+		case "H":
+			result["hours"] += value
+		case "S":
+			result["seconds"] += value
+		}
+	}
+	return result, true
+}
+
 func normalizeOffsetToken(raw string) (string, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -4414,6 +4681,9 @@ func normalizeOffsetToken(raw string) (string, bool) {
 	body := raw[1:]
 	if len(body) == 4 {
 		return string(raw[0]) + body[:2] + ":" + body[2:], true
+	}
+	if len(body) == 2 {
+		return string(raw[0]) + body + ":00", true
 	}
 	if len(body) == 6 {
 		return string(raw[0]) + body[:2] + ":" + body[2:4] + ":" + body[4:], true

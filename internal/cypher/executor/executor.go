@@ -765,7 +765,17 @@ func normalizeResultValue(value any) any {
 		return edgeToMap(typed)
 	case []byte:
 		return string(typed)
+	case string:
+		if mapped, ok := parseStoredMapString(typed); ok {
+			if rendered, ok := renderTemporalValue(mapped); ok {
+				return rendered
+			}
+		}
+		return typed
 	case map[string]any:
+		if rendered, ok := renderTemporalValue(typed); ok {
+			return rendered
+		}
 		out := make(map[string]any, len(typed))
 		for key, item := range typed {
 			out[key] = normalizeResultValue(item)
@@ -786,6 +796,313 @@ func normalizeResultValue(value any) any {
 	default:
 		return value
 	}
+}
+
+func renderTemporalValue(value map[string]any) (string, bool) {
+	typeNameRaw, ok := value["__temporal_type"]
+	if !ok {
+		return "", false
+	}
+	typeName := strings.ToLower(strings.TrimSpace(fmt.Sprint(typeNameRaw)))
+	if typeName == "" {
+		return "", false
+	}
+
+	if raw, ok := value["value"]; ok && strings.TrimSpace(fmt.Sprint(raw)) != "" {
+		return fmt.Sprint(raw), true
+	}
+
+	if typeName == "duration" {
+		return formatDurationComponents(durationComponentsFromMap(value)), true
+	}
+
+	normalized := normalizeTemporalMapForRendering(typeName, value)
+	if normalized == nil {
+		return "", false
+	}
+
+	if truncUnit := strings.TrimSpace(fmt.Sprint(value["truncated"])); truncUnit != "" {
+		normalized = applyTemporalTruncation(typeName, normalized, truncUnit)
+	}
+
+	switch typeName {
+	case "date":
+		t, ok := temporalDateTime(normalized, false)
+		if !ok {
+			return "", false
+		}
+		return t.Format("2006-01-02"), true
+	case "localtime":
+		t, ok := temporalDateTime(normalized, false)
+		if !ok {
+			return "", false
+		}
+		return formatTimeString(t, false), true
+	case "time":
+		t, ok := temporalDateTime(normalized, true)
+		if !ok {
+			return "", false
+		}
+		return formatTimeWithNamedTimezone(t, normalized), true
+	case "localdatetime":
+		t, ok := temporalDateTime(normalized, false)
+		if !ok {
+			return "", false
+		}
+		return formatDateTimeString(t, false), true
+	case "datetime":
+		t, ok := temporalDateTime(normalized, true)
+		if !ok {
+			return "", false
+		}
+		return formatDateTimeWithNamedTimezone(t, normalized), true
+	default:
+		return "", false
+	}
+}
+
+func normalizeTemporalMapForRendering(typeName string, src map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range src {
+		out[k] = v
+	}
+
+	baseDate := time.Time{}
+	hasBaseDate := false
+
+	if embedded, ok := src["date"]; ok {
+		switch typed := embedded.(type) {
+		case map[string]any:
+			if dateText, ok := renderTemporalValue(typed); ok {
+				if t, err := time.Parse("2006-01-02", dateText); err == nil {
+					baseDate = t
+					hasBaseDate = true
+					out["year"] = t.Year()
+					out["month"] = int(t.Month())
+					out["day"] = t.Day()
+				}
+			}
+		case string:
+			if t, err := time.Parse("2006-01-02", strings.TrimSpace(typed)); err == nil {
+				baseDate = t
+				hasBaseDate = true
+				out["year"] = t.Year()
+				out["month"] = int(t.Month())
+				out["day"] = t.Day()
+			}
+		}
+	}
+
+	if week, ok := mapInt(out, "week"); ok {
+		_, explicitYear := src["year"]
+		year, hasYear := mapInt(out, "year")
+		if !explicitYear {
+			if hasBaseDate {
+				year, _ = baseDate.ISOWeek()
+				hasYear = true
+			} else if y, m, d, ok := dateParts(out); ok {
+				t := time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC)
+				year, _ = t.ISOWeek()
+				hasYear = true
+			}
+		}
+		if hasYear {
+			dayOfWeek, hasDOW := mapInt(out, "dayOfWeek")
+			if !hasDOW || dayOfWeek < 1 || dayOfWeek > 7 {
+				if hasBaseDate {
+					wd := int(baseDate.Weekday())
+					if wd == 0 {
+						wd = 7
+					}
+					dayOfWeek = wd
+				} else {
+					dayOfWeek = 1
+				}
+			}
+			if dt, ok := isoWeekDate(year, week, dayOfWeek); ok {
+				out["year"] = dt.Year()
+				out["month"] = int(dt.Month())
+				out["day"] = dt.Day()
+			}
+		}
+	}
+
+	return out
+}
+
+func dateParts(src map[string]any) (int, int, int, bool) {
+	year, yOK := mapInt(src, "year")
+	month, mOK := mapInt(src, "month")
+	day, dOK := mapInt(src, "day")
+	if !(yOK && mOK && dOK) {
+		return 0, 0, 0, false
+	}
+	return year, month, day, true
+}
+
+func temporalDateTime(src map[string]any, withTimezone bool) (time.Time, bool) {
+	year, hasYear := mapInt(src, "year")
+	month, hasMonth := mapInt(src, "month")
+	day, hasDay := mapInt(src, "day")
+	hour, hasHour := mapInt(src, "hour")
+	minute, hasMinute := mapInt(src, "minute")
+	second, hasSecond := mapInt(src, "second")
+	nanosecond, hasNano := mapInt(src, "nanosecond")
+
+	if !hasYear {
+		year = 0
+	}
+	if !hasMonth {
+		month = 1
+	}
+	if !hasDay {
+		day = 1
+	}
+	if !hasHour {
+		hour = 0
+	}
+	if !hasMinute {
+		minute = 0
+	}
+	if !hasSecond {
+		second = 0
+	}
+	if !hasNano {
+		nanosecond = 0
+	}
+
+	loc := time.UTC
+	if withTimezone {
+		if tzRaw, ok := src["timezone"]; ok {
+			tz := strings.TrimSpace(fmt.Sprint(tzRaw))
+			if tz != "" {
+				if offset, err := parseOffsetSeconds(tz); err == nil {
+					loc = time.FixedZone("", offset)
+				} else if l, err := time.LoadLocation(tz); err == nil {
+					loc = l
+				}
+			}
+		}
+	}
+
+	if year == 0 && !hasYear {
+		year = 1970
+	}
+	if month < 1 || month > 12 || day < 1 || day > 31 {
+		return time.Time{}, false
+	}
+	return time.Date(year, time.Month(month), day, hour, minute, second, nanosecond, loc), true
+}
+
+func applyTemporalTruncation(typeName string, src map[string]any, unit string) map[string]any {
+	out := map[string]any{}
+	for k, v := range src {
+		out[k] = v
+	}
+	unit = strings.ToLower(strings.TrimSpace(unit))
+
+	truncateTimeFields := func(target map[string]any, unit string) {
+		switch unit {
+		case "hour":
+			target["minute"] = 0
+			target["second"] = 0
+			target["nanosecond"] = 0
+		case "minute":
+			target["second"] = 0
+			target["nanosecond"] = 0
+		case "second":
+			target["nanosecond"] = 0
+		case "millisecond":
+			n, _ := mapInt(target, "nanosecond")
+			target["nanosecond"] = (n / 1_000_000) * 1_000_000
+		case "microsecond":
+			n, _ := mapInt(target, "nanosecond")
+			target["nanosecond"] = (n / 1_000) * 1_000
+		}
+	}
+
+	switch unit {
+	case "millennium", "century", "decade", "year", "quarter", "month", "week", "day":
+		t, ok := temporalDateTime(out, strings.Contains(typeName, "time") && typeName != "localtime" && typeName != "localdatetime")
+		if !ok {
+			return out
+		}
+		switch unit {
+		case "millennium":
+			y := t.Year()
+			t = time.Date((y/1000)*1000, 1, 1, 0, 0, 0, 0, t.Location())
+		case "century":
+			y := t.Year()
+			t = time.Date((y/100)*100, 1, 1, 0, 0, 0, 0, t.Location())
+		case "decade":
+			y := t.Year()
+			t = time.Date((y/10)*10, 1, 1, 0, 0, 0, 0, t.Location())
+		case "year":
+			t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, t.Location())
+		case "quarter":
+			m := ((int(t.Month())-1)/3)*3 + 1
+			t = time.Date(t.Year(), time.Month(m), 1, 0, 0, 0, 0, t.Location())
+		case "month":
+			t = time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
+		case "week":
+			y, w := t.ISOWeek()
+			dt, ok := isoWeekDate(y, w, 1)
+			if ok {
+				t = time.Date(dt.Year(), dt.Month(), dt.Day(), 0, 0, 0, 0, t.Location())
+			}
+		case "day":
+			t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+		}
+		out["year"] = t.Year()
+		out["month"] = int(t.Month())
+		out["day"] = t.Day()
+		out["hour"] = t.Hour()
+		out["minute"] = t.Minute()
+		out["second"] = t.Second()
+		out["nanosecond"] = t.Nanosecond()
+	case "hour", "minute", "second", "millisecond", "microsecond":
+		truncateTimeFields(out, unit)
+	}
+
+	delete(out, "truncated")
+	return out
+}
+
+func isoWeekDate(year, week, dayOfWeek int) (time.Time, bool) {
+	if week < 1 || week > 53 || dayOfWeek < 1 || dayOfWeek > 7 {
+		return time.Time{}, false
+	}
+	jan4 := time.Date(year, 1, 4, 0, 0, 0, 0, time.UTC)
+	wd := int(jan4.Weekday())
+	if wd == 0 {
+		wd = 7
+	}
+	week1Monday := jan4.AddDate(0, 0, -(wd - 1))
+	return week1Monday.AddDate(0, 0, (week-1)*7+(dayOfWeek-1)), true
+}
+
+func formatTimeWithNamedTimezone(t time.Time, src map[string]any) string {
+	base := formatTimeString(t, true)
+	tz := strings.TrimSpace(fmt.Sprint(src["timezone"]))
+	if tz == "" || strings.HasPrefix(tz, "+") || strings.HasPrefix(tz, "-") {
+		return base
+	}
+	if strings.Contains(tz, "/") {
+		return base + "[" + tz + "]"
+	}
+	return base
+}
+
+func formatDateTimeWithNamedTimezone(t time.Time, src map[string]any) string {
+	base := formatDateTimeString(t, true)
+	tz := strings.TrimSpace(fmt.Sprint(src["timezone"]))
+	if tz == "" || strings.HasPrefix(tz, "+") || strings.HasPrefix(tz, "-") {
+		return base
+	}
+	if strings.Contains(tz, "/") {
+		return base + "[" + tz + "]"
+	}
+	return base
 }
 
 func outcomeFromError(err error) string {

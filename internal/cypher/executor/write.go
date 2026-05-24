@@ -3842,9 +3842,13 @@ func secondsToDuration(seconds float64) time.Duration {
 }
 
 func formatTimeString(t time.Time, includeZone bool) string {
-	hms := t.Format("15:04:05")
+	hms := t.Format("15:04")
+	sec := t.Second()
 	nanos := t.Nanosecond()
 	frac := ""
+	if sec != 0 || nanos != 0 {
+		hms += fmt.Sprintf(":%02d", sec)
+	}
 	if nanos != 0 {
 		frac = "." + fmt.Sprintf("%09d", nanos)
 	}
@@ -3855,8 +3859,12 @@ func formatTimeString(t time.Time, includeZone bool) string {
 }
 
 func formatDateTimeString(t time.Time, includeZone bool) string {
-	base := t.Format("2006-01-02T15:04:05")
+	base := t.Format("2006-01-02T15:04")
+	sec := t.Second()
 	nanos := t.Nanosecond()
+	if sec != 0 || nanos != 0 {
+		base += fmt.Sprintf(":%02d", sec)
+	}
 	if nanos != 0 {
 		base += "." + fmt.Sprintf("%09d", nanos)
 	}

@@ -601,7 +601,7 @@ func evalVertexField(v *graph.Vertex, field string) (any, error) {
 		if !ok {
 			return nil, nil
 		}
-		return string(val), nil
+		return decodeStoredPropertyValue(val), nil
 	}
 }
 
@@ -628,8 +628,37 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 		if !ok {
 			return nil, nil
 		}
-		return string(val), nil
+		return decodeStoredPropertyValue(val), nil
 	}
+}
+
+func decodeStoredPropertyValue(raw []byte) any {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return ""
+	}
+	if strings.EqualFold(text, "null") {
+		return nil
+	}
+	if strings.EqualFold(text, "true") {
+		return true
+	}
+	if strings.EqualFold(text, "false") {
+		return false
+	}
+	if i, err := strconv.Atoi(text); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(text, 64); err == nil {
+		return f
+	}
+	if mapped, ok := parseStoredMapString(text); ok {
+		return mapped
+	}
+	if list, ok := parseStoredListString(text); ok {
+		return list
+	}
+	return text
 }
 
 func evalTemporalAccessor(base map[string]any, field string) (any, bool) {
@@ -944,7 +973,7 @@ func vertexToMap(v *graph.Vertex) map[string]any {
 	}
 	props := map[string]any{}
 	for k, val := range v.Properties {
-		props[k] = string(val)
+		props[k] = decodeStoredPropertyValue(val)
 	}
 	return map[string]any{
 		"tenant":     v.Tenant,
@@ -960,7 +989,7 @@ func edgeToMap(e *graph.Edge) map[string]any {
 	}
 	props := map[string]any{}
 	for k, val := range e.Properties {
-		props[k] = string(val)
+		props[k] = decodeStoredPropertyValue(val)
 	}
 	return map[string]any{
 		"tenant":     e.Tenant,

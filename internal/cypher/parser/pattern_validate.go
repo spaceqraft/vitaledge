@@ -115,6 +115,11 @@ func extractMatchWhere(raw string) (string, bool) {
 }
 
 func validateWherePatternBindings(whereRaw string, bound map[string]patternVarRole, seg statementSegment) error {
+	// Variables introduced inside EXISTS { ... } are scoped to the subquery and
+	// should not be treated as unbounded pattern variables in the outer WHERE.
+	if strings.Contains(strings.ToUpper(strings.ReplaceAll(whereRaw, " ", "")), "EXISTS{") {
+		return nil
+	}
 	for _, b := range scanPatternBindings(whereRaw) {
 		if b.name == "" {
 			continue
@@ -239,6 +244,10 @@ func scanTopLevelAssignment(raw string, start int) (string, int, bool) {
 	}
 	idx = skipSpaces(raw, idx)
 	if idx >= len(raw) || raw[idx] != '=' {
+		return "", start, false
+	}
+	next := skipSpaces(raw, idx+1)
+	if next >= len(raw) || raw[next] != '(' {
 		return "", start, false
 	}
 	return name, idx + 1, true

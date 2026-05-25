@@ -1994,6 +1994,10 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		return nil, nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("%s clause requires at least one projection item", clause.Kind), nil)
 	}
 
+	if err := validateProjectionOrderBy(items, projection.OrderBy, rows); err != nil {
+		return nil, nil, err
+	}
+
 	out := make([]Row, 0, len(rows))
 	columns := make([]string, 0, len(items))
 	hasAggregate := false
@@ -2256,6 +2260,11 @@ func parseProjectionOrderBy(raw string) ([]projectionOrderBySpec, error) {
 		upper := strings.ToUpper(part)
 		spec := projectionOrderBySpec{}
 		switch {
+		case strings.HasSuffix(upper, "DESCENDING"):
+			spec.Descending = true
+			spec.Expression = strings.TrimSpace(part[:len(part)-len("DESCENDING")])
+		case strings.HasSuffix(upper, "ASCENDING"):
+			spec.Expression = strings.TrimSpace(part[:len(part)-len("ASCENDING")])
 		case strings.HasSuffix(upper, "DESC"):
 			spec.Descending = true
 			spec.Expression = strings.TrimSpace(part[:len(part)-len("DESC")])
@@ -2275,6 +2284,112 @@ func parseProjectionOrderBy(raw string) ([]projectionOrderBySpec, error) {
 	}
 
 	return out, nil
+}
+
+func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrderBySpec, rows []Row) error {
+	if len(orderBy) == 0 {
+		return nil
+	}
+
+	hasProjectionAggregate := false
+	for _, item := range items {
+		if item.CountArg != "" || item.CollectArg != "" {
+			hasProjectionAggregate = true
+			break
+		}
+	}
+
+	inScope := map[string]struct{}{}
+	if len(rows) > 0 {
+		for key := range rows[0] {
+			inScope[key] = struct{}{}
+		}
+	}
+	for _, item := range items {
+		if item.Alias != "" {
+			inScope[item.Alias] = struct{}{}
+			continue
+		}
+		if ident, ok := parseSimpleIdentifierRoot(item.Expression); ok {
+			inScope[ident] = struct{}{}
+		}
+	}
+
+	for _, spec := range orderBy {
+		expr := strings.TrimSpace(spec.Expression)
+		if expr == "" {
+			continue
+		}
+		if containsAggregationExpression(expr) && !hasProjectionAggregate {
+			return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "invalid aggregation expression"}
+		}
+		if ident, ok := parseSimpleIdentifierRoot(expr); ok {
+			if _, ok := inScope[ident]; !ok {
+				return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "undefined variable"}
+			}
+		}
+	}
+
+	return nil
+}
+
+func containsAggregationExpression(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	lower := strings.ToLower(raw)
+	aggs := []string{"count(", "max(", "min(", "sum(", "avg(", "collect("}
+	for _, agg := range aggs {
+		if strings.Contains(lower, agg) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSimpleIdentifierRoot(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	if strings.ContainsAny(raw, "()+-*/%<>=,![]{}") {
+		return "", false
+	}
+	root := raw
+	if idx := strings.Index(root, "."); idx >= 0 {
+		root = root[:idx]
+	}
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", false
+	}
+	if !isIdentifierLike(root) {
+		return "", false
+	}
+	return root, true
+}
+
+func isIdentifierLike(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' || (i > 0 && ch >= '0' && ch <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isIdentifierStart(ch byte) bool {
+	return ch == '_' || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+}
+
+func isIdentifierPart(ch byte) bool {
+	return isIdentifierStart(ch) || (ch >= '0' && ch <= '9')
 }
 
 func applyProjectionPostProcessing(rows []Row, clause projectionClauseSpec, params Params) ([]Row, error) {
@@ -2340,42 +2455,10 @@ func sortProjectedRows(rows []Row, orderBy []projectionOrderBySpec, params Param
 }
 
 func compareSortValues(left, right any) int {
-	if left == nil && right == nil {
-		return 0
+	cmp, ok := compareCypherValues(left, right)
+	if ok {
+		return cmp
 	}
-	if left == nil {
-		return -1
-	}
-	if right == nil {
-		return 1
-	}
-
-	leftInt, leftIntErr := toInt(left)
-	rightInt, rightIntErr := toInt(right)
-	if leftIntErr == nil && rightIntErr == nil {
-		switch {
-		case leftInt < rightInt:
-			return -1
-		case leftInt > rightInt:
-			return 1
-		default:
-			return 0
-		}
-	}
-
-	leftBool, leftBoolOK := left.(bool)
-	rightBool, rightBoolOK := right.(bool)
-	if leftBoolOK && rightBoolOK {
-		switch {
-		case !leftBool && rightBool:
-			return -1
-		case leftBool && !rightBool:
-			return 1
-		default:
-			return 0
-		}
-	}
-
 	leftText := fmt.Sprint(left)
 	rightText := fmt.Sprint(right)
 	switch {
@@ -2385,6 +2468,114 @@ func compareSortValues(left, right any) int {
 		return 1
 	default:
 		return 0
+	}
+}
+
+func compareCypherValues(lhs, rhs any) (int, bool) {
+	if lhs == nil && rhs == nil {
+		return 0, true
+	}
+	if lhs == nil {
+		return -1, true
+	}
+	if rhs == nil {
+		return 1, true
+	}
+
+	if leftMap, leftTemporal := temporalMapValue(lhs); leftTemporal {
+		if rightMap, rightTemporal := temporalMapValue(rhs); rightTemporal {
+			if equal, ok := compareTemporalMaps(leftMap, rightMap, "="); ok && equal {
+				return 0, true
+			}
+			if less, ok := compareTemporalMaps(leftMap, rightMap, "<"); ok {
+				if less {
+					return -1, true
+				}
+				return 1, true
+			}
+		}
+	}
+
+	if lf, lok := numericValue(lhs); lok {
+		if rf, rok := numericValue(rhs); rok {
+			switch {
+			case lf < rf:
+				return -1, true
+			case lf > rf:
+				return 1, true
+			default:
+				return 0, true
+			}
+		}
+	}
+
+	if lb, lok := lhs.(bool); lok {
+		if rb, rok := rhs.(bool); rok {
+			switch {
+			case !lb && rb:
+				return -1, true
+			case lb && !rb:
+				return 1, true
+			default:
+				return 0, true
+			}
+		}
+	}
+
+	if ls, lok := lhs.(string); lok {
+		if rs, rok := rhs.(string); rok {
+			switch {
+			case ls < rs:
+				return -1, true
+			case ls > rs:
+				return 1, true
+			default:
+				return 0, true
+			}
+		}
+	}
+
+	if ll, lok := asAnySlice(lhs); lok {
+		if rl, rok := asAnySlice(rhs); rok {
+			limit := len(ll)
+			if len(rl) < limit {
+				limit = len(rl)
+			}
+			for i := 0; i < limit; i++ {
+				cmp, ok := compareCypherValues(ll[i], rl[i])
+				if !ok {
+					return 0, false
+				}
+				if cmp != 0 {
+					return cmp, true
+				}
+			}
+			switch {
+			case len(ll) < len(rl):
+				return -1, true
+			case len(ll) > len(rl):
+				return 1, true
+			default:
+				return 0, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+func asAnySlice(value any) ([]any, bool) {
+	switch typed := value.(type) {
+	case []any:
+		return typed, true
+	case []string:
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, item)
+		}
+		return out, true
+	default:
+		return nil, false
 	}
 }
 
@@ -2460,7 +2651,7 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 			continue
 		}
 		alias := ""
-		if idx := strings.LastIndex(strings.ToUpper(part), "AS"); idx > 0 {
+		if idx := findTopLevelAliasIndex(part); idx > 0 {
 			expr := strings.TrimSpace(part[:idx])
 			alias = normalizeProjectionIdentifier(strings.TrimSpace(part[idx+2:]))
 			if expr == "" || alias == "" {
@@ -2476,6 +2667,75 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 		items = append(items, projectionSpec{Expression: part, CountArg: countArg, CollectArg: collectArg})
 	}
 	return items, nil
+}
+
+func findTopLevelAliasIndex(raw string) int {
+	upper := strings.ToUpper(raw)
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle := false
+	inDouble := false
+	candidates := make([]int, 0, 2)
+
+	for i := 0; i <= len(raw)-2; i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+			continue
+		}
+		if upper[i:i+2] != "AS" {
+			continue
+		}
+		candidates = append(candidates, i)
+	}
+
+	for i := len(candidates) - 1; i >= 0; i-- {
+		idx := candidates[i]
+		lhs := strings.TrimSpace(raw[:idx])
+		rhs := strings.TrimSpace(raw[idx+2:])
+		if lhs == "" || rhs == "" {
+			continue
+		}
+		if strings.HasPrefix(rhs, "`") && strings.HasSuffix(rhs, "`") && len(rhs) >= 2 {
+			return idx
+		}
+		if isIdentifierLike(rhs) {
+			return idx
+		}
+	}
+
+	return -1
 }
 
 func inferProjectionColumns(rows []Row) []string {
@@ -2539,8 +2799,21 @@ func splitTopLevelCommaSeparated(raw string) []string {
 	depthParen := 0
 	depthBracket := 0
 	depthBrace := 0
+	inSingle := false
+	inDouble := false
 	start := 0
 	for i, r := range raw {
+		if r == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if r == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
 		switch r {
 		case '(':
 			depthParen++
@@ -2575,6 +2848,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty expression", nil)
+	}
+	if inner, ok := unwrapOuterParentheses(raw); ok {
+		return evalExpressionWithScope(inner, row, params)
 	}
 	if left, right, ok := splitTopLevelKeyword(raw, "OR"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -2752,6 +3028,25 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
 	}
+	if left, right, ok := splitTopLevelOperator(raw, "%"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		lf, lok := numericValue(lhs)
+		rf, rok := numericValue(rhs)
+		if lok && rok {
+			if rf == 0 {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "modulo by zero", nil)
+			}
+			return math.Mod(lf, rf), nil
+		}
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+	}
 	if left, right, ok := splitTopLevelOperator(raw, "/"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
 		if err != nil {
@@ -2776,6 +3071,76 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	}
 	if value, ok, err := evalTemporalNamespaceFunction(raw, row, params); ok {
 		return value, err
+	}
+	if value, ok, err := evalListComprehension(raw, row, params); ok {
+		return value, err
+	}
+	if arg, ok := parseFunctionCall(raw, "size"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		switch typed := value.(type) {
+		case nil:
+			return nil, nil
+		case []any:
+			return len(typed), nil
+		case []string:
+			return len(typed), nil
+		case string:
+			return len([]rune(typed)), nil
+		case map[string]any:
+			return len(typed), nil
+		default:
+			return nil, graph.NewError(graph.ErrKindSemantic, "size() requires a list, map, or string", nil)
+		}
+	}
+	if arg, ok := parseFunctionCall(raw, "range"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) < 2 || len(parts) > 3 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "range() expects 2 or 3 arguments", nil)
+		}
+		startVal, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		endVal, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		start, err := toInt(startVal)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindSemantic, "range() start must be an integer", err)
+		}
+		end, err := toInt(endVal)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindSemantic, "range() end must be an integer", err)
+		}
+		step := 1
+		if len(parts) == 3 {
+			stepVal, err := evalExpressionWithScope(parts[2], row, params)
+			if err != nil {
+				return nil, err
+			}
+			step, err = toInt(stepVal)
+			if err != nil {
+				return nil, graph.NewError(graph.ErrKindSemantic, "range() step must be an integer", err)
+			}
+			if step == 0 {
+				return nil, graph.NewError(graph.ErrKindSemantic, "range() step cannot be zero", nil)
+			}
+		}
+		out := []any{}
+		if step > 0 {
+			for i := start; i <= end; i += step {
+				out = append(out, i)
+			}
+		} else {
+			for i := start; i >= end; i += step {
+				out = append(out, i)
+			}
+		}
+		return out, nil
 	}
 	if arg, ok := parseFunctionCall(raw, "toString"); ok {
 		value, err := evalExpressionWithScope(arg, row, params)
@@ -2858,6 +3223,75 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+}
+
+func evalListComprehension(raw string, row Row, params Params) (any, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
+		return nil, false, nil
+	}
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	upper := strings.ToUpper(body)
+	inIdx := strings.Index(upper, "IN")
+	if inIdx <= 0 {
+		return nil, false, nil
+	}
+	varName := strings.TrimSpace(body[:inIdx])
+	if !isIdentifierLike(varName) {
+		return nil, false, nil
+	}
+	rest := strings.TrimSpace(body[inIdx+2:])
+	if rest == "" {
+		return nil, true, graph.NewError(graph.ErrKindSemantic, "list comprehension source is required", nil)
+	}
+
+	whereIdx := findTopLevelKeywordIndex(rest, "WHERE")
+	listExpr := rest
+	predicate := ""
+	if whereIdx >= 0 {
+		listExpr = strings.TrimSpace(rest[:whereIdx])
+		predicate = strings.TrimSpace(rest[whereIdx+len("WHERE"):])
+	}
+
+	listValue, err := evalExpressionWithScope(listExpr, row, params)
+	if err != nil {
+		return nil, true, err
+	}
+	values, ok := listValue.([]any)
+	if !ok {
+		if typed, ok := listValue.([]string); ok {
+			values = make([]any, 0, len(typed))
+			for _, v := range typed {
+				values = append(values, v)
+			}
+		} else {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, "list comprehension requires a list source", nil)
+		}
+	}
+
+	out := make([]any, 0, len(values))
+	for _, v := range values {
+		scope := cloneRow(row)
+		scope[varName] = v
+		include := true
+		if predicate != "" {
+			predValue, err := evalExpressionWithScope(predicate, scope, params)
+			if err != nil {
+				return nil, true, err
+			}
+			boolVal, ok := predValue.(bool)
+			if !ok {
+				include = false
+			} else {
+				include = boolVal
+			}
+		}
+		if include {
+			out = append(out, v)
+		}
+	}
+
+	return out, true, nil
 }
 
 func evalLabelsFunction(arg string, binding map[string]any) (any, error) {
@@ -3068,6 +3502,11 @@ func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {
 			if beforeIsWord && afterIsWord {
 				continue
 			}
+			left := strings.TrimSpace(raw[:i])
+			right := strings.TrimSpace(raw[i+len(keyword):])
+			if left == "" || right == "" {
+				continue
+			}
 			return raw[:i], raw[i+len(keyword):], true
 		}
 	}
@@ -3120,31 +3559,23 @@ func compareWhereValues(lhs, rhs any, op string) (bool, error) {
 			return false, nil
 		}
 	}
-
-	if leftMap, leftTemporal := temporalMapValue(lhs); leftTemporal {
-		if rightMap, rightTemporal := temporalMapValue(rhs); rightTemporal {
-			if value, ok := compareTemporalMaps(leftMap, rightMap, op); ok {
-				return value, nil
-			}
-		}
-	}
-
-	leftInt, leftIntErr := toInt(lhs)
-	rightInt, rightIntErr := toInt(rhs)
-	if leftIntErr == nil && rightIntErr == nil {
+	cmp, ok := compareCypherValues(lhs, rhs)
+	if ok {
 		switch op {
 		case "=":
-			return leftInt == rightInt, nil
+			return cmp == 0, nil
 		case "<>":
-			return leftInt != rightInt, nil
+			return cmp != 0, nil
 		case "<":
-			return leftInt < rightInt, nil
+			return cmp < 0, nil
 		case "<=":
-			return leftInt <= rightInt, nil
+			return cmp <= 0, nil
 		case ">":
-			return leftInt > rightInt, nil
+			return cmp > 0, nil
 		case ">=":
-			return leftInt >= rightInt, nil
+			return cmp >= 0, nil
+		default:
+			return false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("WHERE operator %q is not supported", op), nil)
 		}
 	}
 
@@ -3564,14 +3995,7 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 	}
 	if row != nil {
 		if v, ok := row[raw]; ok {
-			switch typed := v.(type) {
-			case *graph.Vertex:
-				return typed.ID, nil
-			case *graph.Edge:
-				return typed.ID, nil
-			default:
-				return typed, nil
-			}
+			return v, nil
 		}
 	}
 	if strings.HasPrefix(raw, "'") || strings.HasPrefix(raw, `"`) {
@@ -3591,6 +4015,44 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 		return f, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("write value %q is not supported", raw), nil)
+}
+
+func unwrapOuterParentheses(raw string) (string, bool) {
+	if len(raw) < 2 || raw[0] != '(' || raw[len(raw)-1] != ')' {
+		return "", false
+	}
+	depth := 0
+	inSingle := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if inSingle {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i < len(raw)-1 {
+				return "", false
+			}
+			if depth < 0 {
+				return "", false
+			}
+		}
+	}
+	if depth != 0 {
+		return "", false
+	}
+	inner := strings.TrimSpace(raw[1 : len(raw)-1])
+	if inner == "" {
+		return "", false
+	}
+	return inner, true
 }
 
 func parseListLiteral(raw string, params Params, row Row) ([]any, error) {

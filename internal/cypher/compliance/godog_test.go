@@ -938,7 +938,80 @@ func quoteString(value string) string {
 func normalizeExpectedCell(value string) string {
 	value = strings.TrimSpace(value)
 	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = canonicalizeEmbeddedMaps(value)
 	return collapseWhitespaceOutsideStrings(value)
+}
+
+func canonicalizeEmbeddedMaps(value string) string {
+	if value == "" {
+		return ""
+	}
+	var out strings.Builder
+	for i := 0; i < len(value); {
+		if value[i] == '{' {
+			end := findMatchingBrace(value, i)
+			if end > i {
+				out.WriteString(canonicalizeMapLiteral(value[i : end+1]))
+				i = end + 1
+				continue
+			}
+		}
+		out.WriteByte(value[i])
+		i++
+	}
+	return out.String()
+}
+
+func canonicalizeMapLiteral(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '{' || raw[len(raw)-1] != '}' {
+		return raw
+	}
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	if body == "" {
+		return "{}"
+	}
+	entries := splitTopLevel(body, ',')
+	canonical := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		key, val, ok := splitKeyValueTopLevel(entry)
+		if !ok {
+			canonical = append(canonical, canonicalizeEmbeddedMaps(entry))
+			continue
+		}
+		canonical = append(canonical, strings.TrimSpace(key)+": "+canonicalizeEmbeddedMaps(strings.TrimSpace(val)))
+	}
+	sort.Strings(canonical)
+	return "{" + strings.Join(canonical, ", ") + "}"
+}
+
+func findMatchingBrace(raw string, start int) int {
+	depth := 0
+	inString := false
+	for i := start; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch ch {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func collapseWhitespaceOutsideStrings(value string) string {

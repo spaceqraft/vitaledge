@@ -2215,6 +2215,14 @@ func TestExecuteRandExpressionAndQuantifierSetup(t *testing.T) {
 	if legacyValue != "u1" {
 		t.Fatalf("unexpected legacy coalesce fallback: %#v", legacyValue)
 	}
+
+	legacyBoolean, err := evalExpression("aOR(bANDc)", map[string]any{"a": true, "b": false, "c": false})
+	if err != nil {
+		t.Fatalf("legacy evalExpression boolean failed: %v", err)
+	}
+	if legacyBoolean != true {
+		t.Fatalf("unexpected legacy boolean result: %#v", legacyBoolean)
+	}
 }
 
 func TestEvalExpressionWithScopeBooleanSemantics(t *testing.T) {
@@ -2392,6 +2400,187 @@ func TestPrecedenceComparisonVsBooleanProbe(t *testing.T) {
 	}
 	if got := res.Rows[0]["result"]; got != true {
 		t.Fatalf("unexpected precedence probe row: %#v", res.Rows[0])
+	}
+}
+
+func TestEvalExpressionWithScopeExponentPrecedenceAndNullPropagation(t *testing.T) {
+	row := Row{}
+
+	value, err := evalExpressionWithScope("4 ^ 3 * 2 ^ 3", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(4 ^ 3 * 2 ^ 3) failed: %v", err)
+	}
+	if fmt.Sprint(value) != "512.0" {
+		t.Fatalf("unexpected exponent multiplicative precedence result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("4 ^ 3 + 2 ^ 3", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(4 ^ 3 + 2 ^ 3) failed: %v", err)
+	}
+	if fmt.Sprint(value) != "72.0" {
+		t.Fatalf("unexpected exponent additive precedence result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("-3 ^ 2", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(-3 ^ 2) failed: %v", err)
+	}
+	if fmt.Sprint(value) != "9.0" {
+		t.Fatalf("unexpected unary-negative exponent result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("4 ^ (3 + 2) ^ 3", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(4 ^ (3 + 2) ^ 3) failed: %v", err)
+	}
+	if fmt.Sprint(value) != "1073741824.0" {
+		t.Fatalf("unexpected left-associative exponent result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("4 ^ (3 / 2) ^ 3", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(4 ^ (3 / 2) ^ 3) failed: %v", err)
+	}
+	if fmt.Sprint(value) != "64.0" {
+		t.Fatalf("unexpected integer-division exponent precedence result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("-(3 ^ 2)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(-(3 ^ 2)) failed: %v", err)
+	}
+	if fmt.Sprint(value) != "-9.0" {
+		t.Fatalf("unexpected grouped unary-negative exponent result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("-(3 + 2)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(-(3 + 2)) failed: %v", err)
+	}
+	if value != -5 {
+		t.Fatalf("unexpected grouped unary-negative additive result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("5 ^ (6 % null)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(5 ^ (6 %% null)) failed: %v", err)
+	}
+	if value != nil {
+		t.Fatalf("expected null arithmetic propagation, got %#v", value)
+	}
+
+	legacyValue, err := evalExpression("4 ^ 3 + 2 ^ 3", map[string]any{})
+	if err != nil {
+		t.Fatalf("legacy evalExpression exponent precedence failed: %v", err)
+	}
+	if fmt.Sprint(legacyValue) != "72.0" {
+		t.Fatalf("unexpected legacy exponent precedence result: %#v", legacyValue)
+	}
+
+	value, err = evalExpressionWithScope("4 / 2 + 3 / 2", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(4 / 2 + 3 / 2) failed: %v", err)
+	}
+	if value != 3 {
+		t.Fatalf("unexpected integer division precedence result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("4 % (2 + 3) % 2", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(4 %% (2 + 3) %% 2) failed: %v", err)
+	}
+	if value != 0 {
+		t.Fatalf("unexpected integer modulo precedence result: %#v", value)
+	}
+}
+
+func TestEvalExpressionWithScopeLabelPredicate(t *testing.T) {
+	row := Row{"n": &graph.Vertex{Labels: []string{"Foo", "Bar"}}}
+
+	value, err := evalExpressionWithScope("n:Foo", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(n:Foo) failed: %v", err)
+	}
+	if value != true {
+		t.Fatalf("unexpected label predicate result: %#v", value)
+	}
+
+	value, err = evalExpressionWithScope("n:Baz", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(n:Baz) failed: %v", err)
+	}
+	if value != false {
+		t.Fatalf("unexpected missing label predicate result: %#v", value)
+	}
+}
+
+func TestExecuteMatchReturnCountComparisonOnEmptyGraph(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+
+	stmt, err := parser.ParseStatement("MATCH (a) RETURN count(a) > 0 AS result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["result"]; got != false {
+		t.Fatalf("unexpected count(a) > 0 result row: %#v", res.Rows[0])
+	}
+}
+
+func TestDeleteBindingSemanticsForReturn(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+
+	stmt, err := parser.ParseStatement("CREATE ()-[:T {num: 1}]->()")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH ()-[r]->() DELETE r RETURN type(r) AS relType")
+	if err != nil {
+		t.Fatalf("parse rel type failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute rel type failed: %v", err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["relType"] != "T" {
+		t.Fatalf("unexpected deleted relationship type result: %#v", res.Rows)
+	}
+
+	stmt, err = parser.ParseStatement("CREATE (:A {num: 0})")
+	if err != nil {
+		t.Fatalf("parse node seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute node seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (n:A) DELETE n RETURN n.num")
+	if err != nil {
+		t.Fatalf("parse deleted property failed: %v", err)
+	}
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err == nil {
+		t.Fatalf("expected deleted node property access error")
+	}
+	if !graph.IsKind(err, graph.ErrKindNotFound) {
+		t.Fatalf("expected ErrKindNotFound, got: %v", err)
 	}
 }
 

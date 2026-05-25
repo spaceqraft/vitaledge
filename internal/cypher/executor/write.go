@@ -70,6 +70,18 @@ type createChainPattern struct {
 	Rels  []createChainRelPattern
 }
 
+type deletedVertexBinding struct {
+	Tenant string
+	ID     string
+	Labels []string
+}
+
+type deletedEdgeBinding struct {
+	Tenant string
+	ID     string
+	Type   string
+}
+
 var autoVertexIDSeq uint64
 
 func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QueryStatement, params Params) (_ *Result, err error) {
@@ -2547,13 +2559,13 @@ func (e *Executor) applyDeleteClause(ctx context.Context, tx graph.Tx, rows []Ro
 				return nil, err
 			}
 			row = cloneRow(row)
-			delete(row, varName)
+			row[varName] = deletedVertexBinding{Tenant: typed.Tenant, ID: typed.ID, Labels: append([]string(nil), typed.Labels...)}
 		case *graph.Edge:
 			if err := tx.DeleteEdge(ctx, typed.Tenant, typed.ID); err != nil {
 				return nil, err
 			}
 			row = cloneRow(row)
-			delete(row, varName)
+			row[varName] = deletedEdgeBinding{Tenant: typed.Tenant, ID: typed.ID, Type: typed.Type}
 		default:
 			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("DELETE on %T is not supported", binding), nil)
 		}
@@ -2640,7 +2652,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		} else {
 			columns = append(columns, item.Expression)
 		}
-		if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" {
+		if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" || len(extractAggregateCalls(item.Expression)) > 0 {
 			hasAggregate = true
 		}
 	}
@@ -2701,18 +2713,20 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 	}
 
 	type projectionGroup struct {
-		projected   Row
-		source      Row
-		counts      map[int]int
-		countSeen   map[int]map[string]struct{}
-		collects    map[int][]any
-		collectSeen map[int]map[string]struct{}
-		aggs        map[int]*projectionAggregate
+		projected        Row
+		source           Row
+		counts           map[int]int
+		countSeen        map[int]map[string]struct{}
+		collects         map[int][]any
+		collectSeen      map[int]map[string]struct{}
+		aggs             map[int]*projectionAggregate
+		aggExprCounts    map[string]int
+		aggExprCountSeen map[string]map[string]struct{}
 	}
 
 	nonAggregateCount := 0
 	for _, item := range items {
-		if item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" {
+		if item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" && len(extractAggregateCalls(item.Expression)) == 0 {
 			nonAggregateCount++
 		}
 	}
@@ -2723,7 +2737,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		projected := Row{}
 		keyValues := make([]any, 0, nonAggregateCount)
 		for _, item := range items {
-			if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" {
+			if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" || len(extractAggregateCalls(item.Expression)) > 0 {
 				continue
 			}
 			value, ok, err := evalProjectionPatternComprehension(ctx, tx, item.Expression, row, params)
@@ -2751,12 +2765,62 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		groupKey := string(keyBytes)
 		group, ok := groups[groupKey]
 		if !ok {
-			group = &projectionGroup{projected: projected, source: cloneRow(row), counts: map[int]int{}, countSeen: map[int]map[string]struct{}{}, collects: map[int][]any{}, collectSeen: map[int]map[string]struct{}{}, aggs: map[int]*projectionAggregate{}}
+			group = &projectionGroup{projected: projected, source: cloneRow(row), counts: map[int]int{}, countSeen: map[int]map[string]struct{}{}, collects: map[int][]any{}, collectSeen: map[int]map[string]struct{}{}, aggs: map[int]*projectionAggregate{}, aggExprCounts: map[string]int{}, aggExprCountSeen: map[string]map[string]struct{}{}}
 			groups[groupKey] = group
 			groupOrder = append(groupOrder, groupKey)
 		}
 
 		for idx, item := range items {
+			calls := extractAggregateCalls(item.Expression)
+			if len(calls) > 0 && item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" {
+				seenCalls := map[string]struct{}{}
+				for _, call := range calls {
+					normalized := normalizeAggregateExprCall(call)
+					if _, seen := seenCalls[normalized]; seen {
+						continue
+					}
+					seenCalls[normalized] = struct{}{}
+					fn := aggregateFuncNameFromCall(call)
+					if fn != "count" {
+						continue
+					}
+					arg, ok := parseFunctionCall(call, "count")
+					if !ok {
+						continue
+					}
+					arg = strings.TrimSpace(arg)
+					if arg == "*" {
+						group.aggExprCounts[normalized]++
+						continue
+					}
+					countExpr, countDistinct := parseCountDistinctArg(arg)
+					if countExpr == "" {
+						countExpr = arg
+					}
+					value, err := evalExpressionWithScope(countExpr, row, params)
+					if err != nil {
+						return nil, nil, err
+					}
+					if value == nil {
+						continue
+					}
+					if countDistinct {
+						if group.aggExprCountSeen[normalized] == nil {
+							group.aggExprCountSeen[normalized] = map[string]struct{}{}
+						}
+						keyBytes, err := json.Marshal(normalizeResultValue(value))
+						if err != nil {
+							keyBytes = []byte(fmt.Sprintf("%v", value))
+						}
+						key := string(keyBytes)
+						if _, ok := group.aggExprCountSeen[normalized][key]; ok {
+							continue
+						}
+						group.aggExprCountSeen[normalized][key] = struct{}{}
+					}
+					group.aggExprCounts[normalized]++
+				}
+			}
 			if item.CountArg != "" {
 				if item.CountArg == "*" {
 					group.counts[idx]++
@@ -2870,12 +2934,36 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 			if item.Alias != "" {
 				key = item.Alias
 			}
+			calls := extractAggregateCalls(item.Expression)
 			if item.CountArg != "" {
 				projected[key] = 0
 			} else if item.CollectArg != "" {
 				projected[key] = []any{}
 			} else if item.AggFunc != "" {
 				projected[key] = nil
+			} else if len(calls) > 0 {
+				evalRow := Row{}
+				rewritten := item.Expression
+				seenCalls := map[string]string{}
+				for idx, call := range calls {
+					normalized := normalizeAggregateExprCall(call)
+					alias, ok := seenCalls[normalized]
+					if !ok {
+						alias = fmt.Sprintf("__agg_expr_%d", idx)
+						seenCalls[normalized] = alias
+						if aggregateFuncNameFromCall(call) == "count" {
+							evalRow[alias] = 0
+						} else {
+							evalRow[alias] = nil
+						}
+					}
+					rewritten = strings.ReplaceAll(rewritten, call, alias)
+				}
+				value, err := evalExpressionWithScope(rewritten, evalRow, params)
+				if err != nil {
+					return nil, nil, err
+				}
+				projected[key] = value
 			} else {
 				projected[key] = nil
 			}
@@ -2903,6 +2991,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 			if item.Alias != "" {
 				key = item.Alias
 			}
+			calls := extractAggregateCalls(item.Expression)
 			if item.CountArg != "" {
 				projected[key] = group.counts[idx]
 				continue
@@ -2935,6 +3024,39 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 				case "max":
 					projected[key] = agg.max
 				}
+				continue
+			}
+			if len(calls) > 0 {
+				evalRow := Row{}
+				for k, v := range projected {
+					evalRow[k] = v
+				}
+				for k, v := range group.source {
+					if _, exists := evalRow[k]; !exists {
+						evalRow[k] = v
+					}
+				}
+				rewritten := item.Expression
+				seenCalls := map[string]string{}
+				for idx, call := range calls {
+					normalized := normalizeAggregateExprCall(call)
+					alias, ok := seenCalls[normalized]
+					if !ok {
+						alias = fmt.Sprintf("__agg_expr_%d", idx)
+						seenCalls[normalized] = alias
+						if aggregateFuncNameFromCall(call) == "count" {
+							evalRow[alias] = group.aggExprCounts[normalized]
+						} else {
+							evalRow[alias] = nil
+						}
+					}
+					rewritten = strings.ReplaceAll(rewritten, call, alias)
+				}
+				value, err := evalExpressionWithScope(rewritten, evalRow, params)
+				if err != nil {
+					return nil, nil, err
+				}
+				projected[key] = value
 			}
 		}
 		out = append(out, projected)
@@ -4196,6 +4318,25 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
 		return evalExpressionWithScope(raw[1:len(raw)-1], row, params)
 	}
+	if left, labels, ok := splitTopLevelLabelPredicate(raw); ok {
+		return evalLabelPredicateExpression(left, labels, row, params)
+	}
+	if strings.HasPrefix(raw, "-(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[2:len(raw)-1]) {
+		value, err := evalExpressionWithScope(raw[2:len(raw)-1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		if integer, err := toInt(value); err == nil {
+			return -integer, nil
+		}
+		if numeric, ok := numericValue(value); ok {
+			return json.Number(formatFloatResult(-numeric)), nil
+		}
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+	}
 	if left, right, ok := splitTopLevelOperator(raw, ">="); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
 		if err != nil {
@@ -4262,60 +4403,13 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return compareExpressionValues(lhs, rhs, "<")
 	}
-	if left, right, ok := splitTopLevelOperator(raw, "+"); ok {
-		lhs, err := evalExpressionWithScope(left, row, params)
-		if err != nil {
-			return nil, err
-		}
-		rhs, err := evalExpressionWithScope(right, row, params)
-		if err != nil {
-			return nil, err
-		}
-		lf, lok := numericValue(lhs)
-		rf, rok := numericValue(rhs)
-		if lok && rok {
-			return lf + rf, nil
-		}
-		if list, ok := normalizeListValue(lhs); ok {
-			out := append([]any{}, list...)
-			if rhsList, ok := normalizeListValue(rhs); ok {
-				out = append(out, rhsList...)
-			} else {
-				out = append(out, rhs)
-			}
-			return out, nil
-		}
-		if rhsList, ok := normalizeListValue(rhs); ok {
-			out := make([]any, 0, len(rhsList)+1)
-			out = append(out, lhs)
-			out = append(out, rhsList...)
-			return out, nil
-		}
-		if value, ok := evalTemporalArithmetic(lhs, rhs, "+"); ok {
-			return value, nil
-		}
-		return fmt.Sprint(lhs) + fmt.Sprint(rhs), nil
+	if left, right, op, ok := splitTopLevelOperatorSetLast(raw, "+", "-"); ok {
+		return evalAdditiveExpression(op, left, right, raw, row, params)
 	}
-	if left, right, ok := splitTopLevelOperator(raw, "-"); ok {
-		lhs, err := evalExpressionWithScope(left, row, params)
-		if err != nil {
-			return nil, err
-		}
-		rhs, err := evalExpressionWithScope(right, row, params)
-		if err != nil {
-			return nil, err
-		}
-		lf, lok := numericValue(lhs)
-		rf, rok := numericValue(rhs)
-		if lok && rok {
-			return lf - rf, nil
-		}
-		if value, ok := evalTemporalArithmetic(lhs, rhs, "-"); ok {
-			return value, nil
-		}
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+	if left, right, op, ok := splitTopLevelOperatorSetLast(raw, "*", "/", "%"); ok {
+		return evalMultiplicativeExpression(op, left, right, raw, row, params)
 	}
-	if left, right, ok := splitTopLevelOperator(raw, "*"); ok {
+	if left, right, ok := splitTopLevelOperatorLast(raw, "^"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
 		if err != nil {
 			return nil, err
@@ -4324,57 +4418,13 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		lf, lok := numericValue(lhs)
-		rf, rok := numericValue(rhs)
-		if lok && rok {
-			return lf * rf, nil
-		}
-		if value, ok := evalTemporalArithmetic(lhs, rhs, "*"); ok {
-			return value, nil
-		}
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
-	}
-	if left, right, ok := splitTopLevelOperator(raw, "%"); ok {
-		lhs, err := evalExpressionWithScope(left, row, params)
-		if err != nil {
-			return nil, err
-		}
-		rhs, err := evalExpressionWithScope(right, row, params)
-		if err != nil {
-			return nil, err
+		if lhs == nil || rhs == nil {
+			return nil, nil
 		}
 		lf, lok := numericValue(lhs)
 		rf, rok := numericValue(rhs)
 		if lok && rok {
-			if rf == 0 {
-				return nil, graph.NewError(graph.ErrKindInvalidInput, "modulo by zero", nil)
-			}
-			return math.Mod(lf, rf), nil
-		}
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
-	}
-	if left, right, ok := splitTopLevelOperator(raw, "/"); ok {
-		lhs, err := evalExpressionWithScope(left, row, params)
-		if err != nil {
-			return nil, err
-		}
-		rhs, err := evalExpressionWithScope(right, row, params)
-		if err != nil {
-			return nil, err
-		}
-		lf, lok := numericValue(lhs)
-		rf, rok := numericValue(rhs)
-		if lok && rok {
-			if rf == 0 {
-				if isFloatLikeNumeric(lhs) || isFloatLikeNumeric(rhs) {
-					return lf / rf, nil
-				}
-				return nil, graph.NewError(graph.ErrKindInvalidInput, "division by zero", nil)
-			}
-			return lf / rf, nil
-		}
-		if value, ok := evalTemporalArithmetic(lhs, rhs, "/"); ok {
-			return value, nil
+			return json.Number(formatFloatResult(math.Pow(lf, rf))), nil
 		}
 		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
 	}
@@ -4643,6 +4693,10 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return evalVertexField(typed, field)
 		case *graph.Edge:
 			return evalEdgeField(typed, field)
+		case deletedVertexBinding:
+			return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
+		case deletedEdgeBinding:
+			return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
 		case map[string]any:
 			if value, ok := evalTemporalAccessor(typed, field); ok {
 				return value, nil
@@ -5331,6 +5385,8 @@ func evalLabelsFunction(arg string, binding map[string]any) (any, error) {
 	switch typed := base.(type) {
 	case *graph.Vertex:
 		return append([]string(nil), typed.Labels...), nil
+	case deletedVertexBinding:
+		return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
 	case map[string]any:
 		if labels, ok := typed["labels"]; ok {
 			switch l := labels.(type) {
@@ -5363,6 +5419,8 @@ func evalTypeFunction(arg string, binding map[string]any) (any, error) {
 	switch typed := base.(type) {
 	case *graph.Edge:
 		return typed.Type, nil
+	case deletedEdgeBinding:
+		return typed.Type, nil
 	case map[string]any:
 		if relType, ok := typed["type"]; ok {
 			return fmt.Sprint(relType), nil
@@ -5392,6 +5450,10 @@ func evalPropertiesFunction(arg string, row Row, params Params) (any, error) {
 		return clonePropertyMap(typed.Properties), nil
 	case *graph.Edge:
 		return clonePropertyMap(typed.Properties), nil
+	case deletedVertexBinding:
+		return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
+	case deletedEdgeBinding:
+		return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
 	case map[string]any:
 		out := make(map[string]any, len(typed))
 		for key, item := range typed {
@@ -5732,6 +5794,114 @@ func splitTopLevelComparison(raw string) (string, string, string, bool) {
 		}
 	}
 	return "", "", "", false
+}
+
+func splitTopLevelLabelPredicate(raw string) (string, []string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil, false
+	}
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case ':':
+			if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+				continue
+			}
+			left := strings.TrimSpace(raw[:i])
+			right := strings.TrimSpace(raw[i+1:])
+			if left == "" || right == "" {
+				return "", nil, false
+			}
+			labels := splitLabels(right)
+			if len(labels) == 0 {
+				return "", nil, false
+			}
+			return left, labels, true
+		}
+	}
+	return "", nil, false
+}
+
+func evalLabelPredicateExpression(left string, labels []string, row Row, params Params) (any, error) {
+	value, err := evalExpressionWithScope(left, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	switch typed := value.(type) {
+	case *graph.Vertex:
+		for _, label := range labels {
+			if !vertexHasLabel(typed, label) {
+				return false, nil
+			}
+		}
+		return true, nil
+	case map[string]any:
+		labelValue, ok := typed["labels"]
+		if !ok {
+			return false, nil
+		}
+		labelSet := map[string]struct{}{}
+		switch current := labelValue.(type) {
+		case []string:
+			for _, label := range current {
+				labelSet[label] = struct{}{}
+			}
+		case []any:
+			for _, rawLabel := range current {
+				labelSet[fmt.Sprint(rawLabel)] = struct{}{}
+			}
+		default:
+			return false, nil
+		}
+		for _, label := range labels {
+			if _, ok := labelSet[label]; !ok {
+				return false, nil
+			}
+		}
+		return true, nil
+	default:
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", left+":"+strings.Join(labels, ":")), nil)
+	}
 }
 
 func compareWhereValues(lhs, rhs any, op string) (bool, error) {
@@ -8083,6 +8253,159 @@ func splitTopLevelOperator(raw string, op string) (string, string, bool) {
 	return "", "", false
 }
 
+func splitTopLevelOperatorLast(raw string, op string) (string, string, bool) {
+	if op == "" {
+		return "", "", false
+	}
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	upper := strings.ToUpper(raw)
+	matchIdx := -1
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(upper[i:], "CASE") {
+			if endIdx, ok := findCaseExpressionEnd(raw, i); ok {
+				i = endIdx
+				continue
+			}
+		}
+		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(raw[i:], op) {
+			left := strings.TrimSpace(raw[:i])
+			right := strings.TrimSpace(raw[i+len(op):])
+			if left != "" && right != "" {
+				matchIdx = i
+			}
+		}
+	}
+	if matchIdx == -1 {
+		return "", "", false
+	}
+	left := strings.TrimSpace(raw[:matchIdx])
+	right := strings.TrimSpace(raw[matchIdx+len(op):])
+	if left == "" || right == "" {
+		return "", "", false
+	}
+	return left, right, true
+}
+
+func splitTopLevelOperatorSetLast(raw string, ops ...string) (string, string, string, bool) {
+	if len(ops) == 0 {
+		return "", "", "", false
+	}
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	upper := strings.ToUpper(raw)
+	matchIdx := -1
+	matchOp := ""
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(upper[i:], "CASE") {
+			if endIdx, ok := findCaseExpressionEnd(raw, i); ok {
+				i = endIdx
+				continue
+			}
+		}
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+			continue
+		}
+		for _, op := range ops {
+			if strings.HasPrefix(raw[i:], op) {
+				if (op == "+" || op == "-") && isUnarySignPosition(raw, i) {
+					continue
+				}
+				left := strings.TrimSpace(raw[:i])
+				right := strings.TrimSpace(raw[i+len(op):])
+				if left != "" && right != "" {
+					matchIdx = i
+					matchOp = op
+				}
+				break
+			}
+		}
+	}
+	if matchIdx == -1 {
+		return "", "", "", false
+	}
+	left := strings.TrimSpace(raw[:matchIdx])
+	right := strings.TrimSpace(raw[matchIdx+len(matchOp):])
+	if left == "" || right == "" {
+		return "", "", "", false
+	}
+	return left, right, matchOp, true
+}
+
 func findCaseExpressionEnd(raw string, start int) (int, bool) {
 	if start < 0 || start >= len(raw) {
 		return -1, false
@@ -8191,6 +8514,150 @@ func numericValue(v any) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func evalAdditiveExpression(op, left, right, raw string, row Row, params Params) (any, error) {
+	lhs, err := evalExpressionWithScope(left, row, params)
+	if err != nil {
+		return nil, err
+	}
+	rhs, err := evalExpressionWithScope(right, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if lhs == nil || rhs == nil {
+		return nil, nil
+	}
+	lf, lok := numericValue(lhs)
+	rf, rok := numericValue(rhs)
+	if lok && rok {
+		if isFloatLikeNumeric(lhs) || isFloatLikeNumeric(rhs) {
+			switch op {
+			case "+":
+				return json.Number(formatFloatResult(lf + rf)), nil
+			case "-":
+				return json.Number(formatFloatResult(lf - rf)), nil
+			}
+		}
+		if li, err := toInt(lhs); err == nil {
+			if ri, err := toInt(rhs); err == nil {
+				switch op {
+				case "+":
+					return li + ri, nil
+				case "-":
+					return li - ri, nil
+				}
+			}
+		}
+		switch op {
+		case "+":
+			return lf + rf, nil
+		case "-":
+			return lf - rf, nil
+		}
+	}
+	if op == "+" {
+		if list, ok := normalizeListValue(lhs); ok {
+			out := append([]any{}, list...)
+			if rhsList, ok := normalizeListValue(rhs); ok {
+				out = append(out, rhsList...)
+			} else {
+				out = append(out, rhs)
+			}
+			return out, nil
+		}
+		if rhsList, ok := normalizeListValue(rhs); ok {
+			out := make([]any, 0, len(rhsList)+1)
+			out = append(out, lhs)
+			out = append(out, rhsList...)
+			return out, nil
+		}
+	}
+	if value, ok := evalTemporalArithmetic(lhs, rhs, op); ok {
+		return value, nil
+	}
+	if op == "+" {
+		return fmt.Sprint(lhs) + fmt.Sprint(rhs), nil
+	}
+	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+}
+
+func evalMultiplicativeExpression(op, left, right, raw string, row Row, params Params) (any, error) {
+	lhs, err := evalExpressionWithScope(left, row, params)
+	if err != nil {
+		return nil, err
+	}
+	rhs, err := evalExpressionWithScope(right, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if lhs == nil || rhs == nil {
+		return nil, nil
+	}
+	lf, lok := numericValue(lhs)
+	rf, rok := numericValue(rhs)
+	if lok && rok {
+		if isFloatLikeNumeric(lhs) || isFloatLikeNumeric(rhs) {
+			if (op == "/" || op == "%") && rf == 0 {
+				if op == "/" {
+					return json.Number(formatFloatResult(lf / rf)), nil
+				}
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "modulo by zero", nil)
+			}
+			switch op {
+			case "*":
+				return json.Number(formatFloatResult(lf * rf)), nil
+			case "/":
+				return json.Number(formatFloatResult(lf / rf)), nil
+			case "%":
+				return json.Number(formatFloatResult(math.Mod(lf, rf))), nil
+			}
+		}
+		li, lerr := toInt(lhs)
+		ri, rerr := toInt(rhs)
+		if lerr == nil && rerr == nil {
+			switch op {
+			case "*":
+				return li * ri, nil
+			case "/":
+				if ri == 0 {
+					return nil, graph.NewError(graph.ErrKindInvalidInput, "division by zero", nil)
+				}
+				return li / ri, nil
+			case "%":
+				if ri == 0 {
+					return nil, graph.NewError(graph.ErrKindInvalidInput, "modulo by zero", nil)
+				}
+				return li % ri, nil
+			}
+		}
+		switch op {
+		case "*":
+			return lf * rf, nil
+		case "/":
+			if rf == 0 {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "division by zero", nil)
+			}
+			return json.Number(formatFloatResult(lf / rf)), nil
+		case "%":
+			if rf == 0 {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "modulo by zero", nil)
+			}
+			return json.Number(formatFloatResult(math.Mod(lf, rf))), nil
+		}
+	}
+	if value, ok := evalTemporalArithmetic(lhs, rhs, op); ok {
+		return value, nil
+	}
+	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+}
+
+func formatFloatResult(value float64) string {
+	formatted := strconv.FormatFloat(value, 'f', -1, 64)
+	if !strings.ContainsAny(formatted, ".eE") {
+		formatted += ".0"
+	}
+	return formatted
 }
 
 func parseStoredMapString(raw string) (map[string]any, bool) {

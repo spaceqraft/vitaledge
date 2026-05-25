@@ -356,3 +356,25 @@ func TestParseStatementRejectsPatternInSetValueExpression(t *testing.T) {
 		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
 	}
 }
+
+func TestParseStatementRejectsUnknownFunctionInReturnProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN foo(n)")
+	if err == nil {
+		t.Fatalf("expected unknown function parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementAllowsKnownFunctionInReturnProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN labels(n)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}

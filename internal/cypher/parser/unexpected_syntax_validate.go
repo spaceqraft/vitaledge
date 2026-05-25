@@ -1,10 +1,78 @@
 package parser
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 )
+
+var supportedExpressionFunctions = map[string]struct{}{
+	"all":                       {},
+	"any":                       {},
+	"avg":                       {},
+	"coalesce":                  {},
+	"collect":                   {},
+	"count":                     {},
+	"date":                      {},
+	"date.realtime":             {},
+	"date.statement":            {},
+	"date.transaction":          {},
+	"date.truncate":             {},
+	"datetime":                  {},
+	"datetime.fromepoch":        {},
+	"datetime.realtime":         {},
+	"datetime.statement":        {},
+	"datetime.transaction":      {},
+	"datetime.truncate":         {},
+	"duration":                  {},
+	"duration.between":          {},
+	"duration.indays":           {},
+	"duration.inmonths":         {},
+	"duration.inseconds":        {},
+	"labels":                    {},
+	"localdatetime":             {},
+	"localdatetime.realtime":    {},
+	"localdatetime.statement":   {},
+	"localdatetime.transaction": {},
+	"localdatetime.truncate":    {},
+	"localtime":                 {},
+	"localtime.realtime":        {},
+	"localtime.statement":       {},
+	"localtime.transaction":     {},
+	"localtime.truncate":        {},
+	"max":                       {},
+	"min":                       {},
+	"none":                      {},
+	"properties":                {},
+	"rand":                      {},
+	"range":                     {},
+	"reverse":                   {},
+	"single":                    {},
+	"size":                      {},
+	"split":                     {},
+	"substring":                 {},
+	"sum":                       {},
+	"time":                      {},
+	"time.realtime":             {},
+	"time.statement":            {},
+	"time.transaction":          {},
+	"time.truncate":             {},
+	"toboolean":                 {},
+	"tofloat":                   {},
+	"tointeger":                 {},
+	"tostring":                  {},
+	"type":                      {},
+}
+
+var expressionOperatorKeywords = map[string]struct{}{
+	"and": {},
+	"in":  {},
+	"is":  {},
+	"not": {},
+	"or":  {},
+	"xor": {},
+}
 
 func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 	switch typed := stmt.(type) {
@@ -12,6 +80,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 		for _, item := range typed.Return.Items {
 			if containsForbiddenPatternExpression(item.Expression.Raw) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
+			}
+			if name, ok := firstUnknownFunctionCall(item.Expression.Raw); ok {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 			}
 		}
 	case *ast.QueryStatement:
@@ -24,12 +95,18 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if containsForbiddenPatternExpression(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
 						}
+						if name, ok := firstUnknownFunctionCall(expr); ok {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
+						}
 					}
 				case ast.ClauseKindSet:
 					expressions := extractSetValueExpressions(clause.Raw)
 					for _, expr := range expressions {
 						if containsForbiddenPatternExpression(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
+						}
+						if name, ok := firstUnknownFunctionCall(expr); ok {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 						}
 					}
 				}
@@ -232,4 +309,84 @@ func containsForbiddenPatternExpression(expr string) bool {
 	}
 
 	return false
+}
+
+func firstUnknownFunctionCall(expr string) (string, bool) {
+	inSingle := false
+	inDouble := false
+
+	for i := 0; i < len(expr); i++ {
+		ch := expr[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || expr[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || expr[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		}
+
+		if !isFunctionIdentStart(ch) {
+			continue
+		}
+		if i > 0 && isFunctionIdentPart(expr[i-1]) {
+			continue
+		}
+
+		j := i + 1
+		for j < len(expr) && isFunctionIdentPart(expr[j]) {
+			j++
+		}
+		if j <= i+1 {
+			continue
+		}
+
+		name := expr[i:j]
+		if strings.HasSuffix(name, ".") || strings.Contains(name, "..") {
+			i = j - 1
+			continue
+		}
+
+		k := j
+		for k < len(expr) && (expr[k] == ' ' || expr[k] == '\t' || expr[k] == '\n' || expr[k] == '\r') {
+			k++
+		}
+		if k >= len(expr) || expr[k] != '(' {
+			i = j - 1
+			continue
+		}
+
+		if _, ok := supportedExpressionFunctions[strings.ToLower(name)]; !ok {
+			if _, keyword := expressionOperatorKeywords[strings.ToLower(name)]; keyword {
+				i = j - 1
+				continue
+			}
+			return name, true
+		}
+
+		i = j - 1
+	}
+
+	return "", false
+}
+
+func isFunctionIdentStart(ch byte) bool {
+	return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_'
+}
+
+func isFunctionIdentPart(ch byte) bool {
+	return isFunctionIdentStart(ch) || (ch >= '0' && ch <= '9') || ch == '.'
 }

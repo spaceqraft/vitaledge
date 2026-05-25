@@ -9,14 +9,16 @@ import (
 type patternVarRole string
 
 const (
-	patternRoleNode patternVarRole = "node"
-	patternRoleRel  patternVarRole = "relationship"
-	patternRolePath patternVarRole = "path"
+	patternRoleValue patternVarRole = "value"
+	patternRoleNode  patternVarRole = "node"
+	patternRoleRel   patternVarRole = "relationship"
+	patternRolePath  patternVarRole = "path"
 )
 
 type patternBinding struct {
-	name string
-	role patternVarRole
+	name        string
+	role        patternVarRole
+	constrained bool
 }
 
 func validatePatternVariableScoping(stmt ast.Statement, seg statementSegment) error {
@@ -25,7 +27,8 @@ func validatePatternVariableScoping(stmt ast.Statement, seg statementSegment) er
 	switch typed := stmt.(type) {
 	case *ast.MatchQueryStatement:
 		for _, match := range typed.MatchClauses {
-			if err := validatePatternBindings(match.Pattern, bound, seg); err != nil {
+			clauseIntroduced := map[string]struct{}{}
+			if err := validatePatternBindings(match.Pattern, bound, seg, ast.ClauseKindMatch, clauseIntroduced); err != nil {
 				return err
 			}
 			if match.Where != nil {
@@ -37,17 +40,36 @@ func validatePatternVariableScoping(stmt ast.Statement, seg statementSegment) er
 	case *ast.QueryStatement:
 		for _, part := range typed.Parts {
 			for _, clause := range part.Clauses {
-				if clause.Kind != ast.ClauseKindMatch && clause.Kind != ast.ClauseKindOptionalMatch {
+				switch clause.Kind {
+				case ast.ClauseKindWith:
+					recordWithBindings(clause.Raw, bound)
+					continue
+				case ast.ClauseKindUnwind:
+					recordUnwindBinding(clause.Raw, bound)
+					continue
+				case ast.ClauseKindMatch, ast.ClauseKindOptionalMatch, ast.ClauseKindCreate, ast.ClauseKindMerge:
+					// handled below
+				default:
 					continue
 				}
-				pattern, ok := extractMatchPattern(clause.Raw)
+
+				patternRaw, ok := extractClausePattern(clause.Raw, clause.Kind)
 				if !ok {
 					continue
 				}
-				if err := validatePatternBindings(pattern, bound, seg); err != nil {
-					return err
+
+				clauseIntroduced := map[string]struct{}{}
+				for _, pattern := range splitTopLevelComma(patternRaw) {
+					if err := validatePatternBindings(pattern, bound, seg, clause.Kind, clauseIntroduced); err != nil {
+						return err
+					}
 				}
-				if where, ok := extractMatchWhere(clause.Raw); ok {
+
+				if (clause.Kind == ast.ClauseKindMatch || clause.Kind == ast.ClauseKindOptionalMatch) && clause.Kind != ast.ClauseKindCreate {
+					where, hasWhere := extractMatchWhere(clause.Raw)
+					if !hasWhere {
+						continue
+					}
 					if err := validateWherePatternBindings(where, bound, seg); err != nil {
 						return err
 					}
@@ -59,24 +81,230 @@ func validatePatternVariableScoping(stmt ast.Statement, seg statementSegment) er
 	return nil
 }
 
-func validatePatternBindings(pattern string, bound map[string]patternVarRole, seg statementSegment) error {
+func validatePatternBindings(pattern string, bound map[string]patternVarRole, seg statementSegment, clauseKind ast.ClauseKind, clauseIntroduced map[string]struct{}) error {
 	bindings := scanPatternBindings(pattern)
+	patternHasRelationship := strings.Contains(pattern, "-[") || strings.Contains(pattern, "--")
 	for _, b := range bindings {
 		if b.name == "" {
 			continue
 		}
 		if prev, ok := bound[b.name]; ok {
 			if prev == b.role {
+				_, seenInClause := clauseIntroduced[b.name]
+				if shouldRejectSameRoleRebinding(clauseKind, b, seenInClause, patternHasRelationship) {
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "variable already bound", Statement: seg.index}
+				}
 				continue
 			}
 			if prev == patternRolePath || b.role == patternRolePath {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "variable already bound", Statement: seg.index}
 			}
+			if prev == patternRoleValue || b.role == patternRoleValue {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "variable type conflict", Statement: seg.index}
+			}
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "variable type conflict", Statement: seg.index}
 		}
 		bound[b.name] = b.role
+		if clauseIntroduced != nil {
+			clauseIntroduced[b.name] = struct{}{}
+		}
 	}
 	return nil
+}
+
+func shouldRejectSameRoleRebinding(clauseKind ast.ClauseKind, b patternBinding, seenInClause bool, patternHasRelationship bool) bool {
+	switch clauseKind {
+	case ast.ClauseKindCreate:
+		if b.role == patternRoleNode {
+			if b.constrained {
+				return true
+			}
+			if !patternHasRelationship {
+				return true
+			}
+			return false
+		}
+		return true
+	case ast.ClauseKindMerge:
+		if b.role == patternRoleRel || b.role == patternRolePath {
+			return true
+		}
+		return b.role == patternRoleNode && b.constrained
+	default:
+		_ = seenInClause
+		_ = patternHasRelationship
+		return false
+	}
+}
+
+func extractClausePattern(raw string, kind ast.ClauseKind) (string, bool) {
+	text := strings.TrimSpace(raw)
+	upper := strings.ToUpper(text)
+
+	switch kind {
+	case ast.ClauseKindMatch, ast.ClauseKindOptionalMatch:
+		return extractMatchPattern(raw)
+	case ast.ClauseKindCreate:
+		if strings.HasPrefix(upper, "CREATE") {
+			text = strings.TrimSpace(text[len("CREATE"):])
+			return text, text != ""
+		}
+	case ast.ClauseKindMerge:
+		if strings.HasPrefix(upper, "MERGE") {
+			text = strings.TrimSpace(text[len("MERGE"):])
+			if idx := indexTopLevelKeyword(text, "ONCREATE"); idx >= 0 {
+				text = strings.TrimSpace(text[:idx])
+			}
+			if idx := indexTopLevelKeyword(text, "ONMATCH"); idx >= 0 {
+				text = strings.TrimSpace(text[:idx])
+			}
+			return text, text != ""
+		}
+	}
+
+	return "", false
+}
+
+func splitTopLevelComma(raw string) []string {
+	parts := []string{}
+	start := 0
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inString := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case ',':
+			if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+				part := strings.TrimSpace(raw[start:i])
+				if part != "" {
+					parts = append(parts, part)
+				}
+				start = i + 1
+			}
+		}
+	}
+
+	last := strings.TrimSpace(raw[start:])
+	if last != "" {
+		parts = append(parts, last)
+	}
+
+	return parts
+}
+
+func recordWithBindings(raw string, bound map[string]patternVarRole) {
+	text := strings.TrimSpace(raw)
+	upper := strings.ToUpper(text)
+	if !strings.HasPrefix(upper, "WITH") {
+		return
+	}
+	text = strings.TrimSpace(text[len("WITH"):])
+
+	if idx := indexTopLevelKeyword(text, "WHERE"); idx >= 0 {
+		text = strings.TrimSpace(text[:idx])
+	}
+	if idx := indexTopLevelKeyword(text, "ORDERBY"); idx >= 0 {
+		text = strings.TrimSpace(text[:idx])
+	}
+	if idx := indexTopLevelKeyword(text, "SKIP"); idx >= 0 {
+		text = strings.TrimSpace(text[:idx])
+	}
+	if idx := indexTopLevelKeyword(text, "LIMIT"); idx >= 0 {
+		text = strings.TrimSpace(text[:idx])
+	}
+
+	for _, item := range splitTopLevelComma(text) {
+		alias, expr, ok := parseProjectionAlias(item)
+		if !ok || alias == "" {
+			continue
+		}
+		bound[alias] = roleForProjectionExpr(expr, bound)
+	}
+}
+
+func recordUnwindBinding(raw string, bound map[string]patternVarRole) {
+	text := strings.TrimSpace(raw)
+	upper := strings.ToUpper(text)
+	if !strings.HasPrefix(upper, "UNWIND") {
+		return
+	}
+	text = strings.TrimSpace(text[len("UNWIND"):])
+	idx := indexTopLevelKeyword(text, "AS")
+	if idx < 0 {
+		return
+	}
+	aliasRaw := strings.TrimSpace(text[idx+len("AS"):])
+	alias, _, ok := readIdentifier(aliasRaw, 0)
+	if !ok || alias == "" {
+		return
+	}
+	bound[alias] = patternRoleValue
+}
+
+func parseProjectionAlias(item string) (alias string, expr string, ok bool) {
+	idx := indexTopLevelKeyword(item, "AS")
+	if idx >= 0 {
+		expr = strings.TrimSpace(item[:idx])
+		aliasRaw := strings.TrimSpace(item[idx+len("AS"):])
+		if aliasRaw == "" {
+			return "", "", false
+		}
+		name, _, nameOK := readIdentifier(aliasRaw, 0)
+		if !nameOK || name == "" {
+			return "", "", false
+		}
+		return name, expr, true
+	}
+
+	name, _, nameOK := readIdentifier(strings.TrimSpace(item), 0)
+	if !nameOK || name == "" {
+		return "", "", false
+	}
+	return name, name, true
+}
+
+func roleForProjectionExpr(expr string, bound map[string]patternVarRole) patternVarRole {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return patternRoleValue
+	}
+	name, next, ok := readIdentifier(expr, 0)
+	if ok {
+		next = skipSpaces(expr, next)
+		if next == len(expr) {
+			if prev, exists := bound[name]; exists {
+				return prev
+			}
+		}
+	}
+	return patternRoleValue
 }
 
 func extractMatchPattern(raw string) (string, bool) {
@@ -198,7 +426,7 @@ func scanPatternBindings(pattern string) []patternBinding {
 
 		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
 			if name, next, ok := scanTopLevelAssignment(pattern, i); ok {
-				bindings = append(bindings, patternBinding{name: name, role: patternRolePath})
+				bindings = append(bindings, patternBinding{name: name, role: patternRolePath, constrained: true})
 				i = next - 1
 				continue
 			}
@@ -207,8 +435,8 @@ func scanPatternBindings(pattern string) []patternBinding {
 		switch ch {
 		case '(':
 			depthParen++
-			if name, next, ok := scanNodeBinding(pattern, i+1); ok {
-				bindings = append(bindings, patternBinding{name: name, role: patternRoleNode})
+			if name, constrained, next, ok := scanNodeBinding(pattern, i+1); ok {
+				bindings = append(bindings, patternBinding{name: name, role: patternRoleNode, constrained: constrained})
 				i = next - 1
 			}
 		case ')':
@@ -217,8 +445,8 @@ func scanPatternBindings(pattern string) []patternBinding {
 			}
 		case '[':
 			depthBracket++
-			if name, next, ok := scanRelBinding(pattern, i+1); ok {
-				bindings = append(bindings, patternBinding{name: name, role: patternRoleRel})
+			if name, constrained, next, ok := scanRelBinding(pattern, i+1); ok {
+				bindings = append(bindings, patternBinding{name: name, role: patternRoleRel, constrained: constrained})
 				i = next - 1
 			}
 		case ']':
@@ -253,48 +481,50 @@ func scanTopLevelAssignment(raw string, start int) (string, int, bool) {
 	return name, idx + 1, true
 }
 
-func scanNodeBinding(raw string, start int) (string, int, bool) {
+func scanNodeBinding(raw string, start int) (string, bool, int, bool) {
 	idx := skipSpaces(raw, start)
 	if idx >= len(raw) {
-		return "", start, false
+		return "", false, start, false
 	}
 	if raw[idx] == ')' || raw[idx] == ':' || raw[idx] == '{' {
-		return "", start, false
+		return "", false, start, false
 	}
 	name, next, ok := readIdentifier(raw, idx)
 	if !ok {
-		return "", start, false
+		return "", false, start, false
 	}
 	next = skipSpaces(raw, next)
 	if next >= len(raw) {
-		return "", start, false
+		return "", false, start, false
 	}
 	if raw[next] != ')' && raw[next] != ':' && raw[next] != '{' {
-		return "", start, false
+		return "", false, start, false
 	}
-	return name, next, true
+	constrained := raw[next] == ':' || raw[next] == '{'
+	return name, constrained, next, true
 }
 
-func scanRelBinding(raw string, start int) (string, int, bool) {
+func scanRelBinding(raw string, start int) (string, bool, int, bool) {
 	idx := skipSpaces(raw, start)
 	if idx >= len(raw) {
-		return "", start, false
+		return "", false, start, false
 	}
 	if raw[idx] == ']' || raw[idx] == ':' || raw[idx] == '*' || raw[idx] == '{' {
-		return "", start, false
+		return "", false, start, false
 	}
 	name, next, ok := readIdentifier(raw, idx)
 	if !ok {
-		return "", start, false
+		return "", false, start, false
 	}
 	next = skipSpaces(raw, next)
 	if next >= len(raw) {
-		return "", start, false
+		return "", false, start, false
 	}
 	if raw[next] != ']' && raw[next] != ':' && raw[next] != '*' && raw[next] != '{' {
-		return "", start, false
+		return "", false, start, false
 	}
-	return name, next, true
+	constrained := raw[next] == ':' || raw[next] == '*' || raw[next] == '{'
+	return name, constrained, next, true
 }
 
 func readIdentifier(raw string, start int) (string, int, bool) {

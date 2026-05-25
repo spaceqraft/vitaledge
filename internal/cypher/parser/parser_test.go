@@ -186,3 +186,77 @@ func TestParseStatementStandaloneCallSupported(t *testing.T) {
 		t.Fatalf("expected STANDALONE_CALL clause kind, got %s", call.Call.Kind)
 	}
 }
+
+func TestParseStatementVariableTypeConflictWithMatchNode(t *testing.T) {
+	_, err := ParseStatement("WITH 1 AS n MATCH (n) RETURN n")
+	if err == nil {
+		t.Fatalf("expected variable type conflict parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementCreateAlreadyBoundNode(t *testing.T) {
+	_, err := ParseStatement("MATCH (a) CREATE (a) RETURN a")
+	if err == nil {
+		t.Fatalf("expected variable already bound parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementCreateAlreadyBoundNodeWithLabels(t *testing.T) {
+	_, err := ParseStatement("CREATE (n:Foo)-[:T1]->(), (n:Bar)-[:T2]->()")
+	if err == nil {
+		t.Fatalf("expected variable already bound parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementMergeAllowsBoundEndpointWithoutNewPredicates(t *testing.T) {
+	_, err := ParseStatement("MATCH (a), (b) MERGE (a)-[:KNOWS]->(b) RETURN a")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementMergeRejectsNewPredicateOnBoundNode(t *testing.T) {
+	_, err := ParseStatement("CREATE (a:Foo) MERGE (a)-[r:KNOWS]->(a:Bar)")
+	if err == nil {
+		t.Fatalf("expected variable already bound parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementCreateAllowsBoundEndpointsInRelationshipPattern(t *testing.T) {
+	_, err := ParseStatement("CREATE (a), (b) CREATE (a)-[:KNOWS]->(b)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}

@@ -2576,6 +2576,49 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty expression", nil)
 	}
+	if left, right, ok := splitTopLevelKeyword(raw, "OR"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalBooleanBinary("OR", lhs, rhs)
+	}
+	if left, right, ok := splitTopLevelKeyword(raw, "XOR"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalBooleanBinary("XOR", lhs, rhs)
+	}
+	if left, right, ok := splitTopLevelKeyword(raw, "AND"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalBooleanBinary("AND", lhs, rhs)
+	}
+	if hasLogicalNotPrefix(raw) {
+		value, err := evalExpressionWithScope(strings.TrimSpace(raw[3:]), row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalBooleanNot(value)
+	}
+	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
+		return evalExpressionWithScope(raw[1:len(raw)-1], row, params)
+	}
 	if left, right, ok := splitTopLevelOperator(raw, ">="); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
 		if err != nil {
@@ -2903,8 +2946,19 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 		return e.evalWhereExpression(ctx, tx, right, row, params)
 	}
 
-	upper := strings.ToUpper(raw)
-	if strings.HasPrefix(upper, "NOT") {
+	if left, right, ok := splitTopLevelKeyword(raw, "XOR"); ok {
+		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
+		if err != nil {
+			return false, err
+		}
+		rhs, err := e.evalWhereExpression(ctx, tx, right, row, params)
+		if err != nil {
+			return false, err
+		}
+		return lhs != rhs, nil
+	}
+
+	if hasLogicalNotPrefix(raw) {
 		value, err := e.evalWhereExpression(ctx, tx, strings.TrimSpace(raw[3:]), row, params)
 		if err != nil {
 			return false, err
@@ -3005,10 +3059,30 @@ func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {
 			continue
 		}
 		if depth == 0 && strings.HasPrefix(upper[i:], keyword) {
+			if keyword == "OR" && i > 0 && strings.EqualFold(raw[i-1:i+len(keyword)], "XOR") {
+				continue
+			}
+			beforeIsWord := i > 0 && isAlphaOrUnderscore(raw[i-1])
+			afterIdx := i + len(keyword)
+			afterIsWord := afterIdx < len(raw) && isAlphaOrUnderscore(raw[afterIdx])
+			if beforeIsWord && afterIsWord {
+				continue
+			}
 			return raw[:i], raw[i+len(keyword):], true
 		}
 	}
 	return raw, "", false
+}
+
+func hasLogicalNotPrefix(raw string) bool {
+	return len(raw) >= 3 && strings.EqualFold(raw[:3], "NOT")
+}
+
+func isAlphaOrUnderscore(ch byte) bool {
+	if ch == '_' {
+		return true
+	}
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
 }
 
 func splitTopLevelComparison(raw string) (string, string, string, bool) {
@@ -3215,6 +3289,65 @@ func truthyWhereValue(value any) bool {
 	default:
 		return true
 	}
+}
+
+func evalBooleanNot(value any) (any, error) {
+	b, isNull, err := asNullableBoolean(value)
+	if err != nil {
+		return nil, err
+	}
+	if isNull {
+		return nil, nil
+	}
+	return !b, nil
+}
+
+func evalBooleanBinary(op string, lhs, rhs any) (any, error) {
+	l, lNull, err := asNullableBoolean(lhs)
+	if err != nil {
+		return nil, err
+	}
+	r, rNull, err := asNullableBoolean(rhs)
+	if err != nil {
+		return nil, err
+	}
+
+	switch strings.ToUpper(strings.TrimSpace(op)) {
+	case "AND":
+		if (!lNull && !l) || (!rNull && !r) {
+			return false, nil
+		}
+		if lNull || rNull {
+			return nil, nil
+		}
+		return true, nil
+	case "OR":
+		if (!lNull && l) || (!rNull && r) {
+			return true, nil
+		}
+		if lNull || rNull {
+			return nil, nil
+		}
+		return false, nil
+	case "XOR":
+		if lNull || rNull {
+			return nil, nil
+		}
+		return l != r, nil
+	default:
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("boolean operator %q is not supported", op), nil)
+	}
+}
+
+func asNullableBoolean(value any) (bool, bool, error) {
+	if value == nil {
+		return false, true, nil
+	}
+	b, ok := value.(bool)
+	if !ok {
+		return false, false, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	return b, false, nil
 }
 
 func parensAreBalanced(raw string) bool {

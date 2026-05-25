@@ -641,6 +641,26 @@ func evalExpression(raw string, binding map[string]any) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "type"); ok {
 		return evalTypeFunction(arg, binding)
 	}
+	if arg, ok := parseFunctionCall(raw, "coalesce"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) == 0 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "coalesce() expects at least one argument", nil)
+		}
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			value, err := evalExpression(part, binding)
+			if err != nil {
+				return nil, err
+			}
+			if value != nil {
+				return value, nil
+			}
+		}
+		return nil, nil
+	}
 	if v, ok := binding[raw]; ok {
 		switch typed := v.(type) {
 		case *graph.Vertex:

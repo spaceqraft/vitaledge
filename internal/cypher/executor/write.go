@@ -3898,6 +3898,21 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if lok && rok {
 			return lf + rf, nil
 		}
+		if list, ok := normalizeListValue(lhs); ok {
+			out := append([]any{}, list...)
+			if rhsList, ok := normalizeListValue(rhs); ok {
+				out = append(out, rhsList...)
+			} else {
+				out = append(out, rhs)
+			}
+			return out, nil
+		}
+		if rhsList, ok := normalizeListValue(rhs); ok {
+			out := make([]any, 0, len(rhsList)+1)
+			out = append(out, lhs)
+			out = append(out, rhsList...)
+			return out, nil
+		}
 		if value, ok := evalTemporalArithmetic(lhs, rhs, "+"); ok {
 			return value, nil
 		}
@@ -4090,6 +4105,50 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return rendered, nil
 		}
 		return fmt.Sprint(normalized), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "coalesce"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) == 0 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "coalesce() expects at least one argument", nil)
+		}
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			value, err := evalExpressionWithScope(part, row, params)
+			if err != nil {
+				return nil, err
+			}
+			if value != nil {
+				return value, nil
+			}
+		}
+		return nil, nil
+	}
+	if arg, ok := parseFunctionCall(raw, "reverse"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		if list, ok := normalizeListValue(value); ok {
+			out := make([]any, len(list))
+			for i := range list {
+				out[i] = list[len(list)-1-i]
+			}
+			return out, nil
+		}
+		if str, ok := value.(string); ok {
+			runes := []rune(str)
+			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+				runes[i], runes[j] = runes[j], runes[i]
+			}
+			return string(runes), nil
+		}
+		return nil, graph.NewError(graph.ErrKindSemantic, "reverse() requires a list or string", nil)
 	}
 	if arg, ok := parseFunctionCall(raw, "date.truncate"); ok {
 		return evalTemporalTruncateFunction("date", arg, row, params)

@@ -1662,6 +1662,52 @@ func TestExecuteRandExpressionAndQuantifierSetup(t *testing.T) {
 			t.Fatalf("unexpected quantifier result: %#v", row["result"])
 		}
 	}
+
+	caseStmt, err := parser.ParseStatement("WITH [1, 2, 3] AS list, 9 AS x RETURN CASE WHEN rand() < 2 THEN reverse(list) ELSE list END + x AS out")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err = exec.ExecuteStatement(ctx, caseStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	out, ok := res.Rows[0]["out"].([]any)
+	if !ok {
+		t.Fatalf("unexpected CASE+reverse output type: %#v", res.Rows[0]["out"])
+	}
+	if len(out) != 4 || out[3] != 9 {
+		t.Fatalf("unexpected CASE+reverse output: %#v", out)
+	}
+
+	coalesceStmt, err := parser.ParseStatement("WITH null AS fixedList, [1, 2, 3] AS list RETURN coalesce(fixedList,list) AS chosen")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err = exec.ExecuteStatement(ctx, coalesceStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	chosen, ok := res.Rows[0]["chosen"].([]any)
+	if !ok {
+		t.Fatalf("unexpected coalesce output type: %#v", res.Rows[0]["chosen"])
+	}
+	if len(chosen) != 3 || chosen[0] != 1 || chosen[1] != 2 || chosen[2] != 3 {
+		t.Fatalf("unexpected coalesce output: %#v", chosen)
+	}
+
+	legacyValue, err := evalExpression("coalesce(a.title, a.name)", map[string]any{"a": map[string]any{"name": "u1"}})
+	if err != nil {
+		t.Fatalf("legacy evalExpression coalesce failed: %v", err)
+	}
+	if legacyValue != "u1" {
+		t.Fatalf("unexpected legacy coalesce fallback: %#v", legacyValue)
+	}
 }
 
 func errUnexpected(message string) error {

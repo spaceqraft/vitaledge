@@ -99,7 +99,7 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 			case ast.ClauseKindUnwind:
 				rows, stepErr = e.applyUnwindClause(rows, clause, params)
 			case ast.ClauseKindWith:
-				rows, resultColumns, stepErr = e.applyProjectionClause(rows, clause, params, false)
+				rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, false)
 			case ast.ClauseKindCreate:
 				rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, false)
 			case ast.ClauseKindMerge:
@@ -111,7 +111,7 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 			case ast.ClauseKindDelete:
 				rows, stepErr = e.applyDeleteClause(ctx, tx, rows, clause, params)
 			case ast.ClauseKindReturn:
-				rows, resultColumns, stepErr = e.applyProjectionClause(rows, clause, params, true)
+				rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, true)
 				returnSeen = true
 				if stepErr != nil {
 					return stepErr
@@ -174,39 +174,263 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	if err != nil {
 		return nil, err
 	}
-	if multi, ok := parseMultiNodeMatchPattern(spec.Pattern); ok {
+	patternRaw := spec.Pattern
+	pathVar := ""
+	if boundVar, innerPattern, ok := parseBoundPathPattern(spec.Pattern); ok {
+		pathVar = boundVar
+		patternRaw = innerPattern
+	}
+	if multi, ok := parseMultiNodeMatchPattern(patternRaw); ok {
 		return e.expandMultiNodeMatch(ctx, tx, rows, spec, multi, params)
 	}
-	if node, err := parseNodePattern(spec.Pattern); err == nil {
+	if node, err := parseNodePattern(patternRaw); err == nil {
 		return e.expandNodeMatch(ctx, tx, rows, spec, node, params)
 	}
-	if anchored, err := parseAnchoredOutPattern(spec.Pattern); err == nil {
+	if anchored, err := parseAnchoredOutPattern(patternRaw); err == nil {
 		if shouldUseAnchoredOutPath(rows, anchored) {
 			return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
 		}
 	}
-	if directed, err := parseDirectedAdjacentPattern(spec.Pattern); err == nil {
+	if directed, err := parseDirectedAdjacentPattern(patternRaw); err == nil {
 		return e.expandDirectedAdjacentMatch(ctx, tx, rows, spec, directed, params)
 	}
-	if reverseDirected, err := parseReverseDirectedAdjacentPattern(spec.Pattern); err == nil {
+	if reverseDirected, err := parseReverseDirectedAdjacentPattern(patternRaw); err == nil {
 		return e.expandReverseDirectedAdjacentMatch(ctx, tx, rows, spec, reverseDirected, params)
 	}
-	if undirected, err := parseUndirectedAdjacentPattern(spec.Pattern); err == nil {
+	if undirected, err := parseUndirectedAdjacentPattern(patternRaw); err == nil {
 		return e.expandUndirectedAdjacentMatch(ctx, tx, rows, spec, undirected, params)
 	}
-	if rel, err := parseDirectedRelationshipPattern(spec.Pattern); err == nil {
-		return e.expandDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+	if rel, err := parseDirectedRelationshipPattern(patternRaw); err == nil {
+		matched, matchErr := e.expandDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+		if matchErr != nil {
+			return nil, matchErr
+		}
+		if pathVar != "" {
+			attachBoundPathValues(matched, pathVar, rel.Left.Var, rel.EdgeVar, rel.Right.Var, "forward")
+		}
+		return matched, nil
 	}
-	if rel, err := parseReverseDirectedRelationshipPattern(spec.Pattern); err == nil {
-		return e.expandReverseDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+	if rel, err := parseReverseDirectedRelationshipPattern(patternRaw); err == nil {
+		matched, matchErr := e.expandReverseDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+		if matchErr != nil {
+			return nil, matchErr
+		}
+		if pathVar != "" {
+			attachBoundPathValues(matched, pathVar, rel.Left.Var, rel.EdgeVar, rel.Right.Var, "reverse")
+		}
+		return matched, nil
 	}
-	if rel, err := parseUndirectedRelationshipPattern(spec.Pattern); err == nil {
-		return e.expandUndirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+	if rel, err := parseUndirectedRelationshipPattern(patternRaw); err == nil {
+		matched, matchErr := e.expandUndirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+		if matchErr != nil {
+			return nil, matchErr
+		}
+		if pathVar != "" {
+			attachBoundPathValues(matched, pathVar, rel.Left.Var, rel.EdgeVar, rel.Right.Var, "undirected")
+		}
+		return matched, nil
 	}
-	if chain, err := parseTwoHopDirectedChainPattern(spec.Pattern); err == nil {
+	if chain, err := parseTwoHopDirectedChainPattern(patternRaw); err == nil {
 		return e.expandTwoHopDirectedChainMatch(ctx, tx, rows, spec, chain, params)
 	}
 	return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
+}
+
+func parseBoundPathPattern(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && (i == 0 || raw[i-1] != '\\') && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			depthParen--
+		case '[':
+			depthBracket++
+		case ']':
+			depthBracket--
+		case '{':
+			depthBrace++
+		case '}':
+			depthBrace--
+		case '=':
+			if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+				left := strings.TrimSpace(raw[:i])
+				right := strings.TrimSpace(raw[i+1:])
+				if !identifierRE.MatchString(left) || !strings.HasPrefix(right, "(") {
+					return "", "", false
+				}
+				return left, right, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func attachBoundPathValues(rows []Row, pathVar, leftVar, edgeVar, rightVar, direction string) {
+	if pathVar == "" {
+		return
+	}
+	for _, row := range rows {
+		left := vertexFromRowBinding(row, leftVar)
+		edge := edgeFromRowBinding(row, edgeVar)
+		right := vertexFromRowBinding(row, rightVar)
+		row[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: right, Direction: direction}
+	}
+}
+
+type cypherPathValue struct {
+	Left      *graph.Vertex
+	Edge      *graph.Edge
+	Right     *graph.Vertex
+	Direction string
+}
+
+func (p cypherPathValue) String() string {
+	left := renderPathNode(p.Left)
+	right := renderPathNode(p.Right)
+	edge := renderPathEdge(p.Edge)
+	switch p.Direction {
+	case "reverse":
+		return "<" + left + "<-" + edge + "-" + right + ">"
+	case "undirected":
+		return "<" + left + "-" + edge + "-" + right + ">"
+	default:
+		return "<" + left + "-" + edge + "->" + right + ">"
+	}
+}
+
+func renderPathNode(v *graph.Vertex) string {
+	if v == nil {
+		return "()"
+	}
+	labels := append([]string(nil), v.Labels...)
+	sort.Strings(labels)
+	b := strings.Builder{}
+	b.WriteString("(")
+	for _, label := range labels {
+		b.WriteString(":" + label)
+	}
+	if len(v.Properties) > 0 {
+		parts := make([]string, 0, len(v.Properties))
+		for key, raw := range v.Properties {
+			parts = append(parts, key+": "+renderPathLiteral(decodeStoredPropertyValue(raw)))
+		}
+		sort.Strings(parts)
+		if len(labels) > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString("{" + strings.Join(parts, ", ") + "}")
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func renderPathEdge(e *graph.Edge) string {
+	if e == nil {
+		return "[]"
+	}
+	b := strings.Builder{}
+	b.WriteString("[")
+	if strings.TrimSpace(e.Type) != "" {
+		b.WriteString(":" + e.Type)
+	}
+	if len(e.Properties) > 0 {
+		parts := make([]string, 0, len(e.Properties))
+		for key, raw := range e.Properties {
+			parts = append(parts, key+": "+renderPathLiteral(decodeStoredPropertyValue(raw)))
+		}
+		sort.Strings(parts)
+		if strings.TrimSpace(e.Type) != "" {
+			b.WriteString(" ")
+		}
+		b.WriteString("{" + strings.Join(parts, ", ") + "}")
+	}
+	b.WriteString("]")
+	return b.String()
+}
+
+func renderPathLiteral(v any) string {
+	switch typed := normalizeResultValue(v).(type) {
+	case nil:
+		return "null"
+	case string:
+		return "'" + strings.ReplaceAll(typed, "'", "\\'") + "'"
+	case bool:
+		if typed {
+			return "true"
+		}
+		return "false"
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			parts = append(parts, renderPathLiteral(item))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for k := range typed {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, k+": "+renderPathLiteral(typed[k]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func vertexFromRowBinding(row Row, key string) *graph.Vertex {
+	if strings.TrimSpace(key) == "" || row == nil {
+		return nil
+	}
+	if value, ok := row[key]; ok {
+		if vertex, ok := value.(*graph.Vertex); ok {
+			return vertex
+		}
+	}
+	return nil
+}
+
+func edgeFromRowBinding(row Row, key string) *graph.Edge {
+	if row == nil {
+		return nil
+	}
+	if strings.TrimSpace(key) != "" {
+		if value, ok := row[key]; ok {
+			if edge, ok := value.(*graph.Edge); ok {
+				return edge
+			}
+		}
+	}
+	if value, ok := row["edge"]; ok {
+		if edge, ok := value.(*graph.Edge); ok {
+			return edge
+		}
+	}
+	return nil
 }
 
 func parseMultiNodeMatchPattern(raw string) ([]nodePattern, bool) {
@@ -1446,12 +1670,6 @@ func (e *Executor) applyCreateClause(ctx context.Context, tx graph.Tx, rows []Ro
 }
 
 func (e *Executor) applyCreatePattern(ctx context.Context, tx graph.Tx, rows []Row, raw string, params Params, tenant string, merge bool) ([]Row, error) {
-	if m := createVertexPatternRE.FindStringSubmatch(raw); len(m) == 4 {
-		return e.applyCreateVertex(ctx, tx, rows, m, params, tenant, merge)
-	}
-	if spec, ok := parseCreateVertexPatternSpec(raw); ok {
-		return e.applyCreateVertexSpec(ctx, tx, rows, spec, params, tenant, merge)
-	}
 	if isMissingRelationshipTypePattern(raw) {
 		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
 	}
@@ -1466,6 +1684,12 @@ func (e *Executor) applyCreatePattern(ctx context.Context, tx graph.Tx, rows []R
 	}
 	if chain, ok := parseCreateChainPattern(raw); ok {
 		return e.applyCreateChainPattern(ctx, tx, rows, chain, params, tenant, merge)
+	}
+	if m := createVertexPatternRE.FindStringSubmatch(raw); len(m) == 4 {
+		return e.applyCreateVertex(ctx, tx, rows, m, params, tenant, merge)
+	}
+	if spec, ok := parseCreateVertexPatternSpec(raw); ok {
+		return e.applyCreateVertexSpec(ctx, tx, rows, spec, params, tenant, merge)
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("CREATE/MERGE pattern %q is not yet supported", raw), nil)
 }
@@ -1981,7 +2205,7 @@ func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Param
 	return out, nil
 }
 
-func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params Params, final bool) ([]Row, []string, error) {
+func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, final bool) ([]Row, []string, error) {
 	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
 	projection, err := parseProjectionClauseSpec(raw)
 	if err != nil {
@@ -1995,7 +2219,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		return nil, nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("%s clause requires at least one projection item", clause.Kind), nil)
 	}
 
-	if err := validateProjectionOrderBy(items, projection.OrderBy, rows); err != nil {
+	if err := validateProjectionOrderBy(items, projection.OrderBy, rows, projection.Distinct); err != nil {
 		return nil, nil, err
 	}
 	projection.OrderBy = rewriteOrderByAggregateReferences(projection.OrderBy, items)
@@ -2022,6 +2246,11 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 	if !hasAggregate {
 		for _, row := range rows {
 			projected := Row{}
+			if len(projection.OrderBy) > 0 && !hasStar {
+				for key, value := range row {
+					projected[key] = value
+				}
+			}
 			for _, item := range items {
 				if item.Expression == "*" {
 					for key, value := range row {
@@ -2029,7 +2258,13 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 					}
 					continue
 				}
-				value, err := evalExpressionWithScope(item.Expression, row, params)
+				value, ok, err := evalProjectionPatternComprehension(ctx, tx, item.Expression, row, params)
+				if err != nil {
+					return nil, nil, err
+				}
+				if !ok {
+					value, err = evalExpressionWithScope(item.Expression, row, params)
+				}
 				if err != nil {
 					return nil, nil, err
 				}
@@ -2048,6 +2283,9 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		if err != nil {
 			return nil, nil, err
 		}
+		if len(projection.OrderBy) > 0 && !hasStar {
+			out = trimProjectionRows(out, columns)
+		}
 		return out, columns, nil
 	}
 
@@ -2061,10 +2299,13 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 	}
 
 	type projectionGroup struct {
-		projected Row
-		counts    map[int]int
-		collects  map[int][]any
-		aggs      map[int]*projectionAggregate
+		projected   Row
+		source      Row
+		counts      map[int]int
+		countSeen   map[int]map[string]struct{}
+		collects    map[int][]any
+		collectSeen map[int]map[string]struct{}
+		aggs        map[int]*projectionAggregate
 	}
 
 	nonAggregateCount := 0
@@ -2083,7 +2324,13 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 			if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" {
 				continue
 			}
-			value, err := evalExpressionWithScope(item.Expression, row, params)
+			value, ok, err := evalProjectionPatternComprehension(ctx, tx, item.Expression, row, params)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !ok {
+				value, err = evalExpressionWithScope(item.Expression, row, params)
+			}
 			if err != nil {
 				return nil, nil, err
 			}
@@ -2102,7 +2349,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		groupKey := string(keyBytes)
 		group, ok := groups[groupKey]
 		if !ok {
-			group = &projectionGroup{projected: projected, counts: map[int]int{}, collects: map[int][]any{}, aggs: map[int]*projectionAggregate{}}
+			group = &projectionGroup{projected: projected, source: cloneRow(row), counts: map[int]int{}, countSeen: map[int]map[string]struct{}{}, collects: map[int][]any{}, collectSeen: map[int]map[string]struct{}{}, aggs: map[int]*projectionAggregate{}}
 			groups[groupKey] = group
 			groupOrder = append(groupOrder, groupKey)
 		}
@@ -2113,19 +2360,52 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 					group.counts[idx]++
 					continue
 				}
-				value, err := evalExpressionWithScope(item.CountArg, row, params)
+				countExpr, countDistinct := parseCountDistinctArg(item.CountArg)
+				if countExpr == "" {
+					countExpr = item.CountArg
+				}
+				value, err := evalExpressionWithScope(countExpr, row, params)
 				if err != nil {
 					return nil, nil, err
 				}
 				if value != nil {
+					if countDistinct {
+						if group.countSeen[idx] == nil {
+							group.countSeen[idx] = map[string]struct{}{}
+						}
+						keyBytes, err := json.Marshal(normalizeResultValue(value))
+						if err != nil {
+							keyBytes = []byte(fmt.Sprintf("%v", value))
+						}
+						key := string(keyBytes)
+						if _, ok := group.countSeen[idx][key]; ok {
+							continue
+						}
+						group.countSeen[idx][key] = struct{}{}
+					}
 					group.counts[idx]++
 				}
 				continue
 			}
 			if item.CollectArg != "" {
-				value, err := evalExpressionWithScope(item.CollectArg, row, params)
+				collectExpr, collectDistinct := parseCollectDistinctArg(item.CollectArg)
+				value, err := evalExpressionWithScope(collectExpr, row, params)
 				if err != nil {
 					return nil, nil, err
+				}
+				if collectDistinct {
+					if group.collectSeen[idx] == nil {
+						group.collectSeen[idx] = map[string]struct{}{}
+					}
+					keyBytes, err := json.Marshal(normalizeResultValue(value))
+					if err != nil {
+						keyBytes = []byte(fmt.Sprintf("%v", value))
+					}
+					key := string(keyBytes)
+					if _, ok := group.collectSeen[idx][key]; ok {
+						continue
+					}
+					group.collectSeen[idx][key] = struct{}{}
 				}
 				group.collects[idx] = append(group.collects[idx], value)
 				continue
@@ -2209,6 +2489,13 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 	for _, groupKey := range groupOrder {
 		group := groups[groupKey]
 		projected := cloneRow(group.projected)
+		if len(projection.OrderBy) > 0 && !hasStar && group.source != nil {
+			for key, value := range group.source {
+				if _, exists := projected[key]; !exists {
+					projected[key] = value
+				}
+			}
+		}
 		for idx, item := range items {
 			key := item.Expression
 			if item.Alias != "" {
@@ -2257,6 +2544,9 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 	if err != nil {
 		return nil, nil, err
 	}
+	if len(projection.OrderBy) > 0 && !hasStar {
+		out = trimProjectionRows(out, columns)
+	}
 	return out, columns, nil
 }
 
@@ -2270,6 +2560,7 @@ type projectionSpec struct {
 }
 
 type projectionClauseSpec struct {
+	Distinct      bool
 	ProjectionRaw string
 	OrderBy       []projectionOrderBySpec
 	SkipRaw       string
@@ -2296,8 +2587,13 @@ func parseProjectionClauseSpec(raw string) (projectionClauseSpec, error) {
 	if firstTail >= 0 {
 		projectionRaw = raw[:firstTail]
 	}
+	projectionDistinct := false
+	if strings.HasPrefix(strings.ToUpper(projectionRaw), "DISTINCT") {
+		projectionDistinct = true
+		projectionRaw = strings.TrimSpace(projectionRaw[len("DISTINCT"):])
+	}
 
-	out := projectionClauseSpec{ProjectionRaw: strings.TrimSpace(projectionRaw)}
+	out := projectionClauseSpec{Distinct: projectionDistinct, ProjectionRaw: strings.TrimSpace(projectionRaw)}
 
 	if orderByIdx >= 0 {
 		end := minPositiveIndex(greaterIndex(skipIdx, orderByIdx), greaterIndex(limitIdx, orderByIdx))
@@ -2373,7 +2669,7 @@ func parseProjectionOrderBy(raw string) ([]projectionOrderBySpec, error) {
 	return out, nil
 }
 
-func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrderBySpec, rows []Row) error {
+func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrderBySpec, rows []Row, distinct bool) error {
 	if len(orderBy) == 0 {
 		return nil
 	}
@@ -2396,18 +2692,25 @@ func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrder
 	}
 
 	inScope := map[string]struct{}{}
-	if len(rows) > 0 {
+	distinctScope := map[string]struct{}{}
+	distinctExpandableRoots := map[string]struct{}{}
+	if !distinct && len(rows) > 0 {
 		for key := range rows[0] {
 			inScope[key] = struct{}{}
 		}
 	}
 	for _, item := range items {
+		rawExpr := strings.TrimSpace(item.Expression)
+		distinctScope[normalizeProjectionExpr(item.Expression)] = struct{}{}
 		if item.Alias != "" {
 			inScope[item.Alias] = struct{}{}
-			continue
+			distinctScope[normalizeProjectionExpr(item.Alias)] = struct{}{}
 		}
 		if ident, ok := parseSimpleIdentifierRoot(item.Expression); ok {
 			inScope[ident] = struct{}{}
+			if rawExpr == ident {
+				distinctExpandableRoots[ident] = struct{}{}
+			}
 		}
 	}
 
@@ -2436,6 +2739,17 @@ func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrder
 			}
 			continue
 		}
+		if distinct {
+			if _, ok := distinctScope[normalizeProjectionExpr(expr)]; ok {
+				continue
+			}
+			if ident, ok := parseSimpleIdentifierRoot(expr); ok {
+				if _, in := distinctExpandableRoots[ident]; in {
+					continue
+				}
+			}
+			return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "undefined variable"}
+		}
 		if ident, ok := parseSimpleIdentifierRoot(expr); ok {
 			if _, ok := inScope[ident]; !ok {
 				return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "undefined variable"}
@@ -2444,6 +2758,10 @@ func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrder
 	}
 
 	return nil
+}
+
+func normalizeProjectionExpr(raw string) string {
+	return strings.ToUpper(normalizeClauseBody(strings.TrimSpace(raw)))
 }
 
 func containsAggregationExpression(raw string) bool {
@@ -2703,6 +3021,9 @@ func isIdentifierPart(ch byte) bool {
 }
 
 func applyProjectionPostProcessing(rows []Row, clause projectionClauseSpec, params Params) ([]Row, error) {
+	if clause.Distinct {
+		rows = distinctProjectionRows(rows)
+	}
 	if len(clause.OrderBy) > 0 && len(rows) > 1 {
 		sorted, err := sortProjectedRows(rows, clause.OrderBy, params)
 		if err != nil {
@@ -2721,6 +3042,46 @@ func applyProjectionPostProcessing(rows []Row, clause projectionClauseSpec, para
 	}
 
 	return applySkipLimit(rows, skip, limit), nil
+}
+
+func distinctProjectionRows(rows []Row) []Row {
+	if len(rows) <= 1 {
+		return rows
+	}
+	seen := map[string]struct{}{}
+	out := make([]Row, 0, len(rows))
+	for _, row := range rows {
+		canonical := map[string]any{}
+		for key, value := range row {
+			canonical[key] = normalizeResultValue(value)
+		}
+		keyBytes, err := json.Marshal(canonical)
+		if err != nil {
+			keyBytes = []byte(fmt.Sprintf("%v", canonical))
+		}
+		key := string(keyBytes)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, row)
+	}
+	return out
+}
+
+func trimProjectionRows(rows []Row, columns []string) []Row {
+	if len(rows) == 0 || len(columns) == 0 {
+		return rows
+	}
+	out := make([]Row, 0, len(rows))
+	for _, row := range rows {
+		trimmed := Row{}
+		for _, col := range columns {
+			trimmed[col] = row[col]
+		}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 func sortProjectedRows(rows []Row, orderBy []projectionOrderBySpec, params Params) ([]Row, error) {
@@ -2786,9 +3147,19 @@ func compareCypherValues(lhs, rhs any) (int, bool) {
 		return 0, true
 	}
 	if lhs == nil {
-		return -1, true
+		// Cypher ORDER BY places null values after non-null values.
+		return 1, true
 	}
 	if rhs == nil {
+		return -1, true
+	}
+
+	leftRank := cypherSortRank(lhs)
+	rightRank := cypherSortRank(rhs)
+	if leftRank != rightRank {
+		if leftRank < rightRank {
+			return -1, true
+		}
 		return 1, true
 	}
 
@@ -2808,6 +3179,18 @@ func compareCypherValues(lhs, rhs any) (int, bool) {
 
 	if lf, lok := numericValue(lhs); lok {
 		if rf, rok := numericValue(rhs); rok {
+			leftNaN := math.IsNaN(lf)
+			rightNaN := math.IsNaN(rf)
+			if leftNaN || rightNaN {
+				switch {
+				case leftNaN && rightNaN:
+					return 0, true
+				case leftNaN:
+					return 1, true
+				default:
+					return -1, true
+				}
+			}
 			switch {
 			case lf < rf:
 				return -1, true
@@ -2845,6 +3228,17 @@ func compareCypherValues(lhs, rhs any) (int, bool) {
 		}
 	}
 
+	if _, lhsString := lhs.(string); lhsString {
+		if _, rhsNumeric := numericValue(rhs); rhsNumeric {
+			return -1, true
+		}
+	}
+	if _, rhsString := rhs.(string); rhsString {
+		if _, lhsNumeric := numericValue(lhs); lhsNumeric {
+			return 1, true
+		}
+	}
+
 	if ll, lok := asAnySlice(lhs); lok {
 		if rl, rok := asAnySlice(rhs); rok {
 			limit := len(ll)
@@ -2872,6 +3266,71 @@ func compareCypherValues(lhs, rhs any) (int, bool) {
 	}
 
 	return 0, false
+}
+
+func cypherSortRank(value any) int {
+	if value == nil {
+		return 90
+	}
+	if f, ok := numericValue(value); ok {
+		if math.IsNaN(f) {
+			return 80
+		}
+		return 70
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		if isRelationshipMapShape(typed) {
+			return 20
+		}
+		if isNodeMapShape(typed) {
+			return 10
+		}
+		return 0
+	case *graph.Vertex:
+		return 10
+	case *graph.Edge:
+		return 20
+	case []any, []string:
+		return 30
+	case cypherPathValue:
+		return 40
+	case string:
+		return 50
+	case bool:
+		return 60
+	default:
+		if _, ok := asAnySlice(value); ok {
+			return 30
+		}
+		if rv := reflect.ValueOf(value); rv.IsValid() {
+			if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
+				return 30
+			}
+		}
+		return 85
+	}
+}
+
+func isNodeMapShape(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	_, hasLabels := value["labels"]
+	_, hasProps := value["properties"]
+	_, hasType := value["type"]
+	return hasLabels && hasProps && !hasType
+}
+
+func isRelationshipMapShape(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	_, hasType := value["type"]
+	_, hasProps := value["properties"]
+	_, hasSrc := value["src"]
+	_, hasDst := value["dst"]
+	return hasType && hasProps && hasSrc && hasDst
 }
 
 func asAnySlice(value any) ([]any, bool) {
@@ -3098,12 +3557,30 @@ func parseCountExpression(raw string) (string, bool) {
 	return arg, true
 }
 
+func parseCountDistinctArg(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	upper := strings.ToUpper(raw)
+	if strings.HasPrefix(upper, "DISTINCT") {
+		return strings.TrimSpace(raw[len("DISTINCT"):]), true
+	}
+	return raw, false
+}
+
 func parseCollectExpression(raw string) (string, bool) {
 	arg, ok := parseFunctionCall(raw, "collect")
 	if !ok || arg == "" {
 		return "", false
 	}
 	return arg, true
+}
+
+func parseCollectDistinctArg(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	upper := strings.ToUpper(raw)
+	if strings.HasPrefix(upper, "DISTINCT") {
+		return strings.TrimSpace(raw[len("DISTINCT"):]), true
+	}
+	return raw, false
 }
 
 func parseNamedAggregateExpression(raw string) (string, string, bool) {
@@ -3384,6 +3861,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		rf, rok := numericValue(rhs)
 		if lok && rok {
 			if rf == 0 {
+				if isFloatLikeNumeric(lhs) || isFloatLikeNumeric(rhs) {
+					return lf / rf, nil
+				}
 				return nil, graph.NewError(graph.ErrKindInvalidInput, "division by zero", nil)
 			}
 			return lf / rf, nil
@@ -3501,6 +3981,55 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "type"); ok {
 		return evalTypeFunction(arg, row)
 	}
+	if baseExpr, indexExpr, ok := splitTrailingSubscript(raw); ok {
+		base, err := evalExpressionWithScope(baseExpr, row, params)
+		if err != nil {
+			base, err = evalWriteValue(baseExpr, params, row)
+		}
+		if err != nil {
+			return nil, err
+		}
+		indexValue, err := evalExpressionWithScope(indexExpr, row, params)
+		if err != nil {
+			indexValue, err = evalWriteValue(indexExpr, params, row)
+		}
+		if err != nil {
+			return nil, err
+		}
+		idx, err := toInt(indexValue)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("index %q is not an integer", strings.TrimSpace(indexExpr)), err)
+		}
+		switch typed := base.(type) {
+		case []any:
+			if idx < 0 {
+				idx = len(typed) + idx
+			}
+			if idx < 0 || idx >= len(typed) {
+				return nil, nil
+			}
+			return typed[idx], nil
+		case []string:
+			if idx < 0 {
+				idx = len(typed) + idx
+			}
+			if idx < 0 || idx >= len(typed) {
+				return nil, nil
+			}
+			return typed[idx], nil
+		case string:
+			runes := []rune(typed)
+			if idx < 0 {
+				idx = len(runes) + idx
+			}
+			if idx < 0 || idx >= len(runes) {
+				return nil, nil
+			}
+			return string(runes[idx]), nil
+		default:
+			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+		}
+	}
 	if value, err := evalWriteValue(raw, params, row); err == nil {
 		return value, nil
 	}
@@ -3547,6 +4076,73 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+}
+
+func isFloatLikeNumeric(v any) bool {
+	switch typed := v.(type) {
+	case float64, float32:
+		return true
+	case json.Number:
+		s := strings.TrimSpace(typed.String())
+		return strings.ContainsAny(s, ".eE")
+	case string:
+		s := strings.TrimSpace(typed)
+		return strings.ContainsAny(s, ".eE")
+	default:
+		return false
+	}
+}
+
+func splitTrailingSubscript(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasSuffix(raw, "]") {
+		return "", "", false
+	}
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := len(raw) - 1; i >= 0; i-- {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && (i == 0 || raw[i-1] != '\\') && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case ']':
+			depthBracket++
+		case '[':
+			depthBracket--
+			if depthBracket == 0 {
+				base := strings.TrimSpace(raw[:i])
+				index := strings.TrimSpace(raw[i+1 : len(raw)-1])
+				if base == "" || index == "" {
+					return "", "", false
+				}
+				return base, index, true
+			}
+		case ')':
+			depthParen++
+		case '(':
+			depthParen--
+		case '}':
+			depthBrace++
+		case '{':
+			depthBrace--
+		}
+		if depthParen < 0 || depthBracket < 0 || depthBrace < 0 {
+			return "", "", false
+		}
+	}
+	return "", "", false
 }
 
 func evalListComprehension(raw string, row Row, params Params) (any, bool, error) {
@@ -3824,7 +4420,9 @@ func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {
 			afterIdx := i + len(keyword)
 			afterIsWord := afterIdx < len(raw) && isAlphaOrUnderscore(raw[afterIdx])
 			if beforeIsWord && afterIsWord {
-				continue
+				if !shouldSplitCompressedKeyword(raw, i, len(keyword)) {
+					continue
+				}
 			}
 			left := strings.TrimSpace(raw[:i])
 			right := strings.TrimSpace(raw[i+len(keyword):])
@@ -3839,6 +4437,20 @@ func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {
 
 func hasLogicalNotPrefix(raw string) bool {
 	return len(raw) >= 3 && strings.EqualFold(raw[:3], "NOT")
+}
+
+func shouldSplitCompressedKeyword(raw string, idx, kwLen int) bool {
+	if idx <= 0 || idx+kwLen >= len(raw) {
+		return false
+	}
+	left := raw[:idx]
+	right := raw[idx+kwLen:]
+	if left == "" || right == "" {
+		return false
+	}
+	leftHasExprMarker := strings.ContainsAny(left, ".)]}")
+	rightHasExprMarker := strings.ContainsAny(right, ".[({$")
+	return leftHasExprMarker && rightHasExprMarker
 }
 
 func isAlphaOrUnderscore(ch byte) bool {
@@ -4134,7 +4746,11 @@ func evalUnwindValues(raw string, params Params, row Row) ([]any, error) {
 		parts := splitTopLevelCommaSeparated(inner)
 		values := make([]any, 0, len(parts))
 		for _, part := range parts {
-			value, err := evalWriteValue(part, params, row)
+			part = strings.TrimSpace(part)
+			value, err := evalExpressionWithScope(part, row, params)
+			if err != nil {
+				value, err = evalWriteValue(part, params, row)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -4155,11 +4771,166 @@ func evalUnwindValues(raw string, params Params, row Row) ([]any, error) {
 			return flattenListValue(value)
 		}
 	}
+	if value, err := evalExpressionWithScope(raw, row, params); err == nil {
+		return flattenListValue(value)
+	}
 	value, err := evalWriteValue(raw, params, row)
 	if err == nil {
 		return []any{value}, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("UNWIND expression %q is not yet supported", raw), nil)
+}
+
+func evalProjectionPatternComprehension(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (any, bool, error) {
+	if tx == nil {
+		return nil, false, nil
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false, nil
+	}
+	pathVar, sourceVar, ok := parseSimpleUndirectedPathComprehension(raw)
+	if !ok {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(pathVar) == "" || strings.TrimSpace(sourceVar) == "" {
+		return nil, true, graph.NewError(graph.ErrKindSemantic, "pattern comprehension variables are required", nil)
+	}
+	binding, has := row[sourceVar]
+	if !has || binding == nil {
+		return []any{}, true, nil
+	}
+	vertex, ok := binding.(*graph.Vertex)
+	if !ok {
+		return nil, true, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", sourceVar), nil)
+	}
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, true, err
+	}
+	out := make([]any, 0)
+	if err := tx.ScanOutEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+		right, err := tx.GetVertex(ctx, tenant, edge.DstID)
+		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				return nil
+			}
+			return err
+		}
+		out = append(out, cypherPathValue{Left: vertex, Edge: edge, Right: right, Direction: "forward"})
+		return nil
+	}); err != nil {
+		return nil, true, err
+	}
+	if err := tx.ScanInEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+		left, err := tx.GetVertex(ctx, tenant, edge.SrcID)
+		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				return nil
+			}
+			return err
+		}
+		out = append(out, cypherPathValue{Left: vertex, Edge: edge, Right: left, Direction: "reverse"})
+		return nil
+	}); err != nil {
+		return nil, true, err
+	}
+	return out, true, nil
+}
+
+func parseSimpleUndirectedPathComprehension(raw string) (pathVar string, sourceVar string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
+		return "", "", false
+	}
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	pipeIdx := findTopLevelPipeIndex(body)
+	if pipeIdx <= 0 {
+		return "", "", false
+	}
+	left := strings.TrimSpace(body[:pipeIdx])
+	proj := strings.TrimSpace(body[pipeIdx+1:])
+	eqIdx := strings.Index(left, "=")
+	if eqIdx <= 0 {
+		return "", "", false
+	}
+	pathVar = strings.TrimSpace(left[:eqIdx])
+	pattern := strings.TrimSpace(left[eqIdx+1:])
+	if !isIdentifierLike(pathVar) || strings.TrimSpace(proj) != pathVar {
+		return "", "", false
+	}
+	pattern = strings.ReplaceAll(pattern, " ", "")
+	if !strings.HasPrefix(pattern, "(") || !strings.HasSuffix(pattern, ")") {
+		return "", "", false
+	}
+	if !strings.Contains(pattern, "--") || strings.Contains(pattern, "[") || strings.Contains(pattern, "]") {
+		return "", "", false
+	}
+	if !strings.HasSuffix(pattern, "--()") {
+		return "", "", false
+	}
+	if !strings.HasPrefix(pattern, "(") {
+		return "", "", false
+	}
+	closeIdx := strings.Index(pattern, ")")
+	if closeIdx <= 1 {
+		return "", "", false
+	}
+	sourceVar = strings.TrimSpace(pattern[1:closeIdx])
+	if !isIdentifierLike(sourceVar) {
+		return "", "", false
+	}
+	if pattern[closeIdx:] != ")--()" {
+		return "", "", false
+	}
+	return pathVar, sourceVar, true
+}
+
+func findTopLevelPipeIndex(raw string) int {
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && (i == 0 || raw[i-1] != '\\') && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '|':
+			if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func flattenListValue(value any) ([]any, error) {
@@ -4336,7 +5107,8 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 		return n, nil
 	}
 	if f, err := strconv.ParseFloat(raw, 64); err == nil {
-		return f, nil
+		_ = f
+		return json.Number(raw), nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("write value %q is not supported", raw), nil)
 }
@@ -4387,7 +5159,11 @@ func parseListLiteral(raw string, params Params, row Row) ([]any, error) {
 	parts := splitTopLevelCommaSeparated(body)
 	out := make([]any, 0, len(parts))
 	for _, part := range parts {
-		value, err := evalWriteValue(part, params, row)
+		part = strings.TrimSpace(part)
+		value, err := evalExpressionWithScope(part, row, params)
+		if err != nil {
+			value, err = evalWriteValue(part, params, row)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -4401,7 +5177,28 @@ func parseInlineMapLiteral(raw string, params Params, row Row) (map[string]any, 
 	if body == "" {
 		return map[string]any{}, nil
 	}
-	return parsePropertyMap(body, params, row)
+	out := map[string]any{}
+	for _, pair := range splitTopLevelCommaSeparated(body) {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		parts := strings.SplitN(pair, ":", 2)
+		if len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("property pair %q is not supported", pair), nil)
+		}
+		key := strings.TrimSpace(parts[0])
+		valueExpr := strings.TrimSpace(parts[1])
+		value, err := evalExpressionWithScope(valueExpr, row, params)
+		if err != nil {
+			value, err = evalWriteValue(valueExpr, params, row)
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[key] = value
+	}
+	return out, nil
 }
 
 func evalTemporalConstructor(name, arg string, params Params, row Row) (any, error) {
@@ -5871,6 +6668,9 @@ func splitTopLevelOperator(raw string, op string) (string, string, bool) {
 			}
 		}
 		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(raw[i:], op) {
+			if (op == "+" || op == "-") && isUnarySignPosition(raw, i) {
+				continue
+			}
 			left := strings.TrimSpace(raw[:i])
 			right := strings.TrimSpace(raw[i+len(op):])
 			if left == "" || right == "" {
@@ -5882,6 +6682,25 @@ func splitTopLevelOperator(raw string, op string) (string, string, bool) {
 	return "", "", false
 }
 
+func isUnarySignPosition(raw string, idx int) bool {
+	if idx == 0 {
+		return true
+	}
+	for i := idx - 1; i >= 0; i-- {
+		ch := raw[i]
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			continue
+		}
+		switch ch {
+		case '(', '[', '{', ',', '+', '-', '*', '/', '%', '=', '<', '>', '!':
+			return true
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func numericValue(v any) (float64, bool) {
 	switch typed := v.(type) {
 	case int:
@@ -5890,6 +6709,12 @@ func numericValue(v any) (float64, bool) {
 		return float64(typed), true
 	case float64:
 		return typed, true
+	case json.Number:
+		f, err := typed.Float64()
+		if err == nil {
+			return f, true
+		}
+		return 0, false
 	case float32:
 		return float64(typed), true
 	case string:
@@ -6081,18 +6906,79 @@ func applyTemporalAndDuration(temporal map[string]any, dur durationComponents, o
 	case "date":
 		dayCarry := int(truncTowardZero(addSeconds / 86400))
 		dateAdjusted = base.AddDate(addY, addM, addD+dayCarry)
-		return dateAdjusted.Format("2006-01-02"), true
+		return temporalResultFromTime("date", dateAdjusted, temporal), true
 	case "localtime":
-		return formatTimeString(adjusted, false), true
+		return temporalResultFromTime("localtime", adjusted, temporal), true
 	case "time":
-		return formatTimeString(adjusted, true), true
+		return temporalResultFromTime("time", adjusted, temporal), true
 	case "localdatetime":
-		return formatDateTimeString(adjusted, false), true
+		return temporalResultFromTime("localdatetime", adjusted, temporal), true
 	case "datetime":
-		return formatDateTimeString(adjusted, true), true
+		return temporalResultFromTime("datetime", adjusted, temporal), true
 	default:
 		return nil, false
 	}
+}
+
+func temporalResultFromTime(typeName string, t time.Time, source map[string]any) map[string]any {
+	out := map[string]any{"__temporal_type": typeName}
+	switch typeName {
+	case "date":
+		out["year"] = t.Year()
+		out["month"] = int(t.Month())
+		out["day"] = t.Day()
+	case "localtime":
+		out["hour"] = t.Hour()
+		out["minute"] = t.Minute()
+		out["second"] = t.Second()
+		out["nanosecond"] = t.Nanosecond()
+	case "time":
+		out["hour"] = t.Hour()
+		out["minute"] = t.Minute()
+		out["second"] = t.Second()
+		out["nanosecond"] = t.Nanosecond()
+		if tzRaw, ok := source["timezone"]; ok {
+			tz := strings.TrimSpace(fmt.Sprint(tzRaw))
+			if tz != "" {
+				out["timezone"] = tz
+			} else {
+				_, off := t.Zone()
+				out["timezone"] = formatOffsetString(off)
+			}
+		} else {
+			_, off := t.Zone()
+			out["timezone"] = formatOffsetString(off)
+		}
+	case "localdatetime":
+		out["year"] = t.Year()
+		out["month"] = int(t.Month())
+		out["day"] = t.Day()
+		out["hour"] = t.Hour()
+		out["minute"] = t.Minute()
+		out["second"] = t.Second()
+		out["nanosecond"] = t.Nanosecond()
+	case "datetime":
+		out["year"] = t.Year()
+		out["month"] = int(t.Month())
+		out["day"] = t.Day()
+		out["hour"] = t.Hour()
+		out["minute"] = t.Minute()
+		out["second"] = t.Second()
+		out["nanosecond"] = t.Nanosecond()
+		if tzRaw, ok := source["timezone"]; ok {
+			tz := strings.TrimSpace(fmt.Sprint(tzRaw))
+			if tz != "" {
+				out["timezone"] = tz
+			} else {
+				_, off := t.Zone()
+				out["timezone"] = formatOffsetString(off)
+			}
+		} else {
+			_, off := t.Zone()
+			out["timezone"] = formatOffsetString(off)
+		}
+	}
+	return out
 }
 
 func decomposeDuration(dur durationComponents) (int, int, int, float64) {
@@ -6324,9 +7210,6 @@ func unquoteCypherString(raw string) (string, error) {
 func normalizeVertexProperties(props map[string]any) graph.PropertyMap {
 	out := graph.PropertyMap{}
 	for k, v := range props {
-		if strings.EqualFold(k, "id") {
-			continue
-		}
 		out[k] = valueToBytes(v)
 	}
 	return out
@@ -6335,9 +7218,6 @@ func normalizeVertexProperties(props map[string]any) graph.PropertyMap {
 func normalizeEdgeProperties(props map[string]any) graph.PropertyMap {
 	out := graph.PropertyMap{}
 	for k, v := range props {
-		if strings.EqualFold(k, "id") {
-			continue
-		}
 		out[k] = valueToBytes(v)
 	}
 	return out

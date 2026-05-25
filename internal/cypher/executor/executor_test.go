@@ -343,8 +343,8 @@ func TestExecuteUnsupportedShape(t *testing.T) {
 
 	exec := New(store, Options{})
 	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "srcID": "u1"})
-	if !graph.IsKind(err, graph.ErrKindUnsupported) {
-		t.Fatalf("expected unsupported error, got %v", err)
+	if graph.IsKind(err, graph.ErrKindUnsupported) {
+		t.Fatalf("expected DISTINCT shape to be handled, got unsupported error: %v", err)
 	}
 }
 

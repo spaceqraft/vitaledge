@@ -134,14 +134,65 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 	if len(stmt.MatchClauses) == 0 {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "at least one MATCH clause is required", nil)
 	}
+	if !shouldUseProjectionEngineForReturn(stmt.Return) {
+		return e.executeMatchQueryLegacy(ctx, stmt, params)
+	}
+
+	rows := []Row{{}}
+	resultColumns := []string{}
+
+	execErr := e.store.View(ctx, func(tx graph.Tx) error {
+		for _, match := range stmt.MatchClauses {
+			kind := ast.ClauseKindMatch
+			if match.Optional {
+				kind = ast.ClauseKindOptionalMatch
+			}
+			nextRows, err := e.applyMatchClause(ctx, tx, rows, ast.Clause{Kind: kind, Raw: renderMatchClauseRaw(match)}, params)
+			if err != nil {
+				return err
+			}
+			rows = nextRows
+		}
+
+		projectedRows, cols, err := e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: renderReturnClauseRaw(stmt.Return)}, params, true)
+		if err != nil {
+			return err
+		}
+		rows = projectedRows
+		resultColumns = cols
+		return nil
+	})
+	if execErr != nil {
+		return nil, execErr
+	}
+
+	result := &Result{Columns: resultColumns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}
+	result.Rows = normalizeResultRows(result.Rows)
+	return result, nil
+}
+
+func shouldUseProjectionEngineForReturn(ret ast.ReturnClause) bool {
+	if ret.IncludeAll || ret.Distinct || len(ret.OrderBy) > 0 {
+		return true
+	}
+	for _, item := range ret.Items {
+		raw := strings.ToUpper(strings.TrimSpace(item.Expression.Raw))
+		if raw == "" {
+			continue
+		}
+		if strings.Contains(raw, "DISTINCT") {
+			return true
+		}
+		if strings.Contains(raw, "COLLECT(") || strings.Contains(raw, "COUNT(") || strings.Contains(raw, "SUM(") || strings.Contains(raw, "AVG(") || strings.Contains(raw, "MIN(") || strings.Contains(raw, "MAX(") {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Executor) executeMatchQueryLegacy(ctx context.Context, stmt *ast.MatchQueryStatement, params Params) (*Result, error) {
 	if stmt.Return.IncludeAll || len(stmt.Return.Items) == 0 {
 		return nil, graph.NewError(graph.ErrKindUnsupported, "RETURN * is not yet supported", nil)
-	}
-	if stmt.Return.Distinct {
-		return nil, graph.NewError(graph.ErrKindUnsupported, "RETURN DISTINCT is not yet supported", nil)
-	}
-	if len(stmt.Return.OrderBy) > 0 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, "ORDER BY is not yet supported", nil)
 	}
 
 	skip, err := evalOptionalInt(stmt.Return.Skip, params)
@@ -204,6 +255,67 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 	}
 	result.Rows = normalizeResultRows(result.Rows)
 	return result, nil
+}
+
+func renderMatchClauseRaw(match ast.MatchClause) string {
+	raw := "MATCH " + strings.TrimSpace(match.Pattern)
+	if match.Optional {
+		raw = "OPTIONAL MATCH " + strings.TrimSpace(match.Pattern)
+	}
+	if match.Where != nil && strings.TrimSpace(match.Where.Raw) != "" {
+		raw += " WHERE " + strings.TrimSpace(match.Where.Raw)
+	}
+	return raw
+}
+
+func renderReturnClauseRaw(ret ast.ReturnClause) string {
+	parts := make([]string, 0, len(ret.Items)+4)
+	if ret.IncludeAll {
+		parts = append(parts, "*")
+	}
+	for _, item := range ret.Items {
+		expr := strings.TrimSpace(item.Expression.Raw)
+		if expr == "" {
+			continue
+		}
+		if alias := strings.TrimSpace(item.Alias); alias != "" {
+			expr += " AS " + alias
+		}
+		parts = append(parts, expr)
+	}
+	raw := "RETURN "
+	if ret.Distinct {
+		raw += "DISTINCT "
+	}
+	raw += strings.Join(parts, ", ")
+
+	if len(ret.OrderBy) > 0 {
+		orderParts := make([]string, 0, len(ret.OrderBy))
+		for _, item := range ret.OrderBy {
+			expr := strings.TrimSpace(item.Expression.Raw)
+			if expr == "" {
+				continue
+			}
+			switch item.Direction {
+			case ast.SortDirectionDesc:
+				expr += " DESC"
+			case ast.SortDirectionAsc:
+				expr += " ASC"
+			}
+			orderParts = append(orderParts, expr)
+		}
+		if len(orderParts) > 0 {
+			raw += " ORDER BY " + strings.Join(orderParts, ", ")
+		}
+	}
+
+	if ret.Skip != nil && strings.TrimSpace(ret.Skip.Raw) != "" {
+		raw += " SKIP " + strings.TrimSpace(ret.Skip.Raw)
+	}
+	if ret.Limit != nil && strings.TrimSpace(ret.Limit.Raw) != "" {
+		raw += " LIMIT " + strings.TrimSpace(ret.Limit.Raw)
+	}
+	return raw
 }
 
 func evalReturnRow(items []ast.ProjectionItem, binding map[string]any) (Row, error) {
@@ -586,22 +698,23 @@ func evalVertexField(v *graph.Vertex, field string) (any, error) {
 	if v == nil {
 		return nil, nil
 	}
+	if v.Properties != nil {
+		if val, ok := v.Properties[field]; ok {
+			return decodeStoredPropertyValue(val), nil
+		}
+	}
 	switch field {
 	case "id":
+		if i, err := strconv.Atoi(v.ID); err == nil {
+			return i, nil
+		}
 		return v.ID, nil
 	case "tenant":
 		return v.Tenant, nil
 	case "labels":
 		return append([]string(nil), v.Labels...), nil
 	default:
-		if v.Properties == nil {
-			return nil, nil
-		}
-		val, ok := v.Properties[field]
-		if !ok {
-			return nil, nil
-		}
-		return decodeStoredPropertyValue(val), nil
+		return nil, nil
 	}
 }
 
@@ -609,8 +722,16 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 	if e == nil {
 		return nil, nil
 	}
+	if e.Properties != nil {
+		if val, ok := e.Properties[field]; ok {
+			return decodeStoredPropertyValue(val), nil
+		}
+	}
 	switch field {
 	case "id":
+		if i, err := strconv.Atoi(e.ID); err == nil {
+			return i, nil
+		}
 		return e.ID, nil
 	case "tenant":
 		return e.Tenant, nil
@@ -621,14 +742,7 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 	case "dst":
 		return e.DstID, nil
 	default:
-		if e.Properties == nil {
-			return nil, nil
-		}
-		val, ok := e.Properties[field]
-		if !ok {
-			return nil, nil
-		}
-		return decodeStoredPropertyValue(val), nil
+		return nil, nil
 	}
 }
 
@@ -650,7 +764,8 @@ func decodeStoredPropertyValue(raw []byte) any {
 		return i
 	}
 	if f, err := strconv.ParseFloat(text, 64); err == nil {
-		return f
+		_ = f
+		return json.Number(text)
 	}
 	if mapped, ok := parseStoredMapString(text); ok {
 		return mapped
@@ -900,10 +1015,10 @@ func evalOptionalInt(expr *ast.Expression, params Params) (int, error) {
 		}
 		n, err := toInt(v)
 		if err != nil {
-			return 0, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("parameter %q is not an int", name), err)
+			return 0, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("parameter %q is not an int", name), err)
 		}
 		if n < 0 {
-			return 0, graph.NewError(graph.ErrKindInvalidInput, "numeric expression must be >= 0", nil)
+			return 0, graph.NewError(graph.ErrKindUnsupported, "numeric expression must be >= 0", nil)
 		}
 		return n, nil
 	}
@@ -912,7 +1027,7 @@ func evalOptionalInt(expr *ast.Expression, params Params) (int, error) {
 		return 0, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("numeric expression %q is not supported", raw), err)
 	}
 	if n < 0 {
-		return 0, graph.NewError(graph.ErrKindInvalidInput, "numeric expression must be >= 0", nil)
+		return 0, graph.NewError(graph.ErrKindUnsupported, "numeric expression must be >= 0", nil)
 	}
 	return n, nil
 }
@@ -957,9 +1072,25 @@ func toInt(v any) (int, error) {
 	case uint32:
 		return int(n), nil
 	case float64:
+		if math.Trunc(n) != n {
+			return 0, fmt.Errorf("non-integer float64")
+		}
 		return int(n), nil
 	case float32:
+		if math.Trunc(float64(n)) != float64(n) {
+			return 0, fmt.Errorf("non-integer float32")
+		}
 		return int(n), nil
+	case json.Number:
+		s := strings.TrimSpace(n.String())
+		if strings.ContainsAny(s, ".eE") {
+			return 0, fmt.Errorf("non-integer json.Number")
+		}
+		parsed, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return int(parsed), nil
 	case string:
 		return strconv.Atoi(strings.TrimSpace(n))
 	default:
@@ -973,7 +1104,7 @@ func vertexToMap(v *graph.Vertex) map[string]any {
 	}
 	props := map[string]any{}
 	for k, val := range v.Properties {
-		props[k] = decodeStoredPropertyValue(val)
+		props[k] = normalizeResultValue(decodeStoredPropertyValue(val))
 	}
 	return map[string]any{
 		"tenant":     v.Tenant,
@@ -989,7 +1120,7 @@ func edgeToMap(e *graph.Edge) map[string]any {
 	}
 	props := map[string]any{}
 	for k, val := range e.Properties {
-		props[k] = decodeStoredPropertyValue(val)
+		props[k] = normalizeResultValue(decodeStoredPropertyValue(val))
 	}
 	return map[string]any{
 		"tenant":     e.Tenant,
@@ -1164,6 +1295,37 @@ func parseStoredListString(raw string) ([]any, bool) {
 		if mapped, ok := parseStoredMapString(part); ok {
 			out = append(out, mapped)
 			continue
+		}
+		if nested, ok := parseStoredListString(part); ok {
+			out = append(out, nested)
+			continue
+		}
+		if strings.EqualFold(part, "null") {
+			out = append(out, nil)
+			continue
+		}
+		if strings.EqualFold(part, "true") {
+			out = append(out, true)
+			continue
+		}
+		if strings.EqualFold(part, "false") {
+			out = append(out, false)
+			continue
+		}
+		if i, err := strconv.Atoi(part); err == nil {
+			out = append(out, i)
+			continue
+		}
+		if f, err := strconv.ParseFloat(part, 64); err == nil {
+			_ = f
+			out = append(out, json.Number(part))
+			continue
+		}
+		if len(part) >= 2 {
+			if (part[0] == '\'' && part[len(part)-1] == '\'') || (part[0] == '"' && part[len(part)-1] == '"') {
+				out = append(out, part[1:len(part)-1])
+				continue
+			}
 		}
 		out = append(out, part)
 	}

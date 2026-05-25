@@ -2867,6 +2867,109 @@ func TestExecutePathFunctionsReturnNullOnNullPath(t *testing.T) {
 	}
 }
 
+func TestExecutePercentileAggregates(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE ({price: 10.0}), ({price: 20.0}), ({price: 30.0})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (n) RETURN percentileDisc(n.price, 0.5) AS d, percentileCont(n.price, 0.5) AS c")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["d"]; got != json.Number("20.0") {
+		t.Fatalf("expected d=20.0, got %#v", got)
+	}
+	if got := res.Rows[0]["c"]; got != json.Number("20.0") {
+		t.Fatalf("expected c=20.0, got %#v", got)
+	}
+}
+
+func TestExecutePercentileAggregatesRejectOutOfRangePercentile(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE ({price: 10.0})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (n) RETURN percentileDisc(n.price, 1.1) AS p")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err == nil {
+		t.Fatalf("expected out-of-range percentileDisc error")
+	}
+	if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+		t.Fatalf("expected ErrKindInvalidInput for percentileDisc, got %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (n) RETURN percentileCont(n.price, -1) AS p")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err == nil {
+		t.Fatalf("expected out-of-range percentileCont error")
+	}
+	if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+		t.Fatalf("expected ErrKindInvalidInput for percentileCont, got %v", err)
+	}
+}
+
+func TestExecutePatternComprehensionProjectionLiteral(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (:S)-[:REL]->(), (:S)-[:REL]->(), (:S)")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (n:S) RETURN size([(n)-->() | 1]) AS deg ORDER BY deg DESC")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["deg"]; got != 1 {
+		t.Fatalf("expected first deg=1, got %#v", got)
+	}
+}
+
 func errUnexpected(message string) error {
 	return &testError{message: message}
 }

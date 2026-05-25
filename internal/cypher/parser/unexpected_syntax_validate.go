@@ -53,6 +53,8 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"min":                       {},
 	"none":                      {},
 	"nodes":                     {},
+	"percentilecont":            {},
+	"percentiledisc":            {},
 	"properties":                {},
 	"rand":                      {},
 	"range":                     {},
@@ -79,12 +81,14 @@ var supportedExpressionFunctions = map[string]struct{}{
 }
 
 var expressionOperatorKeywords = map[string]struct{}{
-	"and": {},
-	"in":  {},
-	"is":  {},
-	"not": {},
-	"or":  {},
-	"xor": {},
+	"and":  {},
+	"in":   {},
+	"is":   {},
+	"not":  {},
+	"or":   {},
+	"by":   {},
+	"with": {},
+	"xor":  {},
 }
 
 func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {

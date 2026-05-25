@@ -400,6 +400,20 @@ func TestParseStatementAllowsRemainingFunctionSurfaceInReturnProjection(t *testi
 	}
 }
 
+func TestParseStatementAllowsPercentileAggregateFunctions(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN percentileDisc(n.price, 0.5), percentileCont(n.price, 0.5)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsOrderByParenthesizedExpression(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) WITH n ORDER BY (n.id) RETURN count(n)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementRejectsHexIntegerOverflow(t *testing.T) {
 	_, err := ParseStatement("RETURN 0x8000000000000000 AS n")
 	if err == nil {

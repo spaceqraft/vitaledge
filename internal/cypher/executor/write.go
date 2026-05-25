@@ -2612,19 +2612,6 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 	if err != nil {
 		return nil, nil, err
 	}
-	if projection.WhereRaw != "" {
-		filtered := make([]Row, 0, len(rows))
-		for _, row := range rows {
-			ok, err := e.evalWhereExpression(ctx, tx, projection.WhereRaw, row, params)
-			if err != nil {
-				return nil, nil, err
-			}
-			if ok {
-				filtered = append(filtered, row)
-			}
-		}
-		rows = filtered
-	}
 	items, err := parseProjectionItems(projection.ProjectionRaw)
 	if err != nil {
 		return nil, nil, err
@@ -2637,6 +2624,23 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		return nil, nil, err
 	}
 	projection.OrderBy = rewriteOrderByAggregateReferences(projection.OrderBy, items)
+
+	filterProjectedRows := func(in []Row) ([]Row, error) {
+		if projection.WhereRaw == "" {
+			return in, nil
+		}
+		filtered := make([]Row, 0, len(in))
+		for _, row := range in {
+			ok, err := e.evalWhereExpression(ctx, tx, projection.WhereRaw, row, params)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				filtered = append(filtered, row)
+			}
+		}
+		return filtered, nil
+	}
 
 	out := make([]Row, 0, len(rows))
 	columns := make([]string, 0, len(items))
@@ -2693,6 +2697,10 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		if hasStar {
 			columns = inferProjectionColumns(out)
 		}
+		out, err = filterProjectedRows(out)
+		if err != nil {
+			return nil, nil, err
+		}
 		out, err = applyProjectionPostProcessing(out, projection, params)
 		if err != nil {
 			return nil, nil, err
@@ -2709,6 +2717,8 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		sum      float64
 		min      any
 		max      any
+		values   []float64
+		pValue   *float64
 		hasValue bool
 	}
 
@@ -2877,10 +2887,6 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 				continue
 			}
 			if item.AggFunc != "" {
-				value, err := evalExpressionWithScope(item.AggArg, row, params)
-				if err != nil {
-					return nil, nil, err
-				}
 				agg := group.aggs[idx]
 				if agg == nil {
 					agg = &projectionAggregate{funcName: item.AggFunc}
@@ -2888,6 +2894,10 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 				}
 				switch item.AggFunc {
 				case "sum", "avg":
+					value, err := evalExpressionWithScope(item.AggArg, row, params)
+					if err != nil {
+						return nil, nil, err
+					}
 					if value == nil {
 						continue
 					}
@@ -2899,6 +2909,10 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					agg.count++
 					agg.hasValue = true
 				case "min":
+					value, err := evalExpressionWithScope(item.AggArg, row, params)
+					if err != nil {
+						return nil, nil, err
+					}
 					if value == nil {
 						continue
 					}
@@ -2911,6 +2925,10 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 						agg.min = value
 					}
 				case "max":
+					value, err := evalExpressionWithScope(item.AggArg, row, params)
+					if err != nil {
+						return nil, nil, err
+					}
 					if value == nil {
 						continue
 					}
@@ -2922,6 +2940,34 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					if cmp, ok := compareCypherValues(value, agg.max); ok && cmp > 0 {
 						agg.max = value
 					}
+				case "percentiledisc", "percentilecont":
+					valueExpr, percentileExpr, ok := parsePercentileAggregateArgs(item.AggArg)
+					if !ok {
+						return nil, nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+					}
+					percentileRaw, err := evalExpressionWithScope(percentileExpr, row, params)
+					if err != nil {
+						return nil, nil, err
+					}
+					p, ok := numericValue(percentileRaw)
+					if !ok || p < 0 || p > 1 {
+						return nil, nil, graph.NewError(graph.ErrKindInvalidInput, "NumberOutOfRange", nil)
+					}
+					agg.pValue = &p
+
+					valueRaw, err := evalExpressionWithScope(valueExpr, row, params)
+					if err != nil {
+						return nil, nil, err
+					}
+					if valueRaw == nil {
+						continue
+					}
+					n, ok := numericValue(valueRaw)
+					if !ok {
+						continue
+					}
+					agg.values = append(agg.values, n)
+					agg.hasValue = true
 				}
 			}
 		}
@@ -2969,6 +3015,10 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 			}
 		}
 		out = append(out, projected)
+		out, err = filterProjectedRows(out)
+		if err != nil {
+			return nil, nil, err
+		}
 		out, err = applyProjectionPostProcessing(out, projection, params)
 		if err != nil {
 			return nil, nil, err
@@ -3023,6 +3073,42 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					projected[key] = agg.min
 				case "max":
 					projected[key] = agg.max
+				case "percentiledisc":
+					if agg.pValue == nil || len(agg.values) == 0 {
+						projected[key] = nil
+						continue
+					}
+					values := append([]float64(nil), agg.values...)
+					sort.Float64s(values)
+					idx := int(math.Ceil(*agg.pValue*float64(len(values)))) - 1
+					if idx < 0 {
+						idx = 0
+					}
+					if idx >= len(values) {
+						idx = len(values) - 1
+					}
+					projected[key] = json.Number(formatFloatResult(values[idx]))
+				case "percentilecont":
+					if agg.pValue == nil || len(agg.values) == 0 {
+						projected[key] = nil
+						continue
+					}
+					values := append([]float64(nil), agg.values...)
+					sort.Float64s(values)
+					if len(values) == 1 {
+						projected[key] = json.Number(formatFloatResult(values[0]))
+						continue
+					}
+					pos := *agg.pValue * float64(len(values)-1)
+					low := int(math.Floor(pos))
+					high := int(math.Ceil(pos))
+					if low == high {
+						projected[key] = json.Number(formatFloatResult(values[low]))
+						continue
+					}
+					frac := pos - float64(low)
+					interpolated := values[low] + (values[high]-values[low])*frac
+					projected[key] = json.Number(formatFloatResult(interpolated))
 				}
 				continue
 			}
@@ -3063,6 +3149,10 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 	}
 	if hasStar {
 		columns = inferProjectionColumns(out)
+	}
+	out, err = filterProjectedRows(out)
+	if err != nil {
+		return nil, nil, err
 	}
 	out, err = applyProjectionPostProcessing(out, projection, params)
 	if err != nil {
@@ -3428,11 +3518,24 @@ func stripAggregateCalls(raw string) string {
 
 func isAggregateFunctionName(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "count", "collect", "sum", "min", "max", "avg":
+	case "count", "collect", "sum", "min", "max", "avg", "percentiledisc", "percentilecont":
 		return true
 	default:
 		return false
 	}
+}
+
+func parsePercentileAggregateArgs(raw string) (string, string, bool) {
+	parts := splitTopLevelCommaSeparated(raw)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	valueExpr := strings.TrimSpace(parts[0])
+	percentileExpr := strings.TrimSpace(parts[1])
+	if valueExpr == "" || percentileExpr == "" {
+		return "", "", false
+	}
+	return valueExpr, percentileExpr, true
 }
 
 func findClosingParen(raw string, openIdx int) int {
@@ -4156,13 +4259,13 @@ func parseCollectDistinctArg(raw string) (string, bool) {
 }
 
 func parseNamedAggregateExpression(raw string) (string, string, bool) {
-	aggFuncs := []string{"sum", "min", "max", "avg"}
+	aggFuncs := []string{"sum", "min", "max", "avg", "percentileDisc", "percentileCont"}
 	for _, fn := range aggFuncs {
 		arg, ok := parseFunctionCall(raw, fn)
 		if !ok || strings.TrimSpace(arg) == "" {
 			continue
 		}
-		return fn, strings.TrimSpace(arg), true
+		return strings.ToLower(fn), strings.TrimSpace(arg), true
 	}
 	return "", "", false
 }
@@ -6858,11 +6961,17 @@ func evalProjectionPatternComprehension(ctx context.Context, tx graph.Tx, raw st
 	if raw == "" {
 		return nil, false, nil
 	}
-	pathVar, sourceVar, ok := parseSimpleUndirectedPathComprehension(raw)
+	wrapSize := false
+	if arg, ok := parseFunctionCall(raw, "size"); ok {
+		raw = strings.TrimSpace(arg)
+		wrapSize = true
+	}
+
+	pathVar, sourceVar, projectionExpr, direction, ok := parseSimpleUndirectedPathComprehension(raw)
 	if !ok {
 		return nil, false, nil
 	}
-	if strings.TrimSpace(pathVar) == "" || strings.TrimSpace(sourceVar) == "" {
+	if strings.TrimSpace(sourceVar) == "" || strings.TrimSpace(projectionExpr) == "" {
 		return nil, true, graph.NewError(graph.ErrKindSemantic, "pattern comprehension variables are required", nil)
 	}
 	binding, has := row[sourceVar]
@@ -6878,81 +6987,112 @@ func evalProjectionPatternComprehension(ctx context.Context, tx graph.Tx, raw st
 		return nil, true, err
 	}
 	out := make([]any, 0)
-	if err := tx.ScanOutEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
-		right, err := tx.GetVertex(ctx, tenant, edge.DstID)
-		if err != nil {
-			if graph.IsKind(err, graph.ErrKindNotFound) {
-				return nil
+	if direction == "any" || direction == "out" {
+		if err := tx.ScanOutEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+			right, err := tx.GetVertex(ctx, tenant, edge.DstID)
+			if err != nil {
+				if graph.IsKind(err, graph.ErrKindNotFound) {
+					return nil
+				}
+				return err
 			}
-			return err
+			scope := cloneRow(row)
+			if pathVar != "" {
+				scope[pathVar] = cypherPathValue{Left: vertex, Edge: edge, Right: right, Direction: "forward"}
+			}
+			projected, err := evalExpressionWithScope(projectionExpr, scope, params)
+			if err != nil {
+				return err
+			}
+			out = append(out, projected)
+			return nil
+		}); err != nil {
+			return nil, true, err
 		}
-		out = append(out, cypherPathValue{Left: vertex, Edge: edge, Right: right, Direction: "forward"})
-		return nil
-	}); err != nil {
-		return nil, true, err
 	}
-	if err := tx.ScanInEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
-		left, err := tx.GetVertex(ctx, tenant, edge.SrcID)
-		if err != nil {
-			if graph.IsKind(err, graph.ErrKindNotFound) {
-				return nil
+	if direction == "any" || direction == "in" {
+		if err := tx.ScanInEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+			left, err := tx.GetVertex(ctx, tenant, edge.SrcID)
+			if err != nil {
+				if graph.IsKind(err, graph.ErrKindNotFound) {
+					return nil
+				}
+				return err
 			}
-			return err
+			scope := cloneRow(row)
+			if pathVar != "" {
+				scope[pathVar] = cypherPathValue{Left: vertex, Edge: edge, Right: left, Direction: "reverse"}
+			}
+			projected, err := evalExpressionWithScope(projectionExpr, scope, params)
+			if err != nil {
+				return err
+			}
+			out = append(out, projected)
+			return nil
+		}); err != nil {
+			return nil, true, err
 		}
-		out = append(out, cypherPathValue{Left: vertex, Edge: edge, Right: left, Direction: "reverse"})
-		return nil
-	}); err != nil {
-		return nil, true, err
+	}
+	if wrapSize {
+		return len(out), true, nil
 	}
 	return out, true, nil
 }
 
-func parseSimpleUndirectedPathComprehension(raw string) (pathVar string, sourceVar string, ok bool) {
+func parseSimpleUndirectedPathComprehension(raw string) (pathVar string, sourceVar string, projectionExpr string, direction string, ok bool) {
 	raw = strings.TrimSpace(raw)
 	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
-		return "", "", false
+		return "", "", "", "", false
 	}
 	body := strings.TrimSpace(raw[1 : len(raw)-1])
 	pipeIdx := findTopLevelPipeIndex(body)
 	if pipeIdx <= 0 {
-		return "", "", false
+		return "", "", "", "", false
 	}
 	left := strings.TrimSpace(body[:pipeIdx])
-	proj := strings.TrimSpace(body[pipeIdx+1:])
+	projectionExpr = strings.TrimSpace(body[pipeIdx+1:])
 	eqIdx := strings.Index(left, "=")
-	if eqIdx <= 0 {
-		return "", "", false
+	pattern := left
+	if eqIdx > 0 {
+		pathVar = strings.TrimSpace(left[:eqIdx])
+		pattern = strings.TrimSpace(left[eqIdx+1:])
+		if !isIdentifierLike(pathVar) {
+			return "", "", "", "", false
+		}
 	}
-	pathVar = strings.TrimSpace(left[:eqIdx])
-	pattern := strings.TrimSpace(left[eqIdx+1:])
-	if !isIdentifierLike(pathVar) || strings.TrimSpace(proj) != pathVar {
-		return "", "", false
+	if projectionExpr == "" {
+		return "", "", "", "", false
 	}
 	pattern = strings.ReplaceAll(pattern, " ", "")
 	if !strings.HasPrefix(pattern, "(") || !strings.HasSuffix(pattern, ")") {
-		return "", "", false
+		return "", "", "", "", false
 	}
 	if !strings.Contains(pattern, "--") || strings.Contains(pattern, "[") || strings.Contains(pattern, "]") {
-		return "", "", false
-	}
-	if !strings.HasSuffix(pattern, "--()") {
-		return "", "", false
+		return "", "", "", "", false
 	}
 	if !strings.HasPrefix(pattern, "(") {
-		return "", "", false
+		return "", "", "", "", false
 	}
 	closeIdx := strings.Index(pattern, ")")
 	if closeIdx <= 1 {
-		return "", "", false
+		return "", "", "", "", false
 	}
 	sourceVar = strings.TrimSpace(pattern[1:closeIdx])
 	if !isIdentifierLike(sourceVar) {
-		return "", "", false
+		return "", "", "", "", false
 	}
-	if pattern[closeIdx:] != ")--()" {
-		return "", "", false
+	remainder := pattern[closeIdx:]
+	switch remainder {
+	case ")--()":
+		direction = "any"
+	case ")-->()":
+		direction = "out"
+	case ")<--()":
+		direction = "in"
+	default:
+		return "", "", "", "", false
 	}
-	return pathVar, sourceVar, true
+	return pathVar, sourceVar, projectionExpr, direction, true
 }
 
 func findTopLevelPipeIndex(raw string) int {

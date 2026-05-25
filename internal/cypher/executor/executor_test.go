@@ -2355,6 +2355,30 @@ func TestEvalExpressionWithScopeToIntegerAndProperties(t *testing.T) {
 		t.Fatalf("evalExpressionWithScope(toInteger) = %#v, want 2", idx)
 	}
 
+	idx, err = evalExpressionWithScope("toInteger(82.9)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(toInteger(float)) failed: %v", err)
+	}
+	if idx != 82 {
+		t.Fatalf("evalExpressionWithScope(toInteger(float)) = %#v, want 82", idx)
+	}
+
+	idx, err = evalExpressionWithScope("toInteger('2.9')", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(toInteger(decimal string)) failed: %v", err)
+	}
+	if idx != 2 {
+		t.Fatalf("evalExpressionWithScope(toInteger(decimal string)) = %#v, want 2", idx)
+	}
+
+	nullValue, err := evalExpressionWithScope("toInteger('foo')", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(toInteger(non-numerical string)) failed: %v", err)
+	}
+	if nullValue != nil {
+		t.Fatalf("evalExpressionWithScope(toInteger(non-numerical string)) = %#v, want nil", nullValue)
+	}
+
 	mapProps, err := evalExpressionWithScope("properties(m)", row, nil)
 	if err != nil {
 		t.Fatalf("evalExpressionWithScope(properties(map)) failed: %v", err)
@@ -2379,6 +2403,44 @@ func TestEvalExpressionWithScopeToIntegerAndProperties(t *testing.T) {
 	}
 	if !graph.IsKind(err, graph.ErrKindSemantic) || !strings.Contains(strings.ToLower(err.Error()), "invalid argument type") {
 		t.Fatalf("unexpected properties(1) error: %v", err)
+	}
+}
+
+func TestEvalExpressionWithScopeConversionRejectsStructuralValues(t *testing.T) {
+	row := Row{
+		"list": []any{1, 2, 3},
+		"mapv": map[string]any{"name": "Apa"},
+		"n":    &graph.Vertex{ID: "n1"},
+		"r":    &graph.Edge{ID: "r1", SrcID: "n1", DstID: "n2"},
+		"p":    cypherPathValue{Left: &graph.Vertex{ID: "n1"}, Edge: &graph.Edge{ID: "r1", SrcID: "n1", DstID: "n2"}, Right: &graph.Vertex{ID: "n2"}},
+	}
+
+	cases := []struct {
+		expr string
+	}{
+		{expr: "toInteger(list)"},
+		{expr: "toInteger(mapv)"},
+		{expr: "toInteger(n)"},
+		{expr: "toInteger(r)"},
+		{expr: "toInteger(p)"},
+		{expr: "toString(list)"},
+		{expr: "toString(mapv)"},
+		{expr: "toString(n)"},
+		{expr: "toString(r)"},
+		{expr: "toString(p)"},
+	}
+
+	for _, tc := range cases {
+		_, err := evalExpressionWithScope(tc.expr, row, nil)
+		if err == nil {
+			t.Fatalf("evalExpressionWithScope(%q) expected error", tc.expr)
+		}
+		if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+			t.Fatalf("evalExpressionWithScope(%q) error kind = %v, want invalid input", tc.expr, err)
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "invalidargumentvalue") {
+			t.Fatalf("evalExpressionWithScope(%q) error = %v, want InvalidArgumentValue", tc.expr, err)
+		}
 	}
 }
 
@@ -2640,6 +2702,29 @@ func TestExecuteReturnScientificNotationLiterals(t *testing.T) {
 	}
 	if got := res.Rows[0]["d"]; got != json.Number("1e-305") {
 		t.Fatalf("expected d=1e-305, got %#v", got)
+	}
+}
+
+func TestExecuteDurationPreservesNanosecondPrecision(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("RETURN duration({days: 14, seconds: 70, nanoseconds: 1}) AS d")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["d"]; got != "P14DT1M10.000000001S" {
+		t.Fatalf("expected duration with nanos, got %#v", got)
 	}
 }
 

@@ -195,15 +195,15 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 		return e.expandMultiNodeMatch(ctx, tx, rows, spec, multi, params)
 	}
 	if node, err := parseNodePattern(patternRaw); err == nil {
-		return e.expandNodeMatch(ctx, tx, rows, spec, node, params)
+		return e.expandNodeMatch(ctx, tx, rows, spec, node, params, pathVar)
 	}
 	if anchored, err := parseAnchoredOutPattern(patternRaw); err == nil {
 		if shouldUseAnchoredOutPath(rows, anchored) {
-			return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
+			return e.expandAnchoredMatch(ctx, tx, rows, spec, params, pathVar)
 		}
 	}
 	if directed, err := parseDirectedAdjacentPattern(patternRaw); err == nil {
-		return e.expandDirectedAdjacentMatch(ctx, tx, rows, spec, directed, params)
+		return e.expandDirectedAdjacentMatch(ctx, tx, rows, spec, directed, params, pathVar)
 	}
 	if reverseDirected, err := parseReverseDirectedAdjacentPattern(patternRaw); err == nil {
 		return e.expandReverseDirectedAdjacentMatch(ctx, tx, rows, spec, reverseDirected, params)
@@ -242,7 +242,7 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 		return matched, nil
 	}
 	if chain, err := parseTwoHopDirectedChainPattern(patternRaw); err == nil {
-		return e.expandTwoHopDirectedChainMatch(ctx, tx, rows, spec, chain, params)
+		return e.expandTwoHopDirectedChainMatch(ctx, tx, rows, spec, chain, params, pathVar)
 	}
 	if chain, err := parseMultiHopAdjacentChainPattern(patternRaw); err == nil {
 		matched, matchErr := e.expandMultiHopAdjacentChainMatch(ctx, tx, rows, spec, chain, params, pathVar)
@@ -252,7 +252,7 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 		ensureOptionalPathBinding(matched, pathVar)
 		return matched, nil
 	}
-	return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
+	return e.expandAnchoredMatch(ctx, tx, rows, spec, params, pathVar)
 }
 
 func parseBoundPathPattern(raw string) (string, string, bool) {
@@ -326,6 +326,9 @@ type cypherPathValue struct {
 
 func (p cypherPathValue) String() string {
 	left := renderPathNode(p.Left)
+	if p.Edge == nil && p.Right == nil {
+		return "<" + left + ">"
+	}
 	right := renderPathNode(p.Right)
 	edge := renderPathEdge(p.Edge)
 	switch p.Direction {
@@ -587,7 +590,7 @@ func parseAnchoredMatchClauseRaw(raw string) (anchoredMatchSpec, error) {
 	return spec, nil
 }
 
-func (e *Executor) expandAnchoredMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, params Params) ([]Row, error) {
+func (e *Executor) expandAnchoredMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, params Params, pathVar string) ([]Row, error) {
 	pattern, err := parseAnchoredOutPattern(spec.Pattern)
 	if err != nil {
 		return nil, err
@@ -638,6 +641,9 @@ func (e *Executor) expandAnchoredMatch(ctx context.Context, tx graph.Tx, rows []
 				merged[pattern.SourceVar] = src
 				merged[pattern.TargetVar] = dst
 				merged["edge"] = edge
+				if pathVar != "" {
+					merged[pathVar] = cypherPathValue{Left: src, Edge: edge, Right: dst, Direction: "forward"}
+				}
 
 				if spec.Where != "" {
 					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
@@ -662,6 +668,9 @@ func (e *Executor) expandAnchoredMatch(ctx context.Context, tx graph.Tx, rows []
 			merged[pattern.SourceVar] = nil
 			merged[pattern.TargetVar] = nil
 			merged["edge"] = nil
+			if pathVar != "" {
+				merged[pathVar] = nil
+			}
 			out = append(out, merged)
 		}
 	}
@@ -723,7 +732,7 @@ func (e *Executor) resolveAnchoredSources(ctx context.Context, tx graph.Tx, tena
 	return []*graph.Vertex{vertex}, nil
 }
 
-func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern nodePattern, params Params) ([]Row, error) {
+func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern nodePattern, params Params, pathVar string) ([]Row, error) {
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, err
@@ -746,6 +755,9 @@ func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row,
 				continue
 			}
 			merged := cloneRow(row)
+			if pathVar != "" {
+				merged[pathVar] = cypherPathValue{Left: candidate}
+			}
 			merged[pattern.Var] = candidate
 
 			if spec.Where != "" {
@@ -764,6 +776,9 @@ func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row,
 
 		if spec.Optional && !matched {
 			merged := cloneRow(row)
+			if pathVar != "" {
+				merged[pathVar] = nil
+			}
 			merged[pattern.Var] = nil
 			out = append(out, merged)
 		}
@@ -857,7 +872,7 @@ func (e *Executor) expandUndirectedAdjacentMatch(ctx context.Context, tx graph.T
 	return out, nil
 }
 
-func (e *Executor) expandDirectedAdjacentMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern directedAdjacentPattern, params Params) ([]Row, error) {
+func (e *Executor) expandDirectedAdjacentMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern directedAdjacentPattern, params Params, pathVar string) ([]Row, error) {
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, err
@@ -869,6 +884,10 @@ func (e *Executor) expandDirectedAdjacentMatch(ctx context.Context, tx graph.Tx,
 
 	out := make([]Row, 0)
 	for _, row := range rows {
+		if pathVar != "" {
+			row = cloneRow(row)
+			row[pathVar] = nil
+		}
 		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
@@ -898,6 +917,9 @@ func (e *Executor) expandDirectedAdjacentMatch(ctx context.Context, tx graph.Tx,
 				}
 				if pattern.Right.Var != "" {
 					merged[pattern.Right.Var] = neighbor
+				}
+				if pathVar != "" {
+					merged[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: neighbor, Direction: "forward"}
 				}
 
 				if spec.Where != "" {
@@ -1297,7 +1319,7 @@ func (e *Executor) expandUndirectedRelationshipMatch(ctx context.Context, tx gra
 	return out, nil
 }
 
-func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern twoHopDirectedChainPattern, params Params) ([]Row, error) {
+func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern twoHopDirectedChainPattern, params Params, pathVar string) ([]Row, error) {
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, err
@@ -1359,7 +1381,8 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 				if len(pattern.SecondEdgeAnyOf) > 0 {
 					secondScanType = ""
 				}
-				if err := tx.ScanInEdges(ctx, tenant, mid.ID, secondScanType, 0, func(edge2 *graph.Edge) error {
+
+				collectRight := func(edge2 *graph.Edge, rightID string) error {
 					if !edgeTypeMatches(edge2, pattern.SecondEdgeType, pattern.SecondEdgeAnyOf) {
 						return nil
 					}
@@ -1367,7 +1390,7 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 						return nil
 					}
 
-					right, err := tx.GetVertex(ctx, tenant, edge2.SrcID)
+					right, err := tx.GetVertex(ctx, tenant, rightID)
 					if err != nil {
 						if graph.IsKind(err, graph.ErrKindNotFound) {
 							return nil
@@ -1381,6 +1404,15 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 					merged := cloneRow(mergedMid)
 					if pattern.Right.Var != "" {
 						merged[pattern.Right.Var] = right
+					}
+					if pathVar != "" {
+						directions := []string{"forward"}
+						if pattern.SecondForward {
+							directions = append(directions, "forward")
+						} else {
+							directions = append(directions, "reverse")
+						}
+						merged[pathVar] = multiHopPathValue([]*graph.Vertex{left, mid, right}, []*graph.Edge{edge1, edge2}, directions)
 					}
 					if !nodePatternMatches(right, pattern.Right, params, merged) {
 						return nil
@@ -1399,8 +1431,20 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 					matched = true
 					out = append(out, merged)
 					return nil
-				}); err != nil {
-					return err
+				}
+
+				if pattern.SecondForward {
+					if err := tx.ScanOutEdges(ctx, tenant, mid.ID, secondScanType, 0, func(edge2 *graph.Edge) error {
+						return collectRight(edge2, edge2.DstID)
+					}); err != nil {
+						return err
+					}
+				} else {
+					if err := tx.ScanInEdges(ctx, tenant, mid.ID, secondScanType, 0, func(edge2 *graph.Edge) error {
+						return collectRight(edge2, edge2.SrcID)
+					}); err != nil {
+						return err
+					}
 				}
 				return nil
 			}); err != nil {
@@ -1410,6 +1454,9 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 
 		if spec.Optional && !matched {
 			merged := cloneRow(row)
+			if pathVar != "" {
+				merged[pathVar] = nil
+			}
 			if pattern.Left.Var != "" {
 				merged[pattern.Left.Var] = nil
 			}
@@ -1424,15 +1471,6 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 	}
 
 	return out, nil
-}
-
-// multiHopPartialPath holds a partially-expanded path while walking hops.
-type multiHopPartialPath struct {
-	Nodes      []*graph.Vertex
-	Edges      []*graph.Edge
-	Directions []string
-	AccRow     Row             // accumulated bindings (includes all already-bound hop vars)
-	UsedEdges  map[string]bool // edge IDs already traversed (Cypher path-uniqueness rule)
 }
 
 func ensureOptionalPathBinding(rows []Row, pathVar string) {
@@ -1473,6 +1511,14 @@ type multiHopCypherPath struct {
 	Nodes      []*graph.Vertex
 	Edges      []*graph.Edge
 	Directions []string
+}
+
+type multiHopPartialPath struct {
+	Nodes      []*graph.Vertex
+	Edges      []*graph.Edge
+	Directions []string
+	AccRow     Row
+	UsedEdges  map[string]bool
 }
 
 func (p multiHopCypherPath) String() string {
@@ -4628,28 +4674,14 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if value == nil {
-			return nil, nil
-		}
-		normalized := normalizeResultValue(value)
-		if rendered, ok := normalized.(string); ok {
-			return rendered, nil
-		}
-		return fmt.Sprint(normalized), nil
+		return evalToStringValue(value)
 	}
 	if arg, ok := parseFunctionCall(raw, "toInteger"); ok {
 		value, err := evalExpressionWithScope(arg, row, params)
 		if err != nil {
 			return nil, err
 		}
-		if value == nil {
-			return nil, nil
-		}
-		integer, err := toInt(value)
-		if err != nil {
-			return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", err)
-		}
-		return integer, nil
+		return evalToIntegerValue(value)
 	}
 	if arg, ok := parseFunctionCall(raw, "toBoolean"); ok {
 		value, err := evalExpressionWithScope(arg, row, params)
@@ -6033,6 +6065,48 @@ func evalToBooleanValue(value any) (any, error) {
 		}
 	}
 	return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+}
+
+func evalToStringValue(value any) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if isInvalidTypeConversionValue(value) {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	return fmt.Sprint(normalizeResultValue(value)), nil
+}
+
+func evalToIntegerValue(value any) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if isInvalidTypeConversionValue(value) {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	normalized := normalizeResultValue(value)
+	switch typed := normalized.(type) {
+	case string:
+		s := strings.TrimSpace(typed)
+		if s == "" {
+			return nil, nil
+		}
+		if f, ok := numericValue(s); ok {
+			return int(truncTowardZero(f)), nil
+		}
+		return nil, nil
+	case json.Number:
+		f, err := typed.Float64()
+		if err != nil {
+			return nil, nil
+		}
+		return int(truncTowardZero(f)), nil
+	default:
+		if f, ok := numericValue(normalized); ok {
+			return int(truncTowardZero(f)), nil
+		}
+		return nil, nil
+	}
 }
 
 func evalToFloatValue(value any) (any, error) {
@@ -9721,9 +9795,6 @@ func formatDurationComponents(dur durationComponents) string {
 	if nanos <= -1_000_000_000 {
 		secInt--
 		nanos += 1_000_000_000
-	}
-	if nanos != 0 && math.Abs(float64(nanos)) <= 1 {
-		nanos = 0
 	}
 
 	b := strings.Builder{}

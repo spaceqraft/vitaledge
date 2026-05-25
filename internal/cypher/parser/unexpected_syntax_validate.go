@@ -97,6 +97,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 	case *ast.MatchQueryStatement:
 		bound := map[string]patternVarRole{}
 		for _, match := range typed.MatchClauses {
+			if err := validatePatternParameterUsage(match.Pattern, seg); err != nil {
+				return err
+			}
 			for _, binding := range scanPatternBindings(match.Pattern) {
 				if binding.name == "" {
 					continue
@@ -121,12 +124,24 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 			}
 		}
+		if typed.Return.IncludeAll && len(bound) == 0 {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
+		}
+		if err := validateProjectionClauseNames(typed.Return.Items, typed.Return.IncludeAll, bound, seg); err != nil {
+			return err
+		}
 	case *ast.QueryStatement:
 		bound := map[string]patternVarRole{}
 		for _, part := range typed.Parts {
 			for _, clause := range part.Clauses {
 				switch clause.Kind {
 				case ast.ClauseKindReturn, ast.ClauseKindWith:
+					if hasTopLevelStarProjection(clause.Raw, clause.Kind) && len(bound) == 0 {
+						return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
+					}
+					if err := validateProjectionClauseNamesFromRaw(clause.Raw, clause.Kind, bound, seg); err != nil {
+						return err
+					}
 					expressions := extractProjectionExpressions(clause.Raw, clause.Kind)
 					for _, expr := range expressions {
 						if containsForbiddenPatternExpression(expr) {
@@ -175,6 +190,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						continue
 					}
 					for _, pattern := range splitTopLevelComma(patternRaw) {
+						if err := validatePatternParameterUsage(pattern, seg); err != nil {
+							return err
+						}
 						for _, binding := range scanPatternBindings(pattern) {
 							if binding.name == "" {
 								continue
@@ -188,6 +206,164 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 	}
 
 	return nil
+}
+
+func validateProjectionClauseNames(items []ast.ProjectionItem, includeAll bool, bound map[string]patternVarRole, seg statementSegment) error {
+	seen := map[string]struct{}{}
+	if includeAll && len(bound) == 0 {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
+	}
+	for _, item := range items {
+		name := projectionOutputName(item)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "column name conflict", Statement: seg.index}
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+func validateProjectionClauseNamesFromRaw(raw string, kind ast.ClauseKind, bound map[string]patternVarRole, seg statementSegment) error {
+	items := splitProjectionItems(raw, kind)
+	seen := map[string]struct{}{}
+	if hasTopLevelStarProjection(raw, kind) && len(bound) == 0 {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
+	}
+	for _, item := range items {
+		if item == "" || item == "*" {
+			continue
+		}
+		name := projectionOutputNameFromRaw(item)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "column name conflict", Statement: seg.index}
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+func splitProjectionItems(raw string, kind ast.ClauseKind) []string {
+	text := strings.TrimSpace(raw)
+	upper := strings.ToUpper(text)
+	switch kind {
+	case ast.ClauseKindReturn:
+		if strings.HasPrefix(upper, "RETURN") {
+			text = strings.TrimSpace(text[len("RETURN"):])
+		}
+		if strings.HasPrefix(strings.ToUpper(text), "DISTINCT") {
+			text = strings.TrimSpace(text[len("DISTINCT"):])
+		}
+		if idx := indexTopLevelKeyword(text, "ORDERBY"); idx >= 0 {
+			text = strings.TrimSpace(text[:idx])
+		}
+		if idx := indexTopLevelKeyword(text, "SKIP"); idx >= 0 {
+			text = strings.TrimSpace(text[:idx])
+		}
+		if idx := indexTopLevelKeyword(text, "LIMIT"); idx >= 0 {
+			text = strings.TrimSpace(text[:idx])
+		}
+	case ast.ClauseKindWith:
+		if strings.HasPrefix(upper, "WITH") {
+			text = strings.TrimSpace(text[len("WITH"):])
+		}
+		if strings.HasPrefix(strings.ToUpper(text), "DISTINCT") {
+			text = strings.TrimSpace(text[len("DISTINCT"):])
+		}
+		if idx := indexTopLevelKeyword(text, "WHERE"); idx >= 0 {
+			text = strings.TrimSpace(text[:idx])
+		}
+		if idx := indexTopLevelKeyword(text, "ORDERBY"); idx >= 0 {
+			text = strings.TrimSpace(text[:idx])
+		}
+		if idx := indexTopLevelKeyword(text, "SKIP"); idx >= 0 {
+			text = strings.TrimSpace(text[:idx])
+		}
+		if idx := indexTopLevelKeyword(text, "LIMIT"); idx >= 0 {
+			text = strings.TrimSpace(text[:idx])
+		}
+	}
+	if text == "" {
+		return nil
+	}
+	return splitTopLevelComma(text)
+}
+
+func projectionOutputName(item ast.ProjectionItem) string {
+	if strings.TrimSpace(item.Alias) != "" {
+		return strings.TrimSpace(item.Alias)
+	}
+	return projectionOutputNameFromRaw(item.Expression.Raw)
+}
+
+func projectionOutputNameFromRaw(raw string) string {
+	text := strings.TrimSpace(raw)
+	if text == "" || text == "*" {
+		return ""
+	}
+	name, next, ok := readIdentifier(text, 0)
+	if !ok {
+		return ""
+	}
+	next = skipSpaces(text, next)
+	if next != len(text) {
+		return ""
+	}
+	return name
+}
+
+func hasTopLevelStarProjection(raw string, kind ast.ClauseKind) bool {
+	for _, item := range splitProjectionItems(raw, kind) {
+		if strings.TrimSpace(item) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func validatePatternParameterUsage(pattern string, seg statementSegment) error {
+	if !containsTopLevelPatternParameter(pattern) {
+		return nil
+	}
+	return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid parameter use", Statement: seg.index}
+}
+
+func containsTopLevelPatternParameter(pattern string) bool {
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(pattern); i++ {
+		ch := pattern[i]
+		if ch == '\'' && (i == 0 || pattern[i-1] != '\\') && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && (i == 0 || pattern[i-1] != '\\') && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '$':
+			if depthBrace == 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func extractProjectionExpressions(raw string, kind ast.ClauseKind) []string {

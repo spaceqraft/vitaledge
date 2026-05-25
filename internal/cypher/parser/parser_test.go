@@ -319,6 +319,51 @@ func TestParseStatementAllowsSizeOnPatternComprehension(t *testing.T) {
 	}
 }
 
+func TestParseStatementRejectsPatternParameterUseAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("MATCH (n$param) RETURN n")
+	if err == nil {
+		t.Fatalf("expected invalid parameter use parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsReturnStarWithoutScope(t *testing.T) {
+	_, err := ParseStatement("RETURN *")
+	if err == nil {
+		t.Fatalf("expected no variables in scope parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsDuplicateProjectionNamesAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN n AS x, n AS x")
+	if err == nil {
+		t.Fatalf("expected column name conflict parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
 func TestParseStatementRejectsPatternInReturnProjection(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) RETURN (n)-[]->()")
 	if err == nil {

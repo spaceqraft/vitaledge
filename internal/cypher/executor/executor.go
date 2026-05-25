@@ -868,6 +868,27 @@ func toInt(v any) (int, error) {
 	}
 }
 
+func isInvalidTypeConversionValue(v any) bool {
+	switch v.(type) {
+	case *graph.Vertex, *graph.Edge, cypherPathValue, multiHopCypherPath,
+		deletedVertexBinding, deletedEdgeBinding, Row, map[string]any, []any:
+		return true
+	}
+
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() {
+		return false
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		return true
+	case reflect.Slice, reflect.Array:
+		return !(rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8)
+	default:
+		return false
+	}
+}
+
 func vertexToMap(v *graph.Vertex) map[string]any {
 	if v == nil {
 		return nil

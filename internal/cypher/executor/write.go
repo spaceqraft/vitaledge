@@ -3817,7 +3817,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return compareWhereValues(lhs, rhs, ">=")
+		return compareExpressionValues(lhs, rhs, ">=")
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "<="); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -3828,7 +3828,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return compareWhereValues(lhs, rhs, "<=")
+		return compareExpressionValues(lhs, rhs, "<=")
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "<>"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -3839,12 +3839,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, lok := temporalMapValue(lhs); lok {
-			if _, rok := temporalMapValue(rhs); rok {
-				return !reflect.DeepEqual(normalizeResultValue(lhs), normalizeResultValue(rhs)), nil
-			}
-		}
-		return !reflect.DeepEqual(lhs, rhs), nil
+		return compareExpressionValuesWithRaw(lhs, rhs, "<>", left, right)
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "="); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -3855,12 +3850,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		if _, lok := temporalMapValue(lhs); lok {
-			if _, rok := temporalMapValue(rhs); rok {
-				return reflect.DeepEqual(normalizeResultValue(lhs), normalizeResultValue(rhs)), nil
-			}
-		}
-		return reflect.DeepEqual(lhs, rhs), nil
+		return compareExpressionValuesWithRaw(lhs, rhs, "=", left, right)
 	}
 	if left, right, ok := splitTopLevelOperator(raw, ">"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -3871,7 +3861,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return compareWhereValues(lhs, rhs, ">")
+		return compareExpressionValues(lhs, rhs, ">")
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "<"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -3882,7 +3872,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return compareWhereValues(lhs, rhs, "<")
+		return compareExpressionValues(lhs, rhs, "<")
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "+"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -4452,6 +4442,7 @@ func evalListPredicateFunction(raw string, row Row, params Params) (any, bool, e
 		anyNull := false
 		anyTrue := false
 		anyFalse := false
+		trueCount := 0
 		for _, value := range values {
 			scope := cloneRow(row)
 			scope[varName] = value
@@ -4466,6 +4457,7 @@ func evalListPredicateFunction(raw string, row Row, params Params) (any, bool, e
 			boolValue := truthyWhereValue(predValue)
 			if boolValue {
 				anyTrue = true
+				trueCount++
 			} else {
 				anyFalse = true
 			}
@@ -4496,11 +4488,14 @@ func evalListPredicateFunction(raw string, row Row, params Params) (any, bool, e
 			}
 			return true, true, nil
 		case "single":
-			if anyTrue && !anyFalse && !anyNull {
-				return true, true, nil
-			}
-			if anyTrue {
+			if trueCount > 1 {
 				return false, true, nil
+			}
+			if trueCount == 1 {
+				if anyNull {
+					return nil, true, nil
+				}
+				return true, true, nil
 			}
 			if anyNull {
 				return nil, true, nil
@@ -4596,7 +4591,10 @@ func splitTopLevelCompressedBoolean(raw, keyword string) (string, string, bool) 
 		if depth != 0 || !strings.HasPrefix(upper[i:], keyword) {
 			continue
 		}
-		if !compressedKeywordHasBoundaries(raw, i, len(keyword)) {
+		if keyword == "OR" && i > 0 && strings.EqualFold(raw[i-1:i+len(keyword)], "XOR") {
+			continue
+		}
+		if raw[i:i+len(keyword)] != keyword {
 			continue
 		}
 		left := strings.TrimSpace(raw[:i])
@@ -4604,9 +4602,7 @@ func splitTopLevelCompressedBoolean(raw, keyword string) (string, string, bool) 
 		if left == "" || right == "" {
 			continue
 		}
-		if isCompressedBooleanOperandShape(left, right) {
-			return left, right, true
-		}
+		return left, right, true
 	}
 	return "", "", false
 }
@@ -5285,16 +5281,40 @@ func splitTopLevelComparison(raw string) (string, string, string, bool) {
 }
 
 func compareWhereValues(lhs, rhs any, op string) (bool, error) {
-	if lhs == nil || rhs == nil {
-		return false, nil
+	value, err := compareExpressionValues(lhs, rhs, op)
+	if err != nil {
+		return false, err
 	}
-	cmp, ok := compareCypherValues(lhs, rhs)
-	if ok {
+	return truthyWhereValue(value), nil
+}
+
+func compareExpressionValues(lhs, rhs any, op string) (any, error) {
+	op = strings.TrimSpace(op)
+	if lhs == nil || rhs == nil {
+		return nil, nil
+	}
+
+	switch op {
+	case "=", "<>":
+		equal, isNull := cypherNullableEqual(lhs, rhs)
+		if isNull {
+			return nil, nil
+		}
+		if op == "=" {
+			return equal, nil
+		}
+		return !equal, nil
+	case "<", "<=", ">", ">=":
+		cmp, ok := compareCypherValues(lhs, rhs)
+		if !ok {
+			return nil, nil
+		}
+		sameKind := cypherSortRank(lhs) == cypherSortRank(rhs)
+		bothNumeric := isNumericType(lhs) && isNumericType(rhs)
+		if !sameKind && !bothNumeric {
+			return nil, nil
+		}
 		switch op {
-		case "=":
-			return cmp == 0, nil
-		case "<>":
-			return cmp != 0, nil
 		case "<":
 			return cmp < 0, nil
 		case "<=":
@@ -5303,29 +5323,147 @@ func compareWhereValues(lhs, rhs any, op string) (bool, error) {
 			return cmp > 0, nil
 		case ">=":
 			return cmp >= 0, nil
-		default:
-			return false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("WHERE operator %q is not supported", op), nil)
+		}
+	default:
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("WHERE operator %q is not supported", op), nil)
+	}
+	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("WHERE operator %q is not supported", op), nil)
+}
+
+func compareExpressionValuesWithRaw(lhs, rhs any, op, leftRaw, rightRaw string) (any, error) {
+	op = strings.TrimSpace(op)
+	if lhs == nil && rhs == nil && (op == "=" || op == "<>") {
+		if shouldTreatDoubleNullAsLogicalEquality(leftRaw, rightRaw) {
+			if op == "=" {
+				return true, nil
+			}
+			return false, nil
+		}
+	}
+	return compareExpressionValues(lhs, rhs, op)
+}
+
+func shouldTreatDoubleNullAsLogicalEquality(leftRaw, rightRaw string) bool {
+	left := strings.ToUpper(strings.TrimSpace(leftRaw))
+	right := strings.ToUpper(strings.TrimSpace(rightRaw))
+	if left == "NULL" && right == "NULL" {
+		return false
+	}
+	return isCompositeTruthExpression(left) || isCompositeTruthExpression(right)
+}
+
+func isCompositeTruthExpression(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	for _, marker := range []string{" OR ", " AND ", " XOR ", "NOT ", " IS NULL", " IS NOT NULL", "ISNULL", "ISNOTNULL", " IN "} {
+		if strings.Contains(raw, marker) {
+			return true
+		}
+	}
+	if strings.ContainsAny(raw, "<>=") {
+		return true
+	}
+	return strings.Contains(raw, "(") || strings.Contains(raw, ")")
+}
+
+func cypherNullableEqual(lhs, rhs any) (equal bool, isNull bool) {
+	if lhs == nil || rhs == nil {
+		return false, true
+	}
+
+	if leftMap, leftTemporal := temporalMapValue(lhs); leftTemporal {
+		if rightMap, rightTemporal := temporalMapValue(rhs); rightTemporal {
+			if result, ok := compareTemporalMaps(leftMap, rightMap, "="); ok {
+				return result, false
+			}
 		}
 	}
 
-	leftStr := fmt.Sprint(lhs)
-	rightStr := fmt.Sprint(rhs)
-	switch op {
-	case "=":
-		return leftStr == rightStr, nil
-	case "<>":
-		return leftStr != rightStr, nil
-	case "<":
-		return leftStr < rightStr, nil
-	case "<=":
-		return leftStr <= rightStr, nil
-	case ">":
-		return leftStr > rightStr, nil
-	case ">=":
-		return leftStr >= rightStr, nil
-	default:
-		return false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("WHERE operator %q is not supported", op), nil)
+	if lf, lok := numericValue(lhs); lok {
+		if rf, rok := numericValue(rhs); rok {
+			return lf == rf, false
+		}
 	}
+
+	if lb, lok := lhs.(bool); lok {
+		rb, rok := rhs.(bool)
+		if !rok {
+			return false, false
+		}
+		return lb == rb, false
+	}
+
+	if ls, lok := lhs.(string); lok {
+		rs, rok := rhs.(string)
+		if !rok {
+			return false, false
+		}
+		return ls == rs, false
+	}
+
+	if ll, lok := asAnySlice(lhs); lok {
+		rl, rok := asAnySlice(rhs)
+		if !rok {
+			return false, false
+		}
+		if len(ll) != len(rl) {
+			return false, false
+		}
+		unknown := false
+		for i := range ll {
+			eq, isNull := cypherNullableEqual(ll[i], rl[i])
+			if isNull {
+				unknown = true
+				continue
+			}
+			if !eq {
+				return false, false
+			}
+		}
+		if unknown {
+			return false, true
+		}
+		return true, false
+	}
+
+	lm, lok := lhs.(map[string]any)
+	rm, rok := rhs.(map[string]any)
+	if lok || rok {
+		if !lok || !rok {
+			return false, false
+		}
+		if len(lm) != len(rm) {
+			return false, false
+		}
+		unknown := false
+		for k, lv := range lm {
+			rv, ok := rm[k]
+			if !ok {
+				return false, false
+			}
+			eq, isNull := cypherNullableEqual(lv, rv)
+			if isNull {
+				unknown = true
+				continue
+			}
+			if !eq {
+				return false, false
+			}
+		}
+		if unknown {
+			return false, true
+		}
+		return true, false
+	}
+
+	return reflect.DeepEqual(lhs, rhs), false
+}
+
+func isNumericType(value any) bool {
+	_, ok := numericValue(value)
+	return ok
 }
 
 func compareTemporalMaps(lhs, rhs map[string]any, op string) (bool, bool) {

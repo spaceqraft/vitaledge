@@ -176,6 +176,10 @@ func shouldUseProjectionEngineForReturn(ret ast.ReturnClause) bool {
 		return true
 	}
 	for _, item := range ret.Items {
+		rawExpr := strings.TrimSpace(item.Expression.Raw)
+		if strings.ContainsAny(rawExpr, " \t\n\r") {
+			return true
+		}
 		raw := strings.ToUpper(strings.TrimSpace(item.Expression.Raw))
 		if raw == "" {
 			continue

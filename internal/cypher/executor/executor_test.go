@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -1707,6 +1708,77 @@ func TestExecuteRandExpressionAndQuantifierSetup(t *testing.T) {
 	}
 	if legacyValue != "u1" {
 		t.Fatalf("unexpected legacy coalesce fallback: %#v", legacyValue)
+	}
+}
+
+func TestEvalExpressionWithScopeBooleanSemantics(t *testing.T) {
+	row := Row{
+		"n0":  0,
+		"s":   "xx",
+		"a":   true,
+		"b":   false,
+		"c":   false,
+		"nil": nil,
+		"n":   nil,
+		"l1":  []any{1, nil},
+		"l2":  []any{1, 2},
+		"m1":  map[string]any{"k": nil},
+		"m2":  map[string]any{"k": 1},
+	}
+
+	cases := []struct {
+		expr string
+		want any
+	}{
+		{expr: "nil = nil", want: nil},
+		{expr: "nil <> nil", want: nil},
+		{expr: "nil > n0", want: nil},
+		{expr: "s > n0", want: nil},
+		{expr: "l1 = l2", want: nil},
+		{expr: "m1 = m2", want: nil},
+		{expr: "aOR(bANDc)", want: true},
+		{expr: "aXORb", want: true},
+		{expr: "aISNULLORnilISNULLORb", want: true},
+		{expr: "n.missing IS NULL", want: true},
+		{expr: "a OR b = c", want: true},
+		{expr: "a OR (b = c)", want: true},
+		{expr: "(a OR b) = c", want: false},
+		{expr: "single(x IN [1, 2] WHERE x = 1)", want: true},
+		{expr: "single(x IN [1, 2] WHERE x > 0)", want: false},
+		{expr: "single(x IN [null, 1] WHERE x = 1)", want: nil},
+		{expr: "single(x IN [null] WHERE x = 1)", want: nil},
+	}
+
+	for _, tc := range cases {
+		got, err := evalExpressionWithScope(tc.expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", tc.expr, err)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %#v", tc.expr, got, tc.want)
+		}
+	}
+}
+
+func TestPrecedenceComparisonVsBooleanProbe(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+
+	stmt, err := parser.ParseStatement("UNWIND [true, false, null] AS a UNWIND [true, false, null] AS b UNWIND [true, false, null] AS c WITH collect((a OR b = c) = (a OR (b = c))) AS eq, collect((a OR b = c) <> ((a OR b) = c)) AS neq RETURN size([x IN eq WHERE x IS NULL]) AS eqNull, size([x IN eq WHERE x = false]) AS eqFalse, size([x IN eq WHERE x = true]) AS eqTrue, all(x IN eq WHERE x) AS allEq, any(x IN neq WHERE x) AS anyNeq, all(x IN eq WHERE x) AND any(x IN neq WHERE x) AS result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["result"]; got != true {
+		t.Fatalf("unexpected precedence probe row: %#v", res.Rows[0])
 	}
 }
 

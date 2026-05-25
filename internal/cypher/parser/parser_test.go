@@ -202,6 +202,20 @@ func TestParseStatementVariableTypeConflictWithMatchNode(t *testing.T) {
 	}
 }
 
+func TestParseStatementOptionalMatchForwardedNodeAllowed(t *testing.T) {
+	_, err := ParseStatement("OPTIONAL MATCH (a:Start) WITH a MATCH (a)-->(b) RETURN b")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementVariableLengthRelationshipListBindingAllowed(t *testing.T) {
+	_, err := ParseStatement("MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 MATCH (first)-[rs*]->(second) RETURN first, second")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementCreateAlreadyBoundNode(t *testing.T) {
 	_, err := ParseStatement("MATCH (a) CREATE (a) RETURN a")
 	if err == nil {
@@ -273,5 +287,72 @@ func TestParseStatementCreateAllowsBoundEndpointsInRelationshipPattern(t *testin
 	_, err := ParseStatement("CREATE (a), (b) CREATE (a)-[:KNOWS]->(b)")
 	if err != nil {
 		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementRejectsSizeOnPatternPredicate(t *testing.T) {
+	_, err := ParseStatement("MATCH (a), (b), (c) RETURN size((a)-[:REL]->(b))")
+	if err == nil {
+		t.Fatalf("expected unexpected syntax parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementAllowsSizeOnPatternComprehension(t *testing.T) {
+	_, err := ParseStatement("MATCH (a) RETURN size([(a)-->() | 1]) AS degree")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementRejectsPatternInReturnProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN (n)-[]->()")
+	if err == nil {
+		t.Fatalf("expected unexpected syntax parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsPatternInWithProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) WITH (n)-[]->() AS x RETURN x")
+	if err == nil {
+		t.Fatalf("expected unexpected syntax parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsPatternInSetValueExpression(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) SET n.prop = head(nodes(head((n)-[:REL]->()))).foo")
+	if err == nil {
+		t.Fatalf("expected unexpected syntax parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
 	}
 }

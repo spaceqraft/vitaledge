@@ -16,7 +16,9 @@ var reverseDirectedAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za
 var directedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var reverseDirectedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var undirectedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-var twoHopDirectedChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var twoHopForwardChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var twoHopConvergingChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var chainNodeSegmentRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var identifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type anchoredOutPattern struct {
@@ -85,6 +87,7 @@ type twoHopDirectedChainPattern struct {
 	FirstEdgeType   string
 	FirstEdgeAnyOf  []string
 	FirstEdgeProps  string
+	SecondForward   bool
 	SecondEdgeType  string
 	SecondEdgeAnyOf []string
 	SecondEdgeProps string
@@ -362,7 +365,12 @@ func parseUndirectedRelationshipPattern(raw string) (undirectedRelationshipPatte
 
 func parseTwoHopDirectedChainPattern(raw string) (twoHopDirectedChainPattern, error) {
 	normalized := normalizeClauseBody(raw)
-	m := twoHopDirectedChainPatternRE.FindStringSubmatch(normalized)
+	m := twoHopForwardChainPatternRE.FindStringSubmatch(normalized)
+	secondForward := true
+	if len(m) != 12 {
+		m = twoHopConvergingChainPatternRE.FindStringSubmatch(normalized)
+		secondForward = false
+	}
 	if len(m) != 12 {
 		return twoHopDirectedChainPattern{}, graph.NewError(
 			graph.ErrKindUnsupported,
@@ -409,10 +417,138 @@ func parseTwoHopDirectedChainPattern(raw string) (twoHopDirectedChainPattern, er
 		FirstEdgeType:   firstType,
 		FirstEdgeAnyOf:  firstAnyOf,
 		FirstEdgeProps:  firstProps,
+		SecondForward:   secondForward,
 		SecondEdgeType:  secondType,
 		SecondEdgeAnyOf: secondAnyOf,
 		SecondEdgeProps: secondProps,
 	}, nil
+}
+
+func parseForwardTwoHopChainPatterns(raw string) (string, string, bool) {
+	normalized := normalizeClauseBody(raw)
+	left, next, ok := scanChainedNodePattern(normalized, 0)
+	if !ok {
+		return "", "", false
+	}
+	edge1, next, ok := scanForwardChainedEdgePattern(normalized, next)
+	if !ok {
+		return "", "", false
+	}
+	mid, next, ok := scanChainedNodePattern(normalized, next)
+	if !ok {
+		return "", "", false
+	}
+	edge2, next, ok := scanForwardChainedEdgePattern(normalized, next)
+	if !ok {
+		return "", "", false
+	}
+	right, next, ok := scanChainedNodePattern(normalized, next)
+	if !ok || next != len(normalized) {
+		return "", "", false
+	}
+	return left + edge1 + mid, mid + edge2 + right, true
+}
+
+func scanChainedNodePattern(raw string, start int) (string, int, bool) {
+	if start >= len(raw) || raw[start] != '(' {
+		return "", start, false
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := start; i < len(raw); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' {
+				if i+1 < len(raw) && raw[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '\\' {
+				i++
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return raw[start : i+1], i + 1, true
+			}
+		}
+	}
+	return "", start, false
+}
+
+func scanForwardChainedEdgePattern(raw string, start int) (string, int, bool) {
+	if strings.HasPrefix(raw[start:], "-->") {
+		return "-->", start + 3, true
+	}
+	if start >= len(raw) || raw[start] != '-' {
+		return "", start, false
+	}
+	idx := start + 1
+	if idx >= len(raw) || raw[idx] != '[' {
+		return "", start, false
+	}
+	depthBracket := 0
+	inSingle := false
+	inDouble := false
+	for i := idx; i < len(raw); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' {
+				if i+1 < len(raw) && raw[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '\\' {
+				i++
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '[':
+			depthBracket++
+		case ']':
+			depthBracket--
+			if depthBracket == 0 {
+				if i+2 >= len(raw) || raw[i+1] != '-' || raw[i+2] != '>' {
+					return "", start, false
+				}
+				return raw[start : i+3], i + 3, true
+			}
+		}
+	}
+	return "", start, false
 }
 
 func parseEdgePatternInner(raw string) (edgeVar string, edgeType string, edgeAnyOf []string, edgeProps string, err error) {
@@ -524,4 +660,124 @@ func parseLabelFilters(raw string) (allOf []string, anyOf []string, excluded []s
 		allOf = append(allOf, part)
 	}
 	return allOf, nil, excluded
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Multi-hop adjacent chain pattern (no explicit edge types, 2+ hops)
+// Handles patterns like:
+//   (n)-->(k)<--(n)          forward+reverse
+//   (a:Label)<--(:B)--()     reverse+undirected
+//   (n)-->(m)--(o)           forward+undirected
+//   (n)-->(m)--(o)--(p)      three hops
+//   (n)<-->(k)<-->(n)        bidirected (treated as undirected each hop)
+// ──────────────────────────────────────────────────────────────────────────
+
+type multiHopAdjacentChainHop struct {
+	Direction string // "forward", "reverse", or "undirected"
+	Node      nodePattern
+}
+
+type multiHopAdjacentChainPattern struct {
+	Start nodePattern
+	Hops  []multiHopAdjacentChainHop // len >= 2
+}
+
+// consumeNodeSegment reads the leading "(…)" node token from s, returning
+// (nodeString, remainder, ok).  Handles nested parens (for props).
+func consumeNodeSegment(s string) (string, string, bool) {
+	if len(s) == 0 || s[0] != '(' {
+		return "", "", false
+	}
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return s[:i+1], s[i+1:], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// consumeAdjacentArrow reads one of -->, <--, --, <--> from the front of s.
+// Returns false when the next token is a bracketed relationship [-…-] or
+// anything else.
+func consumeAdjacentArrow(s string) (string, string, bool) {
+	// Check longest prefixes first so "<-->" doesn't get eaten as "<--".
+	if strings.HasPrefix(s, "<-->") {
+		return "undirected", s[4:], true
+	}
+	if strings.HasPrefix(s, "-->") {
+		return "forward", s[3:], true
+	}
+	if strings.HasPrefix(s, "<--") {
+		return "reverse", s[3:], true
+	}
+	// "--" is undirected; reject "--[" (explicit relationship type).
+	if strings.HasPrefix(s, "--") && (len(s) < 3 || s[2] != '[') {
+		return "undirected", s[2:], true
+	}
+	return "", "", false
+}
+
+// parseChainNodeSegment parses a single "(…)" node token that may have an
+// anonymous variable (unlike parseNodePattern which requires a named var).
+func parseChainNodeSegment(raw string) (nodePattern, error) {
+	normalized := normalizeClauseBody(raw)
+	m := chainNodeSegmentRE.FindStringSubmatch(normalized)
+	if len(m) != 4 {
+		return nodePattern{}, fmt.Errorf("not a node segment: %q", raw)
+	}
+	allOf, anyOf, excluded := parseLabelFilters(m[2])
+	return nodePattern{
+		Var:            m[1],
+		AllOfLabels:    allOf,
+		AnyOfLabels:    anyOf,
+		ExcludedLabels: excluded,
+		PropertiesRaw:  m[3],
+	}, nil
+}
+
+// parseMultiHopAdjacentChainPattern parses any adjacent chain with 2 or more
+// hops and no explicit relationship brackets.  Returns an error if the string
+// does not fit (used as a try-parse in applyMatchClause).
+func parseMultiHopAdjacentChainPattern(raw string) (multiHopAdjacentChainPattern, error) {
+	normalized := normalizeClauseBody(raw)
+
+	nodeStr, rest, ok := consumeNodeSegment(normalized)
+	if !ok {
+		return multiHopAdjacentChainPattern{}, fmt.Errorf("no leading node in %q", raw)
+	}
+	startNode, err := parseChainNodeSegment(nodeStr)
+	if err != nil {
+		return multiHopAdjacentChainPattern{}, err
+	}
+
+	s := rest
+	var hops []multiHopAdjacentChainHop
+	for {
+		dir, afterArrow, arrowOK := consumeAdjacentArrow(s)
+		if !arrowOK {
+			break
+		}
+		hopStr, afterNode, nodeOK := consumeNodeSegment(afterArrow)
+		if !nodeOK {
+			break
+		}
+		hopNode, err := parseChainNodeSegment(hopStr)
+		if err != nil {
+			return multiHopAdjacentChainPattern{}, err
+		}
+		hops = append(hops, multiHopAdjacentChainHop{Direction: dir, Node: hopNode})
+		s = afterNode
+	}
+
+	if len(hops) < 2 || s != "" {
+		return multiHopAdjacentChainPattern{}, fmt.Errorf("not a multi-hop adjacent chain: %q (hops=%d, trailing=%q)", raw, len(hops), s)
+	}
+	return multiHopAdjacentChainPattern{Start: startNode, Hops: hops}, nil
 }

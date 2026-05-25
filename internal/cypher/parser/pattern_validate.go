@@ -89,6 +89,10 @@ func validatePatternBindings(pattern string, bound map[string]patternVarRole, se
 			continue
 		}
 		if prev, ok := bound[b.name]; ok {
+			if prev == patternRoleValue && b.role == patternRoleRel && isVariableLengthRelationshipBinding(pattern, b.name) {
+				// MATCH (a)-[rs*]->(b) can legally reuse a pre-bound list value.
+				continue
+			}
 			if prev == b.role {
 				_, seenInClause := clauseIntroduced[b.name]
 				if shouldRejectSameRoleRebinding(clauseKind, b, seenInClause, patternHasRelationship) {
@@ -318,7 +322,9 @@ func roleForProjectionExpr(expr string, bound map[string]patternVarRole) pattern
 func extractMatchPattern(raw string) (string, bool) {
 	text := strings.TrimSpace(raw)
 	upper := strings.ToUpper(text)
-	if strings.HasPrefix(upper, "OPTIONALMATCH") {
+	if strings.HasPrefix(upper, "OPTIONAL MATCH") {
+		text = strings.TrimSpace(text[len("OPTIONAL MATCH"):])
+	} else if strings.HasPrefix(upper, "OPTIONALMATCH") {
 		text = strings.TrimSpace(text[len("OPTIONALMATCH"):])
 	} else if strings.HasPrefix(upper, "MATCH") {
 		text = strings.TrimSpace(text[len("MATCH"):])
@@ -335,7 +341,9 @@ func extractMatchPattern(raw string) (string, bool) {
 func extractMatchWhere(raw string) (string, bool) {
 	text := strings.TrimSpace(raw)
 	upper := strings.ToUpper(text)
-	if strings.HasPrefix(upper, "OPTIONALMATCH") {
+	if strings.HasPrefix(upper, "OPTIONAL MATCH") {
+		text = strings.TrimSpace(text[len("OPTIONAL MATCH"):])
+	} else if strings.HasPrefix(upper, "OPTIONALMATCH") {
 		text = strings.TrimSpace(text[len("OPTIONALMATCH"):])
 	} else if strings.HasPrefix(upper, "MATCH") {
 		text = strings.TrimSpace(text[len("MATCH"):])
@@ -366,6 +374,35 @@ func validateWherePatternBindings(whereRaw string, bound map[string]patternVarRo
 		return &ParseError{Kind: ParseErrorUnsupported, Message: "undefined variable", Statement: seg.index}
 	}
 	return nil
+}
+
+func isVariableLengthRelationshipBinding(pattern, name string) bool {
+	if pattern == "" || name == "" {
+		return false
+	}
+	needle := "[" + name
+	searchFrom := 0
+	for {
+		idx := strings.Index(pattern[searchFrom:], needle)
+		if idx < 0 {
+			return false
+		}
+		idx += searchFrom
+		after := idx + len(needle)
+		if after < len(pattern) && isIdentifierPart(pattern[after]) {
+			searchFrom = idx + 1
+			continue
+		}
+		close := strings.IndexByte(pattern[after:], ']')
+		if close < 0 {
+			return false
+		}
+		segment := pattern[after : after+close]
+		if strings.Contains(segment, "*") {
+			return true
+		}
+		searchFrom = after + close + 1
+	}
 }
 
 func indexTopLevelKeyword(raw, keyword string) int {

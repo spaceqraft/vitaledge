@@ -232,6 +232,14 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	if chain, err := parseTwoHopDirectedChainPattern(patternRaw); err == nil {
 		return e.expandTwoHopDirectedChainMatch(ctx, tx, rows, spec, chain, params)
 	}
+	if chain, err := parseMultiHopAdjacentChainPattern(patternRaw); err == nil {
+		matched, matchErr := e.expandMultiHopAdjacentChainMatch(ctx, tx, rows, spec, chain, params, pathVar)
+		if matchErr != nil {
+			return nil, matchErr
+		}
+		ensureOptionalPathBinding(matched, pathVar)
+		return matched, nil
+	}
 	return e.expandAnchoredMatch(ctx, tx, rows, spec, params)
 }
 
@@ -1398,6 +1406,251 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 			}
 			if pattern.Right.Var != "" {
 				merged[pattern.Right.Var] = nil
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
+}
+
+// multiHopPartialPath holds a partially-expanded path while walking hops.
+type multiHopPartialPath struct {
+	Nodes      []*graph.Vertex
+	Edges      []*graph.Edge
+	Directions []string
+	AccRow     Row             // accumulated bindings (includes all already-bound hop vars)
+	UsedEdges  map[string]bool // edge IDs already traversed (Cypher path-uniqueness rule)
+}
+
+func ensureOptionalPathBinding(rows []Row, pathVar string) {
+	if pathVar == "" {
+		return
+	}
+	for _, row := range rows {
+		if _, ok := row[pathVar]; !ok {
+			row[pathVar] = nil
+		}
+	}
+}
+
+func setOptionalNoMatchBinding(dst Row, src Row, varName string) {
+	if varName == "" {
+		return
+	}
+	if _, bound := src[varName]; bound {
+		dst[varName] = src[varName]
+	} else {
+		dst[varName] = nil
+	}
+}
+
+func multiHopPathValue(nodes []*graph.Vertex, edges []*graph.Edge, directions []string) any {
+	if len(nodes) == 0 {
+		return nil
+	}
+	if len(nodes) == 1 {
+		return cypherPathValue{Left: nodes[0]}
+	}
+	// Build the path as a serialized string similar to cypherPathValue.
+	// For multi-hop, return a multiHopCypherPath struct.
+	return multiHopCypherPath{Nodes: nodes, Edges: edges, Directions: directions}
+}
+
+type multiHopCypherPath struct {
+	Nodes      []*graph.Vertex
+	Edges      []*graph.Edge
+	Directions []string
+}
+
+func (p multiHopCypherPath) String() string {
+	if len(p.Nodes) == 0 {
+		return "<>"
+	}
+	b := strings.Builder{}
+	b.WriteString("<")
+	b.WriteString(renderPathNode(p.Nodes[0]))
+	for i, edge := range p.Edges {
+		dir := "forward"
+		if i < len(p.Directions) {
+			dir = p.Directions[i]
+		}
+		edgeStr := renderPathEdge(edge)
+		switch dir {
+		case "reverse":
+			b.WriteString("<-" + edgeStr + "-")
+		case "undirected":
+			b.WriteString("-" + edgeStr + "-")
+		default:
+			b.WriteString("-" + edgeStr + "->")
+		}
+		if i+1 < len(p.Nodes) {
+			b.WriteString(renderPathNode(p.Nodes[i+1]))
+		}
+	}
+	b.WriteString(">")
+	return b.String()
+}
+
+func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, chain multiHopAdjacentChainPattern, params Params, pathVar string) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		startCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, chain.Start, params)
+		if err != nil {
+			return nil, err
+		}
+
+		matched := false
+		for _, start := range startCandidates {
+			if start == nil {
+				continue
+			}
+
+			accRow := cloneRow(row)
+			if chain.Start.Var != "" {
+				accRow[chain.Start.Var] = start
+			}
+
+			current := []multiHopPartialPath{{
+				Nodes:     []*graph.Vertex{start},
+				AccRow:    accRow,
+				UsedEdges: make(map[string]bool),
+			}}
+
+			var hopErr error
+			for _, hop := range chain.Hops {
+				var next []multiHopPartialPath
+				for _, partial := range current {
+					last := partial.Nodes[len(partial.Nodes)-1]
+
+					type edgeNeighbor struct {
+						edge      *graph.Edge
+						neighbor  *graph.Vertex
+						direction string
+					}
+					var candidates []edgeNeighbor
+
+					collectFn := func(edge *graph.Edge, neighborID, dir string) error {
+						neighbor, nerr := tx.GetVertex(ctx, tenant, neighborID)
+						if nerr != nil {
+							if graph.IsKind(nerr, graph.ErrKindNotFound) {
+								return nil
+							}
+							return nerr
+						}
+						candidates = append(candidates, edgeNeighbor{edge, neighbor, dir})
+						return nil
+					}
+
+					if hop.Direction == "forward" || hop.Direction == "undirected" {
+						if scanErr := tx.ScanOutEdges(ctx, tenant, last.ID, "", 0, func(edge *graph.Edge) error {
+							return collectFn(edge, edge.DstID, "forward")
+						}); scanErr != nil {
+							hopErr = scanErr
+							break
+						}
+					}
+					if hop.Direction == "reverse" || hop.Direction == "undirected" {
+						if scanErr := tx.ScanInEdges(ctx, tenant, last.ID, "", 0, func(edge *graph.Edge) error {
+							return collectFn(edge, edge.SrcID, "reverse")
+						}); scanErr != nil {
+							hopErr = scanErr
+							break
+						}
+					}
+					if hopErr != nil {
+						break
+					}
+
+					for _, c := range candidates {
+						// Cypher path-uniqueness: each edge may only appear once per path.
+						if partial.UsedEdges[c.edge.ID] {
+							continue
+						}
+						if !nodePatternMatches(c.neighbor, hop.Node, params, partial.AccRow) {
+							continue
+						}
+
+						newNodes := make([]*graph.Vertex, len(partial.Nodes)+1)
+						copy(newNodes, partial.Nodes)
+						newNodes[len(partial.Nodes)] = c.neighbor
+
+						newEdges := make([]*graph.Edge, len(partial.Edges)+1)
+						copy(newEdges, partial.Edges)
+						newEdges[len(partial.Edges)] = c.edge
+
+						newDirs := make([]string, len(partial.Directions)+1)
+						copy(newDirs, partial.Directions)
+						newDirs[len(partial.Directions)] = c.direction
+
+						newAccRow := cloneRow(partial.AccRow)
+						if hop.Node.Var != "" {
+							newAccRow[hop.Node.Var] = c.neighbor
+						}
+
+						newUsed := make(map[string]bool, len(partial.UsedEdges)+1)
+						for k := range partial.UsedEdges {
+							newUsed[k] = true
+						}
+						newUsed[c.edge.ID] = true
+
+						next = append(next, multiHopPartialPath{
+							Nodes:      newNodes,
+							Edges:      newEdges,
+							Directions: newDirs,
+							AccRow:     newAccRow,
+							UsedEdges:  newUsed,
+						})
+					}
+				}
+				if hopErr != nil {
+					break
+				}
+				current = next
+			}
+
+			if hopErr != nil {
+				return nil, hopErr
+			}
+
+			for _, path := range current {
+				merged := cloneRow(path.AccRow)
+				if pathVar != "" {
+					merged[pathVar] = multiHopPathValue(path.Nodes, path.Edges, path.Directions)
+				}
+
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						continue
+					}
+				}
+
+				matched = true
+				out = append(out, merged)
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			if chain.Start.Var != "" {
+				setOptionalNoMatchBinding(merged, row, chain.Start.Var)
+			}
+			for _, hop := range chain.Hops {
+				if hop.Node.Var != "" {
+					setOptionalNoMatchBinding(merged, row, hop.Node.Var)
+				}
 			}
 			out = append(out, merged)
 		}

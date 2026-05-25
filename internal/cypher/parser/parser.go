@@ -76,6 +76,9 @@ func parseSegment(seg statementSegment, fullQuery string) (ast.Statement, error)
 	if err := validatePatternVariableScoping(stmt, seg); err != nil {
 		return nil, err
 	}
+	if err := validateUnexpectedSyntax(stmt, seg); err != nil {
+		return nil, err
+	}
 	return stmt, nil
 }
 

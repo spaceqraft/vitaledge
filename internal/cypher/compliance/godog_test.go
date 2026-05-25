@@ -712,10 +712,13 @@ func (f *cypherTCKFeature) closeStore() error {
 func (f *cypherTCKFeature) snapshotGraph() (graphSnapshot, error) {
 	stats := graphSnapshot{}
 	seenEdges := map[string]struct{}{}
+	seenLabels := map[string]struct{}{}
 	err := f.store.View(f.ctx, func(tx graph.Tx) error {
 		return tx.ScanVertices(f.ctx, defaultTenant, 0, func(vertex *graph.Vertex) error {
 			stats.Nodes++
-			stats.Labels += len(vertex.Labels)
+			for _, label := range vertex.Labels {
+				seenLabels[label] = struct{}{}
+			}
 			stats.Properties += len(vertex.Properties)
 			return tx.ScanOutEdges(f.ctx, defaultTenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
 				if _, ok := seenEdges[edge.ID]; ok {
@@ -728,6 +731,7 @@ func (f *cypherTCKFeature) snapshotGraph() (graphSnapshot, error) {
 			})
 		})
 	})
+	stats.Labels = len(seenLabels)
 	return stats, err
 }
 

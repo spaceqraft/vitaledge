@@ -1417,7 +1417,8 @@ func vertexMatchesProperty(vertex *graph.Vertex, prop string, encoded []byte, la
 }
 
 func (e *Executor) applyCreateClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, merge bool) ([]Row, error) {
-	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
+	rawClause := stripLeadingClauseKeyword(clause.Raw, string(clause.Kind))
+	raw := normalizeClauseBody(stripCypherLineComments(rawClause))
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, err
@@ -1997,6 +1998,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 	if err := validateProjectionOrderBy(items, projection.OrderBy, rows); err != nil {
 		return nil, nil, err
 	}
+	projection.OrderBy = rewriteOrderByAggregateReferences(projection.OrderBy, items)
 
 	out := make([]Row, 0, len(rows))
 	columns := make([]string, 0, len(items))
@@ -2012,7 +2014,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		} else {
 			columns = append(columns, item.Expression)
 		}
-		if item.CountArg != "" || item.CollectArg != "" {
+		if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" {
 			hasAggregate = true
 		}
 	}
@@ -2049,15 +2051,25 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		return out, columns, nil
 	}
 
+	type projectionAggregate struct {
+		funcName string
+		count    int
+		sum      float64
+		min      any
+		max      any
+		hasValue bool
+	}
+
 	type projectionGroup struct {
 		projected Row
 		counts    map[int]int
 		collects  map[int][]any
+		aggs      map[int]*projectionAggregate
 	}
 
 	nonAggregateCount := 0
 	for _, item := range items {
-		if item.CountArg == "" && item.CollectArg == "" {
+		if item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" {
 			nonAggregateCount++
 		}
 	}
@@ -2068,7 +2080,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		projected := Row{}
 		keyValues := make([]any, 0, nonAggregateCount)
 		for _, item := range items {
-			if item.CountArg != "" || item.CollectArg != "" {
+			if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" {
 				continue
 			}
 			value, err := evalExpressionWithScope(item.Expression, row, params)
@@ -2090,7 +2102,7 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 		groupKey := string(keyBytes)
 		group, ok := groups[groupKey]
 		if !ok {
-			group = &projectionGroup{projected: projected, counts: map[int]int{}, collects: map[int][]any{}}
+			group = &projectionGroup{projected: projected, counts: map[int]int{}, collects: map[int][]any{}, aggs: map[int]*projectionAggregate{}}
 			groups[groupKey] = group
 			groupOrder = append(groupOrder, groupKey)
 		}
@@ -2116,6 +2128,55 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 					return nil, nil, err
 				}
 				group.collects[idx] = append(group.collects[idx], value)
+				continue
+			}
+			if item.AggFunc != "" {
+				value, err := evalExpressionWithScope(item.AggArg, row, params)
+				if err != nil {
+					return nil, nil, err
+				}
+				agg := group.aggs[idx]
+				if agg == nil {
+					agg = &projectionAggregate{funcName: item.AggFunc}
+					group.aggs[idx] = agg
+				}
+				switch item.AggFunc {
+				case "sum", "avg":
+					if value == nil {
+						continue
+					}
+					n, ok := numericValue(value)
+					if !ok {
+						continue
+					}
+					agg.sum += n
+					agg.count++
+					agg.hasValue = true
+				case "min":
+					if value == nil {
+						continue
+					}
+					if !agg.hasValue {
+						agg.min = value
+						agg.hasValue = true
+						continue
+					}
+					if cmp, ok := compareCypherValues(value, agg.min); ok && cmp < 0 {
+						agg.min = value
+					}
+				case "max":
+					if value == nil {
+						continue
+					}
+					if !agg.hasValue {
+						agg.max = value
+						agg.hasValue = true
+						continue
+					}
+					if cmp, ok := compareCypherValues(value, agg.max); ok && cmp > 0 {
+						agg.max = value
+					}
+				}
 			}
 		}
 	}
@@ -2131,6 +2192,8 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 				projected[key] = 0
 			} else if item.CollectArg != "" {
 				projected[key] = []any{}
+			} else if item.AggFunc != "" {
+				projected[key] = nil
 			} else {
 				projected[key] = nil
 			}
@@ -2161,6 +2224,28 @@ func (e *Executor) applyProjectionClause(rows []Row, clause ast.Clause, params P
 				} else {
 					projected[key] = []any{}
 				}
+				continue
+			}
+			if item.AggFunc != "" {
+				agg := group.aggs[idx]
+				if agg == nil || !agg.hasValue {
+					projected[key] = nil
+					continue
+				}
+				switch item.AggFunc {
+				case "sum":
+					projected[key] = agg.sum
+				case "avg":
+					if agg.count == 0 {
+						projected[key] = nil
+					} else {
+						projected[key] = agg.sum / float64(agg.count)
+					}
+				case "min":
+					projected[key] = agg.min
+				case "max":
+					projected[key] = agg.max
+				}
 			}
 		}
 		out = append(out, projected)
@@ -2180,6 +2265,8 @@ type projectionSpec struct {
 	Alias      string
 	CountArg   string
 	CollectArg string
+	AggFunc    string
+	AggArg     string
 }
 
 type projectionClauseSpec struct {
@@ -2292,10 +2379,19 @@ func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrder
 	}
 
 	hasProjectionAggregate := false
+	projectedAggFuncs := map[string]struct{}{}
 	for _, item := range items {
-		if item.CountArg != "" || item.CollectArg != "" {
+		if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" {
 			hasProjectionAggregate = true
-			break
+			if item.CountArg != "" {
+				projectedAggFuncs["count"] = struct{}{}
+			}
+			if item.CollectArg != "" {
+				projectedAggFuncs["collect"] = struct{}{}
+			}
+			if item.AggFunc != "" {
+				projectedAggFuncs[strings.ToLower(item.AggFunc)] = struct{}{}
+			}
 		}
 	}
 
@@ -2320,8 +2416,25 @@ func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrder
 		if expr == "" {
 			continue
 		}
-		if containsAggregationExpression(expr) && !hasProjectionAggregate {
+		hasAgg := containsAggregationExpression(expr)
+		if hasAgg && !hasProjectionAggregate {
 			return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "invalid aggregation expression"}
+		}
+		if hasAgg {
+			calls := extractAggregateCalls(expr)
+			for _, call := range calls {
+				fn := aggregateFuncNameFromCall(call)
+				if _, ok := projectedAggFuncs[fn]; !ok {
+					return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "undefined variable"}
+				}
+			}
+			stripped := stripAggregateCalls(expr)
+			for _, ident := range extractIdentifierRoots(stripped) {
+				if _, ok := inScope[ident]; !ok {
+					return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "undefined variable"}
+				}
+			}
+			continue
 		}
 		if ident, ok := parseSimpleIdentifierRoot(expr); ok {
 			if _, ok := inScope[ident]; !ok {
@@ -2338,14 +2451,211 @@ func containsAggregationExpression(raw string) bool {
 	if raw == "" {
 		return false
 	}
-	lower := strings.ToLower(raw)
-	aggs := []string{"count(", "max(", "min(", "sum(", "avg(", "collect("}
-	for _, agg := range aggs {
-		if strings.Contains(lower, agg) {
-			return true
+	return len(extractAggregateCalls(raw)) > 0
+}
+
+func normalizeAggregateExprCall(call string) string {
+	call = strings.TrimSpace(call)
+	idx := strings.Index(call, "(")
+	if idx < 0 || !strings.HasSuffix(call, ")") {
+		return strings.ToLower(call)
+	}
+	fn := strings.ToLower(strings.TrimSpace(call[:idx]))
+	arg := strings.ToLower(strings.TrimSpace(call[idx+1 : len(call)-1]))
+	return fn + "(" + arg + ")"
+}
+
+func projectionKey(item projectionSpec) string {
+	if item.Alias != "" {
+		return item.Alias
+	}
+	return item.Expression
+}
+
+func rewriteOrderByAggregateReferences(orderBy []projectionOrderBySpec, items []projectionSpec) []projectionOrderBySpec {
+	if len(orderBy) == 0 {
+		return orderBy
+	}
+	aggMap := map[string]string{}
+	for _, item := range items {
+		key := projectionKey(item)
+		if item.CountArg != "" {
+			aggMap[normalizeAggregateExprCall("count("+item.CountArg+")")] = key
+		}
+		if item.CollectArg != "" {
+			aggMap[normalizeAggregateExprCall("collect("+item.CollectArg+")")] = key
+		}
+		if item.AggFunc != "" {
+			aggMap[normalizeAggregateExprCall(item.AggFunc+"("+item.AggArg+")")] = key
 		}
 	}
-	return false
+	if len(aggMap) == 0 {
+		return orderBy
+	}
+	out := make([]projectionOrderBySpec, 0, len(orderBy))
+	for _, spec := range orderBy {
+		expr := spec.Expression
+		for _, call := range extractAggregateCalls(expr) {
+			if repl, ok := aggMap[normalizeAggregateExprCall(call)]; ok {
+				expr = strings.ReplaceAll(expr, call, repl)
+			}
+		}
+		out = append(out, projectionOrderBySpec{Expression: expr, Descending: spec.Descending})
+	}
+	return out
+}
+
+func aggregateFuncNameFromCall(call string) string {
+	call = strings.TrimSpace(call)
+	idx := strings.Index(call, "(")
+	if idx < 0 || !strings.HasSuffix(call, ")") {
+		return strings.ToLower(call)
+	}
+	return strings.ToLower(strings.TrimSpace(call[:idx]))
+}
+
+func extractAggregateCalls(raw string) []string {
+	calls := []string{}
+	for i := 0; i < len(raw); {
+		if !isIdentifierStart(raw[i]) {
+			i++
+			continue
+		}
+		if i > 0 && raw[i-1] == '$' {
+			j := i + 1
+			for j < len(raw) && isIdentifierPart(raw[j]) {
+				j++
+			}
+			i = j
+			continue
+		}
+		j := i + 1
+		for j < len(raw) && isIdentifierPart(raw[j]) {
+			j++
+		}
+		name := strings.ToLower(strings.TrimSpace(raw[i:j]))
+		k := skipSpaces(raw, j)
+		if k >= len(raw) || raw[k] != '(' || !isAggregateFunctionName(name) {
+			i = j
+			continue
+		}
+		end := findClosingParen(raw, k)
+		if end < 0 {
+			break
+		}
+		calls = append(calls, strings.TrimSpace(raw[i:end+1]))
+		i = end + 1
+	}
+	return calls
+}
+
+func stripAggregateCalls(raw string) string {
+	var out strings.Builder
+	for i := 0; i < len(raw); {
+		if !isIdentifierStart(raw[i]) {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(raw) && isIdentifierPart(raw[j]) {
+			j++
+		}
+		name := strings.ToLower(strings.TrimSpace(raw[i:j]))
+		k := skipSpaces(raw, j)
+		if k >= len(raw) || raw[k] != '(' || !isAggregateFunctionName(name) {
+			out.WriteString(raw[i:j])
+			i = j
+			continue
+		}
+		end := findClosingParen(raw, k)
+		if end < 0 {
+			out.WriteString(raw[i:])
+			break
+		}
+		out.WriteString("0")
+		i = end + 1
+	}
+	return out.String()
+}
+
+func isAggregateFunctionName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "count", "collect", "sum", "min", "max", "avg":
+		return true
+	default:
+		return false
+	}
+}
+
+func findClosingParen(raw string, openIdx int) int {
+	depth := 0
+	inSingle := false
+	for i := openIdx; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if inSingle {
+			continue
+		}
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func skipSpaces(raw string, i int) int {
+	for i < len(raw) {
+		if raw[i] != ' ' && raw[i] != '\t' && raw[i] != '\n' && raw[i] != '\r' {
+			break
+		}
+		i++
+	}
+	return i
+}
+
+func extractIdentifierRoots(raw string) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	for i := 0; i < len(raw); {
+		if !isIdentifierStart(raw[i]) {
+			i++
+			continue
+		}
+		if i > 0 && raw[i-1] == '$' {
+			j := i + 1
+			for j < len(raw) && isIdentifierPart(raw[j]) {
+				j++
+			}
+			i = j
+			continue
+		}
+		j := i + 1
+		for j < len(raw) && isIdentifierPart(raw[j]) {
+			j++
+		}
+		name := raw[i:j]
+		lower := strings.ToLower(name)
+		if lower == "true" || lower == "false" || lower == "null" || isAggregateFunctionName(lower) {
+			i = j
+			continue
+		}
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+		i = j
+	}
+	return out
 }
 
 func parseSimpleIdentifierRoot(raw string) (string, bool) {
@@ -2393,7 +2703,7 @@ func isIdentifierPart(ch byte) bool {
 }
 
 func applyProjectionPostProcessing(rows []Row, clause projectionClauseSpec, params Params) ([]Row, error) {
-	if len(clause.OrderBy) > 0 {
+	if len(clause.OrderBy) > 0 && len(rows) > 1 {
 		sorted, err := sortProjectedRows(rows, clause.OrderBy, params)
 		if err != nil {
 			return nil, err
@@ -2659,12 +2969,14 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 			}
 			countArg, _ := parseCountExpression(expr)
 			collectArg, _ := parseCollectExpression(expr)
-			items = append(items, projectionSpec{Expression: expr, Alias: alias, CountArg: countArg, CollectArg: collectArg})
+			aggFunc, aggArg, _ := parseNamedAggregateExpression(expr)
+			items = append(items, projectionSpec{Expression: expr, Alias: alias, CountArg: countArg, CollectArg: collectArg, AggFunc: aggFunc, AggArg: aggArg})
 			continue
 		}
 		countArg, _ := parseCountExpression(part)
 		collectArg, _ := parseCollectExpression(part)
-		items = append(items, projectionSpec{Expression: part, CountArg: countArg, CollectArg: collectArg})
+		aggFunc, aggArg, _ := parseNamedAggregateExpression(part)
+		items = append(items, projectionSpec{Expression: part, CountArg: countArg, CollectArg: collectArg, AggFunc: aggFunc, AggArg: aggArg})
 	}
 	return items, nil
 }
@@ -2792,6 +3104,18 @@ func parseCollectExpression(raw string) (string, bool) {
 		return "", false
 	}
 	return arg, true
+}
+
+func parseNamedAggregateExpression(raw string) (string, string, bool) {
+	aggFuncs := []string{"sum", "min", "max", "avg"}
+	for _, fn := range aggFuncs {
+		arg, ok := parseFunctionCall(raw, fn)
+		if !ok || strings.TrimSpace(arg) == "" {
+			continue
+		}
+		return fn, strings.TrimSpace(arg), true
+	}
+	return "", "", false
 }
 
 func splitTopLevelCommaSeparated(raw string) []string {
@@ -6085,6 +6409,69 @@ func splitLabels(raw string) []string {
 func stripLeadingClauseKeyword(raw, keyword string) string {
 	raw = strings.TrimSpace(raw)
 	return strings.TrimSpace(strings.TrimPrefix(raw, keyword))
+}
+
+func stripCypherLineComments(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	inSingle := false
+	inDouble := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if inSingle {
+			b.WriteByte(ch)
+			if ch == '\'' {
+				if i+1 < len(raw) && raw[i+1] == '\'' {
+					b.WriteByte(raw[i+1])
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			b.WriteByte(ch)
+			if ch == '\\' {
+				if i+1 < len(raw) {
+					b.WriteByte(raw[i+1])
+					i++
+				}
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+
+		if ch == '\'' {
+			inSingle = true
+			b.WriteByte(ch)
+			continue
+		}
+		if ch == '"' {
+			inDouble = true
+			b.WriteByte(ch)
+			continue
+		}
+		if ch == '/' && i+1 < len(raw) && raw[i+1] == '/' {
+			for i < len(raw) && raw[i] != '\n' && raw[i] != '\r' {
+				i++
+			}
+			if i < len(raw) {
+				b.WriteByte(raw[i])
+			}
+			continue
+		}
+		b.WriteByte(ch)
+	}
+
+	return b.String()
 }
 
 func normalizeClauseBody(raw string) string {

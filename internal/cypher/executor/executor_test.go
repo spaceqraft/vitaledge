@@ -2266,6 +2266,113 @@ func TestEvalExpressionWithScopeBooleanSemantics(t *testing.T) {
 	}
 }
 
+func TestEvalExpressionWithScopeRangeArgumentErrors(t *testing.T) {
+	row := Row{}
+	cases := []struct {
+		expr    string
+		message string
+	}{
+		{expr: "range(true, 3)", message: "range() start must be an integer"},
+		{expr: "range(1, false)", message: "range() end must be an integer"},
+		{expr: "range(1, 3, 0)", message: "range() step cannot be zero"},
+	}
+
+	for _, tc := range cases {
+		_, err := evalExpressionWithScope(tc.expr, row, nil)
+		if err == nil {
+			t.Fatalf("evalExpressionWithScope(%q) expected error", tc.expr)
+		}
+		if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+			t.Fatalf("evalExpressionWithScope(%q) error kind = %v, want invalid input", tc.expr, err)
+		}
+		if !strings.Contains(err.Error(), tc.message) {
+			t.Fatalf("evalExpressionWithScope(%q) error = %v, want message containing %q", tc.expr, err, tc.message)
+		}
+	}
+}
+
+func TestEvalExpressionWithScopeSubscriptTypeErrors(t *testing.T) {
+	row := Row{
+		"list": []any{1, 2, 3},
+		"mapv": map[string]any{"name": "Apa"},
+	}
+
+	cases := []struct {
+		expr    string
+		message string
+	}{
+		{expr: "true[0]", message: "InvalidArgumentType"},
+		{expr: "'1'[0]", message: "InvalidArgumentType"},
+		{expr: "list[true]", message: "InvalidArgumentType"},
+		{expr: "mapv[0]", message: "MapElementAccessByNonString"},
+	}
+
+	for _, tc := range cases {
+		_, err := evalExpressionWithScope(tc.expr, row, nil)
+		if err == nil {
+			t.Fatalf("evalExpressionWithScope(%q) expected error", tc.expr)
+		}
+		if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+			t.Fatalf("evalExpressionWithScope(%q) error kind = %v, want invalid input", tc.expr, err)
+		}
+		if !strings.Contains(err.Error(), tc.message) {
+			t.Fatalf("evalExpressionWithScope(%q) error = %v, want message containing %q", tc.expr, err, tc.message)
+		}
+	}
+}
+
+func TestEvalExpressionWithScopeMapSubscript(t *testing.T) {
+	row := Row{"expr": map[string]any{"name": "Apa"}}
+	got, err := evalExpressionWithScope("expr['name']", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(map subscript) failed: %v", err)
+	}
+	if got != "Apa" {
+		t.Fatalf("evalExpressionWithScope(map subscript) = %#v, want %q", got, "Apa")
+	}
+}
+
+func TestEvalExpressionWithScopeToIntegerAndProperties(t *testing.T) {
+	row := Row{
+		"m": map[string]any{"name": "Popeye", "level": 9001},
+		"v": &graph.Vertex{Properties: graph.PropertyMap{"name": []byte("Popeye")}},
+	}
+
+	idx, err := evalExpressionWithScope("toInteger('2')", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(toInteger) failed: %v", err)
+	}
+	if idx != 2 {
+		t.Fatalf("evalExpressionWithScope(toInteger) = %#v, want 2", idx)
+	}
+
+	mapProps, err := evalExpressionWithScope("properties(m)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(properties(map)) failed: %v", err)
+	}
+	mapValue, ok := mapProps.(map[string]any)
+	if !ok || mapValue["name"] != "Popeye" || mapValue["level"] != 9001 {
+		t.Fatalf("unexpected properties(map) result: %#v", mapProps)
+	}
+
+	vertexProps, err := evalExpressionWithScope("properties(v)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(properties(vertex)) failed: %v", err)
+	}
+	vertexMap, ok := vertexProps.(map[string]any)
+	if !ok || vertexMap["name"] != "Popeye" {
+		t.Fatalf("unexpected properties(vertex) result: %#v", vertexProps)
+	}
+
+	_, err = evalExpressionWithScope("properties(1)", row, nil)
+	if err == nil {
+		t.Fatalf("evalExpressionWithScope(properties(1)) expected error")
+	}
+	if !graph.IsKind(err, graph.ErrKindSemantic) || !strings.Contains(strings.ToLower(err.Error()), "invalid argument type") {
+		t.Fatalf("unexpected properties(1) error: %v", err)
+	}
+}
+
 func TestPrecedenceComparisonVsBooleanProbe(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

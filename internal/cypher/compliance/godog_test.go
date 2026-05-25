@@ -770,8 +770,12 @@ func classifyError(err error) (phase string, category string) {
 		}
 		return "runtime", "SemanticError"
 	case graph.IsKind(err, graph.ErrKindInvalidInput):
-		if strings.Contains(strings.ToLower(err.Error()), "missing parameter") {
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "missing parameter") {
 			return "compile time", "ParameterMissing"
+		}
+		if strings.Contains(message, "invalidargumenttype") || strings.Contains(message, "mapelementaccessbynonstring") {
+			return "runtime", "TypeError"
 		}
 		return "runtime", "ArgumentError"
 	case graph.IsKind(err, graph.ErrKindUnsupported):
@@ -782,6 +786,32 @@ func classifyError(err error) (phase string, category string) {
 		return "runtime", "SyntaxError"
 	default:
 		return "runtime", "ExecutionError"
+	}
+}
+
+func TestClassifyErrorTypeErrorMappings(t *testing.T) {
+	cases := []struct {
+		err      error
+		phase    string
+		category string
+	}{
+		{
+			err:      graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil),
+			phase:    "runtime",
+			category: "TypeError",
+		},
+		{
+			err:      graph.NewError(graph.ErrKindInvalidInput, "MapElementAccessByNonString", nil),
+			phase:    "runtime",
+			category: "TypeError",
+		},
+	}
+
+	for _, tc := range cases {
+		phase, category := classifyError(tc.err)
+		if phase != tc.phase || category != tc.category {
+			t.Fatalf("classifyError(%v) = (%q, %q), want (%q, %q)", tc.err, phase, category, tc.phase, tc.category)
+		}
 	}
 }
 

@@ -4426,7 +4426,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "range"); ok {
 		parts := splitTopLevelCommaSeparated(arg)
 		if len(parts) < 2 || len(parts) > 3 {
-			return nil, graph.NewError(graph.ErrKindSemantic, "range() expects 2 or 3 arguments", nil)
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "range() expects 2 or 3 arguments", nil)
 		}
 		startVal, err := evalExpressionWithScope(parts[0], row, params)
 		if err != nil {
@@ -4438,11 +4438,11 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		start, err := toInt(startVal)
 		if err != nil {
-			return nil, graph.NewError(graph.ErrKindSemantic, "range() start must be an integer", err)
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "range() start must be an integer", err)
 		}
 		end, err := toInt(endVal)
 		if err != nil {
-			return nil, graph.NewError(graph.ErrKindSemantic, "range() end must be an integer", err)
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "range() end must be an integer", err)
 		}
 		step := 1
 		if len(parts) == 3 {
@@ -4452,10 +4452,10 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			}
 			step, err = toInt(stepVal)
 			if err != nil {
-				return nil, graph.NewError(graph.ErrKindSemantic, "range() step must be an integer", err)
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "range() step must be an integer", err)
 			}
 			if step == 0 {
-				return nil, graph.NewError(graph.ErrKindSemantic, "range() step cannot be zero", nil)
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "range() step cannot be zero", nil)
 			}
 		}
 		out := []any{}
@@ -4483,6 +4483,20 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return rendered, nil
 		}
 		return fmt.Sprint(normalized), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "toInteger"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		integer, err := toInt(value)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", err)
+		}
+		return integer, nil
 	}
 	if arg, ok := parseFunctionCall(raw, "coalesce"); ok {
 		parts := splitTopLevelCommaSeparated(arg)
@@ -4549,6 +4563,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "type"); ok {
 		return evalTypeFunction(arg, row)
 	}
+	if arg, ok := parseFunctionCall(raw, "properties"); ok {
+		return evalPropertiesFunction(arg, row, params)
+	}
 	if baseExpr, indexExpr, ok := splitTrailingSubscript(raw); ok {
 		base, err := evalExpressionWithScope(baseExpr, row, params)
 		if err != nil {
@@ -4564,12 +4581,14 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		idx, err := toInt(indexValue)
-		if err != nil {
-			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("index %q is not an integer", strings.TrimSpace(indexExpr)), err)
-		}
 		switch typed := base.(type) {
+		case nil:
+			return nil, nil
 		case []any:
+			idx, err := toInt(indexValue)
+			if err != nil {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+			}
 			if idx < 0 {
 				idx = len(typed) + idx
 			}
@@ -4578,6 +4597,10 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			}
 			return typed[idx], nil
 		case []string:
+			idx, err := toInt(indexValue)
+			if err != nil {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+			}
 			if idx < 0 {
 				idx = len(typed) + idx
 			}
@@ -4585,17 +4608,17 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 				return nil, nil
 			}
 			return typed[idx], nil
-		case string:
-			runes := []rune(typed)
-			if idx < 0 {
-				idx = len(runes) + idx
+		case map[string]any:
+			key, ok := indexValue.(string)
+			if !ok {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "MapElementAccessByNonString", nil)
 			}
-			if idx < 0 || idx >= len(runes) {
-				return nil, nil
+			if value, ok := typed[key]; ok {
+				return value, nil
 			}
-			return string(runes[idx]), nil
+			return nil, nil
 		default:
-			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
 		}
 	}
 	if value, err := evalWriteValue(raw, params, row); err == nil {
@@ -5346,6 +5369,49 @@ func evalTypeFunction(arg string, binding map[string]any) (any, error) {
 		}
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("type() is not supported on %T", base), nil)
+}
+
+func evalPropertiesFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "properties() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+
+	switch typed := value.(type) {
+	case *graph.Vertex:
+		return clonePropertyMap(typed.Properties), nil
+	case *graph.Edge:
+		return clonePropertyMap(typed.Properties), nil
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = item
+		}
+		return out, nil
+	default:
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+}
+
+func clonePropertyMap(props graph.PropertyMap) map[string]any {
+	if len(props) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(props))
+	for key, raw := range props {
+		out[key] = decodeStoredPropertyValue(raw)
+	}
+	return out
 }
 
 func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (bool, error) {

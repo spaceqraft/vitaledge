@@ -73,6 +73,9 @@ func parseSegment(seg statementSegment, fullQuery string) (ast.Statement, error)
 		return nil, err
 	}
 	restoreExistsBlocks(stmt, rewrite.placeholders)
+	if err := validatePatternVariableScoping(stmt, seg); err != nil {
+		return nil, err
+	}
 	return stmt, nil
 }
 

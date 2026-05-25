@@ -378,3 +378,48 @@ func TestParseStatementAllowsKnownFunctionInReturnProjection(t *testing.T) {
 		t.Fatalf("ParseStatement() unexpected error: %v", err)
 	}
 }
+
+func TestParseStatementRejectsHexIntegerOverflow(t *testing.T) {
+	_, err := ParseStatement("RETURN 0x8000000000000000 AS n")
+	if err == nil {
+		t.Fatalf("expected integer overflow parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsNegativeOctalOverflow(t *testing.T) {
+	_, err := ParseStatement("RETURN -0o1000000000000000000001 AS n")
+	if err == nil {
+		t.Fatalf("expected integer overflow parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsFloatingPointOverflow(t *testing.T) {
+	_, err := ParseStatement("RETURN 1e309 AS n")
+	if err == nil {
+		t.Fatalf("expected floating point overflow parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}

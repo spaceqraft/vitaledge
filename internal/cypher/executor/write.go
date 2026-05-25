@@ -6667,14 +6667,71 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 	if raw == "true" || raw == "false" {
 		return raw == "true", nil
 	}
+	if value, ok, err := parseHexOrOctalIntegerLiteral(raw); ok {
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("write value %q is not supported", raw), err)
+		}
+		return value, nil
+	}
 	if n, err := strconv.Atoi(raw); err == nil {
 		return n, nil
 	}
 	if f, err := strconv.ParseFloat(raw, 64); err == nil {
-		_ = f
-		return json.Number(raw), nil
+		return json.Number(formatFloatResult(f)), nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("write value %q is not supported", raw), nil)
+}
+
+func parseHexOrOctalIntegerLiteral(raw string) (int, bool, error) {
+	if raw == "" {
+		return 0, false, nil
+	}
+	negative := false
+	unsigned := raw
+	if strings.HasPrefix(unsigned, "+") {
+		unsigned = unsigned[1:]
+	} else if strings.HasPrefix(unsigned, "-") {
+		negative = true
+		unsigned = unsigned[1:]
+	}
+	if len(unsigned) < 3 || unsigned[0] != '0' {
+		return 0, false, nil
+	}
+	base := 0
+	switch unsigned[1] {
+	case 'x', 'X':
+		base = 16
+	case 'o', 'O':
+		base = 8
+	default:
+		return 0, false, nil
+	}
+
+	digits := unsigned[2:]
+	if digits == "" {
+		return 0, true, fmt.Errorf("missing integer literal digits")
+	}
+
+	parsed, err := strconv.ParseUint(digits, base, 64)
+	if err != nil {
+		return 0, true, err
+	}
+
+	if negative {
+		const minIntAbs = uint64(1) << 63
+		if parsed > minIntAbs {
+			return 0, true, fmt.Errorf("integer overflow")
+		}
+		if parsed == minIntAbs {
+			return int(math.MinInt64), true, nil
+		}
+		return int(-int64(parsed)), true, nil
+	}
+
+	if parsed > math.MaxInt64 {
+		return 0, true, fmt.Errorf("integer overflow")
+	}
+	return int(parsed), true, nil
 }
 
 func unwrapOuterParentheses(raw string) (string, bool) {
@@ -8385,6 +8442,9 @@ func splitTopLevelOperatorSetLast(raw string, ops ...string) (string, string, st
 				if (op == "+" || op == "-") && isUnarySignPosition(raw, i) {
 					continue
 				}
+				if (op == "+" || op == "-") && isExponentSignPosition(raw, i) {
+					continue
+				}
 				left := strings.TrimSpace(raw[:i])
 				right := strings.TrimSpace(raw[i+len(op):])
 				if left != "" && right != "" {
@@ -8489,6 +8549,34 @@ func isUnarySignPosition(raw string, idx int) bool {
 		}
 	}
 	return true
+}
+
+func isExponentSignPosition(raw string, idx int) bool {
+	if idx <= 0 || idx >= len(raw) {
+		return false
+	}
+	sign := raw[idx]
+	if sign != '+' && sign != '-' {
+		return false
+	}
+	if idx+1 >= len(raw) || raw[idx+1] < '0' || raw[idx+1] > '9' {
+		return false
+	}
+	prevIdx := idx - 1
+	for prevIdx >= 0 && (raw[prevIdx] == ' ' || raw[prevIdx] == '\t' || raw[prevIdx] == '\n' || raw[prevIdx] == '\r') {
+		prevIdx--
+	}
+	if prevIdx < 0 {
+		return false
+	}
+	if raw[prevIdx] != 'e' && raw[prevIdx] != 'E' {
+		return false
+	}
+	if prevIdx == 0 {
+		return false
+	}
+	basePrev := raw[prevIdx-1]
+	return (basePrev >= '0' && basePrev <= '9') || basePrev == '.'
 }
 
 func numericValue(v any) (float64, bool) {
@@ -8653,7 +8741,38 @@ func evalMultiplicativeExpression(op, left, right, raw string, row Row, params P
 }
 
 func formatFloatResult(value float64) string {
+	if value == 0 {
+		return "0.0"
+	}
+	abs := math.Abs(value)
+	if abs >= 1e15 || abs < 1e-8 {
+		formatted := strconv.FormatFloat(value, 'e', -1, 64)
+		parts := strings.SplitN(formatted, "e", 2)
+		if len(parts) != 2 {
+			return formatted
+		}
+		exp := parts[1]
+		expSign := ""
+		if strings.HasPrefix(exp, "+") || strings.HasPrefix(exp, "-") {
+			expSign = exp[:1]
+			exp = exp[1:]
+		}
+		exp = strings.TrimLeft(exp, "0")
+		if exp == "" {
+			exp = "0"
+		}
+		if expSign == "+" {
+			expSign = ""
+		}
+		return parts[0] + "e" + expSign + exp
+	}
 	formatted := strconv.FormatFloat(value, 'f', -1, 64)
+	if strings.HasPrefix(formatted, ".") {
+		formatted = "0" + formatted
+	}
+	if strings.HasPrefix(formatted, "-.") {
+		formatted = "-0" + formatted[1:]
+	}
 	if !strings.ContainsAny(formatted, ".eE") {
 		formatted += ".0"
 	}

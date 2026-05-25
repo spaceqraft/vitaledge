@@ -2,6 +2,8 @@ package parser
 
 import (
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
@@ -84,6 +86,12 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if name, ok := firstUnknownFunctionCall(item.Expression.Raw); ok {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 			}
+			if literal, ok := firstOverflowingHexOrOctalLiteral(item.Expression.Raw); ok {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
+			}
+			if literal, ok := firstOverflowingFloatLiteral(item.Expression.Raw); ok {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
+			}
 		}
 	case *ast.QueryStatement:
 		for _, part := range typed.Parts {
@@ -98,6 +106,12 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if name, ok := firstUnknownFunctionCall(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 						}
+						if literal, ok := firstOverflowingHexOrOctalLiteral(expr); ok {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
+						}
+						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
+						}
 					}
 				case ast.ClauseKindSet:
 					expressions := extractSetValueExpressions(clause.Raw)
@@ -107,6 +121,12 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						}
 						if name, ok := firstUnknownFunctionCall(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
+						}
+						if literal, ok := firstOverflowingHexOrOctalLiteral(expr); ok {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
+						}
+						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 						}
 					}
 				}
@@ -389,4 +409,265 @@ func isFunctionIdentStart(ch byte) bool {
 
 func isFunctionIdentPart(ch byte) bool {
 	return isFunctionIdentStart(ch) || (ch >= '0' && ch <= '9') || ch == '.'
+}
+
+func firstOverflowingHexOrOctalLiteral(expr string) (string, bool) {
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+
+	for i := 0; i < len(expr)-2; i++ {
+		ch := expr[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || expr[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || expr[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		}
+
+		if !isHexOrOctalPrefixAt(expr, i) || !isNumericLiteralBoundaryBefore(expr, i) {
+			continue
+		}
+
+		base := 16
+		if expr[i+1] == 'o' || expr[i+1] == 'O' {
+			base = 8
+		}
+		j := i + 2
+		for j < len(expr) && isDigitForBase(expr[j], base) {
+			j++
+		}
+		if j == i+2 || !isNumericLiteralBoundaryAfter(expr, j) {
+			continue
+		}
+
+		negative := hasUnaryMinusBeforeLiteral(expr, i)
+		if hexOrOctalLiteralOverflows(expr[i:j], base, negative) {
+			if negative {
+				return "-" + expr[i:j], true
+			}
+			return expr[i:j], true
+		}
+		i = j - 1
+	}
+
+	return "", false
+}
+
+func isHexOrOctalPrefixAt(expr string, idx int) bool {
+	if idx < 0 || idx+2 > len(expr) {
+		return false
+	}
+	if expr[idx] != '0' {
+		return false
+	}
+	return expr[idx+1] == 'x' || expr[idx+1] == 'X' || expr[idx+1] == 'o' || expr[idx+1] == 'O'
+}
+
+func isDigitForBase(ch byte, base int) bool {
+	if base == 16 {
+		return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
+	}
+	if base == 8 {
+		return ch >= '0' && ch <= '7'
+	}
+	return false
+}
+
+func isNumericLiteralBoundaryBefore(expr string, idx int) bool {
+	if idx <= 0 {
+		return true
+	}
+	prev := expr[idx-1]
+	return !isIdentifierOrDigitChar(prev)
+}
+
+func isNumericLiteralBoundaryAfter(expr string, idx int) bool {
+	if idx >= len(expr) {
+		return true
+	}
+	next := expr[idx]
+	return !isIdentifierOrDigitChar(next)
+}
+
+func isIdentifierOrDigitChar(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '.'
+}
+
+func hasUnaryMinusBeforeLiteral(expr string, literalStart int) bool {
+	i := literalStart - 1
+	for i >= 0 && (expr[i] == ' ' || expr[i] == '\t' || expr[i] == '\n' || expr[i] == '\r') {
+		i--
+	}
+	if i < 0 || expr[i] != '-' {
+		return false
+	}
+	j := i - 1
+	for j >= 0 && (expr[j] == ' ' || expr[j] == '\t' || expr[j] == '\n' || expr[j] == '\r') {
+		j--
+	}
+	if j < 0 {
+		return true
+	}
+	switch expr[j] {
+	case '(', '[', '{', ',', ':', '+', '-', '*', '/', '%', '^', '<', '>', '=', '!':
+		return true
+	default:
+		return false
+	}
+}
+
+func hexOrOctalLiteralOverflows(raw string, base int, negative bool) bool {
+	if len(raw) < 3 {
+		return false
+	}
+	digits := raw[2:]
+	if digits == "" {
+		return false
+	}
+	parsed, err := strconv.ParseUint(digits, base, 64)
+	if err != nil {
+		return true
+	}
+	if negative {
+		return parsed > (uint64(1) << 63)
+	}
+	return parsed > math.MaxInt64
+}
+
+func firstOverflowingFloatLiteral(expr string) (string, bool) {
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+
+	for i := 0; i < len(expr); i++ {
+		ch := expr[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || expr[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || expr[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		}
+
+		start := i
+		if ch == '.' {
+			if i+1 >= len(expr) || expr[i+1] < '0' || expr[i+1] > '9' {
+				continue
+			}
+		} else if ch < '0' || ch > '9' {
+			continue
+		}
+		if !isNumericLiteralBoundaryBefore(expr, start) {
+			continue
+		}
+
+		j := i
+		for j < len(expr) && expr[j] >= '0' && expr[j] <= '9' {
+			j++
+		}
+		hasDot := false
+		if j < len(expr) && expr[j] == '.' {
+			hasDot = true
+			j++
+			for j < len(expr) && expr[j] >= '0' && expr[j] <= '9' {
+				j++
+			}
+		} else if ch == '.' {
+			hasDot = true
+		}
+
+		hasExponent := false
+		if j < len(expr) && (expr[j] == 'e' || expr[j] == 'E') {
+			eStart := j
+			j++
+			if j < len(expr) && (expr[j] == '+' || expr[j] == '-') {
+				j++
+			}
+			digitStart := j
+			for j < len(expr) && expr[j] >= '0' && expr[j] <= '9' {
+				j++
+			}
+			if j == digitStart {
+				j = eStart
+			} else {
+				hasExponent = true
+			}
+		}
+
+		if !(hasDot || hasExponent) {
+			i = j
+			continue
+		}
+		if !isNumericLiteralBoundaryAfter(expr, j) {
+			i = j
+			continue
+		}
+
+		token := expr[start:j]
+		if value, err := strconv.ParseFloat(token, 64); err != nil {
+			if err == strconv.ErrRange || strings.Contains(strings.ToLower(err.Error()), "value out of range") {
+				if hasUnaryMinusBeforeLiteral(expr, start) {
+					return "-" + token, true
+				}
+				return token, true
+			}
+		} else if math.IsInf(value, 0) {
+			if hasUnaryMinusBeforeLiteral(expr, start) {
+				return "-" + token, true
+			}
+			return token, true
+		}
+
+		i = j - 1
+	}
+
+	return "", false
 }

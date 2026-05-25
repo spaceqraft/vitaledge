@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -2581,6 +2582,64 @@ func TestDeleteBindingSemanticsForReturn(t *testing.T) {
 	}
 	if !graph.IsKind(err, graph.ErrKindNotFound) {
 		t.Fatalf("expected ErrKindNotFound, got: %v", err)
+	}
+}
+
+func TestExecuteReturnHexAndOctalLiterals(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("RETURN 0x1A AS hx, -0o10 AS oc")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["hx"]; got != 26 {
+		t.Fatalf("expected hx=26, got %#v", got)
+	}
+	if got := res.Rows[0]["oc"]; got != -8 {
+		t.Fatalf("expected oc=-8, got %#v", got)
+	}
+}
+
+func TestExecuteReturnScientificNotationLiterals(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("RETURN .1 AS a, 2E-01 AS b, 1e9 AS c, 1e-305 AS d")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["a"]; got != json.Number("0.1") {
+		t.Fatalf("expected a=0.1, got %#v", got)
+	}
+	if got := res.Rows[0]["b"]; got != json.Number("0.2") {
+		t.Fatalf("expected b=0.2, got %#v", got)
+	}
+	if got := res.Rows[0]["c"]; got != json.Number("1000000000.0") {
+		t.Fatalf("expected c=1000000000.0, got %#v", got)
+	}
+	if got := res.Rows[0]["d"]; got != json.Number("1e-305") {
+		t.Fatalf("expected d=1e-305, got %#v", got)
 	}
 }
 

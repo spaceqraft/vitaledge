@@ -24,6 +24,7 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"date.truncate":             {},
 	"datetime":                  {},
 	"datetime.fromepoch":        {},
+	"datetime.fromepochmillis":  {},
 	"datetime.realtime":         {},
 	"datetime.statement":        {},
 	"datetime.transaction":      {},

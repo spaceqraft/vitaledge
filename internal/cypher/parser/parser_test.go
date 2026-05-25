@@ -407,6 +407,13 @@ func TestParseStatementAllowsPercentileAggregateFunctions(t *testing.T) {
 	}
 }
 
+func TestParseStatementAllowsDateTimeFromEpochMillis(t *testing.T) {
+	_, err := ParseStatement("RETURN datetime.fromepochmillis(237821673987) AS d")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementAllowsOrderByParenthesizedExpression(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) WITH n ORDER BY (n.id) RETURN count(n)")
 	if err != nil {

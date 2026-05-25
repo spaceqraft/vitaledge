@@ -141,9 +141,7 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 
 	if !returnSeen {
 		resultColumns = nil
-		if writeQuery && rowsAreEmpty(rows) {
-			rows = nil
-		}
+		rows = nil
 	}
 
 	result := &Result{Columns: resultColumns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}
@@ -1760,6 +1758,9 @@ func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows 
 		if err != nil {
 			return nil, err
 		}
+		if merge && hasNilPropertyValue(props) {
+			return nil, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
+		}
 		normalizedProps := normalizeVertexProperties(props)
 		vertexID := stringFromProperty(props, "id")
 		if vertexID == "" {
@@ -1767,10 +1768,35 @@ func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows 
 				vertexID = existing.ID
 			}
 		}
-		if vertexID == "" {
-			if merge {
-				return nil, graph.NewError(graph.ErrKindInvalidInput, "MERGE vertex requires id", nil)
+
+		if merge && vertexID == "" {
+			matches, err := findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
+			if err != nil {
+				return nil, err
 			}
+			if len(matches) == 0 {
+				vertex := &graph.Vertex{Tenant: tenant, ID: nextAutoVertexID(varName), Labels: labels, Properties: normalizedProps}
+				if err := tx.PutVertex(ctx, vertex); err != nil {
+					return nil, err
+				}
+				merged := cloneRow(row)
+				if varName != "" {
+					merged[varName] = vertex
+				}
+				out = append(out, merged)
+				continue
+			}
+			for _, match := range matches {
+				merged := cloneRow(row)
+				if varName != "" {
+					merged[varName] = match
+				}
+				out = append(out, merged)
+			}
+			continue
+		}
+
+		if vertexID == "" {
 			vertexID = nextAutoVertexID(varName)
 		}
 
@@ -1790,6 +1816,111 @@ func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows 
 		out = append(out, merged)
 	}
 	return out, nil
+}
+
+func hasNilPropertyValue(props map[string]any) bool {
+	for _, value := range props {
+		if value == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func findMergeVerticesByPattern(ctx context.Context, tx graph.Tx, tenant string, labels []string, props map[string]any) ([]*graph.Vertex, error) {
+	matches := make([]*graph.Vertex, 0)
+	err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+		if !vertexMatchesMergePattern(vertex, labels, props) {
+			return nil
+		}
+		matches = append(matches, vertex)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return matches, nil
+}
+
+func vertexMatchesMergePattern(vertex *graph.Vertex, labels []string, props map[string]any) bool {
+	if vertex == nil {
+		return false
+	}
+	if len(labels) > 0 {
+		for _, want := range labels {
+			found := false
+			for _, current := range vertex.Labels {
+				if current == want {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+	}
+	for key, expected := range props {
+		stored, ok := vertex.Properties[key]
+		if !ok {
+			return false
+		}
+		actual := decodeStoredPropertyValue(stored)
+		if !mergePropertyValueEqual(expected, actual) {
+			return false
+		}
+	}
+	return true
+}
+
+func mergePropertyValueEqual(expected, actual any) bool {
+	if reflect.DeepEqual(expected, actual) {
+		return true
+	}
+
+	switch exp := expected.(type) {
+	case int:
+		switch typed := actual.(type) {
+		case int64:
+			return int64(exp) == typed
+		case json.Number:
+			if i, err := typed.Int64(); err == nil {
+				return int64(exp) == i
+			}
+		}
+	case int64:
+		switch typed := actual.(type) {
+		case int:
+			return exp == int64(typed)
+		case json.Number:
+			if i, err := typed.Int64(); err == nil {
+				return exp == i
+			}
+		}
+	case float64:
+		if num, ok := actual.(json.Number); ok {
+			if f, err := num.Float64(); err == nil {
+				return exp == f
+			}
+		}
+	case json.Number:
+		switch typed := actual.(type) {
+		case int:
+			if i, err := exp.Int64(); err == nil {
+				return i == int64(typed)
+			}
+		case int64:
+			if i, err := exp.Int64(); err == nil {
+				return i == typed
+			}
+		case float64:
+			if f, err := exp.Float64(); err == nil {
+				return f == typed
+			}
+		}
+	}
+
+	return fmt.Sprint(expected) == fmt.Sprint(actual)
 }
 
 func parseCreateVertexPatternSpec(raw string) (createVertexPatternSpec, bool) {
@@ -1975,6 +2106,10 @@ func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, row
 }
 
 func createOrMergeEdge(ctx context.Context, tx graph.Tx, leftVertex, rightVertex *graph.Vertex, edgeType string, edgeProps map[string]any, merge bool, direction createEdgeDirection) (*graph.Edge, error) {
+	if merge && hasNilPropertyValue(edgeProps) {
+		return nil, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
+	}
+
 	srcVertex := leftVertex
 	dstVertex := rightVertex
 	switch direction {
@@ -5925,11 +6060,20 @@ func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row 
 			}
 		}
 	}
+	if merge && hasNilPropertyValue(props) {
+		return nil, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
+	}
 
 	vertexID := stringFromProperty(props, "id")
 	if vertexID == "" {
 		if merge {
-			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("MERGE vertex %q requires id", varName), nil)
+			matches, err := findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
+			if err != nil {
+				return nil, err
+			}
+			if len(matches) > 0 {
+				return matches[0], nil
+			}
 		}
 		vertexID = nextAutoVertexID(varName)
 	}

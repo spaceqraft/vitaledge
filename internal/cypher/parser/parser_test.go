@@ -254,6 +254,21 @@ func TestParseStatementMergeRejectsNewPredicateOnBoundNode(t *testing.T) {
 	}
 }
 
+func TestParseStatementMergeRejectsStandaloneAlreadyBoundNode(t *testing.T) {
+	_, err := ParseStatement("MATCH (a) MERGE (a) RETURN a")
+	if err == nil {
+		t.Fatalf("expected variable already bound parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
 func TestParseStatementCreateAllowsBoundEndpointsInRelationshipPattern(t *testing.T) {
 	_, err := ParseStatement("CREATE (a), (b) CREATE (a)-[:KNOWS]->(b)")
 	if err != nil {

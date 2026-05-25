@@ -509,37 +509,28 @@ func TestExecuteCreateMultiPatternWithRelationshipProperties(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(res.Rows))
-	}
-
-	charlieRaw, ok := res.Rows[0]["charlie"]
-	if !ok {
-		t.Fatalf("expected charlie binding")
-	}
-	charlie, ok := charlieRaw.(map[string]any)
-	if !ok {
-		t.Fatalf("expected normalized charlie vertex map, got %T", charlieRaw)
-	}
-	charlieProps, ok := charlie["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected charlie properties map, got %T", charlie["properties"])
-	}
-	if got := charlieProps["name"]; got != "Charlie Sheen" {
-		t.Fatalf("unexpected charlie name: %q", got)
+	if len(res.Rows) != 0 {
+		t.Fatalf("expected 0 rows for CREATE without RETURN, got %d", len(res.Rows))
 	}
 
 	if err := store.View(ctx, func(tx graph.Tx) error {
-		targetRaw, ok := res.Rows[0]["wallStreet"]
-		if !ok {
-			return errUnexpected("expected wallStreet binding")
+		charlieID := ""
+		targetID := ""
+		err := tx.ScanVertices(ctx, "acme", 0, func(vertex *graph.Vertex) error {
+			if got := string(vertex.Properties["name"]); got == "Charlie Sheen" {
+				charlieID = vertex.ID
+			}
+			if got := string(vertex.Properties["title"]); got == "Wall Street" {
+				targetID = vertex.ID
+			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
-		target, ok := targetRaw.(map[string]any)
-		if !ok {
-			return errUnexpected("expected wallStreet vertex binding")
+		if charlieID == "" || targetID == "" {
+			return errUnexpected("expected created vertices were not found")
 		}
-		charlieID, _ := charlie["id"].(string)
-		targetID, _ := target["id"].(string)
 
 		edge, err := tx.GetEdge(ctx, "acme", syntheticEdgeID("acme", charlieID, "ACTED_IN", targetID))
 		if err != nil {

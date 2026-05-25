@@ -129,7 +129,15 @@ func shouldRejectSameRoleRebinding(clauseKind ast.ClauseKind, b patternBinding, 
 		if b.role == patternRoleRel || b.role == patternRolePath {
 			return true
 		}
-		return b.role == patternRoleNode && b.constrained
+		if b.role == patternRoleNode {
+			if b.constrained {
+				return true
+			}
+			if !patternHasRelationship {
+				return true
+			}
+		}
+		return false
 	default:
 		_ = seenInClause
 		_ = patternHasRelationship

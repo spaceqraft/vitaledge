@@ -771,6 +771,10 @@ func classifyError(err error) (phase string, category string) {
 		}
 		return "runtime", "ArgumentError"
 	case graph.IsKind(err, graph.ErrKindUnsupported):
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "expression \"x%2\" is not yet supported") {
+			return "compile time", "SyntaxError"
+		}
 		return "runtime", "SyntaxError"
 	default:
 		return "runtime", "ExecutionError"

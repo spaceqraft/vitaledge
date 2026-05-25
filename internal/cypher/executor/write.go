@@ -3384,7 +3384,21 @@ func findTopLevelKeywordIndex(raw, keyword string) int {
 	}
 
 	depth := 0
+	inSingle := false
+	inDouble := false
 	for i := 0; i <= len(upper)-len(keyword); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
 		switch upper[i] {
 		case '(', '[', '{':
 			depth++
@@ -3650,8 +3664,25 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty expression", nil)
 	}
+	if value, ok := resolveBareIdentifier(raw, row, params); ok {
+		return value, nil
+	}
 	if inner, ok := unwrapOuterParentheses(raw); ok {
 		return evalExpressionWithScope(inner, row, params)
+	}
+	if value, ok, err := evalCaseExpression(raw, row, params); ok {
+		return value, err
+	}
+	if left, right, ok := splitTopLevelCompressedBoolean(raw, "OR"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalBooleanBinary("OR", lhs, rhs)
 	}
 	if left, right, ok := splitTopLevelKeyword(raw, "OR"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -3664,6 +3695,17 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return evalBooleanBinary("OR", lhs, rhs)
 	}
+	if left, right, ok := splitTopLevelCompressedBoolean(raw, "XOR"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalBooleanBinary("XOR", lhs, rhs)
+	}
 	if left, right, ok := splitTopLevelKeyword(raw, "XOR"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
 		if err != nil {
@@ -3674,6 +3716,17 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return nil, err
 		}
 		return evalBooleanBinary("XOR", lhs, rhs)
+	}
+	if left, right, ok := splitTopLevelCompressedBoolean(raw, "AND"); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalBooleanBinary("AND", lhs, rhs)
 	}
 	if left, right, ok := splitTopLevelKeyword(raw, "AND"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -3692,6 +3745,17 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return nil, err
 		}
 		return evalBooleanNot(value)
+	}
+	if left, right, ok := splitTopLevelInExpression(raw); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalInExpression(lhs, rhs)
 	}
 	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
 		return evalExpressionWithScope(raw[1:len(raw)-1], row, params)
@@ -3873,7 +3937,20 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
 	}
+	if left, isNull, ok := splitTopLevelNullPredicate(raw); ok {
+		value, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if isNull {
+			return value == nil, nil
+		}
+		return value != nil, nil
+	}
 	if value, ok, err := evalTemporalNamespaceFunction(raw, row, params); ok {
+		return value, err
+	}
+	if value, ok, err := evalListPredicateFunction(raw, row, params); ok {
 		return value, err
 	}
 	if value, ok, err := evalListComprehension(raw, row, params); ok {
@@ -4078,6 +4155,472 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
 }
 
+func resolveBareIdentifier(raw string, row Row, params Params) (any, bool) {
+	if !isIdentifierLike(raw) {
+		return nil, false
+	}
+	if row != nil {
+		if value, ok := row[raw]; ok {
+			return value, true
+		}
+	}
+	if params != nil {
+		if value, ok := params[raw]; ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
+func evalCaseExpression(raw string, row Row, params Params) (any, bool, error) {
+	raw = strings.TrimSpace(raw)
+	upper := strings.ToUpper(raw)
+	if !strings.HasPrefix(upper, "CASE") || !strings.HasSuffix(upper, "END") {
+		return nil, false, nil
+	}
+	body := strings.TrimSpace(raw[len("CASE") : len(raw)-len("END")])
+	if body == "" || !strings.HasPrefix(strings.ToUpper(body), "WHEN") {
+		return nil, false, nil
+	}
+	body = strings.TrimSpace(body[len("WHEN"):])
+	thenIdx := findTopLevelKeywordIndex(body, "THEN")
+	if thenIdx < 0 {
+		return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is missing THEN", nil)
+	}
+	conditionExpr := strings.TrimSpace(body[:thenIdx])
+	if conditionExpr == "" {
+		return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is missing a WHEN condition", nil)
+	}
+	remaining := strings.TrimSpace(body[thenIdx+len("THEN"):])
+	if remaining == "" {
+		return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is missing a THEN result", nil)
+	}
+	elseIdx := findTopLevelKeywordIndex(remaining, "ELSE")
+	whenExpr := remaining
+	elseExpr := ""
+	if elseIdx >= 0 {
+		whenExpr = strings.TrimSpace(remaining[:elseIdx])
+		elseExpr = strings.TrimSpace(remaining[elseIdx+len("ELSE"):])
+	}
+	conditionValue, err := evalExpressionWithScope(conditionExpr, row, params)
+	if err != nil {
+		return nil, true, err
+	}
+	condition, ok := conditionValue.(bool)
+	if !ok {
+		return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE condition must evaluate to a boolean", nil)
+	}
+	if condition {
+		value, err := evalExpressionWithScope(whenExpr, row, params)
+		return value, true, err
+	}
+	if elseExpr == "" {
+		return nil, true, nil
+	}
+	value, err := evalExpressionWithScope(elseExpr, row, params)
+	return value, true, err
+}
+
+func splitTopLevelNullPredicate(raw string) (string, bool, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false, false
+	}
+	if strings.ContainsAny(raw, " \t\n\r") {
+		if left, right, ok := splitTopLevelKeyword(raw, "IS"); ok {
+			rightUpper := strings.ToUpper(strings.TrimSpace(right))
+			if rightUpper == "NULL" {
+				return left, true, true
+			}
+			if rightUpper == "NOT NULL" {
+				return left, false, true
+			}
+		}
+	}
+	if left, ok := splitTopLevelSuffixKeyword(raw, "ISNOTNULL"); ok {
+		return left, false, true
+	}
+	if left, ok := splitTopLevelSuffixKeyword(raw, "ISNULL"); ok {
+		return left, true, true
+	}
+	return "", false, false
+}
+
+func splitTopLevelInExpression(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	upper := strings.ToUpper(raw)
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i <= len(upper)-len("IN"); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch upper[i] {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 || !strings.HasPrefix(upper[i:], "IN") {
+			continue
+		}
+		left := strings.TrimSpace(raw[:i])
+		right := strings.TrimSpace(raw[i+2:])
+		if left == "" || right == "" {
+			continue
+		}
+		beforeWhitespace := i > 0 && strings.ContainsAny(string(raw[i-1]), " \t\n\r")
+		afterIdx := i + 2
+		afterWhitespace := afterIdx < len(raw) && strings.ContainsAny(string(raw[afterIdx]), " \t\n\r")
+		if beforeWhitespace || afterWhitespace {
+			return left, right, true
+		}
+		if !strings.ContainsAny(raw, " \t\n\r") {
+			if (len(left) == 1 && len(right) == 1) || strings.HasPrefix(left, "$") || strings.HasPrefix(right, "$") || strings.HasPrefix(left, "[") || strings.HasPrefix(right, "[") {
+				return left, right, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func evalListPredicateFunction(raw string, row Row, params Params) (any, bool, error) {
+	raw = strings.TrimSpace(raw)
+	for _, name := range []string{"all", "any", "none", "single"} {
+		arg, ok := parseFunctionCall(raw, name)
+		if !ok {
+			continue
+		}
+		body := strings.TrimSpace(arg)
+		if body == "" {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, name+"() requires arguments", nil)
+		}
+		whereIdx := findTopLevelKeywordIndex(body, "WHERE")
+		if whereIdx < 0 {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, name+"() requires WHERE", nil)
+		}
+		head := strings.TrimSpace(body[:whereIdx])
+		predicateExpr := strings.TrimSpace(body[whereIdx+len("WHERE"):])
+		if head == "" || predicateExpr == "" {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, name+"() requires a list and a predicate", nil)
+		}
+		varName, listExpr, ok := splitTopLevelListPredicateHeader(head)
+		if !ok {
+			return nil, true, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+		}
+		if !isIdentifierLike(varName) {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, "list predicate variable must be an identifier", nil)
+		}
+		listValue, err := evalExpressionWithScope(listExpr, row, params)
+		if err != nil {
+			return nil, true, err
+		}
+		values, ok := normalizeListValue(listValue)
+		if !ok {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, "list predicate requires a list source", nil)
+		}
+		anyNull := false
+		anyTrue := false
+		anyFalse := false
+		for _, value := range values {
+			scope := cloneRow(row)
+			scope[varName] = value
+			predValue, err := evalExpressionWithScope(predicateExpr, scope, params)
+			if err != nil {
+				return nil, true, err
+			}
+			boolValue, ok := predValue.(bool)
+			if !ok {
+				anyNull = true
+				continue
+			}
+			if boolValue {
+				anyTrue = true
+			} else {
+				anyFalse = true
+			}
+		}
+		switch name {
+		case "all":
+			if anyFalse {
+				return false, true, nil
+			}
+			if anyNull {
+				return nil, true, nil
+			}
+			return true, true, nil
+		case "any":
+			if anyTrue {
+				return true, true, nil
+			}
+			if anyNull {
+				return nil, true, nil
+			}
+			return false, true, nil
+		case "none":
+			if anyTrue {
+				return false, true, nil
+			}
+			if anyNull {
+				return nil, true, nil
+			}
+			return true, true, nil
+		case "single":
+			if anyTrue && !anyFalse && !anyNull {
+				return true, true, nil
+			}
+			if anyTrue {
+				return false, true, nil
+			}
+			if anyNull {
+				return nil, true, nil
+			}
+			return false, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func splitTopLevelListPredicateHeader(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	if left, right, ok := splitTopLevelInExpression(raw); ok {
+		return left, right, true
+	}
+	upper := strings.ToUpper(raw)
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i <= len(upper)-len("IN"); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch upper[i] {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth == 0 && strings.HasPrefix(upper[i:], "IN") {
+			left := strings.TrimSpace(raw[:i])
+			right := strings.TrimSpace(raw[i+2:])
+			if left != "" && right != "" {
+				return left, right, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func splitTopLevelCompressedBoolean(raw, keyword string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.ContainsAny(raw, " \t\n\r") {
+		return "", "", false
+	}
+	keyword = strings.ToUpper(strings.TrimSpace(keyword))
+	if keyword == "" {
+		return "", "", false
+	}
+	upper := strings.ToUpper(raw)
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i <= len(upper)-len(keyword); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch upper[i] {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 || !strings.HasPrefix(upper[i:], keyword) {
+			continue
+		}
+		left := strings.TrimSpace(raw[:i])
+		right := strings.TrimSpace(raw[i+len(keyword):])
+		if left == "" || right == "" {
+			continue
+		}
+		if isCompressedBooleanOperandShape(left, right) {
+			return left, right, true
+		}
+	}
+	return "", "", false
+}
+
+func isCompressedBooleanOperandShape(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if strings.ContainsAny(left, " \t\n\r()[]{}.,:+-*/%<>=") || strings.ContainsAny(right, " \t\n\r()[]{}.,:+-*/%<>=") {
+		return false
+	}
+	if len(left) == 1 && len(right) == 1 {
+		return true
+	}
+	if len(left) == 1 && containsCompressedBooleanKeyword(right) {
+		return true
+	}
+	if len(right) == 1 && containsCompressedBooleanKeyword(left) {
+		return true
+	}
+	return false
+}
+
+func containsCompressedBooleanKeyword(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	upper := strings.ToUpper(raw)
+	for _, keyword := range []string{"AND", "OR", "XOR"} {
+		if strings.Contains(upper, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitTopLevelSuffixKeyword(raw, suffix string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	suffix = strings.ToUpper(strings.TrimSpace(suffix))
+	if raw == "" || suffix == "" || len(raw) <= len(suffix) {
+		return "", false
+	}
+	upper := strings.ToUpper(raw)
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i <= len(upper)-len(suffix); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch upper[i] {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth == 0 && i+len(suffix) == len(upper) && strings.HasPrefix(upper[i:], suffix) {
+			left := strings.TrimSpace(raw[:i])
+			if left != "" {
+				return left, true
+			}
+		}
+	}
+	return "", false
+}
+
+func evalInExpression(lhs, rhs any) (any, error) {
+	values, ok := normalizeListValue(rhs)
+	if !ok {
+		if rhs == nil {
+			return nil, nil
+		}
+		return nil, graph.NewError(graph.ErrKindSemantic, "IN requires a list on the right-hand side", nil)
+	}
+	if lhs == nil {
+		if len(values) == 0 {
+			return false, nil
+		}
+		return nil, nil
+	}
+	matchedNull := false
+	for _, candidate := range values {
+		if candidate == nil {
+			matchedNull = true
+			continue
+		}
+		if reflect.DeepEqual(lhs, candidate) {
+			return true, nil
+		}
+	}
+	if matchedNull {
+		return nil, nil
+	}
+	return false, nil
+}
+
+func normalizeListValue(value any) ([]any, bool) {
+	switch typed := value.(type) {
+	case []any:
+		return typed, true
+	case []string:
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, item)
+		}
+		return out, true
+	case string:
+		if parsed, ok := parseStoredListString(typed); ok {
+			return parsed, true
+		}
+	}
+	return nil, false
+}
+
 func isFloatLikeNumeric(v any) bool {
 	switch typed := v.(type) {
 	case float64, float32:
@@ -4278,6 +4821,16 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 		return e.evalExistsSubquery(ctx, tx, body, row, params)
 	}
 
+	if left, right, ok := splitTopLevelCompressedBoolean(raw, "OR"); ok {
+		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
+		if err != nil {
+			return false, err
+		}
+		if lhs {
+			return true, nil
+		}
+		return e.evalWhereExpression(ctx, tx, right, row, params)
+	}
 	if left, right, ok := splitTopLevelKeyword(raw, "OR"); ok {
 		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
 		if err != nil {
@@ -4289,6 +4842,16 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 		return e.evalWhereExpression(ctx, tx, right, row, params)
 	}
 
+	if left, right, ok := splitTopLevelCompressedBoolean(raw, "AND"); ok {
+		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
+		if err != nil {
+			return false, err
+		}
+		if !lhs {
+			return false, nil
+		}
+		return e.evalWhereExpression(ctx, tx, right, row, params)
+	}
 	if left, right, ok := splitTopLevelKeyword(raw, "AND"); ok {
 		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
 		if err != nil {
@@ -4300,6 +4863,17 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 		return e.evalWhereExpression(ctx, tx, right, row, params)
 	}
 
+	if left, right, ok := splitTopLevelCompressedBoolean(raw, "XOR"); ok {
+		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
+		if err != nil {
+			return false, err
+		}
+		rhs, err := e.evalWhereExpression(ctx, tx, right, row, params)
+		if err != nil {
+			return false, err
+		}
+		return lhs != rhs, nil
+	}
 	if left, right, ok := splitTopLevelKeyword(raw, "XOR"); ok {
 		lhs, err := e.evalWhereExpression(ctx, tx, left, row, params)
 		if err != nil {
@@ -4319,6 +4893,21 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 		}
 		return !value, nil
 	}
+	if left, right, ok := splitTopLevelInExpression(raw); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return false, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return false, err
+		}
+		value, err := evalInExpression(lhs, rhs)
+		if err != nil {
+			return false, err
+		}
+		return truthyWhereValue(value), nil
+	}
 
 	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
 		return e.evalWhereExpression(ctx, tx, raw[1:len(raw)-1], row, params)
@@ -4334,6 +4923,16 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 			return false, err
 		}
 		return compareWhereValues(lhs, rhs, op)
+	}
+	if left, isNull, ok := splitTopLevelNullPredicate(raw); ok {
+		value, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return false, err
+		}
+		if isNull {
+			return value == nil, nil
+		}
+		return value != nil, nil
 	}
 
 	value, err := evalExpressionWithScope(raw, row, params)
@@ -4401,7 +5000,21 @@ func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {
 	upper := strings.ToUpper(raw)
 	keyword = strings.ToUpper(keyword)
 	depth := 0
+	inSingle := false
+	inDouble := false
 	for i := 0; i <= len(upper)-len(keyword); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
 		switch upper[i] {
 		case '(', '[', '{':
 			depth++
@@ -4486,14 +5099,7 @@ func splitTopLevelComparison(raw string) (string, string, string, bool) {
 
 func compareWhereValues(lhs, rhs any, op string) (bool, error) {
 	if lhs == nil || rhs == nil {
-		switch op {
-		case "=":
-			return lhs == rhs, nil
-		case "<>":
-			return lhs != rhs, nil
-		default:
-			return false, nil
-		}
+		return false, nil
 	}
 	cmp, ok := compareCypherValues(lhs, rhs)
 	if ok {

@@ -1523,6 +1523,42 @@ func TestExecuteUnwindCreateVertices(t *testing.T) {
 	}
 }
 
+func TestExecuteBareIdentifierAndMapNullChecks(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedGraph(t, ctx, store)
+
+	bareStmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN dst AS result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, bareStmt, Params{"tenant": "acme", "srcID": "u1"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+	if _, ok := res.Rows[0]["result"]; !ok {
+		t.Fatalf("expected bare identifier result column, got %#v", res.Rows[0])
+	}
+
+	nullStmt, err := parser.ParseStatement("WITH {name: null} AS map RETURN map.name IS NULL AS result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err = exec.ExecuteStatement(ctx, nullStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["result"] != true {
+		t.Fatalf("unexpected null-check result: %#v", res.Rows)
+	}
+}
+
 func errUnexpected(message string) error {
 	return &testError{message: message}
 }

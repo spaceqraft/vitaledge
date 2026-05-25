@@ -1559,6 +1559,111 @@ func TestExecuteBareIdentifierAndMapNullChecks(t *testing.T) {
 	}
 }
 
+func TestExecuteQuantifierAndListPredicateScoping(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("WITH 2 AS r RETURN any(x IN [1, 2, 3] WHERE x < r) AS anyResult, [x IN [1, 2, 3] WHERE x < r | x] AS filtered")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["anyResult"]; got != true {
+		t.Fatalf("unexpected anyResult: %#v", got)
+	}
+	filtered, ok := res.Rows[0]["filtered"].([]any)
+	if !ok {
+		t.Fatalf("unexpected filtered type: %#v", res.Rows[0]["filtered"])
+	}
+	if len(filtered) != 1 || filtered[0] != 1 {
+		t.Fatalf("unexpected filtered result: %#v", filtered)
+	}
+}
+
+func TestExecuteWithWherePreservesOuterScope(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("WITH 1 AS r, 2 AS c WITH c WHERE r = 1 RETURN c AS result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["result"]; got != 2 {
+		t.Fatalf("unexpected result: %#v", got)
+	}
+}
+
+func TestExecuteRandExpressionAndQuantifierSetup(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+
+	randStmt, err := parser.ParseStatement("RETURN rand() > -1 AS result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, randStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["result"] != true {
+		t.Fatalf("unexpected rand result: %#v", res.Rows)
+	}
+
+	listStmt, err := parser.ParseStatement("WITH [1, 2, 3] AS inputList RETURN [y IN inputList WHERE rand() > 0.5 | y] AS list")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err = exec.ExecuteStatement(ctx, listStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if _, ok := res.Rows[0]["list"].([]any); !ok {
+		t.Fatalf("unexpected list result: %#v", res.Rows[0]["list"])
+	}
+
+	quantStmt, err := parser.ParseStatement("WITH [1, 2, 3] AS inputList UNWIND inputList AS x WITH inputList, x, [y IN inputList WHERE rand() > 0.5 | y] AS list WITH any(x IN list WHERE x >= 1) AS result RETURN result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err = exec.ExecuteStatement(ctx, quantStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected at least 1 row, got %d", len(res.Rows))
+	}
+	for _, row := range res.Rows {
+		if _, ok := row["result"].(bool); !ok {
+			t.Fatalf("unexpected quantifier result: %#v", row["result"])
+		}
+	}
+}
+
 func errUnexpected(message string) error {
 	return &testError{message: message}
 }

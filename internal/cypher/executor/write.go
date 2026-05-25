@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand"
 	"reflect"
 	"regexp"
 	"sort"
@@ -2211,6 +2212,19 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 	if err != nil {
 		return nil, nil, err
 	}
+	if projection.WhereRaw != "" {
+		filtered := make([]Row, 0, len(rows))
+		for _, row := range rows {
+			ok, err := e.evalWhereExpression(ctx, tx, projection.WhereRaw, row, params)
+			if err != nil {
+				return nil, nil, err
+			}
+			if ok {
+				filtered = append(filtered, row)
+			}
+		}
+		rows = filtered
+	}
 	items, err := parseProjectionItems(projection.ProjectionRaw)
 	if err != nil {
 		return nil, nil, err
@@ -2562,6 +2576,7 @@ type projectionSpec struct {
 type projectionClauseSpec struct {
 	Distinct      bool
 	ProjectionRaw string
+	WhereRaw      string
 	OrderBy       []projectionOrderBySpec
 	SkipRaw       string
 	LimitRaw      string
@@ -2594,6 +2609,10 @@ func parseProjectionClauseSpec(raw string) (projectionClauseSpec, error) {
 	}
 
 	out := projectionClauseSpec{Distinct: projectionDistinct, ProjectionRaw: strings.TrimSpace(projectionRaw)}
+	if whereIdx := findTopLevelKeywordIndex(out.ProjectionRaw, "WHERE"); whereIdx >= 0 {
+		out.WhereRaw = strings.TrimSpace(out.ProjectionRaw[whereIdx+len("WHERE"):])
+		out.ProjectionRaw = strings.TrimSpace(out.ProjectionRaw[:whereIdx])
+	}
 
 	if orderByIdx >= 0 {
 		end := minPositiveIndex(greaterIndex(skipIdx, orderByIdx), greaterIndex(limitIdx, orderByIdx))
@@ -3443,15 +3462,44 @@ func parseProjectionItems(raw string) ([]projectionSpec, error) {
 			countArg, _ := parseCountExpression(expr)
 			collectArg, _ := parseCollectExpression(expr)
 			aggFunc, aggArg, _ := parseNamedAggregateExpression(expr)
+			if err := validateAggregateArgumentConstant(countArg); err != nil {
+				return nil, err
+			}
+			if err := validateAggregateArgumentConstant(collectArg); err != nil {
+				return nil, err
+			}
+			if err := validateAggregateArgumentConstant(aggArg); err != nil {
+				return nil, err
+			}
 			items = append(items, projectionSpec{Expression: expr, Alias: alias, CountArg: countArg, CollectArg: collectArg, AggFunc: aggFunc, AggArg: aggArg})
 			continue
 		}
 		countArg, _ := parseCountExpression(part)
 		collectArg, _ := parseCollectExpression(part)
 		aggFunc, aggArg, _ := parseNamedAggregateExpression(part)
+		if err := validateAggregateArgumentConstant(countArg); err != nil {
+			return nil, err
+		}
+		if err := validateAggregateArgumentConstant(collectArg); err != nil {
+			return nil, err
+		}
+		if err := validateAggregateArgumentConstant(aggArg); err != nil {
+			return nil, err
+		}
 		items = append(items, projectionSpec{Expression: part, CountArg: countArg, CollectArg: collectArg, AggFunc: aggFunc, AggArg: aggArg})
 	}
 	return items, nil
+}
+
+func validateAggregateArgumentConstant(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if strings.Contains(strings.ToLower(raw), "rand(") {
+		return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NonConstantExpression"}
+	}
+	return nil
 }
 
 func findTopLevelAliasIndex(raw string) int {
@@ -3947,6 +3995,12 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return value != nil, nil
 	}
+	if arg, ok := parseFunctionCall(raw, "rand"); ok {
+		if strings.TrimSpace(arg) != "" {
+			return nil, graph.NewError(graph.ErrKindSemantic, "rand() expects no arguments", nil)
+		}
+		return rand.Float64(), nil
+	}
 	if value, ok, err := evalTemporalNamespaceFunction(raw, row, params); ok {
 		return value, err
 	}
@@ -4346,11 +4400,11 @@ func evalListPredicateFunction(raw string, row Row, params Params) (any, bool, e
 			if err != nil {
 				return nil, true, err
 			}
-			boolValue, ok := predValue.(bool)
-			if !ok {
+			if predValue == nil {
 				anyNull = true
 				continue
 			}
+			boolValue := truthyWhereValue(predValue)
 			if boolValue {
 				anyTrue = true
 			} else {
@@ -4483,6 +4537,9 @@ func splitTopLevelCompressedBoolean(raw, keyword string) (string, string, bool) 
 		if depth != 0 || !strings.HasPrefix(upper[i:], keyword) {
 			continue
 		}
+		if !compressedKeywordHasBoundaries(raw, i, len(keyword)) {
+			continue
+		}
 		left := strings.TrimSpace(raw[:i])
 		right := strings.TrimSpace(raw[i+len(keyword):])
 		if left == "" || right == "" {
@@ -4493,6 +4550,29 @@ func splitTopLevelCompressedBoolean(raw, keyword string) (string, string, bool) 
 		}
 	}
 	return "", "", false
+}
+
+func compressedKeywordHasBoundaries(raw string, idx, kwLen int) bool {
+	if idx < 0 || kwLen <= 0 || idx+kwLen > len(raw) {
+		return false
+	}
+	beforeIsIdent := idx > 0 && isIdentifierByte(raw[idx-1])
+	afterPos := idx + kwLen
+	afterIsIdent := afterPos < len(raw) && isIdentifierByte(raw[afterPos])
+	return !beforeIsIdent && !afterIsIdent
+}
+
+func isIdentifierByte(ch byte) bool {
+	if ch == '_' {
+		return true
+	}
+	if ch >= 'a' && ch <= 'z' {
+		return true
+	}
+	if ch >= 'A' && ch <= 'Z' {
+		return true
+	}
+	return ch >= '0' && ch <= '9'
 }
 
 func isCompressedBooleanOperandShape(left, right string) bool {
@@ -4694,6 +4774,12 @@ func evalListComprehension(raw string, row Row, params Params) (any, bool, error
 		return nil, false, nil
 	}
 	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	pipeIdx := findTopLevelPipeIndex(body)
+	projectionExpr := ""
+	if pipeIdx >= 0 {
+		projectionExpr = strings.TrimSpace(body[pipeIdx+1:])
+		body = strings.TrimSpace(body[:pipeIdx])
+	}
 	upper := strings.ToUpper(body)
 	inIdx := strings.Index(upper, "IN")
 	if inIdx <= 0 {
@@ -4742,15 +4828,22 @@ func evalListComprehension(raw string, row Row, params Params) (any, bool, error
 			if err != nil {
 				return nil, true, err
 			}
-			boolVal, ok := predValue.(bool)
-			if !ok {
+			if predValue == nil {
 				include = false
 			} else {
-				include = boolVal
+				include = truthyWhereValue(predValue)
 			}
 		}
 		if include {
-			out = append(out, v)
+			if projectionExpr == "" {
+				out = append(out, v)
+				continue
+			}
+			projected, err := evalExpressionWithScope(projectionExpr, scope, params)
+			if err != nil {
+				return nil, true, err
+			}
+			out = append(out, projected)
 		}
 	}
 
@@ -5032,7 +5125,7 @@ func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {
 			beforeIsWord := i > 0 && isAlphaOrUnderscore(raw[i-1])
 			afterIdx := i + len(keyword)
 			afterIsWord := afterIdx < len(raw) && isAlphaOrUnderscore(raw[afterIdx])
-			if beforeIsWord && afterIsWord {
+			if beforeIsWord || afterIsWord {
 				if !shouldSplitCompressedKeyword(raw, i, len(keyword)) {
 					continue
 				}
@@ -5076,16 +5169,51 @@ func isAlphaOrUnderscore(ch byte) bool {
 func splitTopLevelComparison(raw string) (string, string, string, bool) {
 	op := []string{"<=", ">=", "<>", "=", "<", ">"}
 	depth := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	upper := strings.ToUpper(raw)
 	for i := 0; i < len(raw); i++ {
-		switch raw[i] {
-		case '(', '[', '{':
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
 			depth++
-		case ')', ']', '}':
+		case ')':
 			if depth > 0 {
 				depth--
 			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
 		}
-		if depth != 0 {
+		if depth == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(upper[i:], "CASE") {
+			if endIdx, ok := findCaseExpressionEnd(raw, i); ok {
+				i = endIdx
+				continue
+			}
+		}
+		if depth != 0 || depthBracket != 0 || depthBrace != 0 {
 			continue
 		}
 		for _, candidate := range op {
@@ -7238,6 +7366,7 @@ func splitTopLevelOperator(raw string, op string) (string, string, bool) {
 	depthBrace := 0
 	inSingle := false
 	inDouble := false
+	upper := strings.ToUpper(raw)
 	for i := 0; i < len(raw); i++ {
 		ch := raw[i]
 		switch ch {
@@ -7273,6 +7402,12 @@ func splitTopLevelOperator(raw string, op string) (string, string, bool) {
 				depthBrace--
 			}
 		}
+		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(upper[i:], "CASE") {
+			if endIdx, ok := findCaseExpressionEnd(raw, i); ok {
+				i = endIdx
+				continue
+			}
+		}
 		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(raw[i:], op) {
 			if (op == "+" || op == "-") && isUnarySignPosition(raw, i) {
 				continue
@@ -7286,6 +7421,72 @@ func splitTopLevelOperator(raw string, op string) (string, string, bool) {
 		}
 	}
 	return "", "", false
+}
+
+func findCaseExpressionEnd(raw string, start int) (int, bool) {
+	if start < 0 || start >= len(raw) {
+		return -1, false
+	}
+	upper := strings.ToUpper(raw)
+	if !strings.HasPrefix(upper[start:], "CASE") {
+		return -1, false
+	}
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	caseDepth := 0
+	for i := start; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+			continue
+		}
+		if strings.HasPrefix(upper[i:], "CASE") {
+			caseDepth++
+			i += len("CASE") - 1
+			continue
+		}
+		if caseDepth > 0 && strings.HasPrefix(upper[i:], "END") {
+			caseDepth--
+			if caseDepth == 0 {
+				return i + len("END") - 1, true
+			}
+			i += len("END") - 1
+		}
+	}
+	return -1, false
 }
 
 func isUnarySignPosition(raw string, idx int) bool {

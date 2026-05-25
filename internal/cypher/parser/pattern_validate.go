@@ -89,6 +89,9 @@ func validatePatternBindings(pattern string, bound map[string]patternVarRole, se
 			continue
 		}
 		if prev, ok := bound[b.name]; ok {
+			if clauseKind == ast.ClauseKindOptionalMatch && prev == patternRoleValue && (b.role == patternRoleNode || b.role == patternRoleRel || b.role == patternRolePath) {
+				continue
+			}
 			if prev == patternRoleValue && b.role == patternRoleRel && isVariableLengthRelationshipBinding(pattern, b.name) {
 				// MATCH (a)-[rs*]->(b) can legally reuse a pre-bound list value.
 				continue

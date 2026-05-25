@@ -13,6 +13,7 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"all":                       {},
 	"any":                       {},
 	"avg":                       {},
+	"abs":                       {},
 	"coalesce":                  {},
 	"collect":                   {},
 	"count":                     {},
@@ -32,7 +33,12 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"duration.indays":           {},
 	"duration.inmonths":         {},
 	"duration.inseconds":        {},
+	"endnode":                   {},
+	"head":                      {},
+	"keys":                      {},
+	"last":                      {},
 	"labels":                    {},
+	"length":                    {},
 	"localdatetime":             {},
 	"localdatetime.realtime":    {},
 	"localdatetime.statement":   {},
@@ -46,15 +52,20 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"max":                       {},
 	"min":                       {},
 	"none":                      {},
+	"nodes":                     {},
 	"properties":                {},
 	"rand":                      {},
 	"range":                     {},
+	"relationships":             {},
 	"reverse":                   {},
+	"sign":                      {},
 	"single":                    {},
 	"size":                      {},
+	"startnode":                 {},
 	"split":                     {},
 	"substring":                 {},
 	"sum":                       {},
+	"tail":                      {},
 	"time":                      {},
 	"time.realtime":             {},
 	"time.statement":            {},
@@ -79,6 +90,15 @@ var expressionOperatorKeywords = map[string]struct{}{
 func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 	switch typed := stmt.(type) {
 	case *ast.MatchQueryStatement:
+		bound := map[string]patternVarRole{}
+		for _, match := range typed.MatchClauses {
+			for _, binding := range scanPatternBindings(match.Pattern) {
+				if binding.name == "" {
+					continue
+				}
+				bound[binding.name] = binding.role
+			}
+		}
 		for _, item := range typed.Return.Items {
 			if containsForbiddenPatternExpression(item.Expression.Raw) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
@@ -92,8 +112,12 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if literal, ok := firstOverflowingFloatLiteral(item.Expression.Raw); ok {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 			}
+			if isInvalidLengthArgumentExpression(item.Expression.Raw, bound) {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+			}
 		}
 	case *ast.QueryStatement:
+		bound := map[string]patternVarRole{}
 		for _, part := range typed.Parts {
 			for _, clause := range part.Clauses {
 				switch clause.Kind {
@@ -112,6 +136,12 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 						}
+						if isInvalidLengthArgumentExpression(expr, bound) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+						}
+					}
+					if clause.Kind == ast.ClauseKindWith {
+						recordWithBindings(clause.Raw, bound)
 					}
 				case ast.ClauseKindSet:
 					expressions := extractSetValueExpressions(clause.Raw)
@@ -127,6 +157,24 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						}
 						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
+						}
+						if isInvalidLengthArgumentExpression(expr, bound) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+						}
+					}
+				case ast.ClauseKindUnwind:
+					recordUnwindBinding(clause.Raw, bound)
+				case ast.ClauseKindMatch, ast.ClauseKindOptionalMatch, ast.ClauseKindCreate, ast.ClauseKindMerge:
+					patternRaw, ok := extractClausePattern(clause.Raw, clause.Kind)
+					if !ok {
+						continue
+					}
+					for _, pattern := range splitTopLevelComma(patternRaw) {
+						for _, binding := range scanPatternBindings(pattern) {
+							if binding.name == "" {
+								continue
+							}
+							bound[binding.name] = binding.role
 						}
 					}
 				}
@@ -409,6 +457,41 @@ func isFunctionIdentStart(ch byte) bool {
 
 func isFunctionIdentPart(ch byte) bool {
 	return isFunctionIdentStart(ch) || (ch >= '0' && ch <= '9') || ch == '.'
+}
+
+func isInvalidLengthArgumentExpression(expr string, bound map[string]patternVarRole) bool {
+	name, ok := lengthSimpleIdentifierArg(expr)
+	if !ok {
+		return false
+	}
+	role, exists := bound[name]
+	if !exists {
+		return false
+	}
+	return role == patternRoleNode || role == patternRoleRel || role == patternRoleValue
+}
+
+func lengthSimpleIdentifierArg(expr string) (string, bool) {
+	text := strings.TrimSpace(expr)
+	if len(text) < len("length(")+1 || !strings.HasSuffix(text, ")") {
+		return "", false
+	}
+	if !strings.EqualFold(text[:len("length(")], "length(") {
+		return "", false
+	}
+	inner := strings.TrimSpace(text[len("length(") : len(text)-1])
+	if inner == "" {
+		return "", false
+	}
+	name, next, ok := readIdentifier(inner, 0)
+	if !ok {
+		return "", false
+	}
+	next = skipSpaces(inner, next)
+	if next != len(inner) {
+		return "", false
+	}
+	return name, true
 }
 
 func firstOverflowingHexOrOctalLiteral(expr string) (string, bool) {

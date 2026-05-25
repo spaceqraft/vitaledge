@@ -209,6 +209,13 @@ func TestParseStatementOptionalMatchForwardedNodeAllowed(t *testing.T) {
 	}
 }
 
+func TestParseStatementOptionalMatchNullableAnchorAllowed(t *testing.T) {
+	_, err := ParseStatement("WITH null AS a OPTIONAL MATCH p = (a)-[r]->() RETURN p")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementVariableLengthRelationshipListBindingAllowed(t *testing.T) {
 	_, err := ParseStatement("MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 MATCH (first)-[rs*]->(second) RETURN first, second")
 	if err != nil {
@@ -379,6 +386,20 @@ func TestParseStatementAllowsKnownFunctionInReturnProjection(t *testing.T) {
 	}
 }
 
+func TestParseStatementAllowsPassAFunctionSurfaceInReturnProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN keys(n), head([1,2]), tail([1,2,3]), abs(-2)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsRemainingFunctionSurfaceInReturnProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH p=(a)-[r]->(b) RETURN nodes(p), relationships(p), length(p), startNode(r).id, endNode(r).id, last([1,2]), sign(1)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementRejectsHexIntegerOverflow(t *testing.T) {
 	_, err := ParseStatement("RETURN 0x8000000000000000 AS n")
 	if err == nil {
@@ -413,6 +434,36 @@ func TestParseStatementRejectsFloatingPointOverflow(t *testing.T) {
 	_, err := ParseStatement("RETURN 1e309 AS n")
 	if err == nil {
 		t.Fatalf("expected floating point overflow parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsLengthOnNodeAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN length(n)")
+	if err == nil {
+		t.Fatalf("expected compile-time invalid argument type parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsLengthOnRelationshipAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("MATCH ()-[r]->() RETURN length(r)")
+	if err == nil {
+		t.Fatalf("expected compile-time invalid argument type parse error")
 	}
 
 	var parseErr *ParseError

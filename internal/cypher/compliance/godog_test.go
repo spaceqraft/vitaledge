@@ -774,7 +774,9 @@ func classifyError(err error) (phase string, category string) {
 		if strings.Contains(message, "missing parameter") {
 			return "compile time", "ParameterMissing"
 		}
-		if strings.Contains(message, "invalidargumenttype") || strings.Contains(message, "mapelementaccessbynonstring") {
+		if strings.Contains(message, "invalidargumenttype") ||
+			strings.Contains(message, "invalidargumentvalue") ||
+			strings.Contains(message, "mapelementaccessbynonstring") {
 			return "runtime", "TypeError"
 		}
 		return "runtime", "ArgumentError"
@@ -797,6 +799,11 @@ func TestClassifyErrorTypeErrorMappings(t *testing.T) {
 	}{
 		{
 			err:      graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil),
+			phase:    "runtime",
+			category: "TypeError",
+		},
+		{
+			err:      graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil),
 			phase:    "runtime",
 			category: "TypeError",
 		},

@@ -2643,6 +2643,230 @@ func TestExecuteReturnScientificNotationLiterals(t *testing.T) {
 	}
 }
 
+func TestExecuteReturnPassAFunctionSurface(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (:K {z: 1, a: 2})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (n:K) RETURN keys(n) AS nk, keys({b: 1, a: 2}) AS mk, head([10, 20]) AS h, head([]) AS hn, tail([10, 20, 30]) AS t, tail([10]) AS te, abs(-3) AS ai, abs(-1.5) AS af")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+
+	if got := res.Rows[0]["nk"]; !reflect.DeepEqual(got, []any{"a", "z"}) {
+		t.Fatalf("expected nk=[a z], got %#v", got)
+	}
+	if got := res.Rows[0]["mk"]; !reflect.DeepEqual(got, []any{"a", "b"}) {
+		t.Fatalf("expected mk=[a b], got %#v", got)
+	}
+	if got := res.Rows[0]["h"]; got != 10 {
+		t.Fatalf("expected h=10, got %#v", got)
+	}
+	if got := res.Rows[0]["hn"]; got != nil {
+		t.Fatalf("expected hn=nil, got %#v", got)
+	}
+	if got := res.Rows[0]["t"]; !reflect.DeepEqual(got, []any{20, 30}) {
+		t.Fatalf("expected t=[20 30], got %#v", got)
+	}
+	if got := res.Rows[0]["te"]; !reflect.DeepEqual(got, []any{}) {
+		t.Fatalf("expected te=[], got %#v", got)
+	}
+	if got := res.Rows[0]["ai"]; got != 3 {
+		t.Fatalf("expected ai=3, got %#v", got)
+	}
+	if got := res.Rows[0]["af"]; got != json.Number("1.5") {
+		t.Fatalf("expected af=1.5, got %#v", got)
+	}
+}
+
+func TestExecuteReturnToBooleanAndToFloat(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("RETURN toBoolean('true') AS bt, toBoolean('f alse') AS bi, toBoolean(null) AS bn, toFloat('5') AS fs, toFloat('foo') AS ff, toFloat(3) AS fi, toFloat(3.4) AS fd")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+
+	row := res.Rows[0]
+	if got := row["bt"]; got != true {
+		t.Fatalf("expected bt=true, got %#v", got)
+	}
+	if got := row["bi"]; got != nil {
+		t.Fatalf("expected bi=nil, got %#v", got)
+	}
+	if got := row["bn"]; got != nil {
+		t.Fatalf("expected bn=nil, got %#v", got)
+	}
+	if got := row["fs"]; got != json.Number("5.0") {
+		t.Fatalf("expected fs=5.0, got %#v", got)
+	}
+	if got := row["ff"]; got != nil {
+		t.Fatalf("expected ff=nil, got %#v", got)
+	}
+	if got := row["fi"]; got != json.Number("3.0") {
+		t.Fatalf("expected fi=3.0, got %#v", got)
+	}
+	if got := row["fd"]; got != json.Number("3.4") {
+		t.Fatalf("expected fd=3.4, got %#v", got)
+	}
+}
+
+func TestExecuteToBooleanAndToFloatRejectInvalidTypes(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("RETURN toBoolean([true]) AS b")
+	if err != nil {
+		t.Fatalf("parse toBoolean invalid failed: %v", err)
+	}
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err == nil {
+		t.Fatalf("expected toBoolean invalid type error")
+	}
+	if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+		t.Fatalf("expected ErrKindInvalidInput for toBoolean, got %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("RETURN toFloat(true) AS f")
+	if err != nil {
+		t.Fatalf("parse toFloat invalid failed: %v", err)
+	}
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err == nil {
+		t.Fatalf("expected toFloat invalid type error")
+	}
+	if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+		t.Fatalf("expected ErrKindInvalidInput for toFloat, got %v", err)
+	}
+}
+
+func TestExecuteRemainingFunctionSurfacePathAndRelationship(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (a {id: 2})-[:REL {num: 1}]->(b {id: 1})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH p=(a)-[r:REL]->(b) RETURN size(nodes(p)) AS nn, size(relationships(p)) AS nr, length(p) AS l, startNode(r).id AS s, endNode(r).id AS e, sign(-5) AS sn, sign(0) AS sz, sign(4) AS sp, last([1,2,3]) AS lv, last([]) AS le")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+
+	row := res.Rows[0]
+	if got := row["nn"]; got != 2 {
+		t.Fatalf("expected nn=2, got %#v", got)
+	}
+	if got := row["nr"]; got != 1 {
+		t.Fatalf("expected nr=1, got %#v", got)
+	}
+	if got := row["l"]; got != 1 {
+		t.Fatalf("expected l=1, got %#v", got)
+	}
+	if got := row["s"]; got != 2 {
+		t.Fatalf("expected s=2, got %#v", got)
+	}
+	if got := row["e"]; got != 1 {
+		t.Fatalf("expected e=1, got %#v", got)
+	}
+	if got := row["sn"]; got != -1 {
+		t.Fatalf("expected sn=-1, got %#v", got)
+	}
+	if got := row["sz"]; got != 0 {
+		t.Fatalf("expected sz=0, got %#v", got)
+	}
+	if got := row["sp"]; got != 1 {
+		t.Fatalf("expected sp=1, got %#v", got)
+	}
+	if got := row["lv"]; got != 3 {
+		t.Fatalf("expected lv=3, got %#v", got)
+	}
+	if got := row["le"]; got != nil {
+		t.Fatalf("expected le=nil, got %#v", got)
+	}
+}
+
+func TestExecutePathFunctionsReturnNullOnNullPath(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (:A)")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (a:A) OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p) AS np, relationships(p) AS rp, length(p) AS lp")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["np"]; got != nil {
+		t.Fatalf("expected np=nil, got %#v", got)
+	}
+	if got := res.Rows[0]["rp"]; got != nil {
+		t.Fatalf("expected rp=nil, got %#v", got)
+	}
+	if got := res.Rows[0]["lp"]; got != nil {
+		t.Fatalf("expected lp=nil, got %#v", got)
+	}
+}
+
 func errUnexpected(message string) error {
 	return &testError{message: message}
 }

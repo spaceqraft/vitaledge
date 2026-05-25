@@ -4548,6 +4548,20 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return integer, nil
 	}
+	if arg, ok := parseFunctionCall(raw, "toBoolean"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalToBooleanValue(value)
+	}
+	if arg, ok := parseFunctionCall(raw, "toFloat"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalToFloatValue(value)
+	}
 	if arg, ok := parseFunctionCall(raw, "coalesce"); ok {
 		parts := splitTopLevelCommaSeparated(arg)
 		if len(parts) == 0 {
@@ -4591,6 +4605,39 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return string(runes), nil
 		}
 		return nil, graph.NewError(graph.ErrKindSemantic, "reverse() requires a list or string", nil)
+	}
+	if arg, ok := parseFunctionCall(raw, "keys"); ok {
+		return evalKeysFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "head"); ok {
+		return evalHeadFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "tail"); ok {
+		return evalTailFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "abs"); ok {
+		return evalAbsFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "nodes"); ok {
+		return evalNodesFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "relationships"); ok {
+		return evalRelationshipsFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "length"); ok {
+		return evalLengthFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "last"); ok {
+		return evalLastFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "sign"); ok {
+		return evalSignFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "startNode"); ok {
+		return evalStartNodeFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "endNode"); ok {
+		return evalEndNodeFunction(arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "date.truncate"); ok {
 		return evalTemporalTruncateFunction("date", arg, row, params)
@@ -4679,6 +4726,8 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		base, ok := row[parts[0]]
 		if !ok {
 			if value, ok := params[parts[0]]; ok {
+				base = value
+			} else if value, err := evalExpressionWithScope(parts[0], row, params); err == nil {
 				base = value
 			} else {
 				return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", parts[0]), nil)
@@ -4849,6 +4898,9 @@ func splitTopLevelInExpression(raw string) (string, string, bool) {
 		if depth != 0 || !strings.HasPrefix(upper[i:], "IN") {
 			continue
 		}
+		if raw[i:i+2] != "IN" {
+			continue
+		}
 		left := strings.TrimSpace(raw[:i])
 		right := strings.TrimSpace(raw[i+2:])
 		if left == "" || right == "" {
@@ -4861,7 +4913,7 @@ func splitTopLevelInExpression(raw string) (string, string, bool) {
 			return left, right, true
 		}
 		if !strings.ContainsAny(raw, " \t\n\r") {
-			if (len(left) == 1 && len(right) == 1) || strings.HasPrefix(left, "$") || strings.HasPrefix(right, "$") || strings.HasPrefix(left, "[") || strings.HasPrefix(right, "[") {
+			if (len(left) == 1 && len(right) == 1) || strings.HasPrefix(left, "$") || strings.HasPrefix(right, "$") || strings.HasPrefix(left, "[") || strings.HasPrefix(right, "[") || strings.HasPrefix(left, "'") || strings.HasPrefix(left, `"`) || strings.HasPrefix(right, "(") {
 				return left, right, true
 			}
 		}
@@ -5462,6 +5514,468 @@ func evalPropertiesFunction(arg string, row Row, params Params) (any, error) {
 		return out, nil
 	default:
 		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+}
+
+func evalKeysFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "keys() requires one argument", nil)
+	}
+
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+
+	props := map[string]any{}
+	switch typed := value.(type) {
+	case *graph.Vertex:
+		for key, raw := range typed.Properties {
+			if isStoredNullProperty(raw) {
+				continue
+			}
+			props[key] = true
+		}
+	case *graph.Edge:
+		for key, raw := range typed.Properties {
+			if isStoredNullProperty(raw) {
+				continue
+			}
+			props[key] = true
+		}
+	case deletedVertexBinding:
+		return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
+	case deletedEdgeBinding:
+		return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
+	case map[string]any:
+		props = typed
+	case string:
+		if mapped, ok := parseStoredMapString(typed); ok {
+			props = mapped
+		} else {
+			return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+		}
+	default:
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+
+	keys := make([]string, 0, len(props))
+	for key := range props {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	out := make([]any, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key)
+	}
+	return out, nil
+}
+
+func isStoredNullProperty(raw []byte) bool {
+	text := strings.TrimSpace(string(raw))
+	if strings.EqualFold(text, "null") {
+		return true
+	}
+	return text == "<nil>"
+}
+
+func evalHeadFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "head() requires one argument", nil)
+	}
+
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+
+	list, ok := normalizeListValue(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	if len(list) == 0 {
+		return nil, nil
+	}
+	return list[0], nil
+}
+
+func evalTailFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "tail() requires one argument", nil)
+	}
+
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+
+	list, ok := normalizeListValue(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	if len(list) <= 1 {
+		return []any{}, nil
+	}
+
+	out := make([]any, 0, len(list)-1)
+	out = append(out, list[1:]...)
+	return out, nil
+}
+
+func evalAbsFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "abs() requires one argument", nil)
+	}
+
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+
+	if n, err := toInt(value); err == nil {
+		if n == math.MinInt {
+			return json.Number(formatFloatResult(math.Abs(float64(n)))), nil
+		}
+		if n < 0 {
+			return -n, nil
+		}
+		return n, nil
+	}
+
+	f, ok := numericValue(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	return json.Number(formatFloatResult(math.Abs(f))), nil
+}
+
+func evalNodesFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "nodes() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	if isNullPathValue(value) {
+		return nil, nil
+	}
+	nodes, _, ok := pathComponents(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	out := make([]any, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, node)
+	}
+	return out, nil
+}
+
+func evalRelationshipsFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "relationships() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	if isNullPathValue(value) {
+		return nil, nil
+	}
+	_, edges, ok := pathComponents(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	out := make([]any, 0, len(edges))
+	for _, edge := range edges {
+		out = append(out, edge)
+	}
+	return out, nil
+}
+
+func evalLengthFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "length() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	if isNullPathValue(value) {
+		return nil, nil
+	}
+	_, edges, ok := pathComponents(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	return len(edges), nil
+}
+
+func evalLastFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "last() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	list, ok := normalizeListValue(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	if len(list) == 0 {
+		return nil, nil
+	}
+	return list[len(list)-1], nil
+}
+
+func evalSignFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "sign() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	n, ok := numericValue(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	if n > 0 {
+		return 1, nil
+	}
+	if n < 0 {
+		return -1, nil
+	}
+	return 0, nil
+}
+
+func evalStartNodeFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "startNode() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	edge, ok := edgeValueFromAny(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	if node, ok := findBoundVertexByID(row, edge.SrcID); ok {
+		return node, nil
+	}
+	return map[string]any{"id": edge.SrcID}, nil
+}
+
+func evalEndNodeFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "endNode() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	edge, ok := edgeValueFromAny(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	if node, ok := findBoundVertexByID(row, edge.DstID); ok {
+		return node, nil
+	}
+	return map[string]any{"id": edge.DstID}, nil
+}
+
+func pathComponents(value any) ([]*graph.Vertex, []*graph.Edge, bool) {
+	switch typed := value.(type) {
+	case cypherPathValue:
+		nodes := make([]*graph.Vertex, 0, 2)
+		edges := make([]*graph.Edge, 0, 1)
+		if typed.Left != nil {
+			nodes = append(nodes, typed.Left)
+		}
+		if typed.Edge != nil {
+			edges = append(edges, typed.Edge)
+		}
+		if typed.Right != nil {
+			nodes = append(nodes, typed.Right)
+		}
+		return nodes, edges, true
+	case multiHopCypherPath:
+		nodes := append([]*graph.Vertex(nil), typed.Nodes...)
+		edges := append([]*graph.Edge(nil), typed.Edges...)
+		return nodes, edges, true
+	default:
+		return nil, nil, false
+	}
+}
+
+func isNullPathValue(value any) bool {
+	switch typed := value.(type) {
+	case cypherPathValue:
+		return typed.Left == nil && typed.Edge == nil && typed.Right == nil
+	case multiHopCypherPath:
+		return len(typed.Nodes) == 0 && len(typed.Edges) == 0
+	default:
+		return false
+	}
+}
+
+func edgeValueFromAny(value any) (*graph.Edge, bool) {
+	switch typed := value.(type) {
+	case *graph.Edge:
+		return typed, true
+	case map[string]any:
+		src, sok := typed["src"]
+		dst, dok := typed["dst"]
+		if !sok || !dok {
+			return nil, false
+		}
+		return &graph.Edge{SrcID: fmt.Sprint(src), DstID: fmt.Sprint(dst)}, true
+	default:
+		return nil, false
+	}
+}
+
+func findBoundVertexByID(row Row, vertexID string) (*graph.Vertex, bool) {
+	if row == nil || vertexID == "" {
+		return nil, false
+	}
+	for _, value := range row {
+		vertex, ok := value.(*graph.Vertex)
+		if !ok || vertex == nil {
+			continue
+		}
+		if vertex.ID == vertexID {
+			return vertex, true
+		}
+	}
+	return nil, false
+}
+
+func evalToBooleanValue(value any) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if b, ok := value.(bool); ok {
+		return b, nil
+	}
+	if s, ok := value.(string); ok {
+		s = strings.TrimSpace(s)
+		s = strings.ToLower(s)
+		switch s {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		default:
+			return nil, nil
+		}
+	}
+	return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+}
+
+func evalToFloatValue(value any) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	switch typed := value.(type) {
+	case bool, []any, []string, map[string]any, *graph.Vertex, *graph.Edge, deletedVertexBinding, deletedEdgeBinding:
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	case string:
+		s := strings.TrimSpace(typed)
+		if s == "" {
+			return nil, nil
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return nil, nil
+		}
+		return json.Number(formatFloatResult(f)), nil
+	case json.Number:
+		f, err := typed.Float64()
+		if err != nil {
+			return nil, nil
+		}
+		return json.Number(formatFloatResult(f)), nil
+	case int:
+		return json.Number(formatFloatResult(float64(typed))), nil
+	case int64:
+		return json.Number(formatFloatResult(float64(typed))), nil
+	case int32:
+		return json.Number(formatFloatResult(float64(typed))), nil
+	case uint:
+		return json.Number(formatFloatResult(float64(typed))), nil
+	case uint64:
+		return json.Number(formatFloatResult(float64(typed))), nil
+	case uint32:
+		return json.Number(formatFloatResult(float64(typed))), nil
+	case float64:
+		return json.Number(formatFloatResult(typed)), nil
+	case float32:
+		return json.Number(formatFloatResult(float64(typed))), nil
+	default:
+		if f, ok := numericValue(value); ok {
+			return json.Number(formatFloatResult(f)), nil
+		}
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
 	}
 }
 

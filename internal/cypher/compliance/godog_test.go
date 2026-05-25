@@ -320,11 +320,10 @@ func (f *cypherTCKFeature) noSideEffects() error {
 }
 
 func (f *cypherTCKFeature) sideEffectsShouldBe(table *godog.Table) error {
-	headers, rows, err := readTable(table)
-	if err != nil {
-		return err
+	if table == nil || len(table.Rows) == 0 {
+		return fmt.Errorf("table is empty")
 	}
-	if len(headers) < 2 {
+	if len(table.Rows[0].Cells) < 2 {
 		return fmt.Errorf("side effect table must have two columns")
 	}
 
@@ -341,15 +340,16 @@ func (f *cypherTCKFeature) sideEffectsShouldBe(table *godog.Table) error {
 	}
 
 	expected := map[string]int{}
-	for _, row := range rows {
-		if len(row) < 2 {
+	for _, row := range table.Rows {
+		if len(row.Cells) < 2 {
 			return fmt.Errorf("side effect row must have two values")
 		}
-		count, err := strconv.Atoi(row[1])
+		key := strings.TrimSpace(row.Cells[0].Value)
+		count, err := strconv.Atoi(strings.TrimSpace(row.Cells[1].Value))
 		if err != nil {
-			return fmt.Errorf("invalid side effect count %q: %w", row[1], err)
+			return fmt.Errorf("invalid side effect count %q: %w", row.Cells[1].Value, err)
 		}
-		expected[row[0]] = count
+		expected[key] = count
 	}
 
 	for key, want := range expected {
@@ -440,15 +440,27 @@ func (f *cypherTCKFeature) assertResultTableWithOptions(table *godog.Table, orde
 	if err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(trimmedStrings(f.lastResult.Columns), headers) {
+	normalizedExpectedHeaders := make([]string, len(headers))
+	for i, header := range headers {
+		normalizedExpectedHeaders[i] = normalizeColumnName(header)
+	}
+	normalizedActualHeaders := make([]string, len(f.lastResult.Columns))
+	for i, header := range f.lastResult.Columns {
+		normalizedActualHeaders[i] = normalizeColumnName(header)
+	}
+	if !reflect.DeepEqual(normalizedActualHeaders, normalizedExpectedHeaders) {
 		return fmt.Errorf("expected columns %v, got %v", headers, f.lastResult.Columns)
 	}
 
 	actualRows := make([][]string, 0, len(f.lastResult.Rows))
 	for _, row := range f.lastResult.Rows {
 		serialized := make([]string, 0, len(headers))
-		for _, header := range headers {
-			serialized = append(serialized, renderTCKValue(row[header]))
+		for i, header := range f.lastResult.Columns {
+			value, ok := row[header]
+			if !ok {
+				value = row[normalizedActualHeaders[i]]
+			}
+			serialized = append(serialized, renderTCKValue(value))
 		}
 		actualRows = append(actualRows, serialized)
 	}
@@ -487,6 +499,10 @@ func (f *cypherTCKFeature) assertResultTableWithOptions(table *godog.Table, orde
 		return fmt.Errorf("expected rows %v, got %v", expectedRows, actualRows)
 	}
 	return nil
+}
+
+func normalizeColumnName(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), "")
 }
 
 func canonicalizeListCellOrder(value string) string {
@@ -839,6 +855,14 @@ func renderTCKValue(value any) string {
 		}
 		return "{" + strings.Join(parts, ", ") + "}"
 	default:
+		rv := reflect.ValueOf(value)
+		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && !(rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8) {
+			items := make([]string, 0, rv.Len())
+			for i := 0; i < rv.Len(); i++ {
+				items = append(items, renderTCKValue(rv.Index(i).Interface()))
+			}
+			return "[" + strings.Join(items, ", ") + "]"
+		}
 		return fmt.Sprintf("%v", typed)
 	}
 }

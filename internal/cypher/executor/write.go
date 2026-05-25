@@ -140,6 +140,9 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 
 	if !returnSeen {
 		resultColumns = nil
+		if writeQuery && rowsAreEmpty(rows) {
+			rows = nil
+		}
 	}
 
 	result := &Result{Columns: resultColumns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}
@@ -155,6 +158,15 @@ func hasWriteClause(part ast.QueryPart) bool {
 		}
 	}
 	return false
+}
+
+func rowsAreEmpty(rows []Row) bool {
+	for _, row := range rows {
+		if len(row) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
@@ -2573,12 +2585,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		lf, lok := numericValue(lhs)
-		rf, rok := numericValue(rhs)
-		if lok && rok {
-			return lf >= rf, nil
-		}
-		return fmt.Sprint(lhs) >= fmt.Sprint(rhs), nil
+		return compareWhereValues(lhs, rhs, ">=")
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "<="); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -2589,12 +2596,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		lf, lok := numericValue(lhs)
-		rf, rok := numericValue(rhs)
-		if lok && rok {
-			return lf <= rf, nil
-		}
-		return fmt.Sprint(lhs) <= fmt.Sprint(rhs), nil
+		return compareWhereValues(lhs, rhs, "<=")
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "<>"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -2637,14 +2639,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		lf, lok := numericValue(lhs)
-		rf, rok := numericValue(rhs)
-		if lok && rok {
-			return lf > rf, nil
-		}
-		ls := fmt.Sprint(lhs)
-		rs := fmt.Sprint(rhs)
-		return ls > rs, nil
+		return compareWhereValues(lhs, rhs, ">")
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "<"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -2655,14 +2650,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		lf, lok := numericValue(lhs)
-		rf, rok := numericValue(rhs)
-		if lok && rok {
-			return lf < rf, nil
-		}
-		ls := fmt.Sprint(lhs)
-		rs := fmt.Sprint(rhs)
-		return ls < rs, nil
+		return compareWhereValues(lhs, rhs, "<")
 	}
 	if left, right, ok := splitTopLevelOperator(raw, "+"); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -3059,6 +3047,14 @@ func compareWhereValues(lhs, rhs any, op string) (bool, error) {
 		}
 	}
 
+	if leftMap, leftTemporal := temporalMapValue(lhs); leftTemporal {
+		if rightMap, rightTemporal := temporalMapValue(rhs); rightTemporal {
+			if value, ok := compareTemporalMaps(leftMap, rightMap, op); ok {
+				return value, nil
+			}
+		}
+	}
+
 	leftInt, leftIntErr := toInt(lhs)
 	rightInt, rightIntErr := toInt(rhs)
 	if leftIntErr == nil && rightIntErr == nil {
@@ -3095,6 +3091,108 @@ func compareWhereValues(lhs, rhs any, op string) (bool, error) {
 		return leftStr >= rightStr, nil
 	default:
 		return false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("WHERE operator %q is not supported", op), nil)
+	}
+}
+
+func compareTemporalMaps(lhs, rhs map[string]any, op string) (bool, bool) {
+	leftType := strings.ToLower(strings.TrimSpace(fmt.Sprint(lhs["__temporal_type"])))
+	rightType := strings.ToLower(strings.TrimSpace(fmt.Sprint(rhs["__temporal_type"])))
+	if leftType == "" || rightType == "" {
+		return false, false
+	}
+
+	if leftType == "duration" && rightType == "duration" {
+		leftDur := durationComponentsFromMap(lhs)
+		rightDur := durationComponentsFromMap(rhs)
+		switch op {
+		case "=":
+			return durationComponentsEqual(leftDur, rightDur), true
+		case "<>":
+			return !durationComponentsEqual(leftDur, rightDur), true
+		case "<", "<=", ">", ">=":
+			return compareDurationComponents(leftDur, rightDur, op), true
+		}
+		return false, false
+	}
+
+	leftInstant, ok1 := coerceDurationInstant(lhs)
+	rightInstant, ok2 := coerceDurationInstant(rhs)
+	if !ok1 || !ok2 {
+		return false, false
+	}
+	lt, ok1 := durationInstantToTime(leftInstant)
+	rt, ok2 := durationInstantToTime(rightInstant)
+	if !ok1 || !ok2 {
+		return false, false
+	}
+
+	switch op {
+	case "=":
+		return lt.Equal(rt), true
+	case "<>":
+		return !lt.Equal(rt), true
+	case "<":
+		return lt.Before(rt), true
+	case "<=":
+		return lt.Before(rt) || lt.Equal(rt), true
+	case ">":
+		return lt.After(rt), true
+	case ">=":
+		return lt.After(rt) || lt.Equal(rt), true
+	default:
+		return false, false
+	}
+}
+
+func durationComponentsEqual(left, right durationComponents) bool {
+	const epsilon = 1e-9
+	return math.Abs(left.months-right.months) < epsilon && math.Abs(left.days-right.days) < epsilon && math.Abs(left.seconds-right.seconds) < epsilon
+}
+
+func compareDurationComponents(left, right durationComponents, op string) bool {
+	if durationComponentsEqual(left, right) {
+		switch op {
+		case "<", ">":
+			return false
+		case "<=", ">=":
+			return true
+		}
+	}
+	if left.months != right.months {
+		switch op {
+		case "<":
+			return left.months < right.months
+		case "<=":
+			return left.months < right.months
+		case ">":
+			return left.months > right.months
+		case ">=":
+			return left.months > right.months
+		}
+	}
+	if left.days != right.days {
+		switch op {
+		case "<":
+			return left.days < right.days
+		case "<=":
+			return left.days < right.days
+		case ">":
+			return left.days > right.days
+		case ">=":
+			return left.days > right.days
+		}
+	}
+	switch op {
+	case "<":
+		return left.seconds < right.seconds
+	case "<=":
+		return left.seconds <= right.seconds
+	case ">":
+		return left.seconds > right.seconds
+	case ">=":
+		return left.seconds >= right.seconds
+	default:
+		return false
 	}
 }
 
@@ -3655,6 +3753,9 @@ func parseEmbeddedDate(raw any) (time.Time, bool) {
 		}
 		if v, ok := typed["value"]; ok {
 			if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
+				if idx := strings.IndexAny(s, "Tt"); idx > 0 {
+					s = strings.TrimSpace(s[:idx])
+				}
 				if t, err := time.Parse("2006-01-02", s); err == nil {
 					return t, true
 				}
@@ -3664,6 +3765,9 @@ func parseEmbeddedDate(raw any) (time.Time, bool) {
 		s := strings.TrimSpace(typed)
 		if s == "" {
 			return time.Time{}, false
+		}
+		if idx := strings.IndexAny(s, "Tt"); idx > 0 {
+			s = strings.TrimSpace(s[:idx])
 		}
 		if t, err := time.Parse("2006-01-02", s); err == nil {
 			return t, true
@@ -3885,6 +3989,59 @@ func evalTemporalNamespaceFunction(raw string, row Row, params Params) (any, boo
 		return value, true, err
 	}
 
+	if namespace == "datetime" {
+		switch strings.ToLower(strings.TrimSpace(method)) {
+		case "fromepoch":
+			if len(args) < 1 || len(args) > 2 {
+				return nil, true, graph.NewError(graph.ErrKindSemantic, "datetime.fromepoch requires 1 or 2 arguments", nil)
+			}
+			seconds, ok := numericValue(args[0])
+			if !ok {
+				return nil, true, graph.NewError(graph.ErrKindInvalidInput, "datetime.fromepoch requires numeric seconds", nil)
+			}
+			nanos := 0.0
+			if len(args) == 2 {
+				if v, ok := numericValue(args[1]); ok {
+					nanos = v
+				} else {
+					return nil, true, graph.NewError(graph.ErrKindInvalidInput, "datetime.fromepoch requires numeric nanoseconds", nil)
+				}
+			}
+			t := time.Unix(int64(seconds), int64(nanos)).UTC()
+			return map[string]any{
+				"__temporal_type": "datetime",
+				"year":            t.Year(),
+				"month":           int(t.Month()),
+				"day":             t.Day(),
+				"hour":            t.Hour(),
+				"minute":          t.Minute(),
+				"second":          t.Second(),
+				"nanosecond":      t.Nanosecond(),
+				"timezone":        "Z",
+			}, true, nil
+		case "fromepochmillis":
+			if len(args) != 1 {
+				return nil, true, graph.NewError(graph.ErrKindSemantic, "datetime.fromepochmillis requires 1 argument", nil)
+			}
+			millis, ok := numericValue(args[0])
+			if !ok {
+				return nil, true, graph.NewError(graph.ErrKindInvalidInput, "datetime.fromepochmillis requires numeric milliseconds", nil)
+			}
+			t := time.Unix(0, int64(millis*1_000_000)).UTC()
+			return map[string]any{
+				"__temporal_type": "datetime",
+				"year":            t.Year(),
+				"month":           int(t.Month()),
+				"day":             t.Day(),
+				"hour":            t.Hour(),
+				"minute":          t.Minute(),
+				"second":          t.Second(),
+				"nanosecond":      t.Nanosecond(),
+				"timezone":        "Z",
+			}, true, nil
+		}
+	}
+
 	return map[string]any{"__temporal_type": namespace, "method": method, "args": args}, true, nil
 }
 
@@ -3998,6 +4155,16 @@ func evalDurationMethod(method string, args []any) (any, error) {
 	}
 
 	if methodKey == "inseconds" {
+		if whole, nanos, ok := durationSecondsBetweenExact(left, right); ok {
+			result := map[string]any{"__temporal_type": "duration"}
+			result["years"] = 0
+			result["months"] = 0
+			result["days"] = 0
+			result["seconds"] = whole
+			result["nanoseconds"] = nanos
+			result["nanosecondsOfSecond"] = nanos
+			return result, nil
+		}
 		if secs, ok := durationSecondsBetweenWithoutTimeDateOverflow(left, right); ok {
 			result := map[string]any{"__temporal_type": "duration"}
 			setDurationFields(result, durationComponents{seconds: secs})
@@ -4145,6 +4312,43 @@ func durationSecondsBetweenWithoutTimeDateOverflow(left, right durationInstant) 
 	return seconds, true
 }
 
+func durationSecondsBetweenExact(left, right durationInstant) (int64, int, bool) {
+	if !(left.hasDate && right.hasDate) {
+		return 0, 0, false
+	}
+	leftDays, ok := daysSinceEpoch(left.year, left.month, left.day)
+	if !ok {
+		return 0, 0, false
+	}
+	rightDays, ok := daysSinceEpoch(right.year, right.month, right.day)
+	if !ok {
+		return 0, 0, false
+	}
+
+	leftSec := int64(left.hour*3600 + left.minute*60 + left.second)
+	rightSec := int64(right.hour*3600 + right.minute*60 + right.second)
+	leftNanos := left.nano
+	rightNanos := right.nano
+
+	whole := (rightDays-leftDays)*86400 + (rightSec - leftSec)
+	if left.hasZone && right.hasZone {
+		leftOffset, _ := durationInstantOffsetSeconds(left)
+		rightOffset, _ := durationInstantOffsetSeconds(right)
+		whole += int64(leftOffset - rightOffset)
+	}
+
+	nanos := rightNanos - leftNanos
+	if nanos < 0 {
+		nanos += 1_000_000_000
+		whole--
+	}
+	if nanos >= 1_000_000_000 {
+		nanos -= 1_000_000_000
+		whole++
+	}
+	return whole, nanos, true
+}
+
 func daysSinceEpoch(year, month, day int) (int64, bool) {
 	if month < 1 || month > 12 || day < 1 || day > 31 {
 		return 0, false
@@ -4285,36 +4489,42 @@ func parseTemporalLiteralToMap(typeName, raw string) (map[string]any, bool) {
 		}
 		return map[string]any{"hour": h, "minute": m, "second": s, "nanosecond": n, "timezone": tz}, true
 	case "localdatetime":
-		datePart, timePart, ok := strings.Cut(raw, "T")
+		if datePart, timePart, ok := strings.Cut(raw, "T"); ok {
+			y, mo, d, ok := parseDateParts(datePart)
+			if !ok {
+				return nil, false
+			}
+			h, mi, s, n, _, ok := parseClockAndZone(timePart)
+			if !ok {
+				return nil, false
+			}
+			return map[string]any{"year": y, "month": mo, "day": d, "hour": h, "minute": mi, "second": s, "nanosecond": n}, true
+		}
+		y, mo, d, ok := parseDateParts(raw)
 		if !ok {
 			return nil, false
 		}
-		y, mo, d, ok := parseDateParts(datePart)
-		if !ok {
-			return nil, false
-		}
-		h, mi, s, n, _, ok := parseClockAndZone(timePart)
-		if !ok {
-			return nil, false
-		}
-		return map[string]any{"year": y, "month": mo, "day": d, "hour": h, "minute": mi, "second": s, "nanosecond": n}, true
+		return map[string]any{"year": y, "month": mo, "day": d, "hour": 0, "minute": 0, "second": 0, "nanosecond": 0}, true
 	case "datetime":
-		datePart, timePart, ok := strings.Cut(raw, "T")
+		if datePart, timePart, ok := strings.Cut(raw, "T"); ok {
+			y, mo, d, ok := parseDateParts(datePart)
+			if !ok {
+				return nil, false
+			}
+			h, mi, s, n, tz, ok := parseClockAndZone(timePart)
+			if !ok {
+				return nil, false
+			}
+			if tz == "" {
+				tz = "Z"
+			}
+			return map[string]any{"year": y, "month": mo, "day": d, "hour": h, "minute": mi, "second": s, "nanosecond": n, "timezone": tz}, true
+		}
+		y, mo, d, ok := parseDateParts(raw)
 		if !ok {
 			return nil, false
 		}
-		y, mo, d, ok := parseDateParts(datePart)
-		if !ok {
-			return nil, false
-		}
-		h, mi, s, n, tz, ok := parseClockAndZone(timePart)
-		if !ok {
-			return nil, false
-		}
-		if tz == "" {
-			tz = "Z"
-		}
-		return map[string]any{"year": y, "month": mo, "day": d, "hour": h, "minute": mi, "second": s, "nanosecond": n, "timezone": tz}, true
+		return map[string]any{"year": y, "month": mo, "day": d, "hour": 0, "minute": 0, "second": 0, "nanosecond": 0, "timezone": "Z"}, true
 	case "duration":
 		return parseDurationLiteralToMap(raw)
 	default:
@@ -4882,12 +5092,18 @@ func temporalMapValue(v any) (map[string]any, bool) {
 }
 
 func durationComponentsFromMap(value map[string]any) durationComponents {
-	return durationComponents{
+	raw := durationComponents{
 		months: 12*mapFloat(value, "years") + mapFloat(value, "months"),
 		days:   7*mapFloat(value, "weeks") + mapFloat(value, "days"),
 		seconds: 3600*mapFloat(value, "hours") + 60*mapFloat(value, "minutes") +
 			mapFloat(value, "seconds") + mapFloat(value, "milliseconds")/1000 + mapFloat(value, "microseconds")/1_000_000 + mapFloat(value, "nanoseconds")/1_000_000_000,
 	}
+	return canonicalizeDurationComponents(raw)
+}
+
+func canonicalizeDurationComponents(dur durationComponents) durationComponents {
+	years, months, days, seconds := decomposeDuration(dur)
+	return durationComponents{months: float64(years*12 + months), days: float64(days), seconds: seconds}
 }
 
 func mapFloat(value map[string]any, key string) float64 {
@@ -4939,11 +5155,14 @@ func applyTemporalAndDuration(temporal map[string]any, dur durationComponents, o
 
 	base := time.Date(baseYear, time.Month(baseMonth), baseDay, hour, minute, second, nanosecond, loc)
 	addY, addM, addD, addSeconds := decomposeDuration(dur)
-	adjusted := base.AddDate(addY, addM, addD).Add(secondsToDuration(addSeconds))
+	dateAdjusted := base.AddDate(addY, addM, addD)
+	adjusted := dateAdjusted.Add(secondsToDuration(addSeconds))
 
 	switch temporalType {
 	case "date":
-		return adjusted.Format("2006-01-02"), true
+		dayCarry := int(truncTowardZero(addSeconds / 86400))
+		dateAdjusted = base.AddDate(addY, addM, addD+dayCarry)
+		return dateAdjusted.Format("2006-01-02"), true
 	case "localtime":
 		return formatTimeString(adjusted, false), true
 	case "time":
@@ -4958,13 +5177,14 @@ func applyTemporalAndDuration(temporal map[string]any, dur durationComponents, o
 }
 
 func decomposeDuration(dur durationComponents) (int, int, int, float64) {
+	const avgMonthSeconds = 2629746.0
 	totalMonths := dur.months
 	years := int(truncTowardZero(totalMonths / 12))
 	remainingMonths := totalMonths - float64(years*12)
 	months := int(truncTowardZero(remainingMonths))
 	fracMonths := remainingMonths - float64(months)
 
-	totalDays := dur.days + fracMonths*30
+	totalDays := dur.days + (fracMonths*avgMonthSeconds)/86400
 	days := int(truncTowardZero(totalDays))
 	fracDays := totalDays - float64(days)
 
@@ -4989,6 +5209,9 @@ func formatDurationComponents(dur durationComponents) string {
 	if nanos <= -1_000_000_000 {
 		secInt--
 		nanos += 1_000_000_000
+	}
+	if nanos != 0 && math.Abs(float64(nanos)) <= 1 {
+		nanos = 0
 	}
 
 	b := strings.Builder{}

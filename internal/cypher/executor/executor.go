@@ -1001,6 +1001,9 @@ func normalizeResultValue(value any) any {
 				return rendered
 			}
 		}
+		if parsed, ok := parseStoredListString(typed); ok {
+			return normalizeResultValue(parsed)
+		}
 		return typed
 	case map[string]any:
 		if rendered, ok := renderTemporalValue(typed); ok {
@@ -1024,6 +1027,22 @@ func normalizeResultValue(value any) any {
 		}
 		return out
 	default:
+		rv := reflect.ValueOf(value)
+		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) && !(rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8) {
+			elemKind := rv.Type().Elem().Kind()
+			switch elemKind {
+			case reflect.String, reflect.Bool,
+				reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+				reflect.Float32, reflect.Float64:
+				return value
+			}
+			out := make([]any, rv.Len())
+			for i := 0; i < rv.Len(); i++ {
+				out[i] = normalizeResultValue(rv.Index(i).Interface())
+			}
+			return out
+		}
 		return value
 	}
 }
@@ -1043,6 +1062,9 @@ func renderTemporalValue(value map[string]any) (string, bool) {
 	}
 
 	if typeName == "duration" {
+		if exact, ok := renderDurationFromRawSeconds(value); ok {
+			return exact, true
+		}
 		return formatDurationComponents(durationComponentsFromMap(value)), true
 	}
 
@@ -1091,6 +1113,78 @@ func renderTemporalValue(value map[string]any) (string, bool) {
 	}
 }
 
+func parseStoredListString(raw string) ([]any, bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "[") || !strings.HasSuffix(raw, "]") {
+		return nil, false
+	}
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	if body == "" {
+		return []any{}, true
+	}
+	parts := splitStoredListParts(body)
+	if len(parts) == 0 {
+		return nil, false
+	}
+	out := make([]any, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if mapped, ok := parseStoredMapString(part); ok {
+			out = append(out, mapped)
+			continue
+		}
+		out = append(out, part)
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func splitStoredListParts(raw string) []string {
+	parts := []string{}
+	start := 0
+	depthSquare := 0
+	depthParen := 0
+	depthCurly := 0
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '[':
+			depthSquare++
+		case ']':
+			if depthSquare > 0 {
+				depthSquare--
+			}
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '{':
+			depthCurly++
+		case '}':
+			if depthCurly > 0 {
+				depthCurly--
+			}
+		case ' ':
+			if depthSquare == 0 && depthParen == 0 && depthCurly == 0 {
+				if start < i {
+					parts = append(parts, raw[start:i])
+				}
+				start = i + 1
+			}
+		}
+	}
+	if start < len(raw) {
+		parts = append(parts, raw[start:])
+	}
+	return parts
+}
+
 func normalizeTemporalMapForRendering(typeName string, src map[string]any) map[string]any {
 	out := map[string]any{}
 	for k, v := range src {
@@ -1118,13 +1212,20 @@ func normalizeTemporalMapForRendering(typeName string, src map[string]any) map[s
 		switch typed := embedded.(type) {
 		case map[string]any:
 			if dateText, ok := renderTemporalValue(typed); ok {
+				if idx := strings.IndexAny(dateText, "Tt"); idx > 0 {
+					dateText = strings.TrimSpace(dateText[:idx])
+				}
 				if t, err := time.Parse("2006-01-02", dateText); err == nil {
 					baseDate = t
 					hasBaseDate = true
 				}
 			}
 		case string:
-			if t, err := time.Parse("2006-01-02", strings.TrimSpace(typed)); err == nil {
+			s := strings.TrimSpace(typed)
+			if idx := strings.IndexAny(s, "Tt"); idx > 0 {
+				s = strings.TrimSpace(s[:idx])
+			}
+			if t, err := time.Parse("2006-01-02", s); err == nil {
 				baseDate = t
 				hasBaseDate = true
 			}
@@ -1297,7 +1398,7 @@ func applyTemporalTruncation(typeName string, src map[string]any, unit string) m
 	}
 
 	switch unit {
-	case "millennium", "century", "decade", "year", "quarter", "month", "week", "day":
+	case "millennium", "century", "decade", "year", "weekyear", "quarter", "month", "week", "day":
 		t, ok := temporalDateTime(out, strings.Contains(typeName, "time") && typeName != "localtime" && typeName != "localdatetime")
 		if !ok {
 			return out
@@ -1314,6 +1415,12 @@ func applyTemporalTruncation(typeName string, src map[string]any, unit string) m
 			t = time.Date((y/10)*10, 1, 1, 0, 0, 0, 0, t.Location())
 		case "year":
 			t = time.Date(t.Year(), 1, 1, 0, 0, 0, 0, t.Location())
+		case "weekyear":
+			y, _ := t.ISOWeek()
+			dt, ok := isoWeekDate(y, 1, 1)
+			if ok {
+				t = time.Date(dt.Year(), dt.Month(), dt.Day(), 0, 0, 0, 0, t.Location())
+			}
 		case "quarter":
 			m := ((int(t.Month())-1)/3)*3 + 1
 			t = time.Date(t.Year(), time.Month(m), 1, 0, 0, 0, 0, t.Location())
@@ -1400,6 +1507,51 @@ func formatTimeWithNamedTimezone(t time.Time, src map[string]any) string {
 	}
 	_, off := t.Zone()
 	return base + formatOffsetString(off)
+}
+
+func renderDurationFromRawSeconds(value map[string]any) (string, bool) {
+	for _, key := range []string{"years", "months", "weeks", "days", "hours", "minutes", "milliseconds", "microseconds", "nanoseconds"} {
+		if mapFloat(value, key) != 0 {
+			return "", false
+		}
+	}
+	raw, ok := value["seconds"]
+	if !ok {
+		return "", false
+	}
+	var sec int64
+	switch typed := raw.(type) {
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		if err != nil {
+			return "", false
+		}
+		sec = parsed
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		sec = toInt64(raw)
+	default:
+		return "", false
+	}
+	if sec < 0 {
+		return "", false
+	}
+	hours := sec / 3600
+	sec %= 3600
+	minutes := sec / 60
+	seconds := sec % 60
+
+	b := strings.Builder{}
+	b.WriteString("PT")
+	if hours != 0 {
+		b.WriteString(fmt.Sprintf("%dH", hours))
+	}
+	if minutes != 0 {
+		b.WriteString(fmt.Sprintf("%dM", minutes))
+	}
+	if seconds != 0 || (hours == 0 && minutes == 0) {
+		b.WriteString(fmt.Sprintf("%dS", seconds))
+	}
+	return b.String(), true
 }
 
 func formatDateTimeWithNamedTimezone(t time.Time, src map[string]any) string {

@@ -188,7 +188,7 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 					if err := validateSkipLimitExpressionsInRawClause(clause.Raw, clause.Kind, seg); err != nil {
 						return err
 					}
-					if hasTopLevelStarProjection(clause.Raw, clause.Kind) && len(bound) == 0 {
+					if clause.Kind == ast.ClauseKindReturn && hasTopLevelStarProjection(clause.Raw, clause.Kind) && len(bound) == 0 {
 						return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
 					}
 					if err := validateProjectionClauseNamesFromRaw(clause.Raw, clause.Kind, bound, seg); err != nil {
@@ -365,7 +365,7 @@ func recordInQueryCallBindings(raw string, bound map[string]patternVarRole, seg 
 func validateProjectionClauseNamesFromRaw(raw string, kind ast.ClauseKind, bound map[string]patternVarRole, seg statementSegment) error {
 	items := splitProjectionItems(raw, kind)
 	seen := map[string]struct{}{}
-	if hasTopLevelStarProjection(raw, kind) && len(bound) == 0 {
+	if kind == ast.ClauseKindReturn && hasTopLevelStarProjection(raw, kind) && len(bound) == 0 {
 		return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
 	}
 	for _, item := range items {

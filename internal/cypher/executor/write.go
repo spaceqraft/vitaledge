@@ -6559,6 +6559,11 @@ func evalToStringValue(value any) (any, error) {
 	if value == nil {
 		return nil, nil
 	}
+	if temporal, ok := temporalMapValue(value); ok {
+		if rendered, ok := formatTemporalToString(temporal); ok {
+			return rendered, nil
+		}
+	}
 	if isInvalidTypeConversionValue(value) {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
 	}
@@ -10105,13 +10110,31 @@ func temporalMapValue(v any) (map[string]any, bool) {
 }
 
 func durationComponentsFromMap(value map[string]any) durationComponents {
-	raw := durationComponents{
-		months: 12*mapFloat(value, "years") + mapFloat(value, "months"),
-		days:   7*mapFloat(value, "weeks") + mapFloat(value, "days"),
-		seconds: 3600*mapFloat(value, "hours") + 60*mapFloat(value, "minutes") +
-			mapFloat(value, "seconds") + mapFloat(value, "milliseconds")/1000 + mapFloat(value, "microseconds")/1_000_000 + mapFloat(value, "nanoseconds")/1_000_000_000,
+	seconds := 3600*mapFloat(value, "hours") + 60*mapFloat(value, "minutes") + mapFloat(value, "seconds")
+
+	var nanosAcc int64
+	if ms, ok := mapWholeInt64(value, "milliseconds"); ok {
+		nanosAcc += ms * 1_000_000
+	} else {
+		seconds += mapFloat(value, "milliseconds") / 1_000
 	}
-	return canonicalizeDurationComponents(raw)
+	if us, ok := mapWholeInt64(value, "microseconds"); ok {
+		nanosAcc += us * 1_000
+	} else {
+		seconds += mapFloat(value, "microseconds") / 1_000_000
+	}
+	if ns, ok := mapWholeInt64(value, "nanoseconds"); ok {
+		nanosAcc += ns
+	} else {
+		seconds += mapFloat(value, "nanoseconds") / 1_000_000_000
+	}
+	seconds += float64(nanosAcc) / 1_000_000_000
+
+	return durationComponents{
+		months:  12*mapFloat(value, "years") + mapFloat(value, "months"),
+		days:    7*mapFloat(value, "weeks") + mapFloat(value, "days"),
+		seconds: seconds,
+	}
 }
 
 func canonicalizeDurationComponents(dur durationComponents) durationComponents {
@@ -10128,6 +10151,23 @@ func mapFloat(value map[string]any, key string) float64 {
 		return f
 	}
 	return 0
+}
+
+func mapWholeInt64(value map[string]any, key string) (int64, bool) {
+	raw, ok := value[key]
+	if !ok {
+		return 0, false
+	}
+	intVal, err := toInt(raw)
+	if err != nil {
+		return 0, false
+	}
+	if f, ok := numericValue(raw); ok {
+		if math.Abs(f-float64(intVal)) > 1e-12 {
+			return 0, false
+		}
+	}
+	return int64(intVal), true
 }
 
 func applyTemporalAndDuration(temporal map[string]any, dur durationComponents, op string) (any, bool) {
@@ -10268,13 +10308,34 @@ func decomposeDuration(dur durationComponents) (int, int, int, float64) {
 
 func formatDurationComponents(dur durationComponents) string {
 	years, months, days, seconds := decomposeDuration(dur)
-	hours := int(truncTowardZero(seconds / 3600))
-	seconds -= float64(hours * 3600)
-	minutes := int(truncTowardZero(seconds / 60))
-	seconds -= float64(minutes * 60)
-	secInt := int(truncTowardZero(seconds))
-	frac := seconds - float64(secInt)
-	nanos := int(math.Round(frac * 1_000_000_000))
+	wholeSeconds := int64(truncTowardZero(seconds))
+	frac := seconds - float64(wholeSeconds)
+
+	hours := int(wholeSeconds / 3600)
+	remainingSeconds := wholeSeconds - int64(hours*3600)
+	minutes := int(remainingSeconds / 60)
+	secInt := int(remainingSeconds - int64(minutes*60))
+
+	fracSign := 1
+	if frac < 0 {
+		fracSign = -1
+	}
+	absNanosFloat := math.Abs(frac) * 1_000_000_000
+	absNanos := int(math.Floor(absNanosFloat))
+	nearest := math.Round(absNanosFloat)
+	// Snap values that are very close to integral nanoseconds to avoid binary drift.
+	if math.Abs(absNanosFloat-nearest) < 0.01 {
+		absNanos = int(nearest)
+	}
+	if absNanos >= 1_000_000_000 {
+		if fracSign > 0 {
+			secInt++
+		} else {
+			secInt--
+		}
+		absNanos -= 1_000_000_000
+	}
+	nanos := fracSign * absNanos
 
 	if nanos >= 1_000_000_000 {
 		secInt++
@@ -10386,6 +10447,86 @@ func formatDateTimeString(t time.Time, includeZone bool) string {
 	if includeZone {
 		_, off := t.Zone()
 		base += formatOffsetString(off)
+	}
+	return base
+}
+
+func formatTemporalToString(temporal map[string]any) (string, bool) {
+	typeName := strings.ToLower(strings.TrimSpace(fmt.Sprint(temporal["__temporal_type"])))
+	switch typeName {
+	case "date":
+		y, m, d, ok := resolveDateFromTemporalMap(temporal)
+		if !ok {
+			return "", false
+		}
+		return fmt.Sprintf("%04d-%02d-%02d", y, m, d), true
+	case "localtime":
+		hour, _ := mapInt(temporal, "hour")
+		minute, _ := mapInt(temporal, "minute")
+		second, _ := mapInt(temporal, "second")
+		nano := combineNanoseconds(temporal)
+		return formatClockParts(hour, minute, second, nano), true
+	case "time":
+		hour, _ := mapInt(temporal, "hour")
+		minute, _ := mapInt(temporal, "minute")
+		second, _ := mapInt(temporal, "second")
+		nano := combineNanoseconds(temporal)
+		tzName := strings.TrimSpace(fmt.Sprint(temporal["timezone"]))
+		if tzName == "" {
+			tzName = "Z"
+		}
+		offsetRendered := tzName
+		if offset, err := parseOffsetSeconds(tzName); err == nil {
+			offsetRendered = formatOffsetString(offset)
+		}
+		return formatClockParts(hour, minute, second, nano) + offsetRendered, true
+	case "localdatetime":
+		y, m, d, ok := resolveDateFromTemporalMap(temporal)
+		if !ok {
+			return "", false
+		}
+		hour, _ := mapInt(temporal, "hour")
+		minute, _ := mapInt(temporal, "minute")
+		second, _ := mapInt(temporal, "second")
+		nano := combineNanoseconds(temporal)
+		return fmt.Sprintf("%04d-%02d-%02dT%s", y, m, d, formatClockParts(hour, minute, second, nano)), true
+	case "datetime":
+		y, m, d, ok := resolveDateFromTemporalMap(temporal)
+		if !ok {
+			return "", false
+		}
+		hour, _ := mapInt(temporal, "hour")
+		minute, _ := mapInt(temporal, "minute")
+		second, _ := mapInt(temporal, "second")
+		nano := combineNanoseconds(temporal)
+		tzName := strings.TrimSpace(fmt.Sprint(temporal["timezone"]))
+		if tzName == "" {
+			tzName = "Z"
+		}
+		clock := formatClockParts(hour, minute, second, nano)
+		if offset, err := parseOffsetSeconds(tzName); err == nil {
+			return fmt.Sprintf("%04d-%02d-%02dT%s%s", y, m, d, clock, formatOffsetString(offset)), true
+		}
+		if loc, err := time.LoadLocation(tzName); err == nil {
+			t := time.Date(y, time.Month(m), d, hour, minute, second, nano, loc)
+			_, offset := t.Zone()
+			return fmt.Sprintf("%04d-%02d-%02dT%s%s[%s]", y, m, d, clock, formatOffsetString(offset), tzName), true
+		}
+		return fmt.Sprintf("%04d-%02d-%02dT%s%s", y, m, d, clock, tzName), true
+	case "duration":
+		return formatDurationComponents(durationComponentsFromMap(temporal)), true
+	default:
+		return "", false
+	}
+}
+
+func formatClockParts(hour, minute, second, nano int) string {
+	base := fmt.Sprintf("%02d:%02d", hour, minute)
+	if second != 0 || nano != 0 {
+		base += fmt.Sprintf(":%02d", second)
+	}
+	if nano != 0 {
+		base += "." + strings.TrimRight(fmt.Sprintf("%09d", nano), "0")
 	}
 	return base
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +18,11 @@ import (
 )
 
 type Params map[string]any
+
+var (
+	patternNodeVarRE = regexp.MustCompile(`\((?:\s*)([A-Za-z_][A-Za-z0-9_]*)?(?:(?::|\{|\)))`)
+	patternEdgeVarRE = regexp.MustCompile(`\[(?:\s*)([A-Za-z_][A-Za-z0-9_]*)?(?:(?::|\{|\]))`)
+)
 
 const ProcedureDeclsParam = "__tck_procedures"
 
@@ -148,14 +155,16 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 			if match.Optional {
 				kind = ast.ClauseKindOptionalMatch
 			}
-			nextRows, err := e.applyMatchClause(ctx, tx, rows, ast.Clause{Kind: kind, Raw: renderMatchClauseRaw(match)}, params)
+			matchClause := ast.Clause{Kind: kind, Raw: renderMatchClauseRaw(match)}
+			nextRows, err := e.applyMatchClause(ctx, tx, rows, matchClause, params)
 			if err != nil {
 				return err
 			}
 			rows = nextRows
+			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(matchClause.Raw)...)
 		}
 
-		projectedRows, cols, err := e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: renderReturnClauseRaw(stmt.Return)}, params, true)
+		projectedRows, cols, err := e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: renderReturnClauseRaw(stmt.Return)}, params, resultColumns, true)
 		if err != nil {
 			return err
 		}
@@ -193,6 +202,74 @@ func shouldUseProjectionEngineForReturn(ret ast.ReturnClause) bool {
 		}
 	}
 	return false
+}
+
+func appendUniqueColumns(columns []string, candidates ...string) []string {
+	seen := make(map[string]struct{}, len(columns))
+	for _, col := range columns {
+		col = strings.TrimSpace(col)
+		if col == "" {
+			continue
+		}
+		seen[col] = struct{}{}
+	}
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		columns = append(columns, candidate)
+		seen[candidate] = struct{}{}
+	}
+	return columns
+}
+
+func inferColumnsFromRows(rows []Row) []string {
+	keySet := map[string]struct{}{}
+	for _, row := range rows {
+		for key := range row {
+			if strings.TrimSpace(key) == "" {
+				continue
+			}
+			keySet[key] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(keySet))
+	for key := range keySet {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func inferMatchScopeColumns(clauseRaw string) []string {
+	spec, err := parseAnchoredMatchClauseRaw(clauseRaw)
+	if err != nil {
+		return nil
+	}
+
+	pattern := strings.TrimSpace(spec.Pattern)
+	columns := []string{}
+	if pathVar, innerPattern, ok := parseBoundPathPattern(pattern); ok {
+		columns = appendUniqueColumns(columns, pathVar)
+		pattern = strings.TrimSpace(innerPattern)
+	}
+
+	for _, match := range patternNodeVarRE.FindAllStringSubmatch(pattern, -1) {
+		if len(match) > 1 {
+			columns = appendUniqueColumns(columns, match[1])
+		}
+	}
+	for _, match := range patternEdgeVarRE.FindAllStringSubmatch(pattern, -1) {
+		if len(match) > 1 {
+			columns = appendUniqueColumns(columns, match[1])
+		}
+	}
+
+	return columns
 }
 
 func (e *Executor) executeMatchQueryLegacy(ctx context.Context, stmt *ast.MatchQueryStatement, params Params) (*Result, error) {
@@ -476,6 +553,9 @@ func evalVertexField(v *graph.Vertex, field string) (any, error) {
 	}
 	switch field {
 	case "id":
+		if !shouldExposeEntityID(v.ID) {
+			return nil, nil
+		}
 		if i, err := strconv.Atoi(v.ID); err == nil {
 			return i, nil
 		}
@@ -500,6 +580,9 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 	}
 	switch field {
 	case "id":
+		if !shouldExposeEntityID(e.ID) {
+			return nil, nil
+		}
 		if i, err := strconv.Atoi(e.ID); err == nil {
 			return i, nil
 		}
@@ -515,6 +598,16 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 	default:
 		return nil, nil
 	}
+}
+
+func shouldExposeEntityID(id string) bool {
+	if strings.HasPrefix(id, "auto-") {
+		return false
+	}
+	if strings.Count(id, "|") >= 4 {
+		return false
+	}
+	return true
 }
 
 func decodeStoredPropertyValue(raw []byte) any {

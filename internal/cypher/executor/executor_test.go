@@ -2799,6 +2799,126 @@ func TestExecuteWithCountAliasOrderByLimitThenCollect(t *testing.T) {
 	}
 }
 
+func TestExecuteWithRelationshipAliasAndAggregationPreservesEdgeBinding(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seed, err := parser.ParseStatement("CREATE ()-[:T1]->(:X), ()-[:T2]->(:X), ()-[:T3]->()")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH ()-[r1]->(:X) WITH r1 AS r2, count(*) AS c MATCH ()-[r2]->() RETURN type(r2) AS relType ORDER BY relType")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["relType"]; got != "T1" {
+		t.Fatalf("unexpected first relType: %#v", got)
+	}
+	if got := res.Rows[1]["relType"]; got != "T2" {
+		t.Fatalf("unexpected second relType: %#v", got)
+	}
+}
+
+func TestExecuteWithForwardingNullPreservesStarColumns(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("OPTIONAL MATCH (a:Start) WITH a MATCH (a)-->(b) RETURN *")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("expected 0 rows, got %d", len(res.Rows))
+	}
+	if !reflect.DeepEqual(res.Columns, []string{"a", "b"}) {
+		t.Fatalf("unexpected columns: %#v", res.Columns)
+	}
+}
+
+func TestExecuteMatchCommaSeparatedPatternsWithForwardedBinding(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seed, err := parser.ParseStatement("CREATE (:A)-[:REL]->(:B) CREATE (:X)")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:A) WITH a MATCH (x:X), (a)-->(b) RETURN *")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if !reflect.DeepEqual(res.Columns, []string{"a", "b", "x"}) {
+		t.Fatalf("unexpected columns: %#v", res.Columns)
+	}
+}
+
+func TestExecuteReverseAdjacentThenReverseRelationshipChain(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seed, err := parser.ParseStatement("CREATE (a:Person), (b:Person), (m:Message {id: 10}) CREATE (a)-[:LIKE {creationDate: 20160614}]->(m)-[:POSTED_BY]->(b)")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (person:Person)<--(message)<-[like]-(:Person) RETURN like.creationDate AS likeTime ORDER BY message.id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["likeTime"]; got != 20160614 {
+		t.Fatalf("unexpected likeTime: %#v", got)
+	}
+}
+
 func TestParseNodePatternBareAndLabel(t *testing.T) {
 	if _, err := parseNodePattern("(n)"); err != nil {
 		t.Fatalf("expected bare node pattern to parse: %v", err)

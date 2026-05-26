@@ -131,12 +131,15 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 			switch clause.Kind {
 			case ast.ClauseKindMatch:
 				rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
+				resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(clause.Raw)...)
 			case ast.ClauseKindOptionalMatch:
 				rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
+				resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(clause.Raw)...)
 			case ast.ClauseKindUnwind:
 				rows, stepErr = e.applyUnwindClause(rows, clause, params)
+				resultColumns = appendUniqueColumns(resultColumns, inferColumnsFromRows(rows)...)
 			case ast.ClauseKindWith:
-				rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, false)
+				rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns, false)
 			case ast.ClauseKindCreate:
 				rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, false)
 			case ast.ClauseKindMerge:
@@ -148,7 +151,7 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 			case ast.ClauseKindDelete:
 				rows, stepErr = e.applyDeleteClause(ctx, tx, rows, clause, params)
 			case ast.ClauseKindReturn:
-				rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, true)
+				rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns, true)
 				returnSeen = true
 				if stepErr != nil {
 					return stepErr
@@ -216,6 +219,9 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 		pathVar = boundVar
 		patternRaw = innerPattern
 		expansionSpec.Pattern = innerPattern
+	}
+	if parts := splitTopLevelCommaSeparated(patternRaw); len(parts) > 1 {
+		return e.expandCompositeMatch(ctx, tx, rows, spec, parts, params)
 	}
 	if multi, ok := parseMultiNodeMatchPattern(patternRaw); ok {
 		return e.expandMultiNodeMatch(ctx, tx, rows, spec, multi, params)
@@ -387,6 +393,64 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 		return matched, nil
 	}
 	return e.expandAnchoredMatch(ctx, tx, rows, expansionSpec, params, pathVar)
+}
+
+func (e *Executor) expandCompositeMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, parts []string, params Params) ([]Row, error) {
+	if len(rows) == 0 {
+		rows = []Row{{}}
+	}
+
+	raw := strings.TrimSpace(spec.Pattern)
+	if raw == "" {
+		return rows, nil
+	}
+	matchVars := inferMatchScopeColumns("MATCH " + raw)
+
+	out := make([]Row, 0)
+	for _, row := range rows {
+		partials := []Row{cloneRow(row)}
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			next, err := e.applyMatchClause(ctx, tx, partials, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + part}, params)
+			if err != nil {
+				return nil, err
+			}
+			partials = next
+			if len(partials) == 0 {
+				break
+			}
+		}
+
+		matched := false
+		if len(partials) > 0 {
+			for _, partial := range partials {
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, partial, params)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						continue
+					}
+				}
+				matched = true
+				out = append(out, partial)
+			}
+		}
+
+		if spec.Optional && !matched {
+			merged := cloneRow(row)
+			for _, name := range matchVars {
+				setOptionalNoMatchBinding(merged, row, name)
+			}
+			out = append(out, merged)
+		}
+	}
+
+	return out, nil
 }
 
 func parseBoundPathPattern(raw string) (string, string, bool) {
@@ -1306,6 +1370,9 @@ func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph
 				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
 					return nil
 				}
+				if !edgeBindingMatches(rowWithLeft, pattern.EdgeVar, edge) {
+					return nil
+				}
 				if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
 					return nil
 				}
@@ -1397,6 +1464,9 @@ func (e *Executor) expandReverseDirectedRelationshipMatch(ctx context.Context, t
 			}
 			if err := tx.ScanInEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
 				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
+					return nil
+				}
+				if !edgeBindingMatches(rowWithLeft, pattern.EdgeVar, edge) {
 					return nil
 				}
 				if !edgePatternMatches(edge, pattern.EdgeProps, params, rowWithLeft) {
@@ -1491,6 +1561,10 @@ func (e *Executor) expandUndirectedRelationshipMatch(ctx context.Context, tx gra
 					return nil
 				}
 				emitted[key] = struct{}{}
+
+				if !edgeBindingMatches(rowWithLeft, pattern.EdgeVar, edge) {
+					return nil
+				}
 
 				if !edgePatternMatches(edge, pattern.EdgeProps, params, rowWithLeft) {
 					return nil
@@ -5319,7 +5393,7 @@ func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Param
 	return out, nil
 }
 
-func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, final bool) ([]Row, []string, error) {
+func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, priorColumns []string, final bool) ([]Row, []string, error) {
 	params = withProjectionEvalRuntime(ctx, tx, params, e)
 	raw := strings.TrimSpace(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
 	projection, err := parseProjectionClauseSpec(raw)
@@ -5423,6 +5497,9 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		}
 		if hasStar {
 			columns = inferProjectionColumns(out)
+			if len(columns) == 0 && len(priorColumns) > 0 {
+				columns = append([]string(nil), priorColumns...)
+			}
 		}
 		if projection.WhereRaw == "" {
 			out, err = filterProjectedRows(out)
@@ -5832,7 +5909,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					if agg.count == 0 {
 						projected[key] = nil
 					} else {
-						projected[key] = agg.sum / float64(agg.count)
+						projected[key] = json.Number(formatFloatResult(agg.sum / float64(agg.count)))
 					}
 				case "min":
 					projected[key] = agg.min
@@ -5921,6 +5998,9 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 	}
 	if hasStar {
 		columns = inferProjectionColumns(out)
+		if len(columns) == 0 && len(priorColumns) > 0 {
+			columns = append([]string(nil), priorColumns...)
+		}
 	}
 	out, err = filterProjectedRows(out)
 	if err != nil {
@@ -7758,6 +7838,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 				return nil, graph.NewError(graph.ErrKindInvalidInput, "MapElementAccessByNonString", nil)
 			}
 			if key == "id" {
+				if !shouldExposeEntityID(typed.ID) {
+					return nil, nil
+				}
 				return typed.ID, nil
 			}
 			if typed.Properties == nil {
@@ -7774,6 +7857,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 				return nil, graph.NewError(graph.ErrKindInvalidInput, "MapElementAccessByNonString", nil)
 			}
 			if key == "id" {
+				if !shouldExposeEntityID(typed.ID) {
+					return nil, nil
+				}
 				return typed.ID, nil
 			}
 			if typed.Properties == nil {
@@ -13808,7 +13894,6 @@ func unquoteCypherString(raw string) (string, error) {
 				b.WriteByte('\b')
 			case 'f':
 				b.WriteByte('\f')
-			case 'n':
 				b.WriteByte('\n')
 			case 'r':
 				b.WriteByte('\r')

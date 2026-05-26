@@ -453,6 +453,88 @@ func TestParseStatementRejectsDuplicateProjectionNamesAtCompileTime(t *testing.T
 	}
 }
 
+func TestParseStatementRejectsUndefinedVariableInReturnProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH () RETURN foo")
+	if err == nil {
+		t.Fatalf("expected undefined variable parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsUnaliasedWithExpression(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) WITH n.age + 1 RETURN *")
+	if err == nil {
+		t.Fatalf("expected no expression alias parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementAllowsProjectedPropertyAccessWithAggregation(t *testing.T) {
+	_, err := ParseStatement("MATCH (me:Person)--(you:Person) WITH me.age AS age, me.age + count(you.age) AS agg RETURN *")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementRejectsAmbiguousAggregationWithNoGroupingProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH (me:Person)--(you:Person) WITH me.age + count(you.age) AS agg RETURN *")
+	if err == nil {
+		t.Fatalf("expected ambiguous aggregation parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsAmbiguousAggregationWithComplexGroupingProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH (me:Person)--(you:Person) WITH me.age + you.age AS grp, me.age + you.age + count(*) AS agg RETURN *")
+	if err == nil {
+		t.Fatalf("expected ambiguous aggregation parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsNestedAggregationAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN count(count(*))")
+	if err == nil {
+		t.Fatalf("expected nested aggregation parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
 func TestParseStatementRejectsPatternInReturnProjection(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) RETURN (n)-[]->()")
 	if err == nil {

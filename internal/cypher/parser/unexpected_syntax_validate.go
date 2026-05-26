@@ -144,6 +144,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 		if err := validateProjectionClauseNames(typed.Return.Items, typed.Return.IncludeAll, bound, seg); err != nil {
 			return err
 		}
+		if err := validateProjectionSemanticsFromItems(typed.Return.Items, ast.ClauseKindReturn, bound, seg); err != nil {
+			return err
+		}
 	case *ast.QueryStatement:
 		bound := map[string]patternVarRole{}
 		for _, part := range typed.Parts {
@@ -157,6 +160,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
 					}
 					if err := validateProjectionClauseNamesFromRaw(clause.Raw, clause.Kind, bound, seg); err != nil {
+						return err
+					}
+					if err := validateProjectionSemanticsFromRaw(clause.Raw, clause.Kind, bound, seg); err != nil {
 						return err
 					}
 					expressions := extractProjectionExpressions(clause.Raw, clause.Kind)
@@ -265,7 +271,20 @@ func validateProjectionClauseNamesFromRaw(raw string, kind ast.ClauseKind, bound
 		if item == "" || item == "*" {
 			continue
 		}
-		name := projectionOutputNameFromRaw(item)
+		name := ""
+		if idx := indexTopLevelAliasKeyword(item); idx >= 0 {
+			aliasRaw := strings.TrimSpace(item[idx+len("AS"):])
+			alias, next, ok := readIdentifier(aliasRaw, 0)
+			if ok {
+				next = skipSpaces(aliasRaw, next)
+				if next == len(aliasRaw) {
+					name = alias
+				}
+			}
+		}
+		if name == "" {
+			name = projectionOutputNameFromRaw(item)
+		}
 		if name == "" {
 			continue
 		}
@@ -275,6 +294,459 @@ func validateProjectionClauseNamesFromRaw(raw string, kind ast.ClauseKind, bound
 		seen[name] = struct{}{}
 	}
 	return nil
+}
+
+type projectionSemanticItem struct {
+	Expression string
+	Alias      string
+	HasAlias   bool
+	IsStar     bool
+}
+
+func validateProjectionSemanticsFromItems(items []ast.ProjectionItem, kind ast.ClauseKind, bound map[string]patternVarRole, seg statementSegment) error {
+	semanticItems := make([]projectionSemanticItem, 0, len(items))
+	for _, item := range items {
+		expr := strings.TrimSpace(item.Expression.Raw)
+		semantic := projectionSemanticItem{Expression: expr, Alias: strings.TrimSpace(item.Alias), HasAlias: strings.TrimSpace(item.Alias) != "", IsStar: expr == "*"}
+		semanticItems = append(semanticItems, semantic)
+	}
+	return validateProjectionSemanticItems(semanticItems, kind, bound, seg)
+}
+
+func validateProjectionSemanticsFromRaw(raw string, kind ast.ClauseKind, bound map[string]patternVarRole, seg statementSegment) error {
+	rawItems := splitProjectionItems(raw, kind)
+	semanticItems := make([]projectionSemanticItem, 0, len(rawItems))
+	for _, item := range rawItems {
+		text := strings.TrimSpace(item)
+		if text == "" {
+			continue
+		}
+		if text == "*" {
+			semanticItems = append(semanticItems, projectionSemanticItem{Expression: "*", IsStar: true})
+			continue
+		}
+
+		idx := indexTopLevelAliasKeyword(text)
+		if idx >= 0 {
+			expr := strings.TrimSpace(text[:idx])
+			aliasRaw := strings.TrimSpace(text[idx+len("AS"):])
+			alias, next, ok := readIdentifier(aliasRaw, 0)
+			if ok {
+				next = skipSpaces(aliasRaw, next)
+				if next != len(aliasRaw) {
+					ok = false
+				}
+			}
+			if !ok || alias == "" {
+				semanticItems = append(semanticItems, projectionSemanticItem{Expression: expr, HasAlias: true})
+				continue
+			}
+			semanticItems = append(semanticItems, projectionSemanticItem{Expression: expr, Alias: alias, HasAlias: true})
+			continue
+		}
+
+		semanticItems = append(semanticItems, projectionSemanticItem{Expression: text})
+	}
+
+	return validateProjectionSemanticItems(semanticItems, kind, bound, seg)
+}
+
+func validateProjectionSemanticItems(items []projectionSemanticItem, kind ast.ClauseKind, bound map[string]patternVarRole, seg statementSegment) error {
+	for _, item := range items {
+		if item.IsStar {
+			continue
+		}
+		expr := strings.TrimSpace(item.Expression)
+		if expr == "" {
+			continue
+		}
+
+		if kind == ast.ClauseKindWith && !item.HasAlias && !isSimpleReferenceExpression(expr) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "NoExpressionAlias", Statement: seg.index}
+		}
+
+		if ident, ok := simpleIdentifierExpression(expr); ok {
+			if !isCypherLiteralKeyword(ident) {
+				if _, exists := bound[ident]; !exists {
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+				}
+			}
+		}
+
+		if hasNestedAggregateFunctionCall(expr) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "NestedAggregation", Statement: seg.index}
+		}
+	}
+
+	hasAggregate := false
+	allowedRefs := map[string]struct{}{}
+	for _, item := range items {
+		if item.IsStar {
+			continue
+		}
+		expr := strings.TrimSpace(item.Expression)
+		if expr == "" {
+			continue
+		}
+		if containsAggregateFunctionCall(expr) {
+			hasAggregate = true
+			continue
+		}
+		if ref, ok := normalizeAllowedGroupingReference(expr); ok {
+			allowedRefs[ref] = struct{}{}
+		}
+		if item.Alias != "" {
+			allowedRefs[item.Alias] = struct{}{}
+		}
+	}
+	if !hasAggregate {
+		return nil
+	}
+
+	for _, item := range items {
+		if item.IsStar {
+			continue
+		}
+		expr := strings.TrimSpace(item.Expression)
+		if expr == "" || !containsAggregateFunctionCall(expr) {
+			continue
+		}
+		if strings.Contains(expr, "[") && strings.Contains(strings.ToUpper(expr), " IN ") {
+			continue
+		}
+		for _, ref := range extractNonAggregateReferences(expr) {
+			if isCypherLiteralKeyword(ref) {
+				continue
+			}
+			if _, ok := allowedRefs[ref]; ok {
+				continue
+			}
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "AmbiguousAggregationExpression", Statement: seg.index}
+		}
+	}
+
+	return nil
+}
+
+func isSimpleReferenceExpression(expr string) bool {
+	_, ok := simpleIdentifierOrPropertyExpression(expr)
+	return ok
+}
+
+func simpleIdentifierExpression(expr string) (string, bool) {
+	name, ok := simpleIdentifierOrPropertyExpression(expr)
+	if !ok || strings.Contains(name, ".") {
+		return "", false
+	}
+	return name, true
+}
+
+func simpleIdentifierOrPropertyExpression(expr string) (string, bool) {
+	text := strings.TrimSpace(expr)
+	if text == "" {
+		return "", false
+	}
+	name, next, ok := readIdentifier(text, 0)
+	if !ok {
+		return "", false
+	}
+	for {
+		next = skipSpaces(text, next)
+		if next >= len(text) || text[next] != '.' {
+			break
+		}
+		next = skipSpaces(text, next+1)
+		part, partNext, partOK := readIdentifier(text, next)
+		if !partOK {
+			return "", false
+		}
+		name += "." + part
+		next = partNext
+	}
+	next = skipSpaces(text, next)
+	if next != len(text) {
+		return "", false
+	}
+	return name, true
+}
+
+func normalizeAllowedGroupingReference(expr string) (string, bool) {
+	return simpleIdentifierOrPropertyExpression(expr)
+}
+
+func isCypherLiteralKeyword(name string) bool {
+	return strings.EqualFold(name, "null") || strings.EqualFold(name, "true") || strings.EqualFold(name, "false")
+}
+
+func hasNestedAggregateFunctionCall(expr string) bool {
+	for _, call := range findAggregateFunctionCalls(expr) {
+		if strings.Contains(call.args, "[") && strings.Contains(call.args, "|") {
+			continue
+		}
+		if containsAggregateFunctionCall(call.args) {
+			return true
+		}
+	}
+	return false
+}
+
+type aggregateFunctionCall struct {
+	start int
+	end   int
+	args  string
+}
+
+func findAggregateFunctionCalls(raw string) []aggregateFunctionCall {
+	calls := make([]aggregateFunctionCall, 0)
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || raw[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		}
+
+		if !isFunctionIdentStart(ch) {
+			continue
+		}
+		if i > 0 && isFunctionIdentPart(raw[i-1]) {
+			continue
+		}
+
+		j := i + 1
+		for j < len(raw) && isFunctionIdentPart(raw[j]) {
+			j++
+		}
+		name := strings.ToLower(raw[i:j])
+		if !isAggregateFunctionName(name) {
+			i = j - 1
+			continue
+		}
+
+		k := skipSpaces(raw, j)
+		if k >= len(raw) || raw[k] != '(' {
+			i = j - 1
+			continue
+		}
+		end := findMatchingParen(raw, k)
+		if end < 0 {
+			i = j - 1
+			continue
+		}
+
+		calls = append(calls, aggregateFunctionCall{start: i, end: end + 1, args: raw[k+1 : end]})
+		i = end
+	}
+
+	return calls
+}
+
+func isAggregateFunctionName(name string) bool {
+	switch strings.ToLower(name) {
+	case "count", "collect", "sum", "min", "max", "avg", "percentiledisc", "percentilecont":
+		return true
+	default:
+		return false
+	}
+}
+
+func findMatchingParen(raw string, openIdx int) int {
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := openIdx; i < len(raw); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || raw[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func extractNonAggregateReferences(expr string) []string {
+	if strings.TrimSpace(expr) == "" {
+		return nil
+	}
+	calls := findAggregateFunctionCalls(expr)
+	if len(calls) == 0 {
+		return extractIdentifierPropertyReferences(expr)
+	}
+
+	stripped := expr
+	for i := len(calls) - 1; i >= 0; i-- {
+		call := calls[i]
+		stripped = stripped[:call.start] + " " + stripped[call.end:]
+	}
+	return extractIdentifierPropertyReferences(stripped)
+}
+
+func extractIdentifierPropertyReferences(raw string) []string {
+	refs := make([]string, 0)
+	seen := map[string]struct{}{}
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || raw[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		}
+
+		if !isIdentifierStart(ch) {
+			continue
+		}
+		if i > 0 && (isIdentifierPart(raw[i-1]) || raw[i-1] == '.' || raw[i-1] == '$') {
+			continue
+		}
+
+		name, next, ok := readIdentifier(raw, i)
+		if !ok {
+			continue
+		}
+		if isMapLiteralKeyReference(raw, i, next) {
+			i = next - 1
+			continue
+		}
+		cursor := skipSpaces(raw, next)
+		if cursor < len(raw) && raw[cursor] == '(' {
+			i = next - 1
+			continue
+		}
+
+		for {
+			cursor = skipSpaces(raw, cursor)
+			if cursor >= len(raw) || raw[cursor] != '.' {
+				break
+			}
+			cursor = skipSpaces(raw, cursor+1)
+			part, partNext, partOK := readIdentifier(raw, cursor)
+			if !partOK {
+				break
+			}
+			name += "." + part
+			cursor = partNext
+		}
+
+		if !isCypherLiteralKeyword(name) {
+			if _, exists := seen[name]; !exists {
+				seen[name] = struct{}{}
+				refs = append(refs, name)
+			}
+		}
+		i = next - 1
+	}
+
+	return refs
+}
+
+func isMapLiteralKeyReference(raw string, start int, end int) bool {
+	if start < 0 || end < 0 || start >= len(raw) || end > len(raw) || start >= end {
+		return false
+	}
+	colon := skipSpaces(raw, end)
+	if colon >= len(raw) || raw[colon] != ':' {
+		return false
+	}
+	for i := start - 1; i >= 0; i-- {
+		switch raw[i] {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{', ',':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 func splitProjectionItems(raw string, kind ast.ClauseKind) []string {
@@ -288,7 +760,7 @@ func splitProjectionItems(raw string, kind ast.ClauseKind) []string {
 		if strings.HasPrefix(strings.ToUpper(text), "DISTINCT") {
 			text = strings.TrimSpace(text[len("DISTINCT"):])
 		}
-		if idx := indexTopLevelKeyword(text, "ORDERBY"); idx >= 0 {
+		if idx := indexTopLevelOrderBy(text); idx >= 0 {
 			text = strings.TrimSpace(text[:idx])
 		}
 		if idx := indexTopLevelKeyword(text, "SKIP"); idx >= 0 {
@@ -307,7 +779,7 @@ func splitProjectionItems(raw string, kind ast.ClauseKind) []string {
 		if idx := indexTopLevelKeyword(text, "WHERE"); idx >= 0 {
 			text = strings.TrimSpace(text[:idx])
 		}
-		if idx := indexTopLevelKeyword(text, "ORDERBY"); idx >= 0 {
+		if idx := indexTopLevelOrderBy(text); idx >= 0 {
 			text = strings.TrimSpace(text[:idx])
 		}
 		if idx := indexTopLevelKeyword(text, "SKIP"); idx >= 0 {
@@ -353,6 +825,13 @@ func hasTopLevelStarProjection(raw string, kind ast.ClauseKind) bool {
 		}
 	}
 	return false
+}
+
+func indexTopLevelOrderBy(raw string) int {
+	if idx := indexTopLevelKeyword(raw, "ORDERBY"); idx >= 0 {
+		return idx
+	}
+	return indexTopLevelKeyword(raw, "ORDER BY")
 }
 
 func validatePatternParameterUsage(pattern string, seg statementSegment) error {
@@ -407,7 +886,7 @@ func extractProjectionExpressions(raw string, kind ast.ClauseKind) []string {
 		if strings.HasPrefix(strings.ToUpper(text), "DISTINCT") {
 			text = strings.TrimSpace(text[len("DISTINCT"):])
 		}
-		if idx := indexTopLevelKeyword(text, "ORDERBY"); idx >= 0 {
+		if idx := indexTopLevelOrderBy(text); idx >= 0 {
 			text = strings.TrimSpace(text[:idx])
 		}
 		if idx := indexTopLevelKeyword(text, "SKIP"); idx >= 0 {
@@ -426,7 +905,7 @@ func extractProjectionExpressions(raw string, kind ast.ClauseKind) []string {
 		if idx := indexTopLevelKeyword(text, "WHERE"); idx >= 0 {
 			text = strings.TrimSpace(text[:idx])
 		}
-		if idx := indexTopLevelKeyword(text, "ORDERBY"); idx >= 0 {
+		if idx := indexTopLevelOrderBy(text); idx >= 0 {
 			text = strings.TrimSpace(text[:idx])
 		}
 		if idx := indexTopLevelKeyword(text, "SKIP"); idx >= 0 {

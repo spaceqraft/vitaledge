@@ -310,7 +310,7 @@ func recordUnwindBinding(raw string, bound map[string]patternVarRole) {
 }
 
 func parseProjectionAlias(item string) (alias string, expr string, ok bool) {
-	idx := indexTopLevelKeyword(item, "AS")
+	idx := indexTopLevelAliasKeyword(item)
 	if idx >= 0 {
 		expr = strings.TrimSpace(item[:idx])
 		aliasRaw := strings.TrimSpace(item[idx+len("AS"):])
@@ -329,6 +329,65 @@ func parseProjectionAlias(item string) (alias string, expr string, ok bool) {
 		return "", "", false
 	}
 	return name, name, true
+}
+
+func indexTopLevelAliasKeyword(raw string) int {
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle := false
+	inDouble := false
+
+	for i := 0; i <= len(raw)-2; i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && (i == 0 || raw[i-1] != '\\') && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+			continue
+		}
+		if !strings.EqualFold(raw[i:i+2], "AS") {
+			continue
+		}
+		if i == 0 || !strings.ContainsAny(string(raw[i-1]), " \t\n\r") {
+			continue
+		}
+		after := i + 2
+		if after >= len(raw) || !strings.ContainsAny(string(raw[after]), " \t\n\r") {
+			continue
+		}
+		return i
+	}
+
+	return -1
 }
 
 func roleForProjectionExpr(expr string, bound map[string]patternVarRole) patternVarRole {

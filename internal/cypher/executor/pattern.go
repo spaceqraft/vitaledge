@@ -1433,12 +1433,22 @@ func parseMixedRelationshipChainPattern(raw string) (mixedRelationshipChainPatte
 	nodes := []nodePattern{startNode}
 	segments := make([]mixedRelationshipChainSegment, 0)
 	s := next
-	var sawVariableLength bool
-	var sawStandard bool
 	for len(s) > 0 {
 		segmentRaw, afterSegment, segmentOK := consumeRelationshipSegment(s)
-		if !segmentOK {
-			return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
+		segment := mixedRelationshipChainSegment{}
+		if segmentOK {
+			var err error
+			segment, err = parseMixedRelationshipSegment(segmentRaw)
+			if err != nil {
+				return mixedRelationshipChainPattern{}, err
+			}
+		} else {
+			direction, afterArrow, arrowOK := consumeAdjacentArrow(s)
+			if !arrowOK {
+				return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
+			}
+			segment = mixedRelationshipChainSegment{Direction: direction}
+			afterSegment = afterArrow
 		}
 		nextNodeRaw, afterNode, nodeOK := consumeNodeSegment(afterSegment)
 		if !nodeOK {
@@ -1448,21 +1458,12 @@ func parseMixedRelationshipChainPattern(raw string) (mixedRelationshipChainPatte
 		if err != nil {
 			return mixedRelationshipChainPattern{}, err
 		}
-		segment, err := parseMixedRelationshipSegment(segmentRaw)
-		if err != nil {
-			return mixedRelationshipChainPattern{}, err
-		}
-		if segment.IsVariableLength {
-			sawVariableLength = true
-		} else {
-			sawStandard = true
-		}
 		segments = append(segments, segment)
 		nodes = append(nodes, nextNode)
 		s = afterNode
 	}
 
-	if len(segments) < 2 || !sawVariableLength || !sawStandard {
+	if len(segments) < 2 {
 		return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
 	}
 

@@ -159,6 +159,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if literal, ok := firstOverflowingFloatLiteral(item.Expression.Raw); ok {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 			}
+			if isInvalidTypeArgumentExpression(item.Expression.Raw, bound) || isInvalidLabelsArgumentExpression(item.Expression.Raw, bound) {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+			}
 			if isInvalidLengthArgumentExpression(item.Expression.Raw, bound) || isInvalidSizeArgumentExpression(item.Expression.Raw, bound) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 			}
@@ -220,6 +223,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 						}
+						if isInvalidTypeArgumentExpression(expr, bound) || isInvalidLabelsArgumentExpression(expr, bound) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+						}
 						if isInvalidLengthArgumentExpression(expr, bound) || isInvalidSizeArgumentExpression(expr, bound) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 						}
@@ -248,6 +254,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						}
 						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
+						}
+						if isInvalidTypeArgumentExpression(expr, bound) || isInvalidLabelsArgumentExpression(expr, bound) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
 						}
 						if isInvalidLengthArgumentExpression(expr, bound) || isInvalidSizeArgumentExpression(expr, bound) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
@@ -2012,6 +2021,30 @@ func isInvalidSizeArgumentExpression(expr string, bound map[string]patternVarRol
 	return role == patternRoleNode || role == patternRoleRel || role == patternRolePath
 }
 
+func isInvalidTypeArgumentExpression(expr string, bound map[string]patternVarRole) bool {
+	name, ok := typeSimpleIdentifierArg(expr)
+	if !ok {
+		return false
+	}
+	role, exists := bound[name]
+	if !exists {
+		return false
+	}
+	return role == patternRoleNode || role == patternRolePath || role == patternRoleValue
+}
+
+func isInvalidLabelsArgumentExpression(expr string, bound map[string]patternVarRole) bool {
+	name, ok := labelsSimpleIdentifierArg(expr)
+	if !ok {
+		return false
+	}
+	role, exists := bound[name]
+	if !exists {
+		return false
+	}
+	return role == patternRolePath
+}
+
 func lengthSimpleIdentifierArg(expr string) (string, bool) {
 	text := strings.TrimSpace(expr)
 	if len(text) < len("length(")+1 || !strings.HasSuffix(text, ")") {
@@ -2044,6 +2077,52 @@ func sizeSimpleIdentifierArg(expr string) (string, bool) {
 		return "", false
 	}
 	inner := strings.TrimSpace(text[len("size(") : len(text)-1])
+	if inner == "" {
+		return "", false
+	}
+	name, next, ok := readIdentifier(inner, 0)
+	if !ok {
+		return "", false
+	}
+	next = skipSpaces(inner, next)
+	if next != len(inner) {
+		return "", false
+	}
+	return name, true
+}
+
+func typeSimpleIdentifierArg(expr string) (string, bool) {
+	text := strings.TrimSpace(expr)
+	if len(text) < len("type(")+1 || !strings.HasSuffix(text, ")") {
+		return "", false
+	}
+	if !strings.EqualFold(text[:len("type(")], "type(") {
+		return "", false
+	}
+	inner := strings.TrimSpace(text[len("type(") : len(text)-1])
+	if inner == "" {
+		return "", false
+	}
+	name, next, ok := readIdentifier(inner, 0)
+	if !ok {
+		return "", false
+	}
+	next = skipSpaces(inner, next)
+	if next != len(inner) {
+		return "", false
+	}
+	return name, true
+}
+
+func labelsSimpleIdentifierArg(expr string) (string, bool) {
+	text := strings.TrimSpace(expr)
+	if len(text) < len("labels(")+1 || !strings.HasSuffix(text, ")") {
+		return "", false
+	}
+	if !strings.EqualFold(text[:len("labels(")], "labels(") {
+		return "", false
+	}
+	inner := strings.TrimSpace(text[len("labels(") : len(text)-1])
 	if inner == "" {
 		return "", false
 	}

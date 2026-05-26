@@ -7864,10 +7864,10 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		return evalTemporalTruncateFunction("localdatetime", arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "labels"); ok {
-		return evalLabelsFunction(arg, row)
+		return evalLabelsFunction(arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "type"); ok {
-		return evalTypeFunction(arg, row)
+		return evalTypeFunction(arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "properties"); ok {
 		return evalPropertiesFunction(arg, row, params)
@@ -9330,17 +9330,23 @@ func evalListComprehension(raw string, row Row, params Params) (any, bool, error
 	return out, true, nil
 }
 
-func evalLabelsFunction(arg string, binding map[string]any) (any, error) {
+func evalLabelsFunction(arg string, row Row, params Params) (any, error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "labels() requires one argument", nil)
 	}
-	base, ok := binding[arg]
-	if !ok {
-		return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", arg), nil)
+	base, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		base, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
 	}
 	if base == nil {
 		return nil, nil
+	}
+	if _, _, ok := pathComponents(base); ok {
+		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "InvalidArgumentType"}
 	}
 	switch typed := base.(type) {
 	case *graph.Vertex:
@@ -9361,17 +9367,20 @@ func evalLabelsFunction(arg string, binding map[string]any) (any, error) {
 			}
 		}
 	}
-	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("labels() is not supported on %T", base), nil)
+	return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
 }
 
-func evalTypeFunction(arg string, binding map[string]any) (any, error) {
+func evalTypeFunction(arg string, row Row, params Params) (any, error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "type() requires one argument", nil)
 	}
-	base, ok := binding[arg]
-	if !ok {
-		return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", arg), nil)
+	base, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		base, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
 	}
 	if base == nil {
 		return nil, nil
@@ -9379,14 +9388,19 @@ func evalTypeFunction(arg string, binding map[string]any) (any, error) {
 	switch typed := base.(type) {
 	case *graph.Edge:
 		return typed.Type, nil
+	case *graph.Vertex:
+		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "InvalidArgumentType"}
 	case deletedEdgeBinding:
 		return typed.Type, nil
 	case map[string]any:
+		if _, hasLabels := typed["labels"]; hasLabels {
+			return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "InvalidArgumentType"}
+		}
 		if relType, ok := typed["type"]; ok {
 			return fmt.Sprint(relType), nil
 		}
 	}
-	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("type() is not supported on %T", base), nil)
+	return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
 }
 
 func evalPropertiesFunction(arg string, row Row, params Params) (any, error) {
@@ -10711,7 +10725,23 @@ func evalLabelPredicateExpression(left string, labels []string, row Row, params 
 			}
 		}
 		return true, nil
+	case *graph.Edge:
+		for _, label := range labels {
+			if typed.Type != label {
+				return false, nil
+			}
+		}
+		return true, nil
 	case map[string]any:
+		if relType, ok := typed["type"]; ok {
+			current := fmt.Sprint(relType)
+			for _, label := range labels {
+				if current != label {
+					return false, nil
+				}
+			}
+			return true, nil
+		}
 		labelValue, ok := typed["labels"]
 		if !ok {
 			return false, nil

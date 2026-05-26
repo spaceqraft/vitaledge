@@ -255,6 +255,10 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 					}
 				case ast.ClauseKindUnwind:
 					recordUnwindBinding(clause.Raw, bound)
+				case ast.ClauseKindInQueryCall:
+					if err := recordInQueryCallBindings(clause.Raw, bound, seg); err != nil {
+						return err
+					}
 				case ast.ClauseKindMatch, ast.ClauseKindOptionalMatch, ast.ClauseKindCreate, ast.ClauseKindMerge:
 					patternRaw, ok := extractClausePattern(clause.Raw, clause.Kind)
 					if !ok {
@@ -312,6 +316,48 @@ func validateProjectionClauseNames(items []ast.ProjectionItem, includeAll bool, 
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "column name conflict", Statement: seg.index}
 		}
 		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+func recordInQueryCallBindings(raw string, bound map[string]patternVarRole, seg statementSegment) error {
+	upper := strings.ToUpper(strings.TrimSpace(raw))
+	if !strings.HasPrefix(upper, "CALL") {
+		return nil
+	}
+	yieldIdx := strings.Index(upper, "YIELD")
+	if yieldIdx < 0 {
+		return nil
+	}
+	yieldRaw := strings.TrimSpace(raw[yieldIdx+len("YIELD"):])
+	if yieldRaw == "" {
+		return nil
+	}
+	if strings.TrimSpace(yieldRaw) == "*" {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
+	}
+	items := splitTopLevelComma(yieldRaw)
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		entry := strings.TrimSpace(item)
+		if entry == "" {
+			continue
+		}
+		alias := entry
+		if idx := indexTopLevelAliasKeyword(entry); idx >= 0 {
+			alias = strings.TrimSpace(entry[idx+len("AS"):])
+		}
+		if alias == "" {
+			continue
+		}
+		if _, exists := seen[alias]; exists {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "VariableAlreadyBound", Statement: seg.index}
+		}
+		if _, exists := bound[alias]; exists {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "VariableAlreadyBound", Statement: seg.index}
+		}
+		seen[alias] = struct{}{}
+		bound[alias] = patternRoleValue
 	}
 	return nil
 }

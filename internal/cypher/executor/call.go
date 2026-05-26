@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -402,6 +403,9 @@ func isIntegerValue(v any) bool {
 	switch v.(type) {
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return true
+	case json.Number:
+		_, err := v.(json.Number).Int64()
+		return err == nil
 	default:
 		return false
 	}
@@ -411,6 +415,13 @@ func isFloatValue(v any) bool {
 	switch v.(type) {
 	case float32, float64:
 		return true
+	case json.Number:
+		num := v.(json.Number)
+		if _, err := num.Int64(); err == nil {
+			return false
+		}
+		_, err := num.Float64()
+		return err == nil
 	default:
 		return false
 	}
@@ -442,6 +453,12 @@ func toFloat64(v any) float64 {
 		return float64(n)
 	case float64:
 		return n
+	case json.Number:
+		f, err := n.Float64()
+		if err == nil {
+			return f
+		}
+		return 0
 	default:
 		return 0
 	}
@@ -469,6 +486,12 @@ func toInt64(v any) int64 {
 		return int64(n)
 	case uint64:
 		return int64(n)
+	case json.Number:
+		i, err := n.Int64()
+		if err == nil {
+			return i
+		}
+		return 0
 	default:
 		return 0
 	}

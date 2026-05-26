@@ -518,17 +518,21 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 }
 
 func decodeStoredPropertyValue(raw []byte) any {
-	text := strings.TrimSpace(string(raw))
+	text := string(raw)
 	if text == "" {
 		return ""
 	}
-	if strings.EqualFold(text, "null") {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return text
+	}
+	if text == "null" {
 		return nil
 	}
-	if strings.EqualFold(text, "true") {
+	if text == "true" {
 		return true
 	}
-	if strings.EqualFold(text, "false") {
+	if text == "false" {
 		return false
 	}
 	if i, err := strconv.Atoi(text); err == nil {

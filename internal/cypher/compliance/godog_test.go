@@ -880,6 +880,15 @@ func TestClassifyErrorTypeErrorMappings(t *testing.T) {
 	}
 }
 
+func TestRenderTCKValuePreservesNewlinesAndTabs(t *testing.T) {
+	if got := renderTCKValue("Foo\nFoo"); got != "'Foo\nFoo'" {
+		t.Fatalf("renderTCKValue(newline) = %q, want %q", got, "'Foo\nFoo'")
+	}
+	if got := renderTCKValue("Foo\tFoo"); got != "'Foo\tFoo'" {
+		t.Fatalf("renderTCKValue(tab) = %q, want %q", got, "'Foo\tFoo'")
+	}
+}
+
 func readTable(table *godog.Table) ([]string, [][]string, error) {
 	if table == nil || len(table.Rows) == 0 {
 		return nil, nil, fmt.Errorf("table is empty")
@@ -1034,7 +1043,7 @@ func sortedKeys(value map[string]any) []string {
 }
 
 func quoteString(value string) string {
-	replacer := strings.NewReplacer(`\\`, `\\\\`, `'`, `\\'`, "\n", `\\n`, "\t", `\\t`)
+	replacer := strings.NewReplacer(`\\`, `\\\\`, `'`, `\\'`)
 	return "'" + replacer.Replace(value) + "'"
 }
 

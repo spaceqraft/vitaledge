@@ -3975,6 +3975,63 @@ func TestExecutePatternComprehensionProjectionLiteral(t *testing.T) {
 	}
 }
 
+func TestDecodeStoredPropertyValuePreservesWhitespace(t *testing.T) {
+	if got := decodeStoredPropertyValue([]byte(" Foo ")); got != " Foo " {
+		t.Fatalf("expected preserved whitespace, got %#v", got)
+	}
+	if got := decodeStoredPropertyValue([]byte("\nFoo\n")); got != "\nFoo\n" {
+		t.Fatalf("expected preserved newlines, got %#v", got)
+	}
+}
+
+func TestUnquoteCypherStringSingleQuotedEscapes(t *testing.T) {
+	cases := map[string]string{
+		"'\\nFoo\\n'":     "\nFoo\n",
+		"'\\tFoo\\t'":     "\tFoo\t",
+		"'\\u004Aohn'":    "John",
+		"'Foo''Bar'":      "Foo'Bar",
+		"'\\\\path\\\\x'": "\\path\\x",
+	}
+	for raw, want := range cases {
+		got, err := unquoteCypherString(raw)
+		if err != nil {
+			t.Fatalf("unquoteCypherString(%q) failed: %v", raw, err)
+		}
+		if got != want {
+			t.Fatalf("unquoteCypherString(%q) = %#v, want %#v", raw, got, want)
+		}
+	}
+}
+
+func TestEvalWhereExpressionNotPropagatesNull(t *testing.T) {
+	exec := &Executor{}
+	value, err := exec.evalWhereExpression(context.Background(), nil, "NOT null", Row{}, nil)
+	if err != nil {
+		t.Fatalf("evalWhereExpression failed: %v", err)
+	}
+	if value {
+		t.Fatalf("expected NOT null to be filtered out, got true")
+	}
+}
+
+func TestEvalExpressionWithScopeDecodesSingleQuotedEscapes(t *testing.T) {
+	value, err := evalExpressionWithScope("'\\nFoo\\n'", Row{}, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope failed: %v", err)
+	}
+	if value != "\nFoo\n" {
+		t.Fatalf("expected decoded newline string, got %#v", value)
+	}
+
+	props, err := parsePropertyMap("name: '\\nFoo\\n'", nil, Row{})
+	if err != nil {
+		t.Fatalf("parsePropertyMap failed: %v", err)
+	}
+	if got := props["name"]; got != "\nFoo\n" {
+		t.Fatalf("expected parsed property newline string, got %#v", got)
+	}
+}
+
 func errUnexpected(message string) error {
 	return &testError{message: message}
 }

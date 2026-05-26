@@ -9674,11 +9674,18 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 	}
 
 	if hasLogicalNotPrefix(raw) {
-		value, err := e.evalWhereExpression(ctx, tx, strings.TrimSpace(raw[3:]), row, params)
+		value, err := evalExpressionWithScope(strings.TrimSpace(raw[3:]), row, params)
 		if err != nil {
 			return false, err
 		}
-		return !value, nil
+		b, isNull, err := asNullableBoolean(value)
+		if err != nil {
+			return false, err
+		}
+		if isNull {
+			return false, nil
+		}
+		return !b, nil
 	}
 	if left, right, ok := splitTopLevelInExpression(raw); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
@@ -13778,7 +13785,56 @@ func unquoteCypherString(raw string) (string, error) {
 	inner := raw[1 : len(raw)-1]
 	switch quote {
 	case '\'':
-		return strings.ReplaceAll(inner, "''", "'"), nil
+		var b strings.Builder
+		b.Grow(len(inner))
+		for i := 0; i < len(inner); i++ {
+			ch := inner[i]
+			if ch == '\'' && i+1 < len(inner) && inner[i+1] == '\'' {
+				b.WriteByte('\'')
+				i++
+				continue
+			}
+			if ch != '\\' {
+				b.WriteByte(ch)
+				continue
+			}
+			if i+1 >= len(inner) {
+				return "", fmt.Errorf("invalid string escape")
+			}
+			next := inner[i+1]
+			i++
+			switch next {
+			case 'b':
+				b.WriteByte('\b')
+			case 'f':
+				b.WriteByte('\f')
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			case '\\':
+				b.WriteByte('\\')
+			case '\'':
+				b.WriteByte('\'')
+			case '"':
+				b.WriteByte('"')
+			case 'u':
+				if i+4 >= len(inner) {
+					return "", fmt.Errorf("invalid unicode escape")
+				}
+				codePoint, err := strconv.ParseUint(inner[i+1:i+5], 16, 16)
+				if err != nil {
+					return "", err
+				}
+				b.WriteRune(rune(codePoint))
+				i += 4
+			default:
+				return "", fmt.Errorf("unsupported string escape %q", next)
+			}
+		}
+		return b.String(), nil
 	case '"':
 		unquoted, err := strconv.Unquote(raw)
 		if err != nil {

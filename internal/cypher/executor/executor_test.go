@@ -1944,6 +1944,123 @@ func TestExecuteCountAfterMatchMergeOptionalMatch(t *testing.T) {
 	}
 }
 
+func TestExecuteCountDirectedAndUndirectedSelfLoop(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "loop", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "y"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-loop", Type: "LOOP", SrcID: "loop", DstID: "loop"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-other", Type: "T", SrcID: "x", DstID: "y"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+
+	directed, err := parser.ParseStatement("MATCH (n)-[r]->(n) RETURN count(r) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	directedRes, err := exec.ExecuteStatement(ctx, directed, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if got := fmt.Sprint(directedRes.Rows[0]["c"]); got != "1" {
+		t.Fatalf("expected directed self-loop count 1, got %s", got)
+	}
+
+	undirected, err := parser.ParseStatement("MATCH (n)-[r]-(n) RETURN count(r) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	undirectedRes, err := exec.ExecuteStatement(ctx, undirected, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if got := fmt.Sprint(undirectedRes.Rows[0]["c"]); got != "1" {
+		t.Fatalf("expected undirected self-loop count 1, got %s", got)
+	}
+
+	adjDirected, err := parser.ParseStatement("MATCH (n)-->(n) RETURN count(*) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	adjDirectedRes, err := exec.ExecuteStatement(ctx, adjDirected, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if got := fmt.Sprint(adjDirectedRes.Rows[0]["c"]); got != "1" {
+		t.Fatalf("expected directed adjacent self-loop count 1, got %s", got)
+	}
+
+	adjUndirected, err := parser.ParseStatement("MATCH (n)--(n) RETURN count(*) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	adjUndirectedRes, err := exec.ExecuteStatement(ctx, adjUndirected, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if got := fmt.Sprint(adjUndirectedRes.Rows[0]["c"]); got != "1" {
+		t.Fatalf("expected undirected adjacent self-loop count 1, got %s", got)
+	}
+}
+
+func TestExecuteCountTwoHopUndirectedRelationshipChain(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "l", Labels: []string{"Looper"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T1", SrcID: "a", DstID: "l"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "eloop", Type: "LOOP", SrcID: "l", DstID: "l"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "T2", SrcID: "l", DstID: "b"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH ()-[]-()-[]-() RETURN count(*) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if got := fmt.Sprint(res.Rows[0]["c"]); got != "6" {
+		t.Fatalf("expected count 6, got %s (rows=%#v)", got, res.Rows)
+	}
+}
+
 // ─── Multi-hop adjacent chain regressions ────────────────────────────────────
 
 // TestExecuteReturnNamedPathMixedDirection verifies MATCH p=(a)-->(b)<--(c) RETURN p.

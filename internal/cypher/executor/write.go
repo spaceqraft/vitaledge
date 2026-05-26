@@ -9105,6 +9105,7 @@ func evalDurationMethod(method string, args []any) (any, error) {
 			result["seconds"] = whole
 			result["nanoseconds"] = nanos
 			result["nanosecondsOfSecond"] = nanos
+			result["__duration_exact"] = true
 			return result, nil
 		}
 		if secs, ok := durationSecondsBetweenWithoutTimeDateOverflow(left, right); ok {
@@ -9192,20 +9193,26 @@ func setDurationFields(out map[string]any, dur durationComponents) {
 }
 
 func splitSecondsAndNanoseconds(seconds float64) (int, int) {
-	whole := int(truncTowardZero(seconds))
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0, 0
+	}
+	whole := int(math.Floor(seconds))
 	frac := seconds - float64(whole)
-	nanos := int(math.Round(frac * 1_000_000_000))
+	rawNanos := frac * 1_000_000_000
+	nanos := int(math.Round(rawNanos))
+	if nanos == 0 {
+		if rawNanos > 0 {
+			nanos = 1
+		} else if rawNanos < 0 {
+			nanos = -1
+		}
+	}
 	if nanos >= 1_000_000_000 {
 		whole++
 		nanos -= 1_000_000_000
 	}
-	if nanos <= -1_000_000_000 {
-		whole--
-		nanos += 1_000_000_000
-	}
 	if nanos < 0 {
-		nanos += 1_000_000_000
-		whole--
+		nanos = 0
 	}
 	return whole, nanos
 }
@@ -9223,9 +9230,13 @@ func durationInstantOffsetSeconds(v durationInstant) (int, bool) {
 	if parsed, err := parseOffsetSeconds(v.timezone); err == nil {
 		return parsed, true
 	}
-	if v.hasDate && v.hasTime {
+	if v.hasDate {
 		if loc, err := time.LoadLocation(v.timezone); err == nil {
-			t := time.Date(v.year, time.Month(v.month), v.day, v.hour, v.minute, v.second, v.nano, loc)
+			hour, minute, second, nano := 0, 0, 0, 0
+			if v.hasTime {
+				hour, minute, second, nano = v.hour, v.minute, v.second, v.nano
+			}
+			t := time.Date(v.year, time.Month(v.month), v.day, hour, minute, second, nano, loc)
 			_, off := t.Zone()
 			return off, true
 		}
@@ -10495,6 +10506,26 @@ func temporalMapValue(v any) (map[string]any, bool) {
 
 func durationComponentsFromMap(value map[string]any) durationComponents {
 	seconds := 3600*mapFloat(value, "hours") + 60*mapFloat(value, "minutes") + mapFloat(value, "seconds")
+	months := 12*mapFloat(value, "years") + mapFloat(value, "months")
+	days := 7*mapFloat(value, "weeks") + mapFloat(value, "days")
+
+	// Fractional month components are converted into day/second components before
+	// arithmetic so operations across durations preserve openCypher expectations.
+	const avgMonthSeconds = 2629746.0
+	wholeMonths := truncTowardZero(months)
+	fracMonths := months - wholeMonths
+	if fracMonths != 0 {
+		monthSeconds := fracMonths * avgMonthSeconds
+		wholeDays := truncTowardZero(monthSeconds / 86400)
+		days += wholeDays
+		seconds += monthSeconds - wholeDays*86400
+	}
+	wholeDays := truncTowardZero(days)
+	fracDays := days - wholeDays
+	if fracDays != 0 {
+		seconds += fracDays * 86400
+		days = wholeDays
+	}
 
 	var nanosAcc int64
 	if ms, ok := mapWholeInt64(value, "milliseconds"); ok {
@@ -10513,10 +10544,12 @@ func durationComponentsFromMap(value map[string]any) durationComponents {
 		seconds += mapFloat(value, "nanoseconds") / 1_000_000_000
 	}
 	seconds += float64(nanosAcc) / 1_000_000_000
+	secWhole, secNanos := splitSecondsAndNanoseconds(seconds)
+	seconds = float64(secWhole) + float64(secNanos)/1_000_000_000
 
 	return durationComponents{
-		months:  12*mapFloat(value, "years") + mapFloat(value, "months"),
-		days:    7*mapFloat(value, "weeks") + mapFloat(value, "days"),
+		months:  wholeMonths,
+		days:    days,
 		seconds: seconds,
 	}
 }
@@ -10708,7 +10741,7 @@ func formatDurationComponents(dur durationComponents) string {
 	absNanos := int(math.Floor(absNanosFloat))
 	nearest := math.Round(absNanosFloat)
 	// Snap values that are very close to integral nanoseconds to avoid binary drift.
-	if math.Abs(absNanosFloat-nearest) < 0.01 {
+	if math.Abs(absNanosFloat-nearest) < 0.02 {
 		absNanos = int(nearest)
 	}
 	if absNanos >= 1_000_000_000 {
@@ -10898,10 +10931,77 @@ func formatTemporalToString(temporal map[string]any) (string, bool) {
 		}
 		return fmt.Sprintf("%04d-%02d-%02dT%s%s", y, m, d, clock, tzName), true
 	case "duration":
+		if exact, ok := temporal["__duration_exact"].(bool); ok && exact {
+			if sec, secOK := mapWholeInt64(temporal, "seconds"); secOK {
+				if nanos, nanoOK := mapWholeInt64(temporal, "nanoseconds"); nanoOK {
+					return formatDurationFromExactSecondNanos(sec, int(nanos)), true
+				}
+			}
+		}
 		return formatDurationComponents(durationComponentsFromMap(temporal)), true
 	default:
 		return "", false
 	}
+}
+
+func formatDurationFromExactSecondNanos(seconds int64, nanos int) string {
+	if nanos < 0 {
+		nanos = 0
+	}
+	if nanos >= 1_000_000_000 {
+		seconds += int64(nanos / 1_000_000_000)
+		nanos = nanos % 1_000_000_000
+	}
+
+	negative := seconds < 0
+	absSeconds := seconds
+	absNanos := nanos
+	if negative {
+		absSeconds = -seconds
+		if absNanos > 0 {
+			absSeconds--
+			absNanos = 1_000_000_000 - absNanos
+		}
+	}
+
+	hours := int(absSeconds / 3600)
+	remainingSeconds := absSeconds - int64(hours*3600)
+	minutes := int(remainingSeconds / 60)
+	secInt := int(remainingSeconds - int64(minutes*60))
+
+	b := strings.Builder{}
+	b.WriteString("PT")
+	if hours != 0 {
+		if negative {
+			b.WriteString(fmt.Sprintf("-%dH", hours))
+		} else {
+			b.WriteString(fmt.Sprintf("%dH", hours))
+		}
+	}
+	if minutes != 0 {
+		if negative {
+			b.WriteString(fmt.Sprintf("-%dM", minutes))
+		} else {
+			b.WriteString(fmt.Sprintf("%dM", minutes))
+		}
+	}
+	if secInt != 0 || absNanos != 0 || (hours == 0 && minutes == 0) {
+		if absNanos == 0 {
+			if negative {
+				b.WriteString(fmt.Sprintf("-%dS", secInt))
+			} else {
+				b.WriteString(fmt.Sprintf("%dS", secInt))
+			}
+		} else {
+			sign := ""
+			if negative {
+				sign = "-"
+			}
+			frac := strings.TrimRight(fmt.Sprintf("%09d", absNanos), "0")
+			b.WriteString(fmt.Sprintf("%s%d.%sS", sign, secInt, frac))
+		}
+	}
+	return b.String()
 }
 
 func formatClockParts(hour, minute, second, nano int) string {

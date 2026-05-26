@@ -718,6 +718,7 @@ func evalDurationAccessor(src map[string]any, field string) (any, bool) {
 	timeSeconds := hours*3600 + minutes*60 + seconds
 	timeNanos := timeSecondsToNanoseconds(timeSeconds) + milliseconds*1_000_000 + microseconds*1_000 + nanoseconds
 	timeNanosOfSecond := math.Mod(timeNanos, 1_000_000_000)
+	canonicalSeconds, canonicalNanos := splitSecondsAndNanoseconds(timeSeconds + (milliseconds / 1_000) + (microseconds / 1_000_000) + (nanoseconds / 1_000_000_000))
 
 	switch field {
 	case "years":
@@ -735,7 +736,7 @@ func evalDurationAccessor(src map[string]any, field string) (any, bool) {
 	case "minutes":
 		return int(truncTowardZero(timeSeconds / 60)), true
 	case "seconds":
-		return int(truncTowardZero(timeSeconds)), true
+		return canonicalSeconds, true
 	case "milliseconds":
 		return int(truncTowardZero(timeNanos / 1_000_000)), true
 	case "microseconds":
@@ -759,7 +760,7 @@ func evalDurationAccessor(src map[string]any, field string) (any, bool) {
 	case "microsecondsOfSecond":
 		return int(truncTowardZero(timeNanosOfSecond / 1_000)), true
 	case "nanosecondsOfSecond":
-		return int(truncTowardZero(timeNanosOfSecond)), true
+		return canonicalNanos, true
 	}
 
 	return nil, false
@@ -1013,6 +1014,13 @@ func renderTemporalValue(value map[string]any) (string, bool) {
 	}
 
 	if typeName == "duration" {
+		if exact, ok := value["__duration_exact"].(bool); ok && exact {
+			if sec, secOK := mapWholeInt64(value, "seconds"); secOK {
+				if nanos, nanoOK := mapWholeInt64(value, "nanoseconds"); nanoOK {
+					return formatDurationFromExactSecondNanos(sec, int(nanos)), true
+				}
+			}
+		}
 		if exact, ok := renderDurationFromRawSeconds(value); ok {
 			return exact, true
 		}

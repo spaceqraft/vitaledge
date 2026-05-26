@@ -326,6 +326,36 @@ func TestParseStatementAllowsSizeOnPatternComprehension(t *testing.T) {
 	}
 }
 
+func TestParseStatementRejectsSizeOnPathVariable(t *testing.T) {
+	_, err := ParseStatement("MATCH p = (a)-[*]->(b) RETURN size(p)")
+	if err == nil {
+		t.Fatalf("expected invalid argument type parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsAggregationInListComprehensionProjection(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN [x IN [1, 2, 3] | count(*)]")
+	if err == nil {
+		t.Fatalf("expected invalid aggregation parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
 func TestParseStatementRejectsPatternParameterUseAtCompileTime(t *testing.T) {
 	_, err := ParseStatement("MATCH (n$param) RETURN n")
 	if err == nil {

@@ -74,10 +74,12 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"time.statement":            {},
 	"time.transaction":          {},
 	"time.truncate":             {},
+	"tolower":                   {},
 	"toboolean":                 {},
 	"tofloat":                   {},
 	"tointeger":                 {},
 	"tostring":                  {},
+	"toupper":                   {},
 	"type":                      {},
 }
 
@@ -114,6 +116,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if hasInvalidInLiteralRHS(item.Expression.Raw) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 			}
+			if hasInvalidAggregationInListComprehension(item.Expression.Raw) {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
+			}
 			if name, ok := firstUnknownFunctionCall(item.Expression.Raw); ok {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 			}
@@ -123,7 +128,7 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if literal, ok := firstOverflowingFloatLiteral(item.Expression.Raw); ok {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 			}
-			if isInvalidLengthArgumentExpression(item.Expression.Raw, bound) {
+			if isInvalidLengthArgumentExpression(item.Expression.Raw, bound) || isInvalidSizeArgumentExpression(item.Expression.Raw, bound) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 			}
 		}
@@ -162,6 +167,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if hasInvalidInLiteralRHS(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 						}
+						if hasInvalidAggregationInListComprehension(expr) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
+						}
 						if name, ok := firstUnknownFunctionCall(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 						}
@@ -171,7 +179,7 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 						}
-						if isInvalidLengthArgumentExpression(expr, bound) {
+						if isInvalidLengthArgumentExpression(expr, bound) || isInvalidSizeArgumentExpression(expr, bound) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 						}
 					}
@@ -187,6 +195,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if hasInvalidInLiteralRHS(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 						}
+						if hasInvalidAggregationInListComprehension(expr) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
+						}
 						if name, ok := firstUnknownFunctionCall(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 						}
@@ -196,7 +207,7 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 						}
-						if isInvalidLengthArgumentExpression(expr, bound) {
+						if isInvalidLengthArgumentExpression(expr, bound) || isInvalidSizeArgumentExpression(expr, bound) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 						}
 					}
@@ -952,6 +963,18 @@ func isInvalidLengthArgumentExpression(expr string, bound map[string]patternVarR
 	return role == patternRoleNode || role == patternRoleRel || role == patternRoleValue
 }
 
+func isInvalidSizeArgumentExpression(expr string, bound map[string]patternVarRole) bool {
+	name, ok := sizeSimpleIdentifierArg(expr)
+	if !ok {
+		return false
+	}
+	role, exists := bound[name]
+	if !exists {
+		return false
+	}
+	return role == patternRoleNode || role == patternRoleRel || role == patternRolePath
+}
+
 func lengthSimpleIdentifierArg(expr string) (string, bool) {
 	text := strings.TrimSpace(expr)
 	if len(text) < len("length(")+1 || !strings.HasSuffix(text, ")") {
@@ -973,6 +996,265 @@ func lengthSimpleIdentifierArg(expr string) (string, bool) {
 		return "", false
 	}
 	return name, true
+}
+
+func sizeSimpleIdentifierArg(expr string) (string, bool) {
+	text := strings.TrimSpace(expr)
+	if len(text) < len("size(")+1 || !strings.HasSuffix(text, ")") {
+		return "", false
+	}
+	if !strings.EqualFold(text[:len("size(")], "size(") {
+		return "", false
+	}
+	inner := strings.TrimSpace(text[len("size(") : len(text)-1])
+	if inner == "" {
+		return "", false
+	}
+	name, next, ok := readIdentifier(inner, 0)
+	if !ok {
+		return "", false
+	}
+	next = skipSpaces(inner, next)
+	if next != len(inner) {
+		return "", false
+	}
+	return name, true
+}
+
+func hasInvalidAggregationInListComprehension(expr string) bool {
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(expr); i++ {
+		ch := expr[i]
+		if ch == '\'' && !inDouble && (i == 0 || expr[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || expr[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble || ch != '[' {
+			continue
+		}
+		end := findMatchingBracket(expr, i)
+		if end < 0 {
+			continue
+		}
+		body := strings.TrimSpace(expr[i+1 : end])
+		if body == "" {
+			i = end
+			continue
+		}
+		inIdx := findTopLevelInKeywordIndex(body)
+		if inIdx < 0 {
+			i = end
+			continue
+		}
+		rest := strings.TrimSpace(body[inIdx+2:])
+		if rest == "" {
+			i = end
+			continue
+		}
+		whereIdx := indexTopLevelKeyword(rest, "WHERE")
+		predicate := ""
+		projection := ""
+		if whereIdx >= 0 {
+			tail := strings.TrimSpace(rest[whereIdx+len("WHERE"):])
+			if pipeIdx := findTopLevelPipeIndexInListExpr(tail); pipeIdx >= 0 {
+				predicate = strings.TrimSpace(tail[:pipeIdx])
+				projection = strings.TrimSpace(tail[pipeIdx+1:])
+			} else {
+				predicate = tail
+			}
+		} else if pipeIdx := findTopLevelPipeIndexInListExpr(rest); pipeIdx >= 0 {
+			projection = strings.TrimSpace(rest[pipeIdx+1:])
+		}
+
+		if containsAggregateFunctionCall(predicate) || containsAggregateFunctionCall(projection) {
+			return true
+		}
+		i = end
+	}
+	return false
+}
+
+func findMatchingBracket(raw string, openIdx int) int {
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := openIdx; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func findTopLevelPipeIndexInListExpr(raw string) int {
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '|':
+			if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func findTopLevelInKeywordIndex(raw string) int {
+	upper := strings.ToUpper(raw)
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i <= len(raw)-2; i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+			continue
+		}
+		if !strings.HasPrefix(upper[i:], "IN") {
+			continue
+		}
+		beforeOK := i > 0 && strings.ContainsAny(string(raw[i-1]), " \t\n\r")
+		afterIdx := i + 2
+		afterOK := afterIdx < len(raw) && strings.ContainsAny(string(raw[afterIdx]), " \t\n\r")
+		if beforeOK && afterOK {
+			return i
+		}
+	}
+	return -1
+}
+
+func containsAggregateFunctionCall(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	aggFns := map[string]struct{}{
+		"count":          {},
+		"collect":        {},
+		"sum":            {},
+		"min":            {},
+		"max":            {},
+		"avg":            {},
+		"percentiledisc": {},
+		"percentilecont": {},
+	}
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble || !isFunctionIdentStart(ch) {
+			continue
+		}
+		if i > 0 && isFunctionIdentPart(raw[i-1]) {
+			continue
+		}
+		j := i + 1
+		for j < len(raw) && isFunctionIdentPart(raw[j]) {
+			j++
+		}
+		name := strings.ToLower(raw[i:j])
+		k := skipSpaces(raw, j)
+		if k < len(raw) && raw[k] == '(' {
+			if _, ok := aggFns[name]; ok {
+				return true
+			}
+		}
+		i = j - 1
+	}
+	return false
 }
 
 func firstOverflowingHexOrOctalLiteral(expr string) (string, bool) {

@@ -5321,7 +5321,7 @@ func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Param
 
 func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, final bool) ([]Row, []string, error) {
 	params = withProjectionEvalRuntime(ctx, tx, params, e)
-	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
+	raw := strings.TrimSpace(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
 	projection, err := parseProjectionClauseSpec(raw)
 	if err != nil {
 		return nil, nil, err
@@ -5452,15 +5452,17 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 	}
 
 	type projectionGroup struct {
-		projected        Row
-		source           Row
-		counts           map[int]int
-		countSeen        map[int]map[string]struct{}
-		collects         map[int][]any
-		collectSeen      map[int]map[string]struct{}
-		aggs             map[int]*projectionAggregate
-		aggExprCounts    map[string]int
-		aggExprCountSeen map[string]map[string]struct{}
+		projected          Row
+		source             Row
+		counts             map[int]int
+		countSeen          map[int]map[string]struct{}
+		collects           map[int][]any
+		collectSeen        map[int]map[string]struct{}
+		aggs               map[int]*projectionAggregate
+		aggExprCounts      map[string]int
+		aggExprCountSeen   map[string]map[string]struct{}
+		aggExprCollects    map[string][]any
+		aggExprCollectSeen map[string]map[string]struct{}
 	}
 
 	nonAggregateCount := 0
@@ -5504,7 +5506,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		groupKey := string(keyBytes)
 		group, ok := groups[groupKey]
 		if !ok {
-			group = &projectionGroup{projected: projected, source: cloneRow(row), counts: map[int]int{}, countSeen: map[int]map[string]struct{}{}, collects: map[int][]any{}, collectSeen: map[int]map[string]struct{}{}, aggs: map[int]*projectionAggregate{}, aggExprCounts: map[string]int{}, aggExprCountSeen: map[string]map[string]struct{}{}}
+			group = &projectionGroup{projected: projected, source: cloneRow(row), counts: map[int]int{}, countSeen: map[int]map[string]struct{}{}, collects: map[int][]any{}, collectSeen: map[int]map[string]struct{}{}, aggs: map[int]*projectionAggregate{}, aggExprCounts: map[string]int{}, aggExprCountSeen: map[string]map[string]struct{}{}, aggExprCollects: map[string][]any{}, aggExprCollectSeen: map[string]map[string]struct{}{}}
 			groups[groupKey] = group
 			groupOrder = append(groupOrder, groupKey)
 		}
@@ -5520,44 +5522,72 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					}
 					seenCalls[normalized] = struct{}{}
 					fn := aggregateFuncNameFromCall(call)
-					if fn != "count" {
-						continue
-					}
-					arg, ok := parseFunctionCall(call, "count")
-					if !ok {
-						continue
-					}
-					arg = strings.TrimSpace(arg)
-					if arg == "*" {
-						group.aggExprCounts[normalized]++
-						continue
-					}
-					countExpr, countDistinct := parseCountDistinctArg(arg)
-					if countExpr == "" {
-						countExpr = arg
-					}
-					value, err := evalExpressionWithScope(countExpr, row, params)
-					if err != nil {
-						return nil, nil, err
-					}
-					if value == nil {
-						continue
-					}
-					if countDistinct {
-						if group.aggExprCountSeen[normalized] == nil {
-							group.aggExprCountSeen[normalized] = map[string]struct{}{}
-						}
-						keyBytes, err := json.Marshal(normalizeResultValue(value))
-						if err != nil {
-							keyBytes = []byte(fmt.Sprintf("%v", value))
-						}
-						key := string(keyBytes)
-						if _, ok := group.aggExprCountSeen[normalized][key]; ok {
+					switch fn {
+					case "count":
+						arg, ok := parseFunctionCall(call, "count")
+						if !ok {
 							continue
 						}
-						group.aggExprCountSeen[normalized][key] = struct{}{}
+						arg = strings.TrimSpace(arg)
+						if arg == "*" {
+							group.aggExprCounts[normalized]++
+							continue
+						}
+						countExpr, countDistinct := parseCountDistinctArg(arg)
+						if countExpr == "" {
+							countExpr = arg
+						}
+						value, err := evalExpressionWithScope(countExpr, row, params)
+						if err != nil {
+							return nil, nil, err
+						}
+						if value == nil {
+							continue
+						}
+						if countDistinct {
+							if group.aggExprCountSeen[normalized] == nil {
+								group.aggExprCountSeen[normalized] = map[string]struct{}{}
+							}
+							keyBytes, err := json.Marshal(normalizeResultValue(value))
+							if err != nil {
+								keyBytes = []byte(fmt.Sprintf("%v", value))
+							}
+							key := string(keyBytes)
+							if _, ok := group.aggExprCountSeen[normalized][key]; ok {
+								continue
+							}
+							group.aggExprCountSeen[normalized][key] = struct{}{}
+						}
+						group.aggExprCounts[normalized]++
+					case "collect":
+						arg, ok := parseFunctionCall(call, "collect")
+						if !ok {
+							continue
+						}
+						collectExpr, collectDistinct := parseCollectDistinctArg(arg)
+						value, err := evalExpressionWithScope(collectExpr, row, params)
+						if err != nil {
+							return nil, nil, err
+						}
+						if value == nil {
+							continue
+						}
+						if collectDistinct {
+							if group.aggExprCollectSeen[normalized] == nil {
+								group.aggExprCollectSeen[normalized] = map[string]struct{}{}
+							}
+							keyBytes, err := json.Marshal(normalizeResultValue(value))
+							if err != nil {
+								keyBytes = []byte(fmt.Sprintf("%v", value))
+							}
+							key := string(keyBytes)
+							if _, ok := group.aggExprCollectSeen[normalized][key]; ok {
+								continue
+							}
+							group.aggExprCollectSeen[normalized][key] = struct{}{}
+						}
+						group.aggExprCollects[normalized] = append(group.aggExprCollects[normalized], value)
 					}
-					group.aggExprCounts[normalized]++
 				}
 			}
 			if item.CountArg != "" {
@@ -5729,9 +5759,12 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					if !ok {
 						alias = fmt.Sprintf("__agg_expr_%d", idx)
 						seenCalls[normalized] = alias
-						if aggregateFuncNameFromCall(call) == "count" {
+						switch aggregateFuncNameFromCall(call) {
+						case "count":
 							evalRow[alias] = 0
-						} else {
+						case "collect":
+							evalRow[alias] = []any{}
+						default:
 							evalRow[alias] = nil
 						}
 					}
@@ -5862,9 +5895,16 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					if !ok {
 						alias = fmt.Sprintf("__agg_expr_%d", idx)
 						seenCalls[normalized] = alias
-						if aggregateFuncNameFromCall(call) == "count" {
+						switch aggregateFuncNameFromCall(call) {
+						case "count":
 							evalRow[alias] = group.aggExprCounts[normalized]
-						} else {
+						case "collect":
+							if values, ok := group.aggExprCollects[normalized]; ok {
+								evalRow[alias] = append([]any(nil), values...)
+							} else {
+								evalRow[alias] = []any{}
+							}
+						default:
 							evalRow[alias] = nil
 						}
 					}
@@ -5951,7 +5991,11 @@ func parseProjectionClauseSpec(raw string) (projectionClauseSpec, error) {
 		if end < 0 {
 			end = len(raw)
 		}
-		orderByRaw := strings.TrimSpace(raw[orderByIdx+len("ORDERBY") : end])
+		orderByWidth := len("ORDERBY")
+		if strings.HasPrefix(strings.ToUpper(raw[orderByIdx:]), "ORDER BY") {
+			orderByWidth = len("ORDER BY")
+		}
+		orderByRaw := strings.TrimSpace(raw[orderByIdx+orderByWidth : end])
 		items, err := parseProjectionOrderBy(orderByRaw)
 		if err != nil {
 			return projectionClauseSpec{}, err
@@ -6774,8 +6818,13 @@ func findTopLevelKeywordIndex(raw, keyword string) int {
 			}
 			continue
 		}
-		if depth == 0 && strings.HasPrefix(upper[i:], keyword) {
-			return i
+		if depth == 0 {
+			if strings.HasPrefix(upper[i:], keyword) {
+				return i
+			}
+			if keyword == "ORDERBY" && strings.HasPrefix(upper[i:], "ORDER BY") {
+				return i
+			}
 		}
 	}
 
@@ -7574,6 +7623,34 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return "", nil
 		}
 		return string(runes[start:end]), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "toLower"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		text, ok := value.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return strings.ToLower(text), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "toUpper"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		text, ok := value.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return strings.ToUpper(text), nil
 	}
 	if arg, ok := parseFunctionCall(raw, "keys"); ok {
 		return evalKeysFunction(arg, row, params)
@@ -8625,11 +8702,12 @@ func evalInExpression(lhs, rhs any) (any, error) {
 	}
 	matchedNull := false
 	for _, candidate := range values {
-		if candidate == nil {
+		equal, isNull := cypherNullableEqualForIn(lhs, candidate)
+		if isNull {
 			matchedNull = true
 			continue
 		}
-		if reflect.DeepEqual(lhs, candidate) {
+		if equal {
 			return true, nil
 		}
 	}
@@ -8637,6 +8715,106 @@ func evalInExpression(lhs, rhs any) (any, error) {
 		return nil, nil
 	}
 	return false, nil
+}
+
+func cypherNullableEqualForIn(lhs, rhs any) (equal bool, isNull bool) {
+	if lhs == nil || rhs == nil {
+		return false, true
+	}
+
+	if lf, lok := lhs.(float64); lok && math.IsNaN(lf) {
+		_, rok := rhs.(float64)
+		if rok {
+			return false, false
+		}
+	}
+
+	if isStrictNumericType(lhs) && isStrictNumericType(rhs) {
+		lf, _ := numericValue(lhs)
+		rf, _ := numericValue(rhs)
+		return lf == rf, false
+	}
+
+	if (isStrictNumericType(lhs) && isStringType(rhs)) || (isStrictNumericType(rhs) && isStringType(lhs)) {
+		return false, false
+	}
+
+	if lb, lok := lhs.(bool); lok {
+		rb, rok := rhs.(bool)
+		if !rok {
+			return false, false
+		}
+		return lb == rb, false
+	}
+
+	if ls, lok := lhs.(string); lok {
+		rs, rok := rhs.(string)
+		if !rok {
+			return false, false
+		}
+		return ls == rs, false
+	}
+
+	if ll, lok := asAnySlice(lhs); lok {
+		rl, rok := asAnySlice(rhs)
+		if !rok {
+			return false, false
+		}
+		if len(ll) != len(rl) {
+			return false, false
+		}
+		unknown := false
+		for i := range ll {
+			eq, isNull := cypherNullableEqualForIn(ll[i], rl[i])
+			if isNull {
+				unknown = true
+				continue
+			}
+			if !eq {
+				return false, false
+			}
+		}
+		if unknown {
+			return false, true
+		}
+		return true, false
+	}
+
+	if lm, lok := lhs.(map[string]any); lok {
+		rm, rok := rhs.(map[string]any)
+		if !rok {
+			return false, false
+		}
+		if len(lm) != len(rm) {
+			return false, false
+		}
+		unknown := false
+		for key, lv := range lm {
+			rv, ok := rm[key]
+			if !ok {
+				return false, false
+			}
+			eq, isNull := cypherNullableEqualForIn(lv, rv)
+			if isNull {
+				unknown = true
+				continue
+			}
+			if !eq {
+				return false, false
+			}
+		}
+		if unknown {
+			return false, true
+		}
+		return true, false
+	}
+
+	return reflect.DeepEqual(lhs, rhs), false
+}
+
+func isStringType(value any) bool {
+	_, ok := value.(string)
+	return ok
 }
 
 func normalizeListValue(value any) ([]any, bool) {

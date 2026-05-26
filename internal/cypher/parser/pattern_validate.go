@@ -452,8 +452,12 @@ func validateWherePatternBindings(whereRaw string, bound map[string]patternVarRo
 	if strings.Contains(strings.ToUpper(strings.ReplaceAll(whereRaw, " ", "")), "EXISTS{") {
 		return nil
 	}
+	listComprehensionVars := extractListComprehensionVariables(whereRaw)
 	for _, b := range scanPatternBindings(whereRaw) {
 		if b.name == "" {
+			continue
+		}
+		if _, ok := listComprehensionVars[b.name]; ok {
 			continue
 		}
 		if _, ok := bound[b.name]; ok {
@@ -465,6 +469,64 @@ func validateWherePatternBindings(whereRaw string, bound map[string]patternVarRo
 		return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 	}
 	return nil
+}
+
+func extractListComprehensionVariables(raw string) map[string]struct{} {
+	vars := map[string]struct{}{}
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle := false
+	inDouble := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+			if depthParen == 0 && depthBrace == 0 {
+				innerStart := i + 1
+				name, next, ok := readIdentifier(raw, skipSpaces(raw, innerStart))
+				if ok {
+					next = skipSpaces(raw, next)
+					if next+2 <= len(raw) && strings.EqualFold(raw[next:next+2], "IN") {
+						after := next + 2
+						if after < len(raw) && strings.ContainsAny(string(raw[after]), " \t\n\r") {
+							vars[name] = struct{}{}
+						}
+					}
+				}
+			}
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+	}
+
+	return vars
 }
 
 func isStandaloneNodePatternPredicate(raw string) bool {

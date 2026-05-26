@@ -402,6 +402,104 @@ func TestExecuteCollectSkipsNullValues(t *testing.T) {
 	}
 }
 
+func TestExecuteNestedCollectInsideListComprehension(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("MATCH (n) OPTIONAL MATCH (n)-[r]->(m) RETURN size([x IN collect(r) WHERE x <> null]) AS cn")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := fmt.Sprint(res.Rows[0]["cn"]); got != "0" {
+		t.Fatalf("cn = %v, want 0", res.Rows[0]["cn"])
+	}
+}
+
+func TestExecuteListComprehensionProjectionToLower(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}, Properties: map[string][]byte{"name": []byte("c")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c", Labels: []string{"C"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "T", SrcID: "a", DstID: "c"}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n)-->(b) WHERE n.name IN [x IN labels(b) | toLower(x)] RETURN b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	binding, ok := res.Rows[0]["b"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected map binding for b, got %T", res.Rows[0]["b"])
+	}
+	if got := fmt.Sprint(binding["id"]); got != "c" {
+		t.Fatalf("expected b.id=c, got %s", got)
+	}
+}
+
+func TestExtractAggregateCallsFromNestedListExpressions(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{expr: "size([x IN collect(r) WHERE x <> null])", want: "collect(r)"},
+		{expr: "ALL(ok IN collect((size(list) = 0) = empty) WHERE ok)", want: "collect((size(list) = 0) = empty)"},
+	}
+
+	for _, tc := range cases {
+		calls := extractAggregateCalls(tc.expr)
+		if len(calls) == 0 {
+			t.Fatalf("extractAggregateCalls(%q) returned no calls", tc.expr)
+		}
+		found := false
+		for _, call := range calls {
+			if strings.EqualFold(strings.TrimSpace(call), strings.TrimSpace(tc.want)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("extractAggregateCalls(%q)=%v, want to contain %q", tc.expr, calls, tc.want)
+		}
+	}
+}
+
 func TestExecuteUnsupportedShape(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

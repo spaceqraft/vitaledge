@@ -6666,8 +6666,8 @@ func compareCypherValues(lhs, rhs any) (int, bool) {
 		}
 	}
 
-	if lf, lok := numericValue(lhs); lok {
-		if rf, rok := numericValue(rhs); rok {
+	if lf, lok := comparableNumericValue(lhs); lok {
+		if rf, rok := comparableNumericValue(rhs); rok {
 			leftNaN := math.IsNaN(lf)
 			rightNaN := math.IsNaN(rf)
 			if leftNaN || rightNaN {
@@ -6718,12 +6718,12 @@ func compareCypherValues(lhs, rhs any) (int, bool) {
 	}
 
 	if _, lhsString := lhs.(string); lhsString {
-		if _, rhsNumeric := numericValue(rhs); rhsNumeric {
+		if _, rhsNumeric := comparableNumericValue(rhs); rhsNumeric {
 			return -1, true
 		}
 	}
 	if _, rhsString := rhs.(string); rhsString {
-		if _, lhsNumeric := numericValue(lhs); lhsNumeric {
+		if _, lhsNumeric := comparableNumericValue(lhs); lhsNumeric {
 			return 1, true
 		}
 	}
@@ -6761,7 +6761,7 @@ func cypherSortRank(value any) int {
 	if value == nil {
 		return 90
 	}
-	if f, ok := numericValue(value); ok {
+	if f, ok := comparableNumericValue(value); ok {
 		if math.IsNaN(f) {
 			return 80
 		}
@@ -7278,17 +7278,6 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return evalBooleanNot(value)
 	}
-	if left, right, ok := splitTopLevelInExpression(raw); ok {
-		lhs, err := evalExpressionWithScope(left, row, params)
-		if err != nil {
-			return nil, err
-		}
-		rhs, err := evalExpressionWithScope(right, row, params)
-		if err != nil {
-			return nil, err
-		}
-		return evalInExpression(lhs, rhs)
-	}
 	if left, right, ok := splitTopLevelKeyword(raw, "STARTS WITH"); ok {
 		return evalStringPredicateExpression(left, right, "STARTS WITH", row, params)
 	}
@@ -7394,6 +7383,17 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return nil, err
 		}
 		return compareExpressionValues(lhs, rhs, "<")
+	}
+	if left, right, ok := splitTopLevelInExpression(raw); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return evalInExpression(lhs, rhs)
 	}
 	if left, right, op, ok := splitTopLevelOperatorSetLast(raw, "+", "-"); ok {
 		return evalAdditiveExpression(op, left, right, raw, row, params)
@@ -7833,6 +7833,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		case nil:
 			return nil, nil
 		case *graph.Vertex:
+			if indexValue == nil {
+				return nil, nil
+			}
 			key, ok := indexValue.(string)
 			if !ok {
 				return nil, graph.NewError(graph.ErrKindInvalidInput, "MapElementAccessByNonString", nil)
@@ -7852,6 +7855,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			}
 			return decodeStoredPropertyValue(raw), nil
 		case *graph.Edge:
+			if indexValue == nil {
+				return nil, nil
+			}
 			key, ok := indexValue.(string)
 			if !ok {
 				return nil, graph.NewError(graph.ErrKindInvalidInput, "MapElementAccessByNonString", nil)
@@ -7895,6 +7901,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			}
 			return typed[idx], nil
 		case map[string]any:
+			if indexValue == nil {
+				return nil, nil
+			}
 			key, ok := indexValue.(string)
 			if !ok {
 				return nil, graph.NewError(graph.ErrKindInvalidInput, "MapElementAccessByNonString", nil)
@@ -7916,23 +7925,31 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return value, nil
 	}
-	parts := strings.Split(raw, ".")
-	if len(parts) >= 2 {
-		base, ok := row[parts[0]]
-		if !ok {
-			if value, ok := params[parts[0]]; ok {
+	baseExpr, fields, ok := splitTopLevelFieldAccess(raw)
+	if ok && len(fields) >= 1 {
+		var base any
+		if isIdentifierLike(baseExpr) {
+			if value, exists := row[baseExpr]; exists {
 				base = value
-			} else if value, err := evalExpressionWithScope(parts[0], row, params); err == nil {
+			} else if value, exists := params[baseExpr]; exists {
+				base = value
+			} else if value, err := evalExpressionWithScope(baseExpr, row, params); err == nil {
 				base = value
 			} else {
-				return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", parts[0]), nil)
+				return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", baseExpr), nil)
 			}
+		} else {
+			value, err := evalExpressionWithScope(baseExpr, row, params)
+			if err != nil {
+				return nil, err
+			}
+			base = value
 		}
-		for i := 1; i < len(parts); i++ {
+		for i := 0; i < len(fields); i++ {
 			if base == nil {
 				return nil, nil
 			}
-			next, err := evalFieldAccessValue(base, parts[i])
+			next, err := evalFieldAccessValue(base, fields[i])
 			if err != nil {
 				return nil, err
 			}
@@ -7972,6 +7989,7 @@ func evalPatternComprehensionFromRuntime(raw string, row Row, params Params) (an
 }
 
 func evalFieldAccessValue(base any, field string) (any, error) {
+	field = normalizeFieldAccessPart(field)
 	switch typed := base.(type) {
 	case *graph.Vertex:
 		return evalVertexField(typed, field)
@@ -7999,10 +8017,169 @@ func evalFieldAccessValue(base any, field string) (any, error) {
 			}
 			return nil, nil
 		}
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentTypePropertyAccess", nil)
 	default:
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentTypePropertyAccess", nil)
 	}
+}
+
+func splitTopLevelFieldAccess(raw string) (string, []string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil, false
+	}
+
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle := false
+	inDouble := false
+	firstDot := -1
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '.':
+			if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+				firstDot = i
+				i = len(raw)
+			}
+		}
+	}
+	if firstDot <= 0 {
+		return "", nil, false
+	}
+
+	baseExpr := strings.TrimSpace(raw[:firstDot])
+	tail := raw[firstDot+1:]
+	if baseExpr == "" || strings.TrimSpace(tail) == "" {
+		return "", nil, false
+	}
+
+	readIdentifier := func(text string, idx int) (string, int, bool) {
+		if idx >= len(text) || !isIdentifierStart(text[idx]) {
+			return "", idx, false
+		}
+		start := idx
+		idx++
+		for idx < len(text) && isIdentifierPart(text[idx]) {
+			idx++
+		}
+		return text[start:idx], idx, true
+	}
+
+	readDelimited := func(text string, start int) (string, int, bool) {
+		if start >= len(text) || text[start] != '`' {
+			return "", start, false
+		}
+		var b strings.Builder
+		for i := start + 1; i < len(text); i++ {
+			if text[i] != '`' {
+				b.WriteByte(text[i])
+				continue
+			}
+			if i+1 < len(text) && text[i+1] == '`' {
+				b.WriteByte('`')
+				i++
+				continue
+			}
+			return b.String(), i + 1, true
+		}
+		return "", start, false
+	}
+
+	parts := make([]string, 0, 3)
+	idx := 0
+	for {
+		idx = skipInlineSpaces(tail, idx)
+		if idx >= len(tail) || !isIdentifierStart(tail[idx]) {
+			if idx >= len(tail) {
+				break
+			}
+			if tail[idx] == '`' {
+				field, next, ok := readDelimited(tail, idx)
+				if !ok {
+					return "", nil, false
+				}
+				parts = append(parts, field)
+				idx = skipInlineSpaces(tail, next)
+				if idx >= len(tail) {
+					break
+				}
+				if tail[idx] != '.' {
+					return "", nil, false
+				}
+				idx++
+				continue
+			}
+			return "", nil, false
+		}
+
+		field, next, ok := readIdentifier(tail, idx)
+		if !ok {
+			return "", nil, false
+		}
+		parts = append(parts, field)
+		idx = skipInlineSpaces(tail, next)
+		if idx >= len(tail) {
+			break
+		}
+		if tail[idx] != '.' {
+			return "", nil, false
+		}
+		idx++
+	}
+
+	if len(parts) == 0 {
+		return "", nil, false
+	}
+	return baseExpr, parts, true
+}
+
+func skipInlineSpaces(raw string, idx int) int {
+	for idx < len(raw) {
+		switch raw[idx] {
+		case ' ', '\t', '\n', '\r':
+			idx++
+		default:
+			return idx
+		}
+	}
+	return idx
+}
+
+func normalizeFieldAccessPart(part string) string {
+	part = strings.TrimSpace(part)
+	if len(part) >= 2 && part[0] == '`' && part[len(part)-1] == '`' {
+		return strings.ReplaceAll(part[1:len(part)-1], "``", "`")
+	}
+	return part
 }
 
 func resolveBareIdentifier(raw string, row Row, params Params) (any, bool) {
@@ -9773,6 +9950,61 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 		}
 		return !b, nil
 	}
+
+	if matched, handled, err := e.evalWhereRelationshipPatternPredicate(ctx, tx, raw, row, params); handled {
+		if err != nil {
+			return false, err
+		}
+		return matched, nil
+	}
+
+	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
+		return e.evalWhereExpression(ctx, tx, raw[1:len(raw)-1], row, params)
+	}
+	if operands, operators, ok := splitTopLevelComparisonChain(raw); ok {
+		var sawNull bool
+		for i := 0; i < len(operators); i++ {
+			lhs, err := evalExpressionWithScope(operands[i], row, params)
+			if err != nil {
+				return false, err
+			}
+			rhs, err := evalExpressionWithScope(operands[i+1], row, params)
+			if err != nil {
+				return false, err
+			}
+			result, err := compareExpressionValues(lhs, rhs, operators[i])
+			if err != nil {
+				return false, err
+			}
+			if result == nil {
+				sawNull = true
+				continue
+			}
+			truth, ok := result.(bool)
+			if !ok {
+				return false, nil
+			}
+			if !truth {
+				return false, nil
+			}
+		}
+		if sawNull {
+			return false, nil
+		}
+		return true, nil
+	}
+
+	if left, right, op, ok := splitTopLevelComparison(raw); ok {
+		lhs, err := evalExpressionWithScope(left, row, params)
+		if err != nil {
+			return false, err
+		}
+		rhs, err := evalExpressionWithScope(right, row, params)
+		if err != nil {
+			return false, err
+		}
+		return compareWhereValues(lhs, rhs, op)
+	}
 	if left, right, ok := splitTopLevelInExpression(raw); ok {
 		lhs, err := evalExpressionWithScope(left, row, params)
 		if err != nil {
@@ -9787,29 +10019,6 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 			return false, err
 		}
 		return truthyWhereValue(value), nil
-	}
-
-	if matched, handled, err := e.evalWhereRelationshipPatternPredicate(ctx, tx, raw, row, params); handled {
-		if err != nil {
-			return false, err
-		}
-		return matched, nil
-	}
-
-	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
-		return e.evalWhereExpression(ctx, tx, raw[1:len(raw)-1], row, params)
-	}
-
-	if left, right, op, ok := splitTopLevelComparison(raw); ok {
-		lhs, err := evalExpressionWithScope(left, row, params)
-		if err != nil {
-			return false, err
-		}
-		rhs, err := evalExpressionWithScope(right, row, params)
-		if err != nil {
-			return false, err
-		}
-		return compareWhereValues(lhs, rhs, op)
 	}
 	if left, isNull, ok := splitTopLevelNullPredicate(raw); ok {
 		value, err := evalExpressionWithScope(left, row, params)
@@ -10071,6 +10280,92 @@ func splitTopLevelComparison(raw string) (string, string, string, bool) {
 	return "", "", "", false
 }
 
+func splitTopLevelComparisonChain(raw string) ([]string, []string, bool) {
+	operators := []string{"<=", ">=", "<>", "=", "<", ">"}
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	upper := strings.ToUpper(raw)
+
+	parts := make([]string, 0, 4)
+	ops := make([]string, 0, 3)
+	start := 0
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+		if depthParen == 0 && depthBracket == 0 && depthBrace == 0 && strings.HasPrefix(upper[i:], "CASE") {
+			if endIdx, ok := findCaseExpressionEnd(raw, i); ok {
+				i = endIdx
+				continue
+			}
+		}
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+			continue
+		}
+
+		for _, op := range operators {
+			if strings.HasPrefix(raw[i:], op) {
+				left := strings.TrimSpace(raw[start:i])
+				if left == "" {
+					return nil, nil, false
+				}
+				parts = append(parts, left)
+				ops = append(ops, op)
+				i += len(op) - 1
+				start = i + 1
+				break
+			}
+		}
+	}
+
+	if len(ops) < 2 {
+		return nil, nil, false
+	}
+	last := strings.TrimSpace(raw[start:])
+	if last == "" {
+		return nil, nil, false
+	}
+	parts = append(parts, last)
+	if len(parts) != len(ops)+1 {
+		return nil, nil, false
+	}
+	return parts, ops, true
+}
+
 func splitTopLevelLabelPredicate(raw string) (string, []string, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -10204,6 +10499,18 @@ func compareExpressionValues(lhs, rhs any, op string) (any, error) {
 		}
 		return !equal, nil
 	case "<", "<=", ">", ">=":
+		if ll, lok := asAnySlice(lhs); lok {
+			if rl, rok := asAnySlice(rhs); rok {
+				return compareOrderedLists(ll, rl, op), nil
+			}
+		}
+		if lf, lok := comparableNumericValue(lhs); lok {
+			if rf, rok := comparableNumericValue(rhs); rok {
+				if math.IsNaN(lf) || math.IsNaN(rf) {
+					return false, nil
+				}
+			}
+		}
 		cmp, ok := compareCypherValues(lhs, rhs)
 		if !ok {
 			return nil, nil
@@ -10227,6 +10534,60 @@ func compareExpressionValues(lhs, rhs any, op string) (any, error) {
 		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("WHERE operator %q is not supported", op), nil)
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("WHERE operator %q is not supported", op), nil)
+}
+
+func compareOrderedLists(lhs, rhs []any, op string) any {
+	limit := len(lhs)
+	if len(rhs) < limit {
+		limit = len(rhs)
+	}
+	for i := 0; i < limit; i++ {
+		if lhs[i] == nil || rhs[i] == nil {
+			if lhs[i] == nil && rhs[i] == nil {
+				continue
+			}
+			return nil
+		}
+		cmp, ok := compareCypherValues(lhs[i], rhs[i])
+		if !ok {
+			return nil
+		}
+		if cmp != 0 {
+			switch op {
+			case "<":
+				return cmp < 0
+			case "<=":
+				return cmp < 0
+			case ">":
+				return cmp > 0
+			case ">=":
+				return cmp > 0
+			}
+		}
+	}
+
+	cmp := 0
+	switch {
+	case len(lhs) < len(rhs):
+		cmp = -1
+	case len(lhs) > len(rhs):
+		cmp = 1
+	default:
+		cmp = 0
+	}
+
+	switch op {
+	case "<":
+		return cmp < 0
+	case "<=":
+		return cmp <= 0
+	case ">":
+		return cmp > 0
+	case ">=":
+		return cmp >= 0
+	default:
+		return nil
+	}
 }
 
 func compareExpressionValuesWithRaw(lhs, rhs any, op, leftRaw, rightRaw string) (any, error) {
@@ -10280,8 +10641,13 @@ func cypherNullableEqual(lhs, rhs any) (equal bool, isNull bool) {
 		}
 	}
 
-	if lf, lok := numericValue(lhs); lok {
-		if rf, rok := numericValue(rhs); rok {
+	if lf, lok := comparableNumericValue(lhs); lok {
+		if rf, rok := comparableNumericValue(rhs); rok {
+			if li, lokInt := exactIntegerValue(lhs); lokInt {
+				if ri, rokInt := exactIntegerValue(rhs); rokInt {
+					return li == ri, false
+				}
+			}
 			return lf == rf, false
 		}
 	}
@@ -10357,11 +10723,109 @@ func cypherNullableEqual(lhs, rhs any) (equal bool, isNull bool) {
 		return true, false
 	}
 
+	if equal, handled := comparePathEquality(lhs, rhs); handled {
+		return equal, false
+	}
+
 	return reflect.DeepEqual(lhs, rhs), false
 }
 
+func comparePathEquality(lhs, rhs any) (bool, bool) {
+	leftNodes, leftEdges, ok := pathValueComponents(lhs)
+	if !ok {
+		return false, false
+	}
+	rightNodes, rightEdges, ok := pathValueComponents(rhs)
+	if !ok {
+		return false, false
+	}
+	if len(leftNodes) != len(rightNodes) || len(leftEdges) != len(rightEdges) {
+		return false, true
+	}
+	for i := 0; i < len(leftNodes); i++ {
+		if leftNodes[i] != rightNodes[i] {
+			return false, true
+		}
+	}
+	for i := 0; i < len(leftEdges); i++ {
+		if leftEdges[i] != rightEdges[i] {
+			return false, true
+		}
+	}
+	return true, true
+}
+
+func pathValueComponents(value any) ([]string, []string, bool) {
+	vertexID := func(v *graph.Vertex) string {
+		if v == nil {
+			return ""
+		}
+		return v.ID
+	}
+	edgeID := func(e *graph.Edge) string {
+		if e == nil {
+			return ""
+		}
+		return e.ID
+	}
+
+	switch typed := value.(type) {
+	case cypherPathValue:
+		nodes := []string{vertexID(typed.Left)}
+		edges := []string{}
+		if typed.Edge != nil || typed.Right != nil {
+			edges = append(edges, edgeID(typed.Edge))
+			nodes = append(nodes, vertexID(typed.Right))
+		}
+		return nodes, edges, true
+	case multiHopCypherPath:
+		nodes := make([]string, 0, len(typed.Nodes))
+		for _, node := range typed.Nodes {
+			nodes = append(nodes, vertexID(node))
+		}
+		edges := make([]string, 0, len(typed.Edges))
+		for _, edge := range typed.Edges {
+			edges = append(edges, edgeID(edge))
+		}
+		return nodes, edges, true
+	default:
+		return nil, nil, false
+	}
+}
+
+func exactIntegerValue(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case float32:
+		f := float64(typed)
+		if math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f || f < math.MinInt64 || f > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(f), true
+	case float64:
+		if math.IsNaN(typed) || math.IsInf(typed, 0) || math.Trunc(typed) != typed || typed < math.MinInt64 || typed > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(typed), true
+	case json.Number:
+		if i, err := typed.Int64(); err == nil {
+			return i, true
+		}
+		f, err := typed.Float64()
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f || f < math.MinInt64 || f > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(f), true
+	default:
+		return 0, false
+	}
+}
+
 func isNumericType(value any) bool {
-	_, ok := numericValue(value)
+	_, ok := comparableNumericValue(value)
 	return ok
 }
 
@@ -13005,6 +13469,27 @@ func numericValue(v any) (float64, bool) {
 	return 0, false
 }
 
+func comparableNumericValue(v any) (float64, bool) {
+	switch typed := v.(type) {
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case float64:
+		return typed, true
+	case json.Number:
+		f, err := typed.Float64()
+		if err == nil {
+			return f, true
+		}
+		return 0, false
+	case float32:
+		return float64(typed), true
+	default:
+		return 0, false
+	}
+}
+
 func evalAdditiveExpression(op, left, right, raw string, row Row, params Params) (any, error) {
 	lhs, err := evalExpressionWithScope(left, row, params)
 	if err != nil {
@@ -13138,10 +13623,33 @@ func evalMultiplicativeExpression(op, left, right, raw string, row Row, params P
 	if value, ok := evalTemporalArithmetic(lhs, rhs, op); ok {
 		return value, nil
 	}
-	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", compactExpression(raw)), nil)
+}
+
+func compactExpression(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case ' ', '\t', '\n', '\r':
+			continue
+		default:
+			b.WriteByte(raw[i])
+		}
+	}
+	return b.String()
 }
 
 func formatFloatResult(value float64) string {
+	if math.IsNaN(value) {
+		return "NaN"
+	}
+	if math.IsInf(value, 1) {
+		return "Inf"
+	}
+	if math.IsInf(value, -1) {
+		return "-Inf"
+	}
 	if value == 0 {
 		return "0.0"
 	}
@@ -13894,12 +14402,18 @@ func unquoteCypherString(raw string) (string, error) {
 				b.WriteByte('\b')
 			case 'f':
 				b.WriteByte('\f')
+			case 'n':
 				b.WriteByte('\n')
 			case 'r':
 				b.WriteByte('\r')
 			case 't':
 				b.WriteByte('\t')
 			case '\\':
+				if i+1 < len(inner) && inner[i+1] == '\'' {
+					b.WriteByte('\'')
+					i++
+					break
+				}
 				b.WriteByte('\\')
 			case '\'':
 				b.WriteByte('\'')

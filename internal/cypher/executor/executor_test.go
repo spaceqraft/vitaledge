@@ -4106,11 +4106,13 @@ func TestDecodeStoredPropertyValuePreservesWhitespace(t *testing.T) {
 
 func TestUnquoteCypherStringSingleQuotedEscapes(t *testing.T) {
 	cases := map[string]string{
-		"'\\nFoo\\n'":     "\nFoo\n",
-		"'\\tFoo\\t'":     "\tFoo\t",
-		"'\\u004Aohn'":    "John",
-		"'Foo''Bar'":      "Foo'Bar",
-		"'\\\\path\\\\x'": "\\path\\x",
+		"'\\nFoo\\n'":            "\nFoo\n",
+		"'\\tFoo\\t'":            "\tFoo\t",
+		"'\\u004Aohn'":           "John",
+		"'Foo''Bar'":             "Foo'Bar",
+		"'\\\\path\\\\x'":        "\\path\\x",
+		`'\''`:                   "'",
+		`'a\\bcn5t\'"\\//\\"\''`: `a\bcn5t'"\//\"'`,
 	}
 	for raw, want := range cases {
 		got, err := unquoteCypherString(raw)

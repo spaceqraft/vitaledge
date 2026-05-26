@@ -84,15 +84,26 @@ var supportedExpressionFunctions = map[string]struct{}{
 }
 
 var expressionOperatorKeywords = map[string]struct{}{
-	"and":  {},
-	"in":   {},
-	"is":   {},
-	"not":  {},
-	"or":   {},
-	"by":   {},
-	"with": {},
-	"xor":  {},
+	"and":      {},
+	"in":       {},
+	"is":       {},
+	"not":      {},
+	"or":       {},
+	"starts":   {},
+	"ends":     {},
+	"contains": {},
+	"by":       {},
+	"with":     {},
+	"xor":      {},
 }
+
+type projectionValueKind int
+
+const (
+	projectionValueKindUnknown projectionValueKind = iota
+	projectionValueKindMap
+	projectionValueKindNonMap
+)
 
 func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 	switch typed := stmt.(type) {
@@ -102,11 +113,27 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if err := validatePatternParameterUsage(match.Pattern, seg); err != nil {
 				return err
 			}
+			clauseBound := map[string]patternVarRole{}
 			for _, binding := range scanPatternBindings(match.Pattern) {
 				if binding.name == "" {
 					continue
 				}
-				bound[binding.name] = binding.role
+				clauseBound[binding.name] = binding.role
+			}
+			if match.Where != nil {
+				scope := map[string]patternVarRole{}
+				for name, role := range bound {
+					scope[name] = role
+				}
+				for name, role := range clauseBound {
+					scope[name] = role
+				}
+				if hasUndefinedWhereIdentifier(match.Where.Raw, scope) {
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+				}
+			}
+			for name, role := range clauseBound {
+				bound[name] = role
 			}
 		}
 		for _, item := range typed.Return.Items {
@@ -149,6 +176,7 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 		}
 	case *ast.QueryStatement:
 		bound := map[string]patternVarRole{}
+		valueKinds := map[string]projectionValueKind{}
 		for _, part := range typed.Parts {
 			for _, clause := range part.Clauses {
 				switch clause.Kind {
@@ -163,6 +191,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						return err
 					}
 					if err := validateProjectionSemanticsFromRaw(clause.Raw, clause.Kind, bound, seg); err != nil {
+						return err
+					}
+					if err := validateStaticPropertyAccessTypesFromRaw(clause.Raw, clause.Kind, valueKinds, seg); err != nil {
 						return err
 					}
 					expressions := extractProjectionExpressions(clause.Raw, clause.Kind)
@@ -191,6 +222,7 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 					}
 					if clause.Kind == ast.ClauseKindWith {
 						recordWithBindings(clause.Raw, bound)
+						recordWithValueKinds(clause.Raw, valueKinds)
 					}
 				case ast.ClauseKindSet:
 					expressions := extractSetValueExpressions(clause.Raw)
@@ -224,6 +256,7 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 					if !ok {
 						continue
 					}
+					clauseBound := map[string]patternVarRole{}
 					for _, pattern := range splitTopLevelComma(patternRaw) {
 						if err := validatePatternParameterUsage(pattern, seg); err != nil {
 							return err
@@ -232,8 +265,23 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 							if binding.name == "" {
 								continue
 							}
-							bound[binding.name] = binding.role
+							clauseBound[binding.name] = binding.role
 						}
+					}
+					if whereExpr, ok := extractMatchClauseWhereExpression(clause.Raw, clause.Kind); ok {
+						scope := map[string]patternVarRole{}
+						for name, role := range bound {
+							scope[name] = role
+						}
+						for name, role := range clauseBound {
+							scope[name] = role
+						}
+						if hasUndefinedWhereIdentifier(whereExpr, scope) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+						}
+					}
+					for name, role := range clauseBound {
+						bound[name] = role
 					}
 				}
 			}
@@ -823,6 +871,248 @@ func hasTopLevelStarProjection(raw string, kind ast.ClauseKind) bool {
 		if strings.TrimSpace(item) == "*" {
 			return true
 		}
+	}
+	return false
+}
+
+func extractMatchClauseWhereExpression(raw string, kind ast.ClauseKind) (string, bool) {
+	text := strings.TrimSpace(raw)
+	upper := strings.ToUpper(text)
+	prefix := ""
+	switch kind {
+	case ast.ClauseKindMatch:
+		prefix = "MATCH"
+	case ast.ClauseKindOptionalMatch:
+		prefix = "OPTIONAL MATCH"
+	default:
+		return "", false
+	}
+	if !strings.HasPrefix(upper, prefix) {
+		return "", false
+	}
+	text = strings.TrimSpace(text[len(prefix):])
+	idx := indexTopLevelKeyword(text, "WHERE")
+	if idx < 0 {
+		return "", false
+	}
+	expr := strings.TrimSpace(text[idx+len("WHERE"):])
+	if expr == "" {
+		return "", false
+	}
+	return expr, true
+}
+
+func hasUndefinedWhereIdentifier(expr string, bound map[string]patternVarRole) bool {
+	for _, ref := range extractIdentifierPropertyReferences(expr) {
+		root := ref
+		if idx := strings.Index(root, "."); idx >= 0 {
+			root = root[:idx]
+		}
+		root = strings.TrimSpace(root)
+		if root == "" || isCypherLiteralKeyword(root) {
+			continue
+		}
+		if _, ok := expressionOperatorKeywords[strings.ToLower(root)]; ok {
+			continue
+		}
+		if _, ok := supportedExpressionFunctions[strings.ToLower(root)]; ok {
+			continue
+		}
+		if _, exists := bound[root]; !exists {
+			return true
+		}
+	}
+	return false
+}
+
+func validateStaticPropertyAccessTypesFromRaw(raw string, kind ast.ClauseKind, kinds map[string]projectionValueKind, seg statementSegment) error {
+	for _, expr := range extractProjectionExpressions(raw, kind) {
+		base, ok := simplePropertyAccessBase(expr)
+		if !ok {
+			continue
+		}
+		if kinds[base] == projectionValueKindNonMap {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+		}
+	}
+	return nil
+}
+
+func recordWithValueKinds(raw string, kinds map[string]projectionValueKind) {
+	items := splitProjectionItems(raw, ast.ClauseKindWith)
+	if len(items) == 0 {
+		return
+	}
+
+	original := map[string]projectionValueKind{}
+	for key, kind := range kinds {
+		original[key] = kind
+	}
+
+	hasStar := false
+	projected := map[string]projectionValueKind{}
+	for _, item := range items {
+		entry := strings.TrimSpace(item)
+		if entry == "" {
+			continue
+		}
+		if entry == "*" {
+			hasStar = true
+			continue
+		}
+		alias, expr, ok := parseProjectionAlias(entry)
+		if !ok || alias == "" {
+			continue
+		}
+		kind := inferProjectionValueKind(expr, original)
+		if kind != projectionValueKindUnknown {
+			projected[alias] = kind
+		}
+	}
+
+	for key := range kinds {
+		delete(kinds, key)
+	}
+	if hasStar {
+		for key, kind := range original {
+			kinds[key] = kind
+		}
+	}
+	for key, kind := range projected {
+		kinds[key] = kind
+	}
+}
+
+func inferProjectionValueKind(expr string, known map[string]projectionValueKind) projectionValueKind {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return projectionValueKindUnknown
+	}
+	if kind, ok := known[expr]; ok {
+		return kind
+	}
+	if isMapLiteralExpression(expr) {
+		return projectionValueKindMap
+	}
+	if isNonMapLiteralExpression(expr) {
+		return projectionValueKindNonMap
+	}
+	return projectionValueKindUnknown
+}
+
+func simplePropertyAccessBase(expr string) (string, bool) {
+	trimmed := strings.TrimSpace(expr)
+	if trimmed == "" {
+		return "", false
+	}
+	name, next, ok := readIdentifier(trimmed, 0)
+	if !ok {
+		return "", false
+	}
+	next = skipSpaces(trimmed, next)
+	if next >= len(trimmed) || trimmed[next] != '.' {
+		return "", false
+	}
+	next++
+	for {
+		next = skipSpaces(trimmed, next)
+		if next >= len(trimmed) {
+			return "", false
+		}
+		if trimmed[next] == '`' {
+			closed := false
+			next++
+			for next < len(trimmed) {
+				if trimmed[next] != '`' {
+					next++
+					continue
+				}
+				if next+1 < len(trimmed) && trimmed[next+1] == '`' {
+					next += 2
+					continue
+				}
+				closed = true
+				next++
+				break
+			}
+			if !closed {
+				return "", false
+			}
+		} else {
+			_, idNext, idOK := readIdentifier(trimmed, next)
+			if !idOK {
+				return "", false
+			}
+			next = idNext
+		}
+		next = skipSpaces(trimmed, next)
+		if next == len(trimmed) {
+			return name, true
+		}
+		if trimmed[next] != '.' {
+			return "", false
+		}
+		next++
+	}
+}
+
+func isMapLiteralExpression(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if len(expr) < 2 || expr[0] != '{' || expr[len(expr)-1] != '}' {
+		return false
+	}
+	return bracesAreBalanced(expr[1 : len(expr)-1])
+}
+
+func bracesAreBalanced(raw string) bool {
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '{':
+			depth++
+		case '}':
+			if depth == 0 {
+				return false
+			}
+			depth--
+		}
+	}
+	return depth == 0 && !inSingle && !inDouble
+}
+
+func isNonMapLiteralExpression(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return false
+	}
+	if strings.EqualFold(expr, "null") || strings.EqualFold(expr, "true") || strings.EqualFold(expr, "false") {
+		return true
+	}
+	if (strings.HasPrefix(expr, "'") && strings.HasSuffix(expr, "'")) || (strings.HasPrefix(expr, "\"") && strings.HasSuffix(expr, "\"")) {
+		return true
+	}
+	if _, err := strconv.ParseInt(expr, 10, 64); err == nil {
+		return true
+	}
+	if _, err := strconv.ParseFloat(expr, 64); err == nil {
+		return true
+	}
+	if len(expr) >= 2 && expr[0] == '[' && expr[len(expr)-1] == ']' {
+		return true
 	}
 	return false
 }

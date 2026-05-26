@@ -832,6 +832,9 @@ func classifyError(err error) (phase string, category string) {
 		if strings.Contains(message, "missing parameter") {
 			return "compile time", "ParameterMissing"
 		}
+		if strings.Contains(message, "invalidargumenttypepropertyaccess") {
+			return "compile time", "TypeError"
+		}
 		if strings.Contains(message, "invalidargumenttype") ||
 			strings.Contains(message, "invalidargumentvalue") ||
 			strings.Contains(message, "mapelementaccessbynonstring") {
@@ -1043,7 +1046,7 @@ func sortedKeys(value map[string]any) []string {
 }
 
 func quoteString(value string) string {
-	replacer := strings.NewReplacer(`\\`, `\\\\`, `'`, `\\'`)
+	replacer := strings.NewReplacer("\\", "\\\\", "'", "\\'")
 	return "'" + replacer.Replace(value) + "'"
 }
 

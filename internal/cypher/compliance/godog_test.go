@@ -837,6 +837,7 @@ func classifyError(err error) (phase string, category string) {
 		}
 		if strings.Contains(message, "invalidargumenttype") ||
 			strings.Contains(message, "invalidargumentvalue") ||
+			strings.Contains(message, "invalidpropertytype") ||
 			strings.Contains(message, "mapelementaccessbynonstring") {
 			return "runtime", "TypeError"
 		}
@@ -986,8 +987,6 @@ func renderNodeValue(value map[string]any) string {
 	var b strings.Builder
 	b.WriteByte('(')
 	labels, _ := value["labels"].([]string)
-	labels = append([]string(nil), labels...)
-	sort.Strings(labels)
 	for _, label := range labels {
 		b.WriteByte(':')
 		b.WriteString(label)

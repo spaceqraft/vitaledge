@@ -619,7 +619,6 @@ func renderPathNode(v *graph.Vertex) string {
 		return "()"
 	}
 	labels := append([]string(nil), v.Labels...)
-	sort.Strings(labels)
 	b := strings.Builder{}
 	b.WriteString("(")
 	for _, label := range labels {
@@ -4915,8 +4914,7 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 				continue
 			}
 
-			if match := setClauseRE.FindStringSubmatch(item); len(match) == 4 {
-				varName, field, exprRaw := match[1], match[2], match[3]
+			if varName, field, exprRaw, ok := parseSetPropertyAssignment(item); ok {
 				binding, ok := working[varName]
 				if !ok {
 					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
@@ -4942,7 +4940,11 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 					if value == nil {
 						delete(mutated.Properties, field)
 					} else {
-						mutated.Properties[field] = valueToBytes(value)
+						encoded, err := valueToPropertyBytes(value)
+						if err != nil {
+							return nil, err
+						}
+						mutated.Properties[field] = encoded
 					}
 					if err := tx.PutVertex(ctx, mutated); err != nil {
 						return nil, err
@@ -4962,7 +4964,11 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 					if value == nil {
 						delete(mutated.Properties, field)
 					} else {
-						mutated.Properties[field] = valueToBytes(value)
+						encoded, err := valueToPropertyBytes(value)
+						if err != nil {
+							return nil, err
+						}
+						mutated.Properties[field] = encoded
 					}
 					if err := tx.PutEdge(ctx, mutated); err != nil {
 						return nil, err
@@ -5000,7 +5006,11 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 							delete(mutated.Properties, key)
 							continue
 						}
-						mutated.Properties[key] = valueToBytes(value)
+						encoded, err := valueToPropertyBytes(value)
+						if err != nil {
+							return nil, err
+						}
+						mutated.Properties[key] = encoded
 					}
 					if err := tx.PutVertex(ctx, mutated); err != nil {
 						return nil, err
@@ -5019,7 +5029,11 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 							delete(mutated.Properties, key)
 							continue
 						}
-						mutated.Properties[key] = valueToBytes(value)
+						encoded, err := valueToPropertyBytes(value)
+						if err != nil {
+							return nil, err
+						}
+						mutated.Properties[key] = encoded
 					}
 					if err := tx.PutEdge(ctx, mutated); err != nil {
 						return nil, err
@@ -5056,7 +5070,11 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						if value == nil {
 							continue
 						}
-						mutated.Properties[key] = valueToBytes(value)
+						encoded, err := valueToPropertyBytes(value)
+						if err != nil {
+							return nil, err
+						}
+						mutated.Properties[key] = encoded
 					}
 					if err := tx.PutVertex(ctx, mutated); err != nil {
 						return nil, err
@@ -5074,7 +5092,11 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						if value == nil {
 							continue
 						}
-						mutated.Properties[key] = valueToBytes(value)
+						encoded, err := valueToPropertyBytes(value)
+						if err != nil {
+							return nil, err
+						}
+						mutated.Properties[key] = encoded
 					}
 					if err := tx.PutEdge(ctx, mutated); err != nil {
 						return nil, err
@@ -5126,6 +5148,80 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 		out = append(out, working)
 	}
 	return out, nil
+}
+
+func parseSetPropertyAssignment(item string) (string, string, string, bool) {
+	item = strings.TrimSpace(item)
+	idx := indexTopLevelEqualsInSetItem(item)
+	if idx < 0 {
+		return "", "", "", false
+	}
+	lhs := strings.TrimSpace(item[:idx])
+	rhs := strings.TrimSpace(item[idx+1:])
+	if lhs == "" || rhs == "" {
+		return "", "", "", false
+	}
+
+	base, fields, ok := splitTopLevelFieldAccess(lhs)
+	if !ok || len(fields) != 1 {
+		return "", "", "", false
+	}
+	base = strings.TrimSpace(base)
+	if inner, wrapped := unwrapOuterParentheses(base); wrapped {
+		base = strings.TrimSpace(inner)
+	}
+	if !isIdentifierLike(base) || !isIdentifierLike(fields[0]) {
+		return "", "", "", false
+	}
+
+	return base, fields[0], rhs, true
+}
+
+func indexTopLevelEqualsInSetItem(raw string) int {
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle := false
+	inDouble := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '=':
+			if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+				return i
+			}
+		}
+	}
+
+	return -1
 }
 
 func loadCurrentVertexForWrite(ctx context.Context, tx graph.Tx, vertex *graph.Vertex) (*graph.Vertex, error) {
@@ -14811,6 +14907,47 @@ func valueToBytes(v any) []byte {
 		return []byte("false")
 	default:
 		return []byte(fmt.Sprint(v))
+	}
+}
+
+func valueToPropertyBytes(v any) ([]byte, error) {
+	if !isSupportedPropertyValue(v) {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidPropertyType", nil)
+	}
+	return valueToBytes(v), nil
+}
+
+func isSupportedPropertyValue(v any) bool {
+	switch typed := v.(type) {
+	case nil, string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64,
+		json.Number:
+		return true
+	case map[string]any:
+		_, temporal := typed["__temporal_type"]
+		return temporal
+	case *graph.Vertex, *graph.Edge, cypherPathValue, multiHopCypherPath:
+		return false
+	case []any:
+		for _, item := range typed {
+			if !isSupportedPropertyValue(item) {
+				return false
+			}
+		}
+		return true
+	default:
+		rv := reflect.ValueOf(v)
+		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
+			for i := 0; i < rv.Len(); i++ {
+				if !isSupportedPropertyValue(rv.Index(i).Interface()) {
+					return false
+				}
+			}
+			return true
+		}
+		return false
 	}
 }
 

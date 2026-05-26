@@ -237,6 +237,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 				case ast.ClauseKindSet:
 					expressions := extractSetValueExpressions(clause.Raw)
 					for _, expr := range expressions {
+						if hasUndefinedWhereIdentifier(expr, bound) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+						}
 						if containsForbiddenPatternExpression(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
 						}

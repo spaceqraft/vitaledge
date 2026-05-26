@@ -416,6 +416,21 @@ func TestParseStatementRejectsPatternInSetValueExpression(t *testing.T) {
 	}
 }
 
+func TestParseStatementRejectsStandaloneNodePatternInWhere(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) WHERE (n) RETURN n")
+	if err == nil {
+		t.Fatalf("expected invalid argument type parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
 func TestParseStatementRejectsUnknownFunctionInReturnProjection(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) RETURN foo(n)")
 	if err == nil {

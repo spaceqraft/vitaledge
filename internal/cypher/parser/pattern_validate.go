@@ -1,10 +1,13 @@
 package parser
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 )
+
+var standaloneNodePatternWhereRE = regexp.MustCompile(`^\(\s*(?:[A-Za-z_][A-Za-z0-9_]*)?\s*(?::!?[A-Za-z_][A-Za-z0-9_]*(?:\s*(?::|\|:?)\s*!?[A-Za-z_][A-Za-z0-9_]*)*)?\s*(?:\{[^{}]*\})?\s*\)$`)
 
 type patternVarRole string
 
@@ -458,7 +461,21 @@ func validateWherePatternBindings(whereRaw string, bound map[string]patternVarRo
 		}
 		return &ParseError{Kind: ParseErrorUnsupported, Message: "undefined variable", Statement: seg.index}
 	}
+	if isStandaloneNodePatternPredicate(whereRaw) {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+	}
 	return nil
+}
+
+func isStandaloneNodePatternPredicate(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.Contains(raw, "->") || strings.Contains(raw, "<-") || strings.Contains(raw, "-[") || strings.Contains(raw, "--") {
+		return false
+	}
+	return standaloneNodePatternWhereRE.MatchString(raw)
 }
 
 func isVariableLengthRelationshipBinding(pattern, name string) bool {

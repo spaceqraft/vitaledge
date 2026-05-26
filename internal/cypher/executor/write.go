@@ -87,6 +87,23 @@ type deletedEdgeBinding struct {
 }
 
 const mergeCreatedMarkerKey = "__ve_merge_created"
+const projectionEvalExecutorParam = "__ve_projection_eval_executor"
+const projectionEvalTxParam = "__ve_projection_eval_tx"
+const projectionEvalCtxParam = "__ve_projection_eval_ctx"
+
+func withProjectionEvalRuntime(ctx context.Context, tx graph.Tx, params Params, exec *Executor) Params {
+	if params == nil {
+		params = Params{}
+	}
+	runtime := make(Params, len(params)+3)
+	for key, value := range params {
+		runtime[key] = value
+	}
+	runtime[projectionEvalExecutorParam] = exec
+	runtime[projectionEvalTxParam] = tx
+	runtime[projectionEvalCtxParam] = ctx
+	return runtime
+}
 
 var autoVertexIDSeq uint64
 var autoEdgeIDSeq uint64
@@ -218,35 +235,116 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 		return e.expandReverseDirectedAdjacentMatch(ctx, tx, rows, spec, reverseDirected, params)
 	}
 	if undirected, err := parseUndirectedAdjacentPattern(patternRaw); err == nil {
-		return e.expandUndirectedAdjacentMatch(ctx, tx, rows, spec, undirected, params)
+		return e.expandUndirectedAdjacentMatch(ctx, tx, rows, spec, undirected, params, pathVar)
 	}
 	if rel, err := parseDirectedRelationshipPattern(patternRaw); err == nil {
-		matched, matchErr := e.expandDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+		relForMatch := rel
+		leftVar := rel.Left.Var
+		rightVar := rel.Right.Var
+		edgeVar := rel.EdgeVar
+		cleanupVars := []string{}
+		if pathVar != "" {
+			if leftVar == "" {
+				leftVar = "__ve_path_left"
+				relForMatch.Left.Var = leftVar
+				cleanupVars = append(cleanupVars, leftVar)
+			}
+			if rightVar == "" {
+				rightVar = "__ve_path_right"
+				relForMatch.Right.Var = rightVar
+				cleanupVars = append(cleanupVars, rightVar)
+			}
+			if edgeVar == "" {
+				edgeVar = "__ve_path_edge"
+				relForMatch.EdgeVar = edgeVar
+				cleanupVars = append(cleanupVars, edgeVar)
+			}
+		}
+		matched, matchErr := e.expandDirectedRelationshipMatch(ctx, tx, rows, spec, relForMatch, params)
 		if matchErr != nil {
 			return nil, matchErr
 		}
 		if pathVar != "" {
-			attachBoundPathValues(matched, pathVar, rel.Left.Var, rel.EdgeVar, rel.Right.Var, "forward")
+			attachBoundPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "forward")
+			for _, merged := range matched {
+				for _, key := range cleanupVars {
+					delete(merged, key)
+				}
+			}
 		}
 		return matched, nil
 	}
 	if rel, err := parseReverseDirectedRelationshipPattern(patternRaw); err == nil {
-		matched, matchErr := e.expandReverseDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+		relForMatch := rel
+		leftVar := rel.Left.Var
+		rightVar := rel.Right.Var
+		edgeVar := rel.EdgeVar
+		cleanupVars := []string{}
+		if pathVar != "" {
+			if leftVar == "" {
+				leftVar = "__ve_path_left"
+				relForMatch.Left.Var = leftVar
+				cleanupVars = append(cleanupVars, leftVar)
+			}
+			if rightVar == "" {
+				rightVar = "__ve_path_right"
+				relForMatch.Right.Var = rightVar
+				cleanupVars = append(cleanupVars, rightVar)
+			}
+			if edgeVar == "" {
+				edgeVar = "__ve_path_edge"
+				relForMatch.EdgeVar = edgeVar
+				cleanupVars = append(cleanupVars, edgeVar)
+			}
+		}
+		matched, matchErr := e.expandReverseDirectedRelationshipMatch(ctx, tx, rows, spec, relForMatch, params)
 		if matchErr != nil {
 			return nil, matchErr
 		}
 		if pathVar != "" {
-			attachBoundPathValues(matched, pathVar, rel.Left.Var, rel.EdgeVar, rel.Right.Var, "reverse")
+			attachBoundPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "reverse")
+			for _, merged := range matched {
+				for _, key := range cleanupVars {
+					delete(merged, key)
+				}
+			}
 		}
 		return matched, nil
 	}
 	if rel, err := parseUndirectedRelationshipPattern(patternRaw); err == nil {
-		matched, matchErr := e.expandUndirectedRelationshipMatch(ctx, tx, rows, spec, rel, params)
+		relForMatch := rel
+		leftVar := rel.Left.Var
+		rightVar := rel.Right.Var
+		edgeVar := rel.EdgeVar
+		cleanupVars := []string{}
+		if pathVar != "" {
+			if leftVar == "" {
+				leftVar = "__ve_path_left"
+				relForMatch.Left.Var = leftVar
+				cleanupVars = append(cleanupVars, leftVar)
+			}
+			if rightVar == "" {
+				rightVar = "__ve_path_right"
+				relForMatch.Right.Var = rightVar
+				cleanupVars = append(cleanupVars, rightVar)
+			}
+			if edgeVar == "" {
+				edgeVar = "__ve_path_edge"
+				relForMatch.EdgeVar = edgeVar
+				cleanupVars = append(cleanupVars, edgeVar)
+			}
+		}
+		matched, matchErr := e.expandUndirectedRelationshipMatch(ctx, tx, rows, spec, relForMatch, params)
 		if matchErr != nil {
 			return nil, matchErr
 		}
 		if pathVar != "" {
-			attachBoundPathValues(matched, pathVar, rel.Left.Var, rel.EdgeVar, rel.Right.Var, "undirected")
+			attachBoundPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "undirected")
+			for _, merged := range matched {
+				for _, key := range cleanupVars {
+					delete(merged, key)
+				}
+			}
 		}
 		return matched, nil
 	}
@@ -888,7 +986,7 @@ func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row,
 	return out, nil
 }
 
-func (e *Executor) expandUndirectedAdjacentMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern undirectedAdjacentPattern, params Params) ([]Row, error) {
+func (e *Executor) expandUndirectedAdjacentMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern undirectedAdjacentPattern, params Params, pathVar string) ([]Row, error) {
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, err
@@ -900,6 +998,10 @@ func (e *Executor) expandUndirectedAdjacentMatch(ctx context.Context, tx graph.T
 
 	out := make([]Row, 0)
 	for _, row := range rows {
+		if pathVar != "" {
+			row = cloneRow(row)
+			row[pathVar] = nil
+		}
 		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
@@ -946,6 +1048,15 @@ func (e *Executor) expandUndirectedAdjacentMatch(ctx context.Context, tx graph.T
 				}
 				if pattern.Right.Var != "" {
 					merged[pattern.Right.Var] = neighbor
+				}
+				if pathVar != "" {
+					direction := "undirected"
+					if edge.SrcID == left.ID && edge.DstID == neighbor.ID {
+						direction = "forward"
+					} else if edge.DstID == left.ID && edge.SrcID == neighbor.ID {
+						direction = "reverse"
+					}
+					merged[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: neighbor, Direction: direction}
 				}
 
 				if spec.Where != "" {
@@ -1256,47 +1367,47 @@ func (e *Executor) expandReverseDirectedRelationshipMatch(ctx context.Context, t
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		rightCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Right, params)
+		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
 
 		matched := false
-		for _, right := range rightCandidates {
-			if right == nil {
+		for _, left := range leftCandidates {
+			if left == nil {
 				continue
 			}
-			rowWithRight := cloneRow(row)
-			if pattern.Right.Var != "" {
-				rowWithRight[pattern.Right.Var] = right
+			rowWithLeft := cloneRow(row)
+			if pattern.Left.Var != "" {
+				rowWithLeft[pattern.Left.Var] = left
 			}
 
 			scanType := pattern.EdgeType
 			if len(pattern.EdgeAnyOf) > 0 {
 				scanType = ""
 			}
-			if err := tx.ScanInEdges(ctx, tenant, right.ID, scanType, 0, func(edge *graph.Edge) error {
+			if err := tx.ScanInEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
 				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
 					return nil
 				}
-				if !edgePatternMatches(edge, pattern.EdgeProps, params, rowWithRight) {
+				if !edgePatternMatches(edge, pattern.EdgeProps, params, rowWithLeft) {
 					return nil
 				}
-				left, err := tx.GetVertex(ctx, tenant, edge.SrcID)
+				right, err := tx.GetVertex(ctx, tenant, edge.SrcID)
 				if err != nil {
 					if graph.IsKind(err, graph.ErrKindNotFound) {
 						return nil
 					}
 					return err
 				}
-				if !vertexBindingMatches(rowWithRight, pattern.Left.Var, left) {
+				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, right) {
 					return nil
 				}
-				if !nodePatternMatches(left, pattern.Left, params, rowWithRight) {
+				if !nodePatternMatches(right, pattern.Right, params, rowWithLeft) {
 					return nil
 				}
 
-				merged := cloneRow(rowWithRight)
+				merged := cloneRow(rowWithLeft)
 				if pattern.Left.Var != "" {
 					merged[pattern.Left.Var] = left
 				}
@@ -4832,6 +4943,7 @@ func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Param
 }
 
 func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, final bool) ([]Row, []string, error) {
+	params = withProjectionEvalRuntime(ctx, tx, params, e)
 	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
 	projection, err := parseProjectionClauseSpec(raw)
 	if err != nil {
@@ -4901,7 +5013,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					}
 					continue
 				}
-				value, ok, err := evalProjectionPatternComprehension(ctx, tx, item.Expression, row, params)
+				value, ok, err := e.evalProjectionPatternComprehension(ctx, tx, item.Expression, row, params)
 				if err != nil {
 					return nil, nil, err
 				}
@@ -4990,7 +5102,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 			if item.CountArg != "" || item.CollectArg != "" || item.AggFunc != "" || len(extractAggregateCalls(item.Expression)) > 0 {
 				continue
 			}
-			value, ok, err := evalProjectionPatternComprehension(ctx, tx, item.Expression, row, params)
+			value, ok, err := e.evalProjectionPatternComprehension(ctx, tx, item.Expression, row, params)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -6827,6 +6939,21 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		return value, err
 	}
 	if arg, ok := parseFunctionCall(raw, "size"); ok {
+		if patternValue, handled, err := evalPatternComprehensionFromRuntime(arg, row, params); handled {
+			if err != nil {
+				return nil, err
+			}
+			switch typed := patternValue.(type) {
+			case nil:
+				return nil, nil
+			case []any:
+				return len(typed), nil
+			case []string:
+				return len(typed), nil
+			default:
+				return nil, graph.NewError(graph.ErrKindSemantic, "size() requires a list, map, or string", nil)
+			}
+		}
 		value, err := evalExpressionWithScope(arg, row, params)
 		if err != nil {
 			return nil, err
@@ -7228,6 +7355,12 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if value, err := evalWriteValue(raw, params, row); err == nil {
 		return value, nil
 	}
+	if value, handled, err := evalPatternComprehensionFromRuntime(raw, row, params); handled {
+		if err != nil {
+			return nil, err
+		}
+		return value, nil
+	}
 	parts := strings.Split(raw, ".")
 	if len(parts) >= 2 {
 		base, ok := row[parts[0]]
@@ -7253,6 +7386,34 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		return base, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+}
+
+func evalPatternComprehensionFromRuntime(raw string, row Row, params Params) (any, bool, error) {
+	execRaw, ok := params[projectionEvalExecutorParam]
+	if !ok || execRaw == nil {
+		return nil, false, nil
+	}
+	exec, ok := execRaw.(*Executor)
+	if !ok || exec == nil {
+		return nil, false, nil
+	}
+	txRaw, ok := params[projectionEvalTxParam]
+	if !ok || txRaw == nil {
+		return nil, false, nil
+	}
+	tx, ok := txRaw.(graph.Tx)
+	if !ok || tx == nil {
+		return nil, false, nil
+	}
+	ctxRaw, ok := params[projectionEvalCtxParam]
+	if !ok || ctxRaw == nil {
+		return nil, false, nil
+	}
+	ctx, ok := ctxRaw.(context.Context)
+	if !ok || ctx == nil {
+		return nil, false, nil
+	}
+	return exec.evalProjectionPatternComprehension(ctx, tx, raw, row, params)
 }
 
 func evalFieldAccessValue(base any, field string) (any, error) {
@@ -8965,6 +9126,13 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 		return truthyWhereValue(value), nil
 	}
 
+	if matched, handled, err := e.evalWhereRelationshipPatternPredicate(ctx, tx, raw, row, params); handled {
+		if err != nil {
+			return false, err
+		}
+		return matched, nil
+	}
+
 	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
 		return e.evalWhereExpression(ctx, tx, raw[1:len(raw)-1], row, params)
 	}
@@ -9050,6 +9218,58 @@ func (e *Executor) evalExistsSubquery(ctx context.Context, tx graph.Tx, body str
 		return false, err
 	}
 	return len(rows) > 0, nil
+}
+
+func (e *Executor) evalWhereRelationshipPatternPredicate(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (bool, bool, error) {
+	if tx == nil {
+		return false, false, nil
+	}
+	patternRaw := strings.TrimSpace(raw)
+	if rewritten, ok := rewriteReverseVariableLengthPatternPredicate(patternRaw); ok {
+		patternRaw = rewritten
+	}
+	if !isWhereRelationshipPatternPredicate(patternRaw) {
+		return false, false, nil
+	}
+
+	matches, err := e.applyMatchClause(ctx, tx, []Row{cloneRow(row)}, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + patternRaw}, params)
+	if err != nil {
+		return false, true, err
+	}
+	return len(matches) > 0, true, nil
+}
+
+func rewriteReverseVariableLengthPatternPredicate(raw string) (string, bool) {
+	m := regexp.MustCompile(`^\(([^()]*)\)<-\[([^\]]*\*)\]-\(([^()]*)\)$`).FindStringSubmatch(raw)
+	if len(m) != 4 {
+		return "", false
+	}
+	left := strings.TrimSpace(m[1])
+	edge := strings.TrimSpace(m[2])
+	right := strings.TrimSpace(m[3])
+	return "(" + right + ")-[" + edge + "]->(" + left + ")", true
+}
+
+func isWhereRelationshipPatternPredicate(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	if _, err := parseDirectedRelationshipPattern(raw); err == nil {
+		return true
+	}
+	if _, err := parseReverseDirectedRelationshipPattern(raw); err == nil {
+		return true
+	}
+	if _, err := parseUndirectedRelationshipPattern(raw); err == nil {
+		return true
+	}
+	if _, err := parseDirectedVariableLengthRelationshipPattern(raw); err == nil {
+		return true
+	}
+	if _, err := parseUndirectedVariableLengthRelationshipPattern(raw); err == nil {
+		return true
+	}
+	return false
 }
 
 func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {
@@ -9728,7 +9948,7 @@ func evalUnwindValues(raw string, params Params, row Row) ([]any, error) {
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("UNWIND expression %q is not yet supported", raw), nil)
 }
 
-func evalProjectionPatternComprehension(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (any, bool, error) {
+func (e *Executor) evalProjectionPatternComprehension(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (any, bool, error) {
 	if tx == nil {
 		return nil, false, nil
 	}
@@ -9742,76 +9962,119 @@ func evalProjectionPatternComprehension(ctx context.Context, tx graph.Tx, raw st
 		wrapSize = true
 	}
 
-	pathVar, sourceVar, projectionExpr, direction, ok := parseSimpleUndirectedPathComprehension(raw)
+	patternExpr, projectionExpr, ok := parsePatternComprehension(raw)
 	if !ok {
 		return nil, false, nil
 	}
-	if strings.TrimSpace(sourceVar) == "" || strings.TrimSpace(projectionExpr) == "" {
+	if strings.TrimSpace(patternExpr) == "" || strings.TrimSpace(projectionExpr) == "" {
 		return nil, true, graph.NewError(graph.ErrKindSemantic, "pattern comprehension variables are required", nil)
 	}
-	binding, has := row[sourceVar]
-	if !has || binding == nil {
-		return []any{}, true, nil
-	}
-	vertex, ok := binding.(*graph.Vertex)
-	if !ok {
-		return nil, true, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", sourceVar), nil)
-	}
-	tenant, err := requireStringParam(params, "tenant")
+
+	matches, err := e.applyMatchClause(ctx, tx, []Row{cloneRow(row)}, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + patternExpr}, params)
 	if err != nil {
 		return nil, true, err
 	}
 	out := make([]any, 0)
-	if direction == "any" || direction == "out" {
-		if err := tx.ScanOutEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
-			right, err := tx.GetVertex(ctx, tenant, edge.DstID)
-			if err != nil {
-				if graph.IsKind(err, graph.ErrKindNotFound) {
-					return nil
+	for _, matchRow := range matches {
+		projected, err := evalExpressionWithScope(projectionExpr, matchRow, params)
+		if err != nil {
+			if nested, nestedOK, nestedErr := e.evalProjectionPatternComprehension(ctx, tx, projectionExpr, matchRow, params); nestedOK {
+				if nestedErr != nil {
+					return nil, true, nestedErr
 				}
-				return err
+				projected = nested
+			} else {
+				return nil, true, err
 			}
-			scope := cloneRow(row)
-			if pathVar != "" {
-				scope[pathVar] = cypherPathValue{Left: vertex, Edge: edge, Right: right, Direction: "forward"}
-			}
-			projected, err := evalExpressionWithScope(projectionExpr, scope, params)
-			if err != nil {
-				return err
-			}
-			out = append(out, projected)
-			return nil
-		}); err != nil {
-			return nil, true, err
 		}
-	}
-	if direction == "any" || direction == "in" {
-		if err := tx.ScanInEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
-			left, err := tx.GetVertex(ctx, tenant, edge.SrcID)
-			if err != nil {
-				if graph.IsKind(err, graph.ErrKindNotFound) {
-					return nil
-				}
-				return err
-			}
-			scope := cloneRow(row)
-			if pathVar != "" {
-				scope[pathVar] = cypherPathValue{Left: vertex, Edge: edge, Right: left, Direction: "reverse"}
-			}
-			projected, err := evalExpressionWithScope(projectionExpr, scope, params)
-			if err != nil {
-				return err
-			}
-			out = append(out, projected)
-			return nil
-		}); err != nil {
-			return nil, true, err
-		}
+		out = append(out, projected)
 	}
 	if wrapSize {
 		return len(out), true, nil
 	}
 	return out, true, nil
+}
+
+func parsePatternComprehension(raw string) (patternExpr string, projectionExpr string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
+		return "", "", false
+	}
+	body := strings.TrimSpace(raw[1 : len(raw)-1])
+	pipeIdx := findTopLevelPipeIndex(body)
+	if pipeIdx <= 0 {
+		return "", "", false
+	}
+	left := strings.TrimSpace(body[:pipeIdx])
+	projectionExpr = strings.TrimSpace(body[pipeIdx+1:])
+	if left == "" || projectionExpr == "" {
+		return "", "", false
+	}
+
+	eqIdx := findTopLevelEqualsIndex(left)
+	if eqIdx >= 0 {
+		pathVar := strings.TrimSpace(left[:eqIdx])
+		if pathVar == "" || !isIdentifierLike(pathVar) {
+			return "", "", false
+		}
+		patternExpr = strings.TrimSpace(left[eqIdx+1:])
+		if !strings.HasPrefix(patternExpr, "(") {
+			return "", "", false
+		}
+		return left, projectionExpr, true
+	}
+
+	if !strings.HasPrefix(left, "(") {
+		return "", "", false
+	}
+	return left, projectionExpr, true
+}
+
+func findTopLevelEqualsIndex(raw string) int {
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && (i == 0 || raw[i-1] != '\\') && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '=':
+			if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func parseSimpleUndirectedPathComprehension(raw string) (pathVar string, sourceVar string, projectionExpr string, direction string, ok bool) {

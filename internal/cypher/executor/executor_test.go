@@ -470,7 +470,7 @@ func TestExecuteMatchSetRemoveAndDelete(t *testing.T) {
 		t.Fatalf("execute set/remove failed: %v", err)
 	}
 
-	deleteStmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) DELETE dst")
+	deleteStmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) DETACH DELETE dst")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}

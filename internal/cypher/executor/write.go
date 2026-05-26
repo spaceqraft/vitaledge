@@ -34,8 +34,9 @@ var (
 	createMissingRelTypeReverseRE = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)<--\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
 	createMissingRelTypeUndirRE   = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)--\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
 	setClauseRE                   = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)=(.+)$`)
+	setLabelClauseRE              = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)$`)
 	removeClauseRE                = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$`)
-	deleteClauseRE                = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)$`)
+	removeLabelClauseRE           = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)$`)
 )
 
 type createEdgeDirection string
@@ -3802,130 +3803,353 @@ func isMissingRelationshipTypePattern(raw string) bool {
 }
 
 func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
-	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, "SET"))
-	match := setClauseRE.FindStringSubmatch(raw)
-	if len(match) != 4 {
+	raw := normalizeClauseBody(clause.Raw)
+	raw = stripNormalizedPrefix(raw, "SET")
+	items := splitTopLevelCommaSeparated(raw)
+	if len(items) == 0 {
 		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET clause %q is not yet supported", raw), nil)
 	}
 
-	varName, field, exprRaw := match[1], match[2], match[3]
 	out := make([]Row, 0, len(rows))
 	for _, row := range rows {
-		binding, ok := row[varName]
-		if !ok {
-			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
+		working := row
+		for _, item := range items {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+
+			if match := setClauseRE.FindStringSubmatch(item); len(match) == 4 {
+				varName, field, exprRaw := match[1], match[2], match[3]
+				binding, ok := working[varName]
+				if !ok {
+					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
+				}
+				value, err := evalExpressionWithScope(exprRaw, working, params)
+				if err != nil {
+					value, err = evalWriteValue(exprRaw, params, working)
+				}
+				if err != nil {
+					return nil, err
+				}
+				switch typed := binding.(type) {
+				case *graph.Vertex:
+					if field == "id" {
+						return nil, graph.NewError(graph.ErrKindUnsupported, "setting vertex id is not supported", nil)
+					}
+					mutated := cloneVertex(typed)
+					ensureProperties(mutated)
+					mutated.Properties[field] = valueToBytes(value)
+					if err := tx.PutVertex(ctx, mutated); err != nil {
+						return nil, err
+					}
+					working = cloneRow(working)
+					working[varName] = mutated
+				case *graph.Edge:
+					if field == "id" {
+						return nil, graph.NewError(graph.ErrKindUnsupported, "setting edge id is not supported", nil)
+					}
+					mutated := cloneEdge(typed)
+					ensurePropertiesEdge(mutated)
+					mutated.Properties[field] = valueToBytes(value)
+					if err := tx.PutEdge(ctx, mutated); err != nil {
+						return nil, err
+					}
+					working = cloneRow(working)
+					working[varName] = mutated
+				case nil:
+					continue
+				default:
+					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET on %T is not supported", binding), nil)
+				}
+				continue
+			}
+
+			if match := setLabelClauseRE.FindStringSubmatch(item); len(match) == 3 {
+				varName := match[1]
+				labels := splitLabels(match[2])
+				binding, ok := working[varName]
+				if !ok {
+					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
+				}
+				vertex, ok := binding.(*graph.Vertex)
+				if !ok {
+					if binding == nil {
+						continue
+					}
+					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET on %T is not supported", binding), nil)
+				}
+				mutated := cloneVertex(vertex)
+				for _, label := range labels {
+					if !vertexHasLabel(mutated, label) {
+						mutated.Labels = append(mutated.Labels, label)
+					}
+				}
+				if err := tx.PutVertex(ctx, mutated); err != nil {
+					return nil, err
+				}
+				working = cloneRow(working)
+				working[varName] = mutated
+				continue
+			}
+
+			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET clause %q is not yet supported", raw), nil)
 		}
-		value, err := evalWriteValue(exprRaw, params, row)
-		if err != nil {
-			return nil, err
-		}
-		switch typed := binding.(type) {
-		case *graph.Vertex:
-			if field == "id" {
-				return nil, graph.NewError(graph.ErrKindUnsupported, "setting vertex id is not supported", nil)
-			}
-			mutated := cloneVertex(typed)
-			ensureProperties(mutated)
-			mutated.Properties[field] = valueToBytes(value)
-			if err := tx.PutVertex(ctx, mutated); err != nil {
-				return nil, err
-			}
-			row = cloneRow(row)
-			row[varName] = mutated
-		case *graph.Edge:
-			if field == "id" {
-				return nil, graph.NewError(graph.ErrKindUnsupported, "setting edge id is not supported", nil)
-			}
-			mutated := cloneEdge(typed)
-			ensurePropertiesEdge(mutated)
-			mutated.Properties[field] = valueToBytes(value)
-			if err := tx.PutEdge(ctx, mutated); err != nil {
-				return nil, err
-			}
-			row = cloneRow(row)
-			row[varName] = mutated
-		default:
-			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET on %T is not supported", binding), nil)
-		}
-		out = append(out, row)
+		out = append(out, working)
 	}
 	return out, nil
 }
 
 func (e *Executor) applyRemoveClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
-	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, "REMOVE"))
-	match := removeClauseRE.FindStringSubmatch(raw)
-	if len(match) != 3 {
+	raw := normalizeClauseBody(clause.Raw)
+	raw = stripNormalizedPrefix(raw, "REMOVE")
+	items := splitTopLevelCommaSeparated(raw)
+	if len(items) == 0 {
 		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE clause %q is not yet supported", raw), nil)
 	}
 
-	varName, field := match[1], match[2]
 	out := make([]Row, 0, len(rows))
 	for _, row := range rows {
-		binding, ok := row[varName]
-		if !ok {
-			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
-		}
-		switch typed := binding.(type) {
-		case *graph.Vertex:
-			mutated := cloneVertex(typed)
-			ensureProperties(mutated)
-			delete(mutated.Properties, field)
-			if err := tx.PutVertex(ctx, mutated); err != nil {
-				return nil, err
+		working := row
+		for _, item := range items {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
 			}
-			row = cloneRow(row)
-			row[varName] = mutated
-		case *graph.Edge:
-			mutated := cloneEdge(typed)
-			ensurePropertiesEdge(mutated)
-			delete(mutated.Properties, field)
-			if err := tx.PutEdge(ctx, mutated); err != nil {
-				return nil, err
+
+			if match := removeClauseRE.FindStringSubmatch(item); len(match) == 3 {
+				varName, field := match[1], match[2]
+				binding, ok := working[varName]
+				if !ok {
+					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
+				}
+				switch typed := binding.(type) {
+				case *graph.Vertex:
+					mutated := cloneVertex(typed)
+					ensureProperties(mutated)
+					delete(mutated.Properties, field)
+					if err := tx.PutVertex(ctx, mutated); err != nil {
+						return nil, err
+					}
+					working = cloneRow(working)
+					working[varName] = mutated
+				case *graph.Edge:
+					mutated := cloneEdge(typed)
+					ensurePropertiesEdge(mutated)
+					delete(mutated.Properties, field)
+					if err := tx.PutEdge(ctx, mutated); err != nil {
+						return nil, err
+					}
+					working = cloneRow(working)
+					working[varName] = mutated
+				case nil:
+					continue
+				default:
+					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE on %T is not supported", binding), nil)
+				}
+				continue
 			}
-			row = cloneRow(row)
-			row[varName] = mutated
-		default:
-			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE on %T is not supported", binding), nil)
+
+			if match := removeLabelClauseRE.FindStringSubmatch(item); len(match) == 3 {
+				varName := match[1]
+				labelsToRemove := splitLabels(match[2])
+				binding, ok := working[varName]
+				if !ok {
+					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
+				}
+				vertex, ok := binding.(*graph.Vertex)
+				if !ok {
+					if binding == nil {
+						continue
+					}
+					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE on %T is not supported", binding), nil)
+				}
+				removeSet := map[string]struct{}{}
+				for _, label := range labelsToRemove {
+					removeSet[label] = struct{}{}
+				}
+				mutated := cloneVertex(vertex)
+				kept := make([]string, 0, len(mutated.Labels))
+				for _, label := range mutated.Labels {
+					if _, remove := removeSet[label]; remove {
+						continue
+					}
+					kept = append(kept, label)
+				}
+				mutated.Labels = kept
+				if err := tx.PutVertex(ctx, mutated); err != nil {
+					return nil, err
+				}
+				working = cloneRow(working)
+				working[varName] = mutated
+				continue
+			}
+
+			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE clause %q is not yet supported", raw), nil)
 		}
-		out = append(out, row)
+		out = append(out, working)
 	}
 	return out, nil
 }
 
 func (e *Executor) applyDeleteClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
-	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, "DELETE"))
-	match := deleteClauseRE.FindStringSubmatch(raw)
-	if len(match) != 2 {
+	raw := normalizeClauseBody(clause.Raw)
+	detach := false
+	switch {
+	case strings.HasPrefix(strings.ToUpper(raw), "DETACHDELETE"):
+		detach = true
+		raw = strings.TrimSpace(raw[len("DETACHDELETE"):])
+	case strings.HasPrefix(strings.ToUpper(raw), "DELETE"):
+		raw = strings.TrimSpace(raw[len("DELETE"):])
+	default:
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("DELETE clause %q is not yet supported", raw), nil)
+	}
+	targets := splitTopLevelCommaSeparated(raw)
+	if len(targets) == 0 {
 		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("DELETE clause %q is not yet supported", raw), nil)
 	}
 
-	varName := match[1]
 	out := make([]Row, 0, len(rows))
 	for _, row := range rows {
-		binding, ok := row[varName]
-		if !ok {
-			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
-		}
-		switch typed := binding.(type) {
-		case *graph.Vertex:
-			if err := deleteVertexWithEdges(ctx, tx, typed.Tenant, typed.ID); err != nil {
+		working := row
+		for _, target := range targets {
+			target = strings.TrimSpace(target)
+			if target == "" {
+				continue
+			}
+
+			value, err := evalExpressionWithScope(target, working, params)
+			if err != nil {
+				value, err = evalWriteValue(target, params, working)
+			}
+			if err != nil {
 				return nil, err
 			}
-			row = cloneRow(row)
-			row[varName] = deletedVertexBinding{Tenant: typed.Tenant, ID: typed.ID, Labels: append([]string(nil), typed.Labels...)}
-		case *graph.Edge:
-			if err := tx.DeleteEdge(ctx, typed.Tenant, typed.ID); err != nil {
+
+			replacement, err := e.deleteValue(ctx, tx, value, detach)
+			if err != nil {
 				return nil, err
 			}
-			row = cloneRow(row)
-			row[varName] = deletedEdgeBinding{Tenant: typed.Tenant, ID: typed.ID, Type: typed.Type}
-		default:
-			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("DELETE on %T is not supported", binding), nil)
+
+			if isIdentifierLike(target) {
+				if _, bound := working[target]; bound {
+					working = cloneRow(working)
+					working[target] = replacement
+				}
+			}
 		}
-		out = append(out, row)
+		out = append(out, working)
 	}
 	return out, nil
+}
+
+func stripNormalizedPrefix(raw, prefix string) string {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(strings.ToUpper(raw), prefix) {
+		return strings.TrimSpace(raw[len(prefix):])
+	}
+	return raw
+}
+
+func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, detach bool) (any, error) {
+	switch typed := value.(type) {
+	case nil:
+		return nil, nil
+	case *graph.Vertex:
+		if detach {
+			if err := deleteVertexWithEdges(ctx, tx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+				return nil, err
+			}
+		} else {
+			hasEdges, err := vertexHasAnyEdges(ctx, tx, typed.Tenant, typed.ID)
+			if err != nil {
+				return nil, err
+			}
+			if hasEdges {
+				return nil, graph.NewError(graph.ErrKindConflict, "DeleteConnectedNode", nil)
+			}
+			if err := tx.DeleteVertex(ctx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+				return nil, err
+			}
+		}
+		return deletedVertexBinding{Tenant: typed.Tenant, ID: typed.ID, Labels: append([]string(nil), typed.Labels...)}, nil
+	case *graph.Edge:
+		if err := tx.DeleteEdge(ctx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil, err
+		}
+		return deletedEdgeBinding{Tenant: typed.Tenant, ID: typed.ID, Type: typed.Type}, nil
+	case deletedVertexBinding, deletedEdgeBinding:
+		return typed, nil
+	case cypherPathValue:
+		return e.deletePathValue(ctx, tx, typed, detach)
+	case multiHopCypherPath:
+		return e.deletePathValue(ctx, tx, typed, detach)
+	case []any:
+		for _, item := range typed {
+			if _, err := e.deleteValue(ctx, tx, item, detach); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	default:
+		rv := reflect.ValueOf(value)
+		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
+			for i := 0; i < rv.Len(); i++ {
+				if _, err := e.deleteValue(ctx, tx, rv.Index(i).Interface(), detach); err != nil {
+					return nil, err
+				}
+			}
+			return nil, nil
+		}
+		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("DELETE on %T is not supported", value), nil)
+	}
+}
+
+func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any, detach bool) (any, error) {
+	deleteEdge := func(edge *graph.Edge) error {
+		if edge == nil {
+			return nil
+		}
+		if err := tx.DeleteEdge(ctx, edge.Tenant, edge.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+			return err
+		}
+		return nil
+	}
+
+	deleteVertex := func(vertex *graph.Vertex) error {
+		if vertex == nil || !detach {
+			return nil
+		}
+		if err := deleteVertexWithEdges(ctx, tx, vertex.Tenant, vertex.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+			return err
+		}
+		return nil
+	}
+
+	switch typed := value.(type) {
+	case cypherPathValue:
+		if err := deleteEdge(typed.Edge); err != nil {
+			return nil, err
+		}
+		if err := deleteVertex(typed.Left); err != nil {
+			return nil, err
+		}
+		if err := deleteVertex(typed.Right); err != nil {
+			return nil, err
+		}
+	case multiHopCypherPath:
+		for _, edge := range typed.Edges {
+			if err := deleteEdge(edge); err != nil {
+				return nil, err
+			}
+		}
+		for _, node := range typed.Nodes {
+			if err := deleteVertex(node); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, nil
 }
 
 func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Params) ([]Row, error) {
@@ -5696,6 +5920,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty expression", nil)
+	}
+	if strings.EqualFold(raw, "null") {
+		return nil, nil
 	}
 	if value, ok := resolveBareIdentifier(raw, row, params); ok {
 		return value, nil
@@ -8665,13 +8892,37 @@ func parsePropertyMap(raw string, params Params, row Row) (map[string]any, error
 			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("property pair %q is not supported", pair), nil)
 		}
 		key := strings.TrimSpace(parts[0])
-		value, err := evalWriteValue(parts[1], params, row)
+		valueExpr := strings.TrimSpace(parts[1])
+		value, err := evalExpressionWithScope(valueExpr, row, params)
+		if err != nil {
+			value, err = evalWriteValue(valueExpr, params, row)
+		}
 		if err != nil {
 			return nil, err
 		}
 		out[key] = value
 	}
 	return out, nil
+}
+
+func vertexHasAnyEdges(ctx context.Context, tx graph.Tx, tenant, vertexID string) (bool, error) {
+	hasEdges := false
+	if err := tx.ScanOutEdges(ctx, tenant, vertexID, "", 1, func(edge *graph.Edge) error {
+		hasEdges = true
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if hasEdges {
+		return true, nil
+	}
+	if err := tx.ScanInEdges(ctx, tenant, vertexID, "", 1, func(edge *graph.Edge) error {
+		hasEdges = true
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	return hasEdges, nil
 }
 
 func evalWriteValue(raw string, params Params, row Row) (any, error) {
@@ -11596,6 +11847,8 @@ func stringFromProperty(props map[string]any, key string) string {
 
 func valueToBytes(v any) []byte {
 	switch typed := v.(type) {
+	case nil:
+		return []byte("null")
 	case []byte:
 		return append([]byte(nil), typed...)
 	case string:

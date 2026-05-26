@@ -2140,6 +2140,83 @@ func TestExecuteReturnNamedPathFwdUndirected(t *testing.T) {
 	}
 }
 
+func TestExecuteDirectedThenUndirectedRelationshipChainBindsEdgeVars(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	setup := []string{
+		"CREATE (:A {name:'x'})-[:REL1]->(:B {name:'y'})-[:REL2]->(:C {name:'z'})",
+	}
+	for _, q := range setup {
+		stmt, err := parser.ParseStatement(q)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (x:A)-[r1]->(y:B)-[r2]-(z:C) RETURN type(r1) AS t1, type(r2) AS t2")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := fmt.Sprint(res.Rows[0]["t1"]); got != "REL1" {
+		t.Fatalf("expected t1=REL1, got %q", got)
+	}
+	if got := fmt.Sprint(res.Rows[0]["t2"]); got != "REL2" {
+		t.Fatalf("expected t2=REL2, got %q", got)
+	}
+}
+
+func TestExecuteNamedPathReverseFixedThenUndirectedBoundedVariableLength(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	setup := []string{
+		"CREATE (:Mid {id: 0})-[:CONNECTED_TO]->(:Start {id: 1})",
+		"MATCH (m:Mid {id: 0}) CREATE (m)-[:CONNECTED_TO]->(:N1 {id: 2})-[:CONNECTED_TO]->(:N2 {id: 3})-[:CONNECTED_TO]->(:End {id: 4})",
+	}
+	for _, q := range setup {
+		stmt, err := parser.ParseStatement(q)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+
+	stmt, err := parser.ParseStatement("MATCH p = (:Start)<-[:CONNECTED_TO]-()-[:CONNECTED_TO*3..3]-(:End) RETURN length(p) AS l, size(relationships(p)) AS nr")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := res.Rows[0]["l"]; got != 4 {
+		t.Fatalf("expected length 4, got %#v", got)
+	}
+	if got := res.Rows[0]["nr"]; got != 4 {
+		t.Fatalf("expected relationships size 4, got %#v", got)
+	}
+}
+
 // TestExecuteReturnNamedPathConvergentEmptyWhenNoMatch verifies that
 // MATCH p=(n)-->(k)<--(n) returns no rows when the convergent path doesn't exist.
 func TestExecuteReturnNamedPathConvergentEmptyWhenNoMatch(t *testing.T) {
@@ -3219,6 +3296,73 @@ func TestExecutePathFunctionsReturnNullOnNullPath(t *testing.T) {
 	}
 	if got := res.Rows[0]["lp"]; got != nil {
 		t.Fatalf("expected lp=nil, got %#v", got)
+	}
+}
+
+func TestExecuteDirectedBoundedVariableLengthMatchPathFunctions(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (s:Start {id: 1})-[:REL {num: 1}]->(:Mid {id: 2})-[:REL {num: 2}]->(e:End {id: 3})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH p = (a:Start)-[:REL*2..2]->(b:End) RETURN size(relationships(p)) AS nr, length(p) AS l")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["nr"]; got != 2 {
+		t.Fatalf("expected nr=2, got %#v", got)
+	}
+	if got := res.Rows[0]["l"]; got != 2 {
+		t.Fatalf("expected l=2, got %#v", got)
+	}
+}
+
+func TestExecuteUndirectedBoundedVariableLengthMatchReturnsEdgeSequences(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (a:End {id: 1})-[:REL {num: 1}]->(:Mid {id: 2})-[:REL {num: 2}]->(b:End {id: 3})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (a)-[r:REL*2..2]-(b:End) RETURN size(r) AS nr")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected two rows, got %d", len(res.Rows))
+	}
+	for i, row := range res.Rows {
+		if got := row["nr"]; got != 2 {
+			t.Fatalf("row %d expected nr=2, got %#v", i, got)
+		}
 	}
 }
 

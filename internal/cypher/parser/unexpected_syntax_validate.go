@@ -111,6 +111,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if containsForbiddenPatternExpression(item.Expression.Raw) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
 			}
+			if hasInvalidInLiteralRHS(item.Expression.Raw) {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+			}
 			if name, ok := firstUnknownFunctionCall(item.Expression.Raw); ok {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 			}
@@ -147,6 +150,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if containsForbiddenPatternExpression(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
 						}
+						if hasInvalidInLiteralRHS(expr) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+						}
 						if name, ok := firstUnknownFunctionCall(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 						}
@@ -168,6 +174,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 					for _, expr := range expressions {
 						if containsForbiddenPatternExpression(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
+						}
+						if hasInvalidInLiteralRHS(expr) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 						}
 						if name, ok := firstUnknownFunctionCall(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
@@ -557,6 +566,141 @@ func containsForbiddenPatternExpression(expr string) bool {
 		}
 	}
 
+	return false
+}
+
+func hasInvalidInLiteralRHS(expr string) bool {
+	_, rhs, ok := splitTopLevelInExpressionForValidation(expr)
+	if !ok {
+		return false
+	}
+	return isNonListLiteralExpression(rhs)
+}
+
+func splitTopLevelInExpressionForValidation(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	upper := strings.ToUpper(raw)
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i <= len(upper)-len("IN"); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch upper[i] {
+		case '(':
+			depthParen++
+			continue
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+			continue
+		case '[':
+			depthBracket++
+			continue
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+			continue
+		case '{':
+			depthBrace++
+			continue
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+			continue
+		}
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 || !strings.HasPrefix(upper[i:], "IN") {
+			continue
+		}
+		if raw[i:i+2] != "IN" {
+			continue
+		}
+		if i >= len("CONTA") && i+2 < len(raw) {
+			if strings.EqualFold(raw[i-len("CONTA"):i], "CONTA") {
+				next := raw[i+2]
+				if next == 's' || next == 'S' {
+					continue
+				}
+			}
+		}
+		left := strings.TrimSpace(raw[:i])
+		right := strings.TrimSpace(raw[i+2:])
+		if left == "" || right == "" {
+			continue
+		}
+		beforeWhitespace := i > 0 && strings.ContainsAny(string(raw[i-1]), " \t\n\r")
+		afterIdx := i + 2
+		afterWhitespace := afterIdx < len(raw) && strings.ContainsAny(string(raw[afterIdx]), " \t\n\r")
+		if beforeWhitespace || afterWhitespace {
+			return left, right, true
+		}
+		if !strings.ContainsAny(raw, " \t\n\r") {
+			if (len(left) == 1 && len(right) == 1) || strings.HasPrefix(left, "$") || strings.HasPrefix(right, "$") || strings.HasPrefix(left, "[") || strings.HasPrefix(right, "[") || strings.HasPrefix(left, "'") || strings.HasPrefix(left, `"`) || (strings.HasPrefix(left, "(") && strings.HasSuffix(left, ")")) || strings.HasPrefix(right, "(") || isSimpleNumericLiteralForValidation(left) {
+				return left, right, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func isSimpleNumericLiteralForValidation(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if _, err := strconv.Atoi(raw); err == nil {
+		return true
+	}
+	if _, err := strconv.ParseFloat(raw, 64); err == nil {
+		return true
+	}
+	return false
+}
+
+func isNonListLiteralExpression(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		return false
+	}
+	if strings.HasPrefix(raw, "{") && strings.HasSuffix(raw, "}") {
+		return true
+	}
+	if strings.EqualFold(raw, "true") || strings.EqualFold(raw, "false") || strings.EqualFold(raw, "null") {
+		return true
+	}
+	if strings.HasPrefix(raw, "'") && strings.HasSuffix(raw, "'") && len(raw) >= 2 {
+		return true
+	}
+	if strings.HasPrefix(raw, `"`) && strings.HasSuffix(raw, `"`) && len(raw) >= 2 {
+		return true
+	}
+	if _, err := strconv.Atoi(raw); err == nil {
+		return true
+	}
+	if _, err := strconv.ParseFloat(raw, 64); err == nil {
+		return true
+	}
 	return false
 }
 

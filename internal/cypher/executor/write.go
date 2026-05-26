@@ -112,59 +112,59 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 	if stmt == nil {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "query statement is required", nil)
 	}
-	if len(stmt.Parts) != 1 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, "only single query parts are supported", nil)
+	if len(stmt.Parts) == 0 {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "at least one query part is required", nil)
 	}
-	if len(stmt.Unions) > 0 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, "UNION is not yet supported", nil)
+	if len(stmt.Unions) != 0 && len(stmt.Unions) != len(stmt.Parts)-1 {
+		return nil, &parser.ParseError{Kind: parser.ParseErrorInternal, Message: "invalid union boundaries", Statement: 1}
 	}
-	part := stmt.Parts[0]
+	if err := validateUnionKinds(stmt.Unions); err != nil {
+		return nil, err
+	}
 
-	writeQuery := hasWriteClause(part)
-	rows := []Row{{}}
+	writeQuery := false
+	for _, part := range stmt.Parts {
+		if hasWriteClause(part) {
+			writeQuery = true
+			break
+		}
+	}
+
+	resultRows := []Row{}
 	resultColumns := []string{}
-	returnSeen := false
+	hasAnyReturn := false
 
 	withTx := func(tx graph.Tx) error {
-		for _, clause := range part.Clauses {
-			var stepErr error
-			switch clause.Kind {
-			case ast.ClauseKindMatch:
-				rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
-				resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(clause.Raw)...)
-			case ast.ClauseKindOptionalMatch:
-				rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
-				resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(clause.Raw)...)
-			case ast.ClauseKindUnwind:
-				rows, stepErr = e.applyUnwindClause(rows, clause, params)
-				resultColumns = appendUniqueColumns(resultColumns, inferColumnsFromRows(rows)...)
-			case ast.ClauseKindWith:
-				rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns, false)
-			case ast.ClauseKindCreate:
-				rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, false)
-			case ast.ClauseKindMerge:
-				rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, true)
-			case ast.ClauseKindSet:
-				rows, stepErr = e.applySetClause(ctx, tx, rows, clause, params)
-			case ast.ClauseKindRemove:
-				rows, stepErr = e.applyRemoveClause(ctx, tx, rows, clause, params)
-			case ast.ClauseKindDelete:
-				rows, stepErr = e.applyDeleteClause(ctx, tx, rows, clause, params)
-			case ast.ClauseKindReturn:
-				rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns, true)
-				returnSeen = true
-				if stepErr != nil {
-					return stepErr
-				}
-				return nil
-			case ast.ClauseKindInQueryCall:
-				rows, stepErr = e.applyInQueryCallClause(rows, clause, params)
-			default:
-				return graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("clause %s is not yet supported", clause.Kind), nil)
-			}
+		for idx, part := range stmt.Parts {
+			partRows, partColumns, returnSeen, stepErr := e.executeQueryPart(ctx, tx, part, params)
 			if stepErr != nil {
 				return stepErr
 			}
+			if !returnSeen {
+				if len(stmt.Parts) > 1 {
+					return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "InvalidClauseComposition", Statement: 1}
+				}
+				continue
+			}
+
+			hasAnyReturn = true
+			if idx == 0 {
+				resultRows = append(resultRows, partRows...)
+				resultColumns = append([]string(nil), partColumns...)
+				continue
+			}
+
+			if !equalStringSlices(resultColumns, partColumns) {
+				return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "DifferentColumnsInUnion", Statement: 1}
+			}
+
+			op := stmt.Unions[idx-1]
+			if op == ast.UnionKindAll {
+				resultRows = append(resultRows, partRows...)
+				continue
+			}
+			resultRows = append(resultRows, partRows...)
+			resultRows = distinctProjectionRows(resultRows)
 		}
 		return nil
 	}
@@ -178,14 +178,88 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 		return nil, err
 	}
 
-	if !returnSeen {
+	if !hasAnyReturn {
 		resultColumns = nil
-		rows = nil
+		resultRows = nil
 	}
 
-	result := &Result{Columns: resultColumns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}
+	result := &Result{Columns: resultColumns, Rows: resultRows, Stats: Stats{RowsReturned: len(resultRows)}}
 	result.Rows = normalizeResultRows(result.Rows)
 	return result, nil
+}
+
+func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.QueryPart, params Params) ([]Row, []string, bool, error) {
+	rows := []Row{{}}
+	resultColumns := []string{}
+	returnSeen := false
+
+	for _, clause := range part.Clauses {
+		var stepErr error
+		switch clause.Kind {
+		case ast.ClauseKindMatch:
+			rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
+			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(clause.Raw)...)
+		case ast.ClauseKindOptionalMatch:
+			rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
+			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(clause.Raw)...)
+		case ast.ClauseKindUnwind:
+			rows, stepErr = e.applyUnwindClause(rows, clause, params)
+			resultColumns = appendUniqueColumns(resultColumns, inferColumnsFromRows(rows)...)
+		case ast.ClauseKindWith:
+			rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns, false)
+		case ast.ClauseKindCreate:
+			rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, false)
+		case ast.ClauseKindMerge:
+			rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, true)
+		case ast.ClauseKindSet:
+			rows, stepErr = e.applySetClause(ctx, tx, rows, clause, params)
+		case ast.ClauseKindRemove:
+			rows, stepErr = e.applyRemoveClause(ctx, tx, rows, clause, params)
+		case ast.ClauseKindDelete:
+			rows, stepErr = e.applyDeleteClause(ctx, tx, rows, clause, params)
+		case ast.ClauseKindReturn:
+			rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns, true)
+			returnSeen = true
+			if stepErr != nil {
+				return nil, nil, false, stepErr
+			}
+			return rows, resultColumns, true, nil
+		case ast.ClauseKindInQueryCall:
+			rows, stepErr = e.applyInQueryCallClause(rows, clause, params)
+		default:
+			return nil, nil, false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("clause %s is not yet supported", clause.Kind), nil)
+		}
+		if stepErr != nil {
+			return nil, nil, false, stepErr
+		}
+	}
+
+	return rows, resultColumns, returnSeen, nil
+}
+
+func validateUnionKinds(kinds []ast.UnionKind) error {
+	if len(kinds) <= 1 {
+		return nil
+	}
+	first := kinds[0]
+	for _, kind := range kinds[1:] {
+		if kind != first {
+			return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "InvalidClauseComposition", Statement: 1}
+		}
+	}
+	return nil
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func hasWriteClause(part ast.QueryPart) bool {

@@ -5546,9 +5546,10 @@ func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any, 
 	}
 
 	deleteVertex := func(vertex *graph.Vertex) error {
-		if vertex == nil || !detach {
+		if vertex == nil {
 			return nil
 		}
+		// Deleting a path should remove entities reachable by that path.
 		if err := deleteVertexWithEdges(ctx, tx, vertex.Tenant, vertex.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 			return err
 		}

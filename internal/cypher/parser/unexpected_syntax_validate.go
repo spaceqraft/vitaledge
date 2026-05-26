@@ -265,6 +265,10 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 						}
 					}
+				case ast.ClauseKindDelete:
+					if err := validateDeleteClauseExpressions(clause.Raw, bound, seg); err != nil {
+						return err
+					}
 				case ast.ClauseKindUnwind:
 					recordUnwindBinding(clause.Raw, bound)
 				case ast.ClauseKindInQueryCall:
@@ -312,6 +316,111 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 	}
 
 	return nil
+}
+
+func validateDeleteClauseExpressions(raw string, bound map[string]patternVarRole, seg statementSegment) error {
+	targets, ok := extractDeleteTargetExpressions(raw)
+	if !ok || len(targets) == 0 {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidDelete", Statement: seg.index}
+	}
+
+	for _, target := range targets {
+		expr := strings.TrimSpace(target)
+		if expr == "" {
+			continue
+		}
+		if hasInvalidDeleteTargetSyntax(expr) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidDelete", Statement: seg.index}
+		}
+		if hasUndefinedWhereIdentifier(expr, bound) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+		}
+		if isDefinitelyInvalidDeleteExpression(expr, bound) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+		}
+	}
+	return nil
+}
+
+func extractDeleteTargetExpressions(raw string) ([]string, bool) {
+	text := strings.TrimSpace(raw)
+	upper := strings.ToUpper(text)
+	switch {
+	case strings.HasPrefix(upper, "DETACH DELETE"):
+		text = strings.TrimSpace(text[len("DETACH DELETE"):])
+	case strings.HasPrefix(upper, "DETACHDELETE"):
+		text = strings.TrimSpace(text[len("DETACHDELETE"):])
+	case strings.HasPrefix(upper, "DELETE"):
+		text = strings.TrimSpace(text[len("DELETE"):])
+	default:
+		return nil, false
+	}
+	if text == "" {
+		return nil, false
+	}
+	return splitTopLevelComma(text), true
+}
+
+func hasInvalidDeleteTargetSyntax(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return false
+	}
+	_, next, ok := readIdentifier(expr, 0)
+	if !ok {
+		return false
+	}
+	next = skipSpaces(expr, next)
+	if next >= len(expr) || expr[next] != ':' {
+		return false
+	}
+	for {
+		next = skipSpaces(expr, next+1)
+		_, identEnd, identOK := readIdentifier(expr, next)
+		if !identOK {
+			return false
+		}
+		next = skipSpaces(expr, identEnd)
+		if next >= len(expr) {
+			return true
+		}
+		if expr[next] != ':' {
+			return false
+		}
+	}
+}
+
+func isDefinitelyInvalidDeleteExpression(expr string, bound map[string]patternVarRole) bool {
+	trimmed := strings.TrimSpace(expr)
+	if trimmed == "" || strings.EqualFold(trimmed, "null") {
+		return false
+	}
+	if _, ok := simpleIdentifierExpression(trimmed); ok {
+		return false
+	}
+
+	refs := extractIdentifierPropertyReferences(stripExistsSubqueryBodies(trimmed))
+	for _, ref := range refs {
+		root := ref
+		if idx := strings.Index(root, "."); idx >= 0 {
+			root = root[:idx]
+		}
+		root = strings.TrimSpace(root)
+		if root == "" || isCypherLiteralKeyword(root) {
+			continue
+		}
+		if _, ok := expressionOperatorKeywords[strings.ToLower(root)]; ok {
+			continue
+		}
+		if _, ok := supportedExpressionFunctions[strings.ToLower(root)]; ok {
+			continue
+		}
+		if _, exists := bound[root]; exists {
+			return false
+		}
+	}
+
+	return len(refs) == 0
 }
 
 func validateProjectionClauseNames(items []ast.ProjectionItem, includeAll bool, bound map[string]patternVarRole, seg statementSegment) error {

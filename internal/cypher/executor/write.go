@@ -5921,6 +5921,12 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if raw == "" {
 		return nil, graph.NewError(graph.ErrKindSemantic, "empty expression", nil)
 	}
+	if strings.EqualFold(raw, "true") {
+		return true, nil
+	}
+	if strings.EqualFold(raw, "false") {
+		return false, nil
+	}
 	if strings.EqualFold(raw, "null") {
 		return nil, nil
 	}
@@ -6016,6 +6022,24 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return nil, err
 		}
 		return evalInExpression(lhs, rhs)
+	}
+	if left, right, ok := splitTopLevelKeyword(raw, "STARTS WITH"); ok {
+		return evalStringPredicateExpression(left, right, "STARTS WITH", row, params)
+	}
+	if left, right, ok := splitTopLevelCompactKeyword(raw, "STARTSWITH"); ok {
+		return evalStringPredicateExpression(left, right, "STARTS WITH", row, params)
+	}
+	if left, right, ok := splitTopLevelKeyword(raw, "ENDS WITH"); ok {
+		return evalStringPredicateExpression(left, right, "ENDS WITH", row, params)
+	}
+	if left, right, ok := splitTopLevelCompactKeyword(raw, "ENDSWITH"); ok {
+		return evalStringPredicateExpression(left, right, "ENDS WITH", row, params)
+	}
+	if left, right, ok := splitTopLevelKeyword(raw, "CONTAINS"); ok {
+		return evalStringPredicateExpression(left, right, "CONTAINS", row, params)
+	}
+	if left, right, ok := splitTopLevelCompactKeyword(raw, "CONTAINS"); ok {
+		return evalStringPredicateExpression(left, right, "CONTAINS", row, params)
 	}
 	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
 		return evalExpressionWithScope(raw[1:len(raw)-1], row, params)
@@ -6294,6 +6318,97 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return nil, graph.NewError(graph.ErrKindSemantic, "reverse() requires a list or string", nil)
 	}
+	if arg, ok := parseFunctionCall(raw, "split"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "split() expects exactly two arguments", nil)
+		}
+		input, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		delim, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if input == nil || delim == nil {
+			return nil, nil
+		}
+		inputStr, ok := input.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		delimStr, ok := delim.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		split := strings.Split(inputStr, delimStr)
+		out := make([]any, 0, len(split))
+		for _, s := range split {
+			out = append(out, s)
+		}
+		return out, nil
+	}
+	if arg, ok := parseFunctionCall(raw, "substring"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 2 && len(parts) != 3 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "substring() expects two or three arguments", nil)
+		}
+		input, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		startVal, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if input == nil || startVal == nil {
+			return nil, nil
+		}
+		inputStr, ok := input.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		start, err := toInt(startVal)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+		}
+		runes := []rune(inputStr)
+		if start < 0 {
+			start = len(runes) + start
+		}
+		if start < 0 {
+			start = 0
+		}
+		if start > len(runes) {
+			return "", nil
+		}
+		end := len(runes)
+		if len(parts) == 3 {
+			lengthVal, err := evalExpressionWithScope(parts[2], row, params)
+			if err != nil {
+				return nil, err
+			}
+			if lengthVal == nil {
+				return nil, nil
+			}
+			length, err := toInt(lengthVal)
+			if err != nil {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+			}
+			if length <= 0 {
+				return "", nil
+			}
+			end = start + length
+			if end > len(runes) {
+				end = len(runes)
+			}
+		}
+		if start > end {
+			return "", nil
+		}
+		return string(runes[start:end]), nil
+	}
 	if arg, ok := parseFunctionCall(raw, "keys"); ok {
 		return evalKeysFunction(arg, row, params)
 	}
@@ -6359,6 +6474,31 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		if err != nil {
 			return nil, err
 		}
+		if startExpr, endExpr, ok := splitTopLevelSliceBounds(indexExpr); ok {
+			start, hasStart, startIsNull, err := evalSliceBound(startExpr, row, params)
+			if err != nil {
+				return nil, err
+			}
+			end, hasEnd, endIsNull, err := evalSliceBound(endExpr, row, params)
+			if err != nil {
+				return nil, err
+			}
+			if startIsNull || endIsNull {
+				return nil, nil
+			}
+			switch typed := base.(type) {
+			case nil:
+				return nil, nil
+			case []any:
+				return applySliceAny(typed, start, end, hasStart, hasEnd), nil
+			case []string:
+				return applySliceStringList(typed, start, end, hasStart, hasEnd), nil
+			case string:
+				return applySliceString(typed, start, end, hasStart, hasEnd), nil
+			default:
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+			}
+		}
 		indexValue, err := evalExpressionWithScope(indexExpr, row, params)
 		if err != nil {
 			indexValue, err = evalWriteValue(indexExpr, params, row)
@@ -6410,7 +6550,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		return value, nil
 	}
 	parts := strings.Split(raw, ".")
-	if len(parts) == 2 {
+	if len(parts) >= 2 {
 		base, ok := row[parts[0]]
 		if !ok {
 			if value, ok := params[parts[0]]; ok {
@@ -6421,43 +6561,53 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 				return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("unknown identifier %q", parts[0]), nil)
 			}
 		}
-		if base == nil {
-			return nil, nil
-		}
-		field := parts[1]
-		switch typed := base.(type) {
-		case *graph.Vertex:
-			return evalVertexField(typed, field)
-		case *graph.Edge:
-			return evalEdgeField(typed, field)
-		case deletedVertexBinding:
-			return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
-		case deletedEdgeBinding:
-			return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
-		case map[string]any:
-			if value, ok := evalTemporalAccessor(typed, field); ok {
-				return value, nil
-			}
-			if value, ok := typed[field]; ok {
-				return value, nil
-			}
-			return nil, nil
-		case string:
-			if mapped, ok := parseStoredMapString(typed); ok {
-				if value, ok := evalTemporalAccessor(mapped, field); ok {
-					return value, nil
-				}
-				if value, ok := mapped[field]; ok {
-					return value, nil
-				}
+		for i := 1; i < len(parts); i++ {
+			if base == nil {
 				return nil, nil
 			}
-			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("field access not supported on %T", base), nil)
-		default:
-			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("field access not supported on %T", base), nil)
+			next, err := evalFieldAccessValue(base, parts[i])
+			if err != nil {
+				return nil, err
+			}
+			base = next
 		}
+		return base, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+}
+
+func evalFieldAccessValue(base any, field string) (any, error) {
+	switch typed := base.(type) {
+	case *graph.Vertex:
+		return evalVertexField(typed, field)
+	case *graph.Edge:
+		return evalEdgeField(typed, field)
+	case deletedVertexBinding:
+		return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
+	case deletedEdgeBinding:
+		return nil, graph.NewError(graph.ErrKindNotFound, "DeletedEntityAccess", nil)
+	case map[string]any:
+		if value, ok := evalTemporalAccessor(typed, field); ok {
+			return value, nil
+		}
+		if value, ok := typed[field]; ok {
+			return value, nil
+		}
+		return nil, nil
+	case string:
+		if mapped, ok := parseStoredMapString(typed); ok {
+			if value, ok := evalTemporalAccessor(mapped, field); ok {
+				return value, nil
+			}
+			if value, ok := mapped[field]; ok {
+				return value, nil
+			}
+			return nil, nil
+		}
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	default:
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
 }
 
 func resolveBareIdentifier(raw string, row Row, params Params) (any, bool) {
@@ -6484,46 +6634,126 @@ func evalCaseExpression(raw string, row Row, params Params) (any, bool, error) {
 		return nil, false, nil
 	}
 	body := strings.TrimSpace(raw[len("CASE") : len(raw)-len("END")])
-	if body == "" || !strings.HasPrefix(strings.ToUpper(body), "WHEN") {
+	if body == "" {
 		return nil, false, nil
 	}
-	body = strings.TrimSpace(body[len("WHEN"):])
-	thenIdx := findTopLevelKeywordIndex(body, "THEN")
-	if thenIdx < 0 {
-		return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is missing THEN", nil)
+	comparisonExpr := ""
+	remaining := body
+	if !strings.HasPrefix(strings.ToUpper(remaining), "WHEN") {
+		whenIdx := findTopLevelKeywordIndex(remaining, "WHEN")
+		if whenIdx <= 0 {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is missing WHEN", nil)
+		}
+		comparisonExpr = strings.TrimSpace(remaining[:whenIdx])
+		remaining = strings.TrimSpace(remaining[whenIdx:])
 	}
-	conditionExpr := strings.TrimSpace(body[:thenIdx])
-	if conditionExpr == "" {
-		return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is missing a WHEN condition", nil)
+
+	testValue := any(nil)
+	if comparisonExpr != "" {
+		value, err := evalExpressionWithScope(comparisonExpr, row, params)
+		if err != nil {
+			return nil, true, err
+		}
+		testValue = value
 	}
-	remaining := strings.TrimSpace(body[thenIdx+len("THEN"):])
-	if remaining == "" {
-		return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is missing a THEN result", nil)
+
+	for {
+		if !strings.HasPrefix(strings.ToUpper(remaining), "WHEN") {
+			break
+		}
+		remaining = strings.TrimSpace(remaining[len("WHEN"):])
+		thenIdx := findTopLevelKeywordIndex(remaining, "THEN")
+		if thenIdx < 0 {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is missing THEN", nil)
+		}
+		whenExpr := strings.TrimSpace(remaining[:thenIdx])
+		afterThen := strings.TrimSpace(remaining[thenIdx+len("THEN"):])
+		if whenExpr == "" || afterThen == "" {
+			return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE expression is malformed", nil)
+		}
+
+		nextWhenIdx := findTopLevelKeywordIndex(afterThen, "WHEN")
+		elseIdx := findTopLevelKeywordIndex(afterThen, "ELSE")
+		resultExpr := afterThen
+		remaining = ""
+		if nextWhenIdx >= 0 && (elseIdx < 0 || nextWhenIdx < elseIdx) {
+			resultExpr = strings.TrimSpace(afterThen[:nextWhenIdx])
+			remaining = strings.TrimSpace(afterThen[nextWhenIdx:])
+		} else if elseIdx >= 0 {
+			resultExpr = strings.TrimSpace(afterThen[:elseIdx])
+			remaining = strings.TrimSpace(afterThen[elseIdx:])
+		}
+
+		matched := false
+		if comparisonExpr == "" {
+			conditionValue, err := evalExpressionWithScope(whenExpr, row, params)
+			if err != nil {
+				return nil, true, err
+			}
+			condition, ok := conditionValue.(bool)
+			if !ok {
+				return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE condition must evaluate to a boolean", nil)
+			}
+			matched = condition
+		} else {
+			whenValue, err := evalExpressionWithScope(whenExpr, row, params)
+			if err != nil {
+				return nil, true, err
+			}
+			matched = simpleCaseValuesMatch(testValue, whenValue)
+		}
+
+		if matched {
+			value, err := evalExpressionWithScope(resultExpr, row, params)
+			return value, true, err
+		}
 	}
-	elseIdx := findTopLevelKeywordIndex(remaining, "ELSE")
-	whenExpr := remaining
-	elseExpr := ""
-	if elseIdx >= 0 {
-		whenExpr = strings.TrimSpace(remaining[:elseIdx])
-		elseExpr = strings.TrimSpace(remaining[elseIdx+len("ELSE"):])
-	}
-	conditionValue, err := evalExpressionWithScope(conditionExpr, row, params)
-	if err != nil {
-		return nil, true, err
-	}
-	condition, ok := conditionValue.(bool)
-	if !ok {
-		return nil, true, graph.NewError(graph.ErrKindSemantic, "CASE condition must evaluate to a boolean", nil)
-	}
-	if condition {
-		value, err := evalExpressionWithScope(whenExpr, row, params)
+
+	if strings.HasPrefix(strings.ToUpper(remaining), "ELSE") {
+		elseExpr := strings.TrimSpace(remaining[len("ELSE"):])
+		if elseExpr == "" {
+			return nil, true, nil
+		}
+		value, err := evalExpressionWithScope(elseExpr, row, params)
 		return value, true, err
 	}
-	if elseExpr == "" {
-		return nil, true, nil
+	return nil, true, nil
+}
+
+func simpleCaseValuesMatch(lhs, rhs any) bool {
+	if lhs == nil || rhs == nil {
+		return false
 	}
-	value, err := evalExpressionWithScope(elseExpr, row, params)
-	return value, true, err
+	if ls, ok := lhs.(string); ok {
+		rs, ok := rhs.(string)
+		return ok && ls == rs
+	}
+	if _, ok := rhs.(string); ok {
+		return false
+	}
+	if lb, ok := lhs.(bool); ok {
+		rb, ok := rhs.(bool)
+		return ok && lb == rb
+	}
+	if _, ok := rhs.(bool); ok {
+		return false
+	}
+	if isStrictNumericType(lhs) && isStrictNumericType(rhs) {
+		lf, _ := numericValue(lhs)
+		rf, _ := numericValue(rhs)
+		return lf == rf
+	}
+	equal, isNull := cypherNullableEqual(lhs, rhs)
+	return equal && !isNull
+}
+
+func isStrictNumericType(v any) bool {
+	switch v.(type) {
+	case int, int64, float32, float64, json.Number:
+		return true
+	default:
+		return false
+	}
 }
 
 func splitTopLevelNullPredicate(raw string) (string, bool, bool) {
@@ -6589,6 +6819,14 @@ func splitTopLevelInExpression(raw string) (string, string, bool) {
 		if raw[i:i+2] != "IN" {
 			continue
 		}
+		if i >= len("CONTA") && i+2 < len(raw) {
+			if strings.EqualFold(raw[i-len("CONTA"):i], "CONTA") {
+				next := raw[i+2]
+				if next == 's' || next == 'S' {
+					continue
+				}
+			}
+		}
 		left := strings.TrimSpace(raw[:i])
 		right := strings.TrimSpace(raw[i+2:])
 		if left == "" || right == "" {
@@ -6601,12 +6839,238 @@ func splitTopLevelInExpression(raw string) (string, string, bool) {
 			return left, right, true
 		}
 		if !strings.ContainsAny(raw, " \t\n\r") {
-			if (len(left) == 1 && len(right) == 1) || strings.HasPrefix(left, "$") || strings.HasPrefix(right, "$") || strings.HasPrefix(left, "[") || strings.HasPrefix(right, "[") || strings.HasPrefix(left, "'") || strings.HasPrefix(left, `"`) || strings.HasPrefix(right, "(") {
+			if (len(left) == 1 && len(right) == 1) || strings.HasPrefix(left, "$") || strings.HasPrefix(right, "$") || strings.HasPrefix(left, "[") || strings.HasPrefix(right, "[") || strings.HasPrefix(left, "'") || strings.HasPrefix(left, `"`) || strings.HasPrefix(right, "(") || isSimpleNumericToken(left) || isIdentifierLike(right) {
 				return left, right, true
 			}
 		}
 	}
 	return "", "", false
+}
+
+func splitTopLevelCompactKeyword(raw, keyword string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	upper := strings.ToUpper(raw)
+	keyword = strings.ToUpper(strings.TrimSpace(keyword))
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i <= len(upper)-len(keyword); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch upper[i] {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 || !strings.HasPrefix(upper[i:], keyword) {
+			continue
+		}
+		left := strings.TrimSpace(raw[:i])
+		right := strings.TrimSpace(raw[i+len(keyword):])
+		if left != "" && right != "" {
+			return left, right, true
+		}
+	}
+	return "", "", false
+}
+
+func evalStringPredicateExpression(leftExpr, rightExpr, op string, row Row, params Params) (any, error) {
+	left, err := evalExpressionWithScope(leftExpr, row, params)
+	if err != nil {
+		return nil, err
+	}
+	right, err := evalExpressionWithScope(rightExpr, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if left == nil || right == nil {
+		return nil, nil
+	}
+	ls, ok := left.(string)
+	if !ok {
+		return nil, nil
+	}
+	rs, ok := right.(string)
+	if !ok {
+		return nil, nil
+	}
+	switch op {
+	case "STARTS WITH":
+		return strings.HasPrefix(ls, rs), nil
+	case "ENDS WITH":
+		return strings.HasSuffix(ls, rs), nil
+	default:
+		return strings.Contains(ls, rs), nil
+	}
+}
+
+func splitTopLevelSliceBounds(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw)-1; i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth == 0 && raw[i] == '.' && raw[i+1] == '.' {
+			left := strings.TrimSpace(raw[:i])
+			right := strings.TrimSpace(raw[i+2:])
+			return left, right, true
+		}
+	}
+	return "", "", false
+}
+
+func evalSliceBound(expr string, row Row, params Params) (int, bool, bool, error) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return 0, false, false, nil
+	}
+	value, err := evalExpressionWithScope(expr, row, params)
+	if err != nil {
+		value, err = evalWriteValue(expr, params, row)
+	}
+	if err != nil {
+		return 0, false, false, err
+	}
+	if value == nil {
+		return 0, false, true, nil
+	}
+	bound, err := toInt(value)
+	if err != nil {
+		return 0, false, false, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+	}
+	return bound, true, false, nil
+}
+
+func applySliceAny(values []any, start, end int, hasStart, hasEnd bool) []any {
+	length := len(values)
+	startIdx := 0
+	endIdx := length
+	if hasStart {
+		startIdx = start
+		if startIdx < 0 {
+			startIdx = length + startIdx
+		}
+	}
+	if hasEnd {
+		endIdx = end
+		if endIdx < 0 {
+			endIdx = length + endIdx
+		}
+	}
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if endIdx < 0 {
+		endIdx = 0
+	}
+	if startIdx > length {
+		startIdx = length
+	}
+	if endIdx > length {
+		endIdx = length
+	}
+	if endIdx < startIdx {
+		return []any{}
+	}
+	return append([]any(nil), values[startIdx:endIdx]...)
+}
+
+func applySliceStringList(values []string, start, end int, hasStart, hasEnd bool) []any {
+	anyValues := make([]any, 0, len(values))
+	for _, value := range values {
+		anyValues = append(anyValues, value)
+	}
+	return applySliceAny(anyValues, start, end, hasStart, hasEnd)
+}
+
+func applySliceString(value string, start, end int, hasStart, hasEnd bool) string {
+	runes := []rune(value)
+	length := len(runes)
+	startIdx := 0
+	endIdx := length
+	if hasStart {
+		startIdx = start
+		if startIdx < 0 {
+			startIdx = length + startIdx
+		}
+	}
+	if hasEnd {
+		endIdx = end
+		if endIdx < 0 {
+			endIdx = length + endIdx
+		}
+	}
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if endIdx < 0 {
+		endIdx = 0
+	}
+	if startIdx > length {
+		startIdx = length
+	}
+	if endIdx > length {
+		endIdx = length
+	}
+	if endIdx < startIdx {
+		return ""
+	}
+	return string(runes[startIdx:endIdx])
+}
+
+func isSimpleNumericToken(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if _, err := strconv.Atoi(raw); err == nil {
+		return true
+	}
+	if _, err := strconv.ParseFloat(raw, 64); err == nil {
+		return true
+	}
+	return false
 }
 
 func evalListPredicateFunction(raw string, row Row, params Params) (any, bool, error) {
@@ -8929,6 +9393,12 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 	raw = strings.TrimSpace(raw)
 	if strings.EqualFold(raw, "null") {
 		return nil, nil
+	}
+	if strings.EqualFold(raw, "true") {
+		return true, nil
+	}
+	if strings.EqualFold(raw, "false") {
+		return false, nil
 	}
 	if arg, ok := parseFunctionCall(raw, "date"); ok {
 		return evalTemporalConstructor("date", arg, params, row)

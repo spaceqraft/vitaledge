@@ -17,6 +17,7 @@ var directedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0
 var reverseDirectedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var undirectedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var directedVariableLengthRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var directedVariableLengthThenDirectedVariableLengthPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var undirectedVariableLengthRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var directedRelationshipThenAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var directedThenUndirectedRelationshipChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
@@ -96,6 +97,24 @@ type directedVariableLengthRelationshipPattern struct {
 	EdgeProps string
 	MinHops   int
 	MaxHops   int
+}
+
+type directedVariableLengthThenDirectedVariableLengthPattern struct {
+	Left            nodePattern
+	Mid             nodePattern
+	Right           nodePattern
+	FirstEdgeVar    string
+	FirstEdgeType   string
+	FirstEdgeAnyOf  []string
+	FirstEdgeProps  string
+	FirstMinHops    int
+	FirstMaxHops    int
+	SecondEdgeVar   string
+	SecondEdgeType  string
+	SecondEdgeAnyOf []string
+	SecondEdgeProps string
+	SecondMinHops   int
+	SecondMaxHops   int
 }
 
 type undirectedVariableLengthRelationshipPattern struct {
@@ -183,6 +202,22 @@ type reverseRelationshipThenUndirectedVariableLengthPattern struct {
 	SecondEdgeProps string
 	MinHops         int
 	MaxHops         int
+}
+
+type mixedRelationshipChainSegment struct {
+	Direction        string
+	IsVariableLength bool
+	EdgeVar          string
+	EdgeType         string
+	EdgeAnyOf        []string
+	EdgeProps        string
+	MinHops          int
+	MaxHops          int
+}
+
+type mixedRelationshipChainPattern struct {
+	Nodes    []nodePattern
+	Segments []mixedRelationshipChainSegment
 }
 
 func parseAnchoredOutPattern(raw string) (anchoredOutPattern, error) {
@@ -494,6 +529,67 @@ func parseDirectedVariableLengthRelationshipPattern(raw string) (directedVariabl
 		EdgeProps: edgeProps,
 		MinHops:   minHops,
 		MaxHops:   maxHops,
+	}, nil
+}
+
+func parseDirectedVariableLengthThenDirectedVariableLengthPattern(raw string) (directedVariableLengthThenDirectedVariableLengthPattern, error) {
+	normalized := normalizeClauseBody(raw)
+	m := directedVariableLengthThenDirectedVariableLengthPatternRE.FindStringSubmatch(normalized)
+	if len(m) != 12 {
+		return directedVariableLengthThenDirectedVariableLengthPattern{}, graph.NewError(
+			graph.ErrKindUnsupported,
+			fmt.Sprintf("pattern %q is not yet supported", raw),
+			nil,
+		)
+	}
+
+	leftAll, leftAny, leftExcluded := parseLabelFilters(m[2])
+	midAll, midAny, midExcluded := parseLabelFilters(m[6])
+	rightAll, rightAny, rightExcluded := parseLabelFilters(m[10])
+
+	firstVar, firstType, firstAnyOf, firstProps, firstMinHops, firstMaxHops, err := parseDetailedVariableLengthEdgePatternInner(m[4])
+	if err != nil {
+		return directedVariableLengthThenDirectedVariableLengthPattern{}, err
+	}
+	secondVar, secondType, secondAnyOf, secondProps, secondMinHops, secondMaxHops, err := parseDetailedVariableLengthEdgePatternInner(m[8])
+	if err != nil {
+		return directedVariableLengthThenDirectedVariableLengthPattern{}, err
+	}
+
+	return directedVariableLengthThenDirectedVariableLengthPattern{
+		Left: nodePattern{
+			Var:            m[1],
+			AllOfLabels:    leftAll,
+			AnyOfLabels:    leftAny,
+			ExcludedLabels: leftExcluded,
+			PropertiesRaw:  m[3],
+		},
+		Mid: nodePattern{
+			Var:            m[5],
+			AllOfLabels:    midAll,
+			AnyOfLabels:    midAny,
+			ExcludedLabels: midExcluded,
+			PropertiesRaw:  m[7],
+		},
+		Right: nodePattern{
+			Var:            m[9],
+			AllOfLabels:    rightAll,
+			AnyOfLabels:    rightAny,
+			ExcludedLabels: rightExcluded,
+			PropertiesRaw:  m[11],
+		},
+		FirstEdgeVar:    firstVar,
+		FirstEdgeType:   firstType,
+		FirstEdgeAnyOf:  firstAnyOf,
+		FirstEdgeProps:  firstProps,
+		FirstMinHops:    firstMinHops,
+		FirstMaxHops:    firstMaxHops,
+		SecondEdgeVar:   secondVar,
+		SecondEdgeType:  secondType,
+		SecondEdgeAnyOf: secondAnyOf,
+		SecondEdgeProps: secondProps,
+		SecondMinHops:   secondMinHops,
+		SecondMaxHops:   secondMaxHops,
 	}, nil
 }
 
@@ -1321,4 +1417,176 @@ func parseMultiHopAdjacentChainPattern(raw string) (multiHopAdjacentChainPattern
 		return multiHopAdjacentChainPattern{}, fmt.Errorf("not a multi-hop adjacent chain: %q (hops=%d, trailing=%q)", raw, len(hops), s)
 	}
 	return multiHopAdjacentChainPattern{Start: startNode, Hops: hops}, nil
+}
+
+func parseMixedRelationshipChainPattern(raw string) (mixedRelationshipChainPattern, error) {
+	normalized := normalizeClauseBody(raw)
+	firstNode, next, ok := consumeNodeSegment(normalized)
+	if !ok {
+		return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
+	}
+	startNode, err := parseChainNodeSegment(firstNode)
+	if err != nil {
+		return mixedRelationshipChainPattern{}, err
+	}
+
+	nodes := []nodePattern{startNode}
+	segments := make([]mixedRelationshipChainSegment, 0)
+	s := next
+	var sawVariableLength bool
+	var sawStandard bool
+	for len(s) > 0 {
+		segmentRaw, afterSegment, segmentOK := consumeRelationshipSegment(s)
+		if !segmentOK {
+			return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
+		}
+		nextNodeRaw, afterNode, nodeOK := consumeNodeSegment(afterSegment)
+		if !nodeOK {
+			return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
+		}
+		nextNode, err := parseChainNodeSegment(nextNodeRaw)
+		if err != nil {
+			return mixedRelationshipChainPattern{}, err
+		}
+		segment, err := parseMixedRelationshipSegment(segmentRaw)
+		if err != nil {
+			return mixedRelationshipChainPattern{}, err
+		}
+		if segment.IsVariableLength {
+			sawVariableLength = true
+		} else {
+			sawStandard = true
+		}
+		segments = append(segments, segment)
+		nodes = append(nodes, nextNode)
+		s = afterNode
+	}
+
+	if len(segments) < 2 || !sawVariableLength || !sawStandard {
+		return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
+	}
+
+	return mixedRelationshipChainPattern{Nodes: nodes, Segments: segments}, nil
+}
+
+func consumeRelationshipSegment(s string) (string, string, bool) {
+	if strings.HasPrefix(s, "<-[") {
+		return consumeBracketedRelationshipSegment(s, false)
+	}
+	if strings.HasPrefix(s, "-[") {
+		return consumeBracketedRelationshipSegment(s, true)
+	}
+	return "", "", false
+}
+
+func consumeBracketedRelationshipSegment(s string, forward bool) (string, string, bool) {
+	open := strings.IndexByte(s, '[')
+	if open < 0 {
+		return "", "", false
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := open; i < len(s); i++ {
+		ch := s[i]
+		if inSingle {
+			if ch == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '\\' {
+				i++
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				if forward {
+					if i+2 < len(s) && s[i+1] == '-' && s[i+2] == '>' {
+						return s[:i+3], s[i+3:], true
+					}
+					if i+1 < len(s) && s[i+1] == '-' {
+						return s[:i+2], s[i+2:], true
+					}
+					return "", "", false
+				}
+				if i+2 < len(s) && s[i+1] == '-' && s[i+2] == '>' {
+					return s[:i+3], s[i+3:], true
+				}
+				if i+1 < len(s) && s[i+1] == '-' {
+					return s[:i+2], s[i+2:], true
+				}
+				return "", "", false
+			}
+		}
+	}
+	return "", "", false
+}
+
+func parseMixedRelationshipSegment(raw string) (mixedRelationshipChainSegment, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return mixedRelationshipChainSegment{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("edge pattern [%s] is not yet supported", raw), nil)
+	}
+	forward := strings.HasPrefix(raw, "-[")
+	reverse := strings.HasPrefix(raw, "<-[")
+	if !forward && !reverse {
+		return mixedRelationshipChainSegment{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("edge pattern [%s] is not yet supported", raw), nil)
+	}
+	open := strings.IndexByte(raw, '[')
+	close := strings.LastIndexByte(raw, ']')
+	if open < 0 || close <= open {
+		return mixedRelationshipChainSegment{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("edge pattern [%s] is not yet supported", raw), nil)
+	}
+	inner := strings.TrimSpace(raw[open+1 : close])
+	segment := mixedRelationshipChainSegment{Direction: "forward"}
+	if reverse {
+		segment.Direction = "reverse"
+		if strings.HasSuffix(raw, "->") {
+			segment.Direction = "undirected"
+		}
+	} else if strings.HasSuffix(raw, "-") {
+		segment.Direction = "undirected"
+	}
+	if strings.Contains(inner, "*") {
+		edgeVar, edgeType, edgeAnyOf, edgeProps, minHops, maxHops, err := parseDetailedVariableLengthEdgePatternInner(inner)
+		if err != nil {
+			return mixedRelationshipChainSegment{}, err
+		}
+		segment.IsVariableLength = true
+		segment.EdgeVar = edgeVar
+		segment.EdgeType = edgeType
+		segment.EdgeAnyOf = edgeAnyOf
+		segment.EdgeProps = edgeProps
+		segment.MinHops = minHops
+		segment.MaxHops = maxHops
+		return segment, nil
+	}
+	edgeVar, edgeType, edgeAnyOf, edgeProps, err := parseEdgePatternInner(inner)
+	if err != nil {
+		return mixedRelationshipChainSegment{}, err
+	}
+	segment.EdgeVar = edgeVar
+	segment.EdgeType = edgeType
+	segment.EdgeAnyOf = edgeAnyOf
+	segment.EdgeProps = edgeProps
+	return segment, nil
 }

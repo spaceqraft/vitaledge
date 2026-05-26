@@ -2283,6 +2283,151 @@ func TestExecuteCountTwoHopUndirectedRelationshipChain(t *testing.T) {
 	}
 }
 
+func TestParseMixedRelationshipChainPatternBounds(t *testing.T) {
+	pattern, err := parseMixedRelationshipChainPattern("(a)-[:LIKES*2]->()-[:LIKES]->(c)")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if len(pattern.Segments) != 2 {
+		t.Fatalf("expected 2 segments, got %d", len(pattern.Segments))
+	}
+	if !pattern.Segments[0].IsVariableLength {
+		t.Fatalf("expected first segment to be variable length")
+	}
+	if pattern.Segments[0].Direction != "forward" {
+		t.Fatalf("expected first segment direction forward, got %q", pattern.Segments[0].Direction)
+	}
+	if pattern.Segments[0].MinHops != 2 || pattern.Segments[0].MaxHops != 2 {
+		t.Fatalf("expected first segment bounds 2..2, got %d..%d", pattern.Segments[0].MinHops, pattern.Segments[0].MaxHops)
+	}
+	if pattern.Segments[1].IsVariableLength {
+		t.Fatalf("expected second segment to be a standard relationship")
+	}
+	if pattern.Segments[1].Direction != "forward" {
+		t.Fatalf("expected second segment direction forward, got %q", pattern.Segments[1].Direction)
+	}
+
+	pattern2, err := parseMixedRelationshipChainPattern("(a)-[:LIKES]->()-[:LIKES*2]->(c)")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if len(pattern2.Segments) != 2 {
+		t.Fatalf("expected 2 segments, got %d", len(pattern2.Segments))
+	}
+	if !pattern2.Segments[1].IsVariableLength {
+		t.Fatalf("expected second segment to be variable length")
+	}
+	if pattern2.Segments[1].MinHops != 2 || pattern2.Segments[1].MaxHops != 2 {
+		t.Fatalf("expected second segment bounds 2..2, got %d..%d", pattern2.Segments[1].MinHops, pattern2.Segments[1].MaxHops)
+	}
+}
+
+func TestExecuteMixedChainVariableThenStandardHonorsExactBounds(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}, Properties: graph.PropertyMap{"name": []byte("n0")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Properties: graph.PropertyMap{"name": []byte("n00")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c", Properties: graph.PropertyMap{"name": []byte("n000")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "d", Properties: graph.PropertyMap{"name": []byte("n0000")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "LIKES", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "LIKES", SrcID: "b", DstID: "c"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "LIKES", SrcID: "c", DstID: "d"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:A)\nMATCH (a)-[:LIKES*2]->()-[:LIKES]->(c)\nRETURN c.name AS name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	_, mixedErr := parseMixedRelationshipChainPattern("(a)-[:LIKES*2]->()-[:LIKES]->(c)")
+	if mixedErr != nil {
+		t.Fatalf("mixed parse failed: %v", mixedErr)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := fmt.Sprint(res.Rows[0]["name"]); got != "n0000" {
+		t.Fatalf("expected n0000, got %q", got)
+	}
+}
+
+func TestApplyMatchClauseMixedChainVariableThenStandard(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "d"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "LIKES", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "LIKES", SrcID: "b", DstID: "c"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "LIKES", SrcID: "c", DstID: "d"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	err = store.View(ctx, func(tx graph.Tx) error {
+		a, err := tx.GetVertex(ctx, "acme", "a")
+		if err != nil {
+			return err
+		}
+		rows, err := exec.applyMatchClause(ctx, tx, []Row{{"a": a}}, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH (a)-[:LIKES*2]->()-[:LIKES]->(c)"}, Params{"tenant": "acme"})
+		if err != nil {
+			return err
+		}
+		if len(rows) != 1 {
+			return fmt.Errorf("expected 1 row, got %d: %#v", len(rows), rows)
+		}
+		v, ok := rows[0]["c"].(*graph.Vertex)
+		if !ok || v == nil || v.ID != "d" {
+			return fmt.Errorf("expected c=d, got %#v", rows[0]["c"])
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("applyMatchClause failed: %v", err)
+	}
+}
+
 // ─── Multi-hop adjacent chain regressions ────────────────────────────────────
 
 // TestExecuteReturnNamedPathMixedDirection verifies MATCH p=(a)-->(b)<--(c) RETURN p.

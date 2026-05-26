@@ -9937,7 +9937,14 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 	}
 
 	if hasLogicalNotPrefix(raw) {
-		value, err := evalExpressionWithScope(strings.TrimSpace(raw[3:]), row, params)
+		operand := strings.TrimSpace(raw[3:])
+		if matched, handled, err := e.evalWhereRelationshipPatternPredicate(ctx, tx, operand, row, params); handled {
+			if err != nil {
+				return false, err
+			}
+			return !matched, nil
+		}
+		value, err := evalExpressionWithScope(operand, row, params)
 		if err != nil {
 			return false, err
 		}
@@ -10081,6 +10088,28 @@ func (e *Executor) evalExistsSubquery(ctx context.Context, tx graph.Tx, body str
 		return false, graph.NewError(graph.ErrKindUnsupported, "EXISTS subquery requires transactional context", nil)
 	}
 	body = strings.TrimSpace(body)
+	if result, ok, err := e.evalExistsQueryBody(ctx, tx, body, row, params); ok {
+		return result, err
+	}
+	if patternBody, whereBody, ok := splitExistsPatternBody(body); ok {
+		matches, err := e.applyMatchClause(ctx, tx, []Row{cloneRow(row)}, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + patternBody}, params)
+		if err != nil {
+			return false, err
+		}
+		if whereBody == "" {
+			return len(matches) > 0, nil
+		}
+		for _, matched := range matches {
+			ok, err := e.evalWhereExpression(ctx, tx, whereBody, matched, params)
+			if err != nil {
+				return false, err
+			}
+			if ok {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
 	if !strings.HasPrefix(strings.ToUpper(body), "MATCH") && !strings.HasPrefix(strings.ToUpper(body), "OPTIONALMATCH") {
 		return false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("EXISTS subquery %q is not yet supported", body), nil)
 	}
@@ -10090,6 +10119,151 @@ func (e *Executor) evalExistsSubquery(ctx context.Context, tx graph.Tx, body str
 		return false, err
 	}
 	return len(rows) > 0, nil
+}
+
+func (e *Executor) evalExistsQueryBody(ctx context.Context, tx graph.Tx, body string, row Row, params Params) (bool, bool, error) {
+	body = normalizeClauseBody(stripCypherLineComments(body))
+	upper := strings.ToUpper(body)
+	matchKeyword := ""
+	if strings.HasPrefix(upper, "OPTIONALMATCH") {
+		matchKeyword = "OPTIONALMATCH"
+	} else if strings.HasPrefix(upper, "MATCH") {
+		matchKeyword = "MATCH"
+	} else {
+		return false, false, nil
+	}
+	rest := strings.TrimSpace(body[len(matchKeyword):])
+	nextClauseIdx := minPositiveIndex(
+		findTopLevelKeywordIndex(rest, "WITH"),
+		findTopLevelKeywordIndex(rest, "RETURN"),
+	)
+	matchExpr := rest
+	remaining := ""
+	if nextClauseIdx >= 0 {
+		matchExpr = strings.TrimSpace(rest[:nextClauseIdx])
+		remaining = strings.TrimSpace(rest[nextClauseIdx:])
+	}
+	if matchExpr == "" {
+		return false, true, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("EXISTS subquery %q is not yet supported", body), nil)
+	}
+	matchRaw := "MATCH " + matchExpr
+	matchKind := ast.ClauseKindMatch
+	if matchKeyword == "OPTIONALMATCH" {
+		matchRaw = "OPTIONAL MATCH " + matchExpr
+		matchKind = ast.ClauseKindOptionalMatch
+	}
+	rows := []Row{cloneRow(row)}
+	resultColumns := []string{}
+	rows, err := e.applyMatchClause(ctx, tx, rows, ast.Clause{Kind: matchKind, Raw: matchRaw}, params)
+	if err != nil {
+		return false, true, err
+	}
+	if remaining == "" {
+		return len(rows) > 0, true, nil
+	}
+	upperRemaining := strings.ToUpper(remaining)
+	if strings.HasPrefix(upperRemaining, "WITH") {
+		returnIdx := findTopLevelKeywordIndex(remaining, "RETURN")
+		withRaw := remaining
+		next := ""
+		if returnIdx >= 0 {
+			withRaw = strings.TrimSpace(remaining[:returnIdx])
+			next = strings.TrimSpace(remaining[returnIdx:])
+		}
+		var stepErr error
+		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindWith, Raw: withRaw}, params, resultColumns, false)
+		if stepErr != nil {
+			return false, true, stepErr
+		}
+		remaining = next
+		upperRemaining = strings.ToUpper(remaining)
+	}
+	if strings.HasPrefix(upperRemaining, "RETURN") {
+		var stepErr error
+		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: remaining}, params, resultColumns, true)
+		if stepErr != nil {
+			return false, true, stepErr
+		}
+		return len(rows) > 0, true, nil
+	}
+	if remaining != "" {
+		return false, true, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("EXISTS subquery %q is not yet supported", body), nil)
+	}
+	return len(rows) > 0, true, nil
+}
+
+func splitExistsPatternBody(body string) (patternRaw string, whereRaw string, ok bool) {
+	body = strings.TrimSpace(body)
+	if body == "" || !strings.HasPrefix(body, "(") {
+		return "", "", false
+	}
+	if idx := findTopLevelExistsWhereIndex(body); idx >= 0 {
+		patternRaw = strings.TrimSpace(body[:idx])
+		whereRaw = strings.TrimSpace(body[idx+len("WHERE"):])
+	} else {
+		patternRaw = body
+		whereRaw = ""
+	}
+	if patternRaw == "" {
+		return "", "", false
+	}
+	return patternRaw, whereRaw, true
+}
+
+func findTopLevelExistsWhereIndex(raw string) int {
+	upper := strings.ToUpper(raw)
+	keyword := "WHERE"
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 0; i <= len(raw)-len(keyword); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || raw[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		if strings.HasPrefix(upper[i:], keyword) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (e *Executor) evalWhereRelationshipPatternPredicate(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (bool, bool, error) {
@@ -10139,6 +10313,15 @@ func isWhereRelationshipPatternPredicate(raw string) bool {
 		return true
 	}
 	if _, err := parseUndirectedVariableLengthRelationshipPattern(raw); err == nil {
+		return true
+	}
+	if _, err := parseMixedRelationshipChainPattern(raw); err == nil {
+		return true
+	}
+	if _, err := parseTwoHopDirectedChainPattern(raw); err == nil {
+		return true
+	}
+	if _, err := parseTwoHopUndirectedRelationshipChainPattern(raw); err == nil {
 		return true
 	}
 	return false

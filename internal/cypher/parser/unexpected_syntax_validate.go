@@ -87,6 +87,7 @@ var expressionOperatorKeywords = map[string]struct{}{
 	"and":      {},
 	"in":       {},
 	"is":       {},
+	"exists":   {},
 	"not":      {},
 	"or":       {},
 	"starts":   {},
@@ -127,6 +128,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 				}
 				for name, role := range clauseBound {
 					scope[name] = role
+				}
+				if containsInvalidExistsSubqueryClause(match.Where.Raw) {
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidClauseComposition", Statement: seg.index}
 				}
 				if hasUndefinedWhereIdentifier(match.Where.Raw, scope) {
 					return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
@@ -275,6 +279,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						}
 						for name, role := range clauseBound {
 							scope[name] = role
+						}
+						if containsInvalidExistsSubqueryClause(whereExpr) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidClauseComposition", Statement: seg.index}
 						}
 						if hasUndefinedWhereIdentifier(whereExpr, scope) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
@@ -732,6 +739,9 @@ func extractIdentifierPropertyReferences(raw string) []string {
 		if !isIdentifierStart(ch) {
 			continue
 		}
+		if prev, ok := previousNonSpaceChar(raw, i); ok && (prev == ':' || prev == '|') {
+			continue
+		}
 		if i > 0 && (isIdentifierPart(raw[i-1]) || raw[i-1] == '.' || raw[i-1] == '$') {
 			continue
 		}
@@ -795,6 +805,18 @@ func isMapLiteralKeyReference(raw string, start int, end int) bool {
 		}
 	}
 	return false
+}
+
+func previousNonSpaceChar(raw string, idx int) (byte, bool) {
+	for i := idx - 1; i >= 0; i-- {
+		switch raw[i] {
+		case ' ', '\t', '\n', '\r':
+			continue
+		default:
+			return raw[i], true
+		}
+	}
+	return 0, false
 }
 
 func splitProjectionItems(raw string, kind ast.ClauseKind) []string {
@@ -903,7 +925,7 @@ func extractMatchClauseWhereExpression(raw string, kind ast.ClauseKind) (string,
 }
 
 func hasUndefinedWhereIdentifier(expr string, bound map[string]patternVarRole) bool {
-	for _, ref := range extractIdentifierPropertyReferences(expr) {
+	for _, ref := range extractIdentifierPropertyReferences(stripExistsSubqueryBodies(expr)) {
 		root := ref
 		if idx := strings.Index(root, "."); idx >= 0 {
 			root = root[:idx]
@@ -923,6 +945,206 @@ func hasUndefinedWhereIdentifier(expr string, bound map[string]patternVarRole) b
 		}
 	}
 	return false
+}
+
+func containsInvalidExistsSubqueryClause(expr string) bool {
+	bodies := extractExistsSubqueryBodies(expr)
+	if len(bodies) == 0 {
+		return false
+	}
+	for _, body := range bodies {
+		if containsTopLevelKeywordLoose(body, "SET") ||
+			containsTopLevelKeywordLoose(body, "CREATE") ||
+			containsTopLevelKeywordLoose(body, "MERGE") ||
+			containsTopLevelKeywordLoose(body, "DELETE") ||
+			containsTopLevelKeywordLoose(body, "REMOVE") {
+			return true
+		}
+	}
+	return false
+}
+
+func extractExistsSubqueryBodies(expr string) []string {
+	bodies := make([]string, 0)
+	if expr == "" {
+		return bodies
+	}
+	upper := strings.ToUpper(expr)
+	for i := 0; i < len(expr); {
+		if i+6 <= len(expr) && upper[i:i+6] == "EXISTS" {
+			j := i + 6
+			for j < len(expr) && isSpace(expr[j]) {
+				j++
+			}
+			if j < len(expr) && expr[j] == '{' {
+				end := findMatchingBraceIndex(expr, j)
+				if end > j {
+					bodies = append(bodies, strings.TrimSpace(expr[j+1:end]))
+					i = end + 1
+					continue
+				}
+			}
+		}
+		i++
+	}
+	return bodies
+}
+
+func containsTopLevelKeywordLoose(raw, keyword string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	upper := strings.ToUpper(raw)
+	keyword = strings.ToUpper(strings.TrimSpace(keyword))
+	if keyword == "" || len(upper) < len(keyword) {
+		return false
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := 0; i <= len(upper)-len(keyword); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || raw[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		if strings.HasPrefix(upper[i:], keyword) {
+			prevOK := i == 0 || !isIdentifierPart(raw[i-1])
+			nextPos := i + len(keyword)
+			nextOK := nextPos >= len(raw) || !isIdentifierPart(raw[nextPos])
+			if prevOK && nextOK {
+				return true
+			}
+			if prevOK {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stripExistsSubqueryBodies(expr string) string {
+	if expr == "" {
+		return expr
+	}
+	upper := strings.ToUpper(expr)
+	var out strings.Builder
+	for i := 0; i < len(expr); {
+		if i+6 <= len(expr) && upper[i:i+6] == "EXISTS" {
+			j := i + 6
+			for j < len(expr) && isSpace(expr[j]) {
+				j++
+			}
+			if j < len(expr) && expr[j] == '{' {
+				end := findMatchingBraceIndex(expr, j)
+				if end > j {
+					out.WriteString("EXISTS { }")
+					i = end + 1
+					continue
+				}
+			}
+		}
+		out.WriteByte(expr[i])
+		i++
+	}
+	return out.String()
+}
+
+func findMatchingBraceIndex(raw string, openIdx int) int {
+	if openIdx < 0 || openIdx >= len(raw) || raw[openIdx] != '{' {
+		return -1
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+	for i := openIdx; i < len(raw); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || raw[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+			if depth < 0 {
+				return -1
+			}
+		}
+	}
+	return -1
+}
+
+func isSpace(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
 }
 
 func validateStaticPropertyAccessTypesFromRaw(raw string, kind ast.ClauseKind, kinds map[string]projectionValueKind, seg statementSegment) error {

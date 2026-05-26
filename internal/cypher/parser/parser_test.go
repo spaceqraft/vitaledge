@@ -216,6 +216,13 @@ func TestParseStatementOptionalMatchNullableAnchorAllowed(t *testing.T) {
 	}
 }
 
+func TestParseStatementMatchAfterOptionalCoalesceAliasAllowed(t *testing.T) {
+	_, err := ParseStatement("MATCH (a:Single) OPTIONAL MATCH (a)-->(b:NonExistent) OPTIONAL MATCH (a)-->(c:NonExistent) WITH coalesce(b, c) AS x MATCH (x)-->(d) RETURN d")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementVariableLengthRelationshipListBindingAllowed(t *testing.T) {
 	_, err := ParseStatement("MATCH ()-[r1]->()-[r2]->() WITH [r1, r2] AS rs LIMIT 1 MATCH (first)-[rs*]->(second) RETURN first, second")
 	if err != nil {

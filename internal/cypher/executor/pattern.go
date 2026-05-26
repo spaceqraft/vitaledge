@@ -16,8 +16,11 @@ var reverseDirectedAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za
 var directedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var reverseDirectedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var undirectedRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var directedVariableLengthRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var undirectedVariableLengthRelationshipPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var twoHopForwardChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var twoHopConvergingChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var directedAdjacentThenVariableLengthChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var chainNodeSegmentRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var identifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
@@ -78,6 +81,25 @@ type undirectedRelationshipPattern struct {
 	EdgeType  string
 	EdgeAnyOf []string
 	EdgeProps string
+}
+
+type directedVariableLengthRelationshipPattern struct {
+	Left    nodePattern
+	Right   nodePattern
+	EdgeVar string
+}
+
+type undirectedVariableLengthRelationshipPattern struct {
+	Left    nodePattern
+	Right   nodePattern
+	EdgeVar string
+}
+
+type directedAdjacentThenVariableLengthPattern struct {
+	Left    nodePattern
+	Mid     nodePattern
+	Right   nodePattern
+	EdgeVar string
 }
 
 type twoHopDirectedChainPattern struct {
@@ -361,6 +383,151 @@ func parseUndirectedRelationshipPattern(raw string) (undirectedRelationshipPatte
 		EdgeAnyOf: edgeAnyOf,
 		EdgeProps: edgeProps,
 	}, nil
+}
+
+func parseDirectedVariableLengthRelationshipPattern(raw string) (directedVariableLengthRelationshipPattern, error) {
+	normalized := normalizeClauseBody(raw)
+	m := directedVariableLengthRelationshipPatternRE.FindStringSubmatch(normalized)
+	if len(m) != 8 {
+		return directedVariableLengthRelationshipPattern{}, graph.NewError(
+			graph.ErrKindUnsupported,
+			fmt.Sprintf("pattern %q is not yet supported", raw),
+			nil,
+		)
+	}
+
+	leftAll, leftAny, leftExcluded := parseLabelFilters(m[2])
+	rightAll, rightAny, rightExcluded := parseLabelFilters(m[6])
+	edgeVar, ok := parseVariableLengthEdgePatternInner(m[4])
+	if !ok {
+		return directedVariableLengthRelationshipPattern{}, graph.NewError(
+			graph.ErrKindUnsupported,
+			fmt.Sprintf("pattern %q is not yet supported", raw),
+			nil,
+		)
+	}
+
+	return directedVariableLengthRelationshipPattern{
+		Left: nodePattern{
+			Var:            m[1],
+			AllOfLabels:    leftAll,
+			AnyOfLabels:    leftAny,
+			ExcludedLabels: leftExcluded,
+			PropertiesRaw:  m[3],
+		},
+		Right: nodePattern{
+			Var:            m[5],
+			AllOfLabels:    rightAll,
+			AnyOfLabels:    rightAny,
+			ExcludedLabels: rightExcluded,
+			PropertiesRaw:  m[7],
+		},
+		EdgeVar: edgeVar,
+	}, nil
+}
+
+func parseUndirectedVariableLengthRelationshipPattern(raw string) (undirectedVariableLengthRelationshipPattern, error) {
+	normalized := normalizeClauseBody(raw)
+	m := undirectedVariableLengthRelationshipPatternRE.FindStringSubmatch(normalized)
+	if len(m) != 8 {
+		return undirectedVariableLengthRelationshipPattern{}, graph.NewError(
+			graph.ErrKindUnsupported,
+			fmt.Sprintf("pattern %q is not yet supported", raw),
+			nil,
+		)
+	}
+
+	leftAll, leftAny, leftExcluded := parseLabelFilters(m[2])
+	rightAll, rightAny, rightExcluded := parseLabelFilters(m[6])
+	edgeVar, ok := parseVariableLengthEdgePatternInner(m[4])
+	if !ok {
+		return undirectedVariableLengthRelationshipPattern{}, graph.NewError(
+			graph.ErrKindUnsupported,
+			fmt.Sprintf("pattern %q is not yet supported", raw),
+			nil,
+		)
+	}
+
+	return undirectedVariableLengthRelationshipPattern{
+		Left: nodePattern{
+			Var:            m[1],
+			AllOfLabels:    leftAll,
+			AnyOfLabels:    leftAny,
+			ExcludedLabels: leftExcluded,
+			PropertiesRaw:  m[3],
+		},
+		Right: nodePattern{
+			Var:            m[5],
+			AllOfLabels:    rightAll,
+			AnyOfLabels:    rightAny,
+			ExcludedLabels: rightExcluded,
+			PropertiesRaw:  m[7],
+		},
+		EdgeVar: edgeVar,
+	}, nil
+}
+
+func parseDirectedAdjacentThenVariableLengthPattern(raw string) (directedAdjacentThenVariableLengthPattern, error) {
+	normalized := normalizeClauseBody(raw)
+	m := directedAdjacentThenVariableLengthChainPatternRE.FindStringSubmatch(normalized)
+	if len(m) != 11 {
+		return directedAdjacentThenVariableLengthPattern{}, graph.NewError(
+			graph.ErrKindUnsupported,
+			fmt.Sprintf("pattern %q is not yet supported", raw),
+			nil,
+		)
+	}
+
+	leftAll, leftAny, leftExcluded := parseLabelFilters(m[2])
+	midAll, midAny, midExcluded := parseLabelFilters(m[5])
+	rightAll, rightAny, rightExcluded := parseLabelFilters(m[9])
+	edgeVar, ok := parseVariableLengthEdgePatternInner(m[7])
+	if !ok {
+		return directedAdjacentThenVariableLengthPattern{}, graph.NewError(
+			graph.ErrKindUnsupported,
+			fmt.Sprintf("pattern %q is not yet supported", raw),
+			nil,
+		)
+	}
+
+	return directedAdjacentThenVariableLengthPattern{
+		Left: nodePattern{
+			Var:            m[1],
+			AllOfLabels:    leftAll,
+			AnyOfLabels:    leftAny,
+			ExcludedLabels: leftExcluded,
+			PropertiesRaw:  m[3],
+		},
+		Mid: nodePattern{
+			Var:            m[4],
+			AllOfLabels:    midAll,
+			AnyOfLabels:    midAny,
+			ExcludedLabels: midExcluded,
+			PropertiesRaw:  m[6],
+		},
+		Right: nodePattern{
+			Var:            m[8],
+			AllOfLabels:    rightAll,
+			AnyOfLabels:    rightAny,
+			ExcludedLabels: rightExcluded,
+			PropertiesRaw:  m[10],
+		},
+		EdgeVar: edgeVar,
+	}, nil
+}
+
+func parseVariableLengthEdgePatternInner(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "*" {
+		return "", true
+	}
+	if strings.HasSuffix(raw, "*") {
+		edgeVar := strings.TrimSpace(strings.TrimSuffix(raw, "*"))
+		if identifierRE.MatchString(edgeVar) {
+			return edgeVar, true
+		}
+	}
+	return "", false
 }
 
 func parseTwoHopDirectedChainPattern(raw string) (twoHopDirectedChainPattern, error) {

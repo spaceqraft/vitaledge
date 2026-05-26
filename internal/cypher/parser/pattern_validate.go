@@ -310,6 +310,9 @@ func roleForProjectionExpr(expr string, bound map[string]patternVarRole) pattern
 	if expr == "" {
 		return patternRoleValue
 	}
+	if role, ok := roleForCoalesceExpr(expr, bound); ok {
+		return role
+	}
 	name, next, ok := readIdentifier(expr, 0)
 	if ok {
 		next = skipSpaces(expr, next)
@@ -320,6 +323,62 @@ func roleForProjectionExpr(expr string, bound map[string]patternVarRole) pattern
 		}
 	}
 	return patternRoleValue
+}
+
+func roleForCoalesceExpr(expr string, bound map[string]patternVarRole) (patternVarRole, bool) {
+	trimmed := strings.TrimSpace(expr)
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, "COALESCE(") || !strings.HasSuffix(trimmed, ")") {
+		return "", false
+	}
+	openIdx := strings.Index(trimmed, "(")
+	if openIdx < 0 {
+		return "", false
+	}
+	argsRaw := strings.TrimSpace(trimmed[openIdx+1 : len(trimmed)-1])
+	if argsRaw == "" {
+		return "", false
+	}
+	args := splitTopLevelComma(argsRaw)
+	if len(args) == 0 {
+		return "", false
+	}
+
+	inferred := patternRoleValue
+	hasRole := false
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			continue
+		}
+		if strings.EqualFold(arg, "null") {
+			continue
+		}
+		name, next, ok := readIdentifier(arg, 0)
+		if !ok {
+			return "", false
+		}
+		next = skipSpaces(arg, next)
+		if next != len(arg) {
+			return "", false
+		}
+		role, exists := bound[name]
+		if !exists || role == patternRoleValue {
+			return "", false
+		}
+		if !hasRole {
+			inferred = role
+			hasRole = true
+			continue
+		}
+		if inferred != role {
+			return "", false
+		}
+	}
+	if !hasRole {
+		return "", false
+	}
+	return inferred, true
 }
 
 func extractMatchPattern(raw string) (string, bool) {

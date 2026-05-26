@@ -6839,7 +6839,7 @@ func splitTopLevelInExpression(raw string) (string, string, bool) {
 			return left, right, true
 		}
 		if !strings.ContainsAny(raw, " \t\n\r") {
-			if (len(left) == 1 && len(right) == 1) || strings.HasPrefix(left, "$") || strings.HasPrefix(right, "$") || strings.HasPrefix(left, "[") || strings.HasPrefix(right, "[") || strings.HasPrefix(left, "'") || strings.HasPrefix(left, `"`) || strings.HasPrefix(right, "(") || isSimpleNumericToken(left) || isIdentifierLike(right) {
+			if (len(left) == 1 && len(right) == 1) || strings.HasPrefix(left, "$") || strings.HasPrefix(right, "$") || strings.HasPrefix(left, "[") || strings.HasPrefix(right, "[") || strings.HasPrefix(left, "'") || strings.HasPrefix(left, `"`) || (strings.HasPrefix(left, "(") && strings.HasSuffix(left, ")")) || strings.HasPrefix(right, "(") || isSimpleNumericToken(left) {
 				return left, right, true
 			}
 		}

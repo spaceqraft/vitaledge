@@ -341,6 +341,58 @@ func TestParseStatementRejectsPatternParameterUseAtCompileTime(t *testing.T) {
 	}
 }
 
+func TestParseStatementRejectsNonConstantSkipAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN n SKIP n.count")
+	if err == nil {
+		t.Fatalf("expected non-constant SKIP parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "NonConstantExpression" {
+		t.Fatalf("expected NonConstantExpression parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsNegativeLimitLiteralAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN n LIMIT -1")
+	if err == nil {
+		t.Fatalf("expected negative LIMIT parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "NegativeIntegerArgument" {
+		t.Fatalf("expected NegativeIntegerArgument parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsFloatLimitLiteralAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN n LIMIT 1.5")
+	if err == nil {
+		t.Fatalf("expected float LIMIT parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "InvalidArgumentType" {
+		t.Fatalf("expected InvalidArgumentType parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementAllowsConstantSkipLimitExpressions(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) WITH n SKIP toInteger(rand()*9) LIMIT toInteger(ceil(1.7)) RETURN count(*) AS count")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementRejectsReturnStarWithoutScope(t *testing.T) {
 	_, err := ParseStatement("RETURN *")
 	if err == nil {

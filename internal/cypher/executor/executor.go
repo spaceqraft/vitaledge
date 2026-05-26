@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/paegun/vitaledge/internal/cypher/parser"
 	"github.com/paegun/vitaledge/internal/graph"
 )
 
@@ -248,7 +249,7 @@ func (e *Executor) executeMatchQueryLegacy(ctx context.Context, stmt *ast.MatchQ
 		return nil, execErr
 	}
 
-	rows = applySkipLimit(rows, skip, limit)
+	rows = applySkipLimit(rows, skip, limit, stmt.Return.Limit != nil)
 
 	result := &Result{
 		Columns: columns,
@@ -793,24 +794,38 @@ func evalOptionalInt(expr *ast.Expression, params Params) (int, error) {
 		}
 		return n, nil
 	}
-	n, err := strconv.Atoi(raw)
+	if n, err := strconv.Atoi(raw); err == nil {
+		if n < 0 {
+			return 0, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NegativeIntegerArgument"}
+		}
+		return n, nil
+	}
+
+	value, err := evalExpressionWithScope(raw, nil, params)
 	if err != nil {
+		if graph.IsKind(err, graph.ErrKindSemantic) && strings.Contains(strings.ToLower(err.Error()), "unknown identifier") {
+			return 0, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NonConstantExpression"}
+		}
 		return 0, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("numeric expression %q is not supported", raw), err)
 	}
+	n, err := toInt(value)
+	if err != nil {
+		return 0, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "InvalidArgumentType"}
+	}
 	if n < 0 {
-		return 0, graph.NewError(graph.ErrKindUnsupported, "numeric expression must be >= 0", nil)
+		return 0, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NegativeIntegerArgument"}
 	}
 	return n, nil
 }
 
-func applySkipLimit(rows []Row, skip, limit int) []Row {
+func applySkipLimit(rows []Row, skip, limit int, hasLimit bool) []Row {
 	if skip > len(rows) {
 		return []Row{}
 	}
 	if skip > 0 {
 		rows = rows[skip:]
 	}
-	if limit > 0 && limit < len(rows) {
+	if hasLimit && limit >= 0 && limit < len(rows) {
 		rows = rows[:limit]
 	}
 	return rows

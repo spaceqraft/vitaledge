@@ -3242,6 +3242,47 @@ func TestExecuteReturnHexAndOctalLiterals(t *testing.T) {
 	}
 }
 
+func TestApplySkipLimitLimitZeroReturnsNoRows(t *testing.T) {
+	rows := []Row{{"n": 1}, {"n": 2}, {"n": 3}}
+	trimmed := applySkipLimit(rows, 0, 0, true)
+	if len(trimmed) != 0 {
+		t.Fatalf("expected empty rows for LIMIT 0, got %#v", trimmed)
+	}
+}
+
+func TestExecuteWithConstantLimitExpression(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+
+	seed, err := parser.ParseStatement("UNWIND range(1, 3) AS i CREATE ({nr: i})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n) WITH n LIMIT toInteger(ceil(1.7)) RETURN n.nr AS nr ORDER BY nr")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["nr"]; got != 1 {
+		t.Fatalf("expected first nr=1, got %#v", got)
+	}
+	if got := res.Rows[1]["nr"]; got != 2 {
+		t.Fatalf("expected second nr=2, got %#v", got)
+	}
+}
+
 func TestExecuteReturnScientificNotationLiterals(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

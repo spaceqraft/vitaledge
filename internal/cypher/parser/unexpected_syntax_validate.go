@@ -130,6 +130,12 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 		if typed.Return.IncludeAll && len(bound) == 0 {
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
 		}
+		if err := validateSkipLimitExpressionForClause(typed.Return.Skip, true, seg); err != nil {
+			return err
+		}
+		if err := validateSkipLimitExpressionForClause(typed.Return.Limit, false, seg); err != nil {
+			return err
+		}
 		if err := validateProjectionClauseNames(typed.Return.Items, typed.Return.IncludeAll, bound, seg); err != nil {
 			return err
 		}
@@ -139,6 +145,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			for _, clause := range part.Clauses {
 				switch clause.Kind {
 				case ast.ClauseKindReturn, ast.ClauseKindWith:
+					if err := validateSkipLimitExpressionsInRawClause(clause.Raw, clause.Kind, seg); err != nil {
+						return err
+					}
 					if hasTopLevelStarProjection(clause.Raw, clause.Kind) && len(bound) == 0 {
 						return &ParseError{Kind: ParseErrorUnsupported, Message: "no variables in scope", Statement: seg.index}
 					}
@@ -782,6 +791,153 @@ func isFunctionIdentStart(ch byte) bool {
 
 func isFunctionIdentPart(ch byte) bool {
 	return isFunctionIdentStart(ch) || (ch >= '0' && ch <= '9') || ch == '.'
+}
+
+func validateSkipLimitExpressionsInRawClause(raw string, kind ast.ClauseKind, seg statementSegment) error {
+	if kind != ast.ClauseKindReturn && kind != ast.ClauseKindWith {
+		return nil
+	}
+
+	text := strings.TrimSpace(raw)
+	upper := strings.ToUpper(text)
+	switch kind {
+	case ast.ClauseKindReturn:
+		if strings.HasPrefix(upper, "RETURN") {
+			text = strings.TrimSpace(text[len("RETURN"):])
+		}
+		if strings.HasPrefix(strings.ToUpper(text), "DISTINCT") {
+			text = strings.TrimSpace(text[len("DISTINCT"):])
+		}
+	case ast.ClauseKindWith:
+		if strings.HasPrefix(upper, "WITH") {
+			text = strings.TrimSpace(text[len("WITH"):])
+		}
+		if strings.HasPrefix(strings.ToUpper(text), "DISTINCT") {
+			text = strings.TrimSpace(text[len("DISTINCT"):])
+		}
+	}
+
+	skipIdx := indexTopLevelKeyword(text, "SKIP")
+	limitIdx := indexTopLevelKeyword(text, "LIMIT")
+
+	if skipIdx >= 0 {
+		end := len(text)
+		if limitIdx > skipIdx {
+			end = limitIdx
+		}
+		skipRaw := strings.TrimSpace(text[skipIdx+len("SKIP") : end])
+		if err := validateSkipLimitExpressionRaw(skipRaw, true, seg); err != nil {
+			return err
+		}
+	}
+
+	if limitIdx >= 0 {
+		limitRaw := strings.TrimSpace(text[limitIdx+len("LIMIT"):])
+		if err := validateSkipLimitExpressionRaw(limitRaw, false, seg); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateSkipLimitExpressionForClause(expr *ast.Expression, isSkip bool, seg statementSegment) error {
+	if expr == nil {
+		return nil
+	}
+	return validateSkipLimitExpressionRaw(expr.Raw, isSkip, seg)
+}
+
+func validateSkipLimitExpressionRaw(raw string, _ bool, seg statementSegment) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+	}
+	if strings.HasPrefix(raw, "$") {
+		return nil
+	}
+	if n, err := strconv.Atoi(raw); err == nil {
+		if n < 0 {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "NegativeIntegerArgument", Statement: seg.index}
+		}
+		return nil
+	}
+	if _, err := strconv.ParseFloat(raw, 64); err == nil {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+	}
+	if hasNonConstantIdentifierInSkipLimitExpr(raw) {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "NonConstantExpression", Statement: seg.index}
+	}
+	return nil
+}
+
+func hasNonConstantIdentifierInSkipLimitExpr(raw string) bool {
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || raw[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || raw[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		}
+
+		if !isIdentifierStart(ch) {
+			continue
+		}
+		if i > 0 && (isIdentifierPart(raw[i-1]) || raw[i-1] == '.') {
+			continue
+		}
+
+		j := i + 1
+		for j < len(raw) && (isIdentifierPart(raw[j]) || raw[j] == '.') {
+			j++
+		}
+
+		token := raw[i:j]
+		k := skipSpaces(raw, j)
+		isFuncCall := k < len(raw) && raw[k] == '('
+		if isFuncCall {
+			i = j - 1
+			continue
+		}
+
+		if strings.EqualFold(token, "true") || strings.EqualFold(token, "false") || strings.EqualFold(token, "null") {
+			i = j - 1
+			continue
+		}
+
+		return true
+	}
+
+	return false
 }
 
 func isInvalidLengthArgumentExpression(expr string, bound map[string]patternVarRole) bool {

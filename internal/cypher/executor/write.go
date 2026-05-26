@@ -6028,7 +6028,8 @@ func applyProjectionPostProcessing(rows []Row, clause projectionClauseSpec, para
 		return nil, err
 	}
 
-	return applySkipLimit(rows, skip, limit), nil
+	hasLimit := strings.TrimSpace(clause.LimitRaw) != ""
+	return applySkipLimit(rows, skip, limit, hasLimit), nil
 }
 
 func distinctProjectionRows(rows []Row) []Row {
@@ -7047,6 +7048,20 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return nil, err
 		}
 		return evalToFloatValue(value)
+	}
+	if arg, ok := parseFunctionCall(raw, "ceil"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Ceil(numeric))), nil
 	}
 	if arg, ok := parseFunctionCall(raw, "coalesce"); ok {
 		parts := splitTopLevelCommaSeparated(arg)

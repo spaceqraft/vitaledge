@@ -8103,7 +8103,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			}
 			return decodeStoredPropertyValue(raw), nil
 		case []any:
-			idx, err := toInt(indexValue)
+			idx, err := listIndexToInt(indexValue)
 			if err != nil {
 				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
 			}
@@ -8115,7 +8115,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			}
 			return typed[idx], nil
 		case []string:
-			idx, err := toInt(indexValue)
+			idx, err := listIndexToInt(indexValue)
 			if err != nil {
 				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
 			}
@@ -8184,6 +8184,35 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		return base, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
+}
+
+func listIndexToInt(v any) (int, error) {
+	switch n := v.(type) {
+	case int:
+		return n, nil
+	case int64:
+		return int(n), nil
+	case int32:
+		return int(n), nil
+	case uint:
+		return int(n), nil
+	case uint64:
+		return int(n), nil
+	case uint32:
+		return int(n), nil
+	case json.Number:
+		s := strings.TrimSpace(n.String())
+		if strings.ContainsAny(s, ".eE") {
+			return 0, fmt.Errorf("non-integer json.Number")
+		}
+		parsed, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		return int(parsed), nil
+	default:
+		return 0, fmt.Errorf("unsupported list index type %T", v)
+	}
 }
 
 func evalPatternComprehensionFromRuntime(raw string, row Row, params Params) (any, bool, error) {

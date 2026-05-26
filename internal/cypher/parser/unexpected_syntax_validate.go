@@ -636,6 +636,9 @@ func validateProjectionSemanticItems(items []projectionSemanticItem, kind ast.Cl
 		if strings.Contains(expr, "[") && strings.Contains(strings.ToUpper(expr), " IN ") {
 			continue
 		}
+		if containsQuantifiedPredicateWithIn(expr) {
+			continue
+		}
 		for _, ref := range extractNonAggregateReferences(expr) {
 			if isCypherLiteralKeyword(ref) {
 				continue
@@ -1092,6 +1095,7 @@ func extractMatchClauseWhereExpression(raw string, kind ast.ClauseKind) (string,
 }
 
 func hasUndefinedWhereIdentifier(expr string, bound map[string]patternVarRole) bool {
+	listCompScoped := collectListComprehensionVars(stripExistsSubqueryBodies(expr))
 	for _, ref := range extractIdentifierPropertyReferences(stripExistsSubqueryBodies(expr)) {
 		root := ref
 		if idx := strings.Index(root, "."); idx >= 0 {
@@ -1107,11 +1111,107 @@ func hasUndefinedWhereIdentifier(expr string, bound map[string]patternVarRole) b
 		if _, ok := supportedExpressionFunctions[strings.ToLower(root)]; ok {
 			continue
 		}
+		if _, ok := listCompScoped[root]; ok {
+			continue
+		}
 		if _, exists := bound[root]; !exists {
 			return true
 		}
 	}
 	return false
+}
+
+func containsQuantifiedPredicateWithIn(expr string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(expr))
+	if upper == "" {
+		return false
+	}
+	if strings.Contains(upper, "ALL(") || strings.Contains(upper, "ANY(") || strings.Contains(upper, "NONE(") || strings.Contains(upper, "SINGLE(") {
+		return strings.Contains(upper, " IN ")
+	}
+	return false
+}
+
+func collectListComprehensionVars(expr string) map[string]struct{} {
+	out := map[string]struct{}{}
+	if expr == "" {
+		return out
+	}
+	for i := 0; i < len(expr); i++ {
+		if expr[i] != '[' {
+			continue
+		}
+		end := findMatchingBracketIndex(expr, i)
+		if end <= i+1 {
+			continue
+		}
+		body := strings.TrimSpace(expr[i+1 : end])
+		if name, ok := parseListComprehensionVar(body); ok {
+			out[name] = struct{}{}
+		}
+		for nested := range collectListComprehensionVars(body) {
+			out[nested] = struct{}{}
+		}
+		i = end
+	}
+	return out
+}
+
+func parseListComprehensionVar(body string) (string, bool) {
+	if body == "" {
+		return "", false
+	}
+	name, next, ok := readIdentifier(body, 0)
+	if !ok || name == "" {
+		return "", false
+	}
+	next = skipSpaces(body, next)
+	if next+1 >= len(body) {
+		return "", false
+	}
+	if !strings.EqualFold(body[next:next+2], "IN") {
+		return "", false
+	}
+	prevOK := next == 0 || !isIdentifierPart(body[next-1])
+	post := next + 2
+	nextOK := post >= len(body) || !isIdentifierPart(body[post])
+	if !prevOK || !nextOK {
+		return "", false
+	}
+	return name, true
+}
+
+func findMatchingBracketIndex(raw string, start int) int {
+	if start < 0 || start >= len(raw) || raw[start] != '[' {
+		return -1
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := start; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && (i == 0 || raw[i-1] != '\\') && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && (i == 0 || raw[i-1] != '\\') && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func containsInvalidExistsSubqueryClause(expr string) bool {

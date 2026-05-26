@@ -87,11 +87,26 @@ func validatePatternVariableScoping(stmt ast.Statement, seg statementSegment) er
 func validatePatternBindings(pattern string, bound map[string]patternVarRole, seg statementSegment, clauseKind ast.ClauseKind, clauseIntroduced map[string]struct{}) error {
 	bindings := scanPatternBindings(pattern)
 	patternHasRelationship := strings.Contains(pattern, "-[") || strings.Contains(pattern, "--")
+	seenRelationshipInPattern := map[string]struct{}{}
 	for _, b := range bindings {
 		if b.name == "" {
 			continue
 		}
+		if b.role == patternRoleRel {
+			if _, seen := seenRelationshipInPattern[b.name]; seen {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "RelationshipUniquenessViolation", Statement: seg.index}
+			}
+			seenRelationshipInPattern[b.name] = struct{}{}
+		}
 		if prev, ok := bound[b.name]; ok {
+			if clauseKind == ast.ClauseKindCreate && prev == patternRoleValue && (b.role == patternRoleNode || b.role == patternRoleRel) {
+				// CREATE can bind previously projected values as node/relationship entities.
+				bound[b.name] = b.role
+				if clauseIntroduced != nil {
+					clauseIntroduced[b.name] = struct{}{}
+				}
+				continue
+			}
 			if clauseKind == ast.ClauseKindOptionalMatch && prev == patternRoleValue && (b.role == patternRoleNode || b.role == patternRoleRel || b.role == patternRolePath) {
 				continue
 			}

@@ -1244,6 +1244,7 @@ func parseEdgeTypeFilter(raw string) (edgeType string, edgeAnyOf []string, err e
 	parts := strings.Split(raw, "|")
 	if len(parts) == 1 {
 		typeName := strings.TrimSpace(parts[0])
+		typeName = strings.TrimPrefix(typeName, ":")
 		if !identifierRE.MatchString(typeName) {
 			return "", nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("edge type %q is not yet supported", raw), nil)
 		}
@@ -1252,6 +1253,7 @@ func parseEdgeTypeFilter(raw string) (edgeType string, edgeAnyOf []string, err e
 	out := make([]string, 0, len(parts))
 	for _, part := range parts {
 		typeName := strings.TrimSpace(part)
+		typeName = strings.TrimPrefix(typeName, ":")
 		if !identifierRE.MatchString(typeName) {
 			return "", nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("edge type %q is not yet supported", raw), nil)
 		}

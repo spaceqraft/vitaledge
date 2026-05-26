@@ -447,6 +447,11 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	if chain, err := parseMixedRelationshipChainPattern(patternRaw); err == nil {
 		return e.expandMixedRelationshipChainMatch(ctx, tx, rows, spec, chain, params, pathVar)
 	}
+	if rewritten, ok := rewriteReverseVariableLengthPatternPredicate(patternRaw); ok {
+		if rel, err := parseDirectedVariableLengthRelationshipPattern(rewritten); err == nil {
+			return e.expandVariableLengthDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params, pathVar)
+		}
+	}
 	if rel, err := parseDirectedVariableLengthRelationshipPattern(patternRaw); err == nil {
 		return e.expandVariableLengthDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params, pathVar)
 	}
@@ -3325,10 +3330,16 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 					if len(segment.EdgeAnyOf) > 0 {
 						scanType = ""
 					}
+					emitted := map[string]struct{}{}
 					collect := func(edge *graph.Edge, neighborID string, direction string) error {
 						if edge == nil || used[edge.ID] || pathUsed[edge.ID] {
 							return nil
 						}
+						key := edge.ID + "|" + neighborID
+						if _, ok := emitted[key]; ok {
+							return nil
+						}
+						emitted[key] = struct{}{}
 						if !edgeTypeMatches(edge, segment.EdgeType, segment.EdgeAnyOf) {
 							return nil
 						}
@@ -3814,6 +3825,13 @@ func nodePatternMatches(vertex *graph.Vertex, pattern nodePattern, params Params
 			}
 		}
 	}
+	if len(pattern.AllOfLabels) > 0 && len(pattern.AnyOfLabels) == 0 && len(pattern.ExcludedLabels) == 0 {
+		if pattern.Var == "" {
+			vertex.Labels = reorderLabelsByPattern(vertex.Labels, pattern.AllOfLabels)
+		} else if _, alreadyBound := row[pattern.Var]; !alreadyBound {
+			vertex.Labels = reorderLabelsByPattern(vertex.Labels, pattern.AllOfLabels)
+		}
+	}
 
 	props := strings.TrimSpace(pattern.PropertiesRaw)
 	if props == "" {
@@ -3856,6 +3874,34 @@ func vertexHasLabel(vertex *graph.Vertex, label string) bool {
 		}
 	}
 	return false
+}
+
+func reorderLabelsByPattern(labels []string, ordered []string) []string {
+	if len(labels) == 0 || len(ordered) == 0 {
+		return labels
+	}
+	seen := make(map[string]struct{}, len(labels))
+	out := make([]string, 0, len(labels))
+	for _, want := range ordered {
+		for _, label := range labels {
+			if label != want {
+				continue
+			}
+			if _, ok := seen[label]; ok {
+				break
+			}
+			seen[label] = struct{}{}
+			out = append(out, label)
+			break
+		}
+	}
+	for _, label := range labels {
+		if _, ok := seen[label]; ok {
+			continue
+		}
+		out = append(out, label)
+	}
+	return out
 }
 
 func anchoredSourcePropertyEquality(pattern anchoredOutPattern, params Params, row Row) (string, any, bool) {

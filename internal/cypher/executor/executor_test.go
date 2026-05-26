@@ -692,6 +692,228 @@ func TestExecuteMergeIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestExecuteMergeRelationshipOnCreateSetProperty(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seed, err := parser.ParseStatement("CREATE (:A {name:'A'}), (:B {name:'B'})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a {name:'A'}), (b {name:'B'}) MERGE (a)-[r:TYPE]->(b) ON CREATE SET r.name='foo'")
+	if err != nil {
+		t.Fatalf("parse merge failed: %v", err)
+	}
+
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("merge execute failed: %v", err)
+	}
+}
+
+func TestExecuteMergeRelationshipOnCreateSetMapForms(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seed, err := parser.ParseStatement("CREATE (:A {name:'A'}), (:B {name:'B'})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	replaceStmt, err := parser.ParseStatement("MATCH (a {name:'A'}), (b {name:'B'}) MERGE (a)-[r:TYPE]->(b) ON CREATE SET r=a")
+	if err != nil {
+		t.Fatalf("parse merge replace failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, replaceStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("merge replace execute failed: %v", err)
+	}
+
+	appendStmt, err := parser.ParseStatement("MATCH (a {name:'A'}), (b {name:'B'}) MERGE (a)-[r2:TYPE2]->(b) ON CREATE SET r2+={name:'bar',name2:'baz'}")
+	if err != nil {
+		t.Fatalf("parse merge append failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, appendStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("merge append execute failed: %v", err)
+	}
+}
+
+func TestExecuteMergeMatchAnonymousNodePattern(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seed, err := parser.ParseStatement("CREATE (), ()")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH () MERGE (a:L) ON MATCH SET a:M1 ON CREATE SET a:M2 RETURN count(*) AS c")
+	if err != nil {
+		t.Fatalf("parse merge failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("merge execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one aggregation row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["c"]; got != int64(2) && got != 2 {
+		t.Fatalf("expected count 2, got %#v", got)
+	}
+}
+
+func TestExecuteMergeUndirectedRelationshipNoDuplicateRows(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seed, err := parser.ParseStatement("CREATE (a {id:'a'}), (b {id:'b'}), (c {id:'c'}), (d {id:'d'})")
+	if err != nil {
+		t.Fatalf("parse seed vertices failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed vertices execute failed: %v", err)
+	}
+
+	seedRels, err := parser.ParseStatement("MATCH (a {id:'a'}), (b {id:'b'}), (c {id:'c'}), (d {id:'d'}) CREATE (a)-[:TYPE]->(b), (c)-[:TYPE]->(d)")
+	if err != nil {
+		t.Fatalf("parse seed relationships failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedRels, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed relationships execute failed: %v", err)
+	}
+
+	matchOnly, err := parser.ParseStatement("MATCH (a)--(b) RETURN a, b")
+	if err != nil {
+		t.Fatalf("parse match-only failed: %v", err)
+	}
+	matchRes, err := exec.ExecuteStatement(ctx, matchOnly, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("match-only execute failed: %v", err)
+	}
+	if len(matchRes.Rows) != 4 {
+		t.Fatalf("expected 4 rows from MATCH (a)--(b) orientation expansion, got %d", len(matchRes.Rows))
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)--(b) MERGE (a)-[r:TYPE]-(b) RETURN r")
+	if err != nil {
+		t.Fatalf("parse merge failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("merge execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+
+	seen := map[string]struct{}{}
+	for _, row := range res.Rows {
+		raw, ok := row["r"]
+		if !ok {
+			t.Fatalf("expected r in row: %#v", row)
+		}
+		switch rel := raw.(type) {
+		case *graph.Edge:
+			if rel == nil {
+				t.Fatalf("expected non-nil relationship edge in row: %#v", row)
+			}
+			seen[rel.ID] = struct{}{}
+		case map[string]any:
+			id, ok := rel["id"].(string)
+			if !ok || id == "" {
+				t.Fatalf("expected relationship map to include non-empty id, got %#v", rel)
+			}
+			seen[id] = struct{}{}
+		default:
+			t.Fatalf("expected relationship edge in row, got %#v", raw)
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("expected 2 unique relationships, got %d", len(seen))
+	}
+}
+
+func TestExecuteMergeOnMatchAndOnCreateLabels(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seed, err := parser.ParseStatement("CREATE (), ()")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH () MERGE (a:L) ON MATCH SET a:M1 ON CREATE SET a:M2")
+	if err != nil {
+		t.Fatalf("parse merge failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("merge execute failed: %v", err)
+	}
+
+	labelCounts := map[string]int{}
+	totalNodes := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 0, func(vertex *graph.Vertex) error {
+			totalNodes++
+			for _, label := range vertex.Labels {
+				labelCounts[label]++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+
+	if totalNodes != 3 {
+		t.Fatalf("expected 3 total nodes after merge, got %d", totalNodes)
+	}
+	if labelCounts["L"] != 1 || labelCounts["M1"] != 1 || labelCounts["M2"] != 1 {
+		t.Fatalf("expected one L/M1/M2 label each, got %#v", labelCounts)
+	}
+}
+
+func TestSplitMergePatternAndActionsMatchThenCreate(t *testing.T) {
+	pattern, onCreateSet, onMatchSet := splitMergePatternAndActions("(a:L)ONMATCHSETa:M1ONCREATESETa:M2")
+	if pattern != "(a:L)" {
+		t.Fatalf("unexpected pattern %q", pattern)
+	}
+	if onMatchSet != "a:M1" {
+		t.Fatalf("unexpected ON MATCH set %q", onMatchSet)
+	}
+	if onCreateSet != "a:M2" {
+		t.Fatalf("unexpected ON CREATE set %q", onCreateSet)
+	}
+}
+
 func TestExecuteCreateEdgePattern(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

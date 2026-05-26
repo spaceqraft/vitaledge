@@ -9,7 +9,7 @@ import (
 )
 
 var anchoredOutPatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)\]->\(([A-Za-z_][A-Za-z0-9_]*)\)$`)
-var nodePatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var nodePatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var undirectedAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)--\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var directedAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var reverseDirectedAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<--\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
@@ -130,10 +130,12 @@ type twoHopDirectedChainPattern struct {
 	Left            nodePattern
 	Mid             nodePattern
 	Right           nodePattern
+	FirstEdgeVar    string
 	FirstEdgeType   string
 	FirstEdgeAnyOf  []string
 	FirstEdgeProps  string
 	SecondForward   bool
+	SecondEdgeVar   string
 	SecondEdgeType  string
 	SecondEdgeAnyOf []string
 	SecondEdgeProps string
@@ -747,11 +749,11 @@ func parseTwoHopDirectedChainPattern(raw string) (twoHopDirectedChainPattern, er
 	midAll, midAny, midExcluded := parseLabelFilters(m[6])
 	rightAll, rightAny, rightExcluded := parseLabelFilters(m[10])
 
-	_, firstType, firstAnyOf, firstProps, err := parseEdgePatternInner(m[4])
+	firstVar, firstType, firstAnyOf, firstProps, err := parseEdgePatternInner(m[4])
 	if err != nil {
 		return twoHopDirectedChainPattern{}, err
 	}
-	_, secondType, secondAnyOf, secondProps, err := parseEdgePatternInner(m[8])
+	secondVar, secondType, secondAnyOf, secondProps, err := parseEdgePatternInner(m[8])
 	if err != nil {
 		return twoHopDirectedChainPattern{}, err
 	}
@@ -778,10 +780,12 @@ func parseTwoHopDirectedChainPattern(raw string) (twoHopDirectedChainPattern, er
 			ExcludedLabels: rightExcluded,
 			PropertiesRaw:  m[11],
 		},
+		FirstEdgeVar:    firstVar,
 		FirstEdgeType:   firstType,
 		FirstEdgeAnyOf:  firstAnyOf,
 		FirstEdgeProps:  firstProps,
 		SecondForward:   secondForward,
+		SecondEdgeVar:   secondVar,
 		SecondEdgeType:  secondType,
 		SecondEdgeAnyOf: secondAnyOf,
 		SecondEdgeProps: secondProps,

@@ -2,6 +2,7 @@ package compliance
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,10 +29,13 @@ var procedureSignatureRE = regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\
 var tckDirFlag = flag.String("tck-dir", "", "path to the openCypher TCK features directory")
 
 type graphSnapshot struct {
-	Nodes         int
-	Relationships int
-	Properties    int
-	Labels        int
+	Nodes           int
+	Relationships   int
+	Properties      int
+	Labels          int
+	NodeSet         map[string]struct{}
+	RelationshipSet map[string]struct{}
+	PropertySet     map[string]struct{}
 }
 
 func (g graphSnapshot) Delta(before graphSnapshot) graphSnapshot {
@@ -41,6 +45,48 @@ func (g graphSnapshot) Delta(before graphSnapshot) graphSnapshot {
 		Properties:    g.Properties - before.Properties,
 		Labels:        g.Labels - before.Labels,
 	}
+}
+
+type graphSideEffects struct {
+	AddedNodes           int
+	RemovedNodes         int
+	AddedRelationships   int
+	RemovedRelationships int
+	AddedProperties      int
+	RemovedProperties    int
+	AddedLabels          int
+	RemovedLabels        int
+}
+
+func diffGraphSideEffects(before, after graphSnapshot) graphSideEffects {
+	delta := after.Delta(before)
+	addedNodes, removedNodes := propertySetDelta(before.NodeSet, after.NodeSet)
+	addedRelationships, removedRelationships := propertySetDelta(before.RelationshipSet, after.RelationshipSet)
+	addedProps, removedProps := propertySetDelta(before.PropertySet, after.PropertySet)
+	return graphSideEffects{
+		AddedNodes:           addedNodes,
+		RemovedNodes:         removedNodes,
+		AddedRelationships:   addedRelationships,
+		RemovedRelationships: removedRelationships,
+		AddedProperties:      addedProps,
+		RemovedProperties:    removedProps,
+		AddedLabels:          max(delta.Labels, 0),
+		RemovedLabels:        max(-delta.Labels, 0),
+	}
+}
+
+func propertySetDelta(before, after map[string]struct{}) (added int, removed int) {
+	for key := range after {
+		if _, ok := before[key]; !ok {
+			added++
+		}
+	}
+	for key := range before {
+		if _, ok := after[key]; !ok {
+			removed++
+		}
+	}
+	return added, removed
 }
 
 type cypherTCKFeature struct {
@@ -312,9 +358,9 @@ func (f *cypherTCKFeature) resultShouldBeInOrderIgnoringListOrder(table *godog.T
 }
 
 func (f *cypherTCKFeature) noSideEffects() error {
-	delta := f.afterQueryCounts.Delta(f.beforeQueryCounts)
-	if delta != (graphSnapshot{}) {
-		return fmt.Errorf("expected no side effects, got %+v", delta)
+	effects := diffGraphSideEffects(f.beforeQueryCounts, f.afterQueryCounts)
+	if effects != (graphSideEffects{}) {
+		return fmt.Errorf("expected no side effects, got %+v", effects)
 	}
 	return nil
 }
@@ -327,16 +373,16 @@ func (f *cypherTCKFeature) sideEffectsShouldBe(table *godog.Table) error {
 		return fmt.Errorf("side effect table must have two columns")
 	}
 
-	delta := f.afterQueryCounts.Delta(f.beforeQueryCounts)
+	effects := diffGraphSideEffects(f.beforeQueryCounts, f.afterQueryCounts)
 	actual := map[string]int{
-		"+nodes":         max(delta.Nodes, 0),
-		"-nodes":         max(-delta.Nodes, 0),
-		"+relationships": max(delta.Relationships, 0),
-		"-relationships": max(-delta.Relationships, 0),
-		"+properties":    max(delta.Properties, 0),
-		"-properties":    max(-delta.Properties, 0),
-		"+labels":        max(delta.Labels, 0),
-		"-labels":        max(-delta.Labels, 0),
+		"+nodes":         effects.AddedNodes,
+		"-nodes":         effects.RemovedNodes,
+		"+relationships": effects.AddedRelationships,
+		"-relationships": effects.RemovedRelationships,
+		"+properties":    effects.AddedProperties,
+		"-properties":    effects.RemovedProperties,
+		"+labels":        effects.AddedLabels,
+		"-labels":        effects.RemovedLabels,
 	}
 
 	expected := map[string]int{}
@@ -710,23 +756,35 @@ func (f *cypherTCKFeature) closeStore() error {
 }
 
 func (f *cypherTCKFeature) snapshotGraph() (graphSnapshot, error) {
-	stats := graphSnapshot{}
+	stats := graphSnapshot{
+		NodeSet:         map[string]struct{}{},
+		RelationshipSet: map[string]struct{}{},
+		PropertySet:     map[string]struct{}{},
+	}
 	seenEdges := map[string]struct{}{}
 	seenLabels := map[string]struct{}{}
 	err := f.store.View(f.ctx, func(tx graph.Tx) error {
 		return tx.ScanVertices(f.ctx, defaultTenant, 0, func(vertex *graph.Vertex) error {
 			stats.Nodes++
+			stats.NodeSet[fmt.Sprintf("%s:%s", vertex.Tenant, vertex.ID)] = struct{}{}
 			for _, label := range vertex.Labels {
 				seenLabels[label] = struct{}{}
 			}
 			stats.Properties += len(vertex.Properties)
+			for key, value := range vertex.Properties {
+				stats.PropertySet[fmt.Sprintf("v:%s:%s:%s", vertex.ID, key, hex.EncodeToString(value))] = struct{}{}
+			}
 			return tx.ScanOutEdges(f.ctx, defaultTenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
 				if _, ok := seenEdges[edge.ID]; ok {
 					return nil
 				}
 				seenEdges[edge.ID] = struct{}{}
 				stats.Relationships++
+				stats.RelationshipSet[fmt.Sprintf("%s:%s", edge.Tenant, edge.ID)] = struct{}{}
 				stats.Properties += len(edge.Properties)
+				for key, value := range edge.Properties {
+					stats.PropertySet[fmt.Sprintf("e:%s:%s:%s", edge.ID, key, hex.EncodeToString(value))] = struct{}{}
+				}
 				return nil
 			})
 		})

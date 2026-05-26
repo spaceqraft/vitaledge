@@ -255,12 +255,35 @@ func recordWithBindings(raw string, bound map[string]patternVarRole) {
 		text = strings.TrimSpace(text[:idx])
 	}
 
-	for _, item := range splitTopLevelComma(text) {
+	items := splitTopLevelComma(text)
+	hasStar := false
+	original := make(map[string]patternVarRole, len(bound))
+	for key, role := range bound {
+		original[key] = role
+	}
+	projected := map[string]patternVarRole{}
+	for _, item := range items {
+		if strings.TrimSpace(item) == "*" {
+			hasStar = true
+			continue
+		}
 		alias, expr, ok := parseProjectionAlias(item)
 		if !ok || alias == "" {
 			continue
 		}
-		bound[alias] = roleForProjectionExpr(expr, bound)
+		projected[alias] = roleForProjectionExpr(expr, original)
+	}
+
+	for key := range bound {
+		delete(bound, key)
+	}
+	if hasStar {
+		for key, role := range original {
+			bound[key] = role
+		}
+	}
+	for key, role := range projected {
+		bound[key] = role
 	}
 }
 

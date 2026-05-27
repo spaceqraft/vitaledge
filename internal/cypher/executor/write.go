@@ -3843,12 +3843,6 @@ func nodePatternMatches(vertex *graph.Vertex, pattern nodePattern, params Params
 		return false
 	}
 	for key, value := range parsed {
-		if strings.EqualFold(key, "id") {
-			if vertex.ID != stringFromProperty(map[string]any{"id": value}, "id") {
-				return false
-			}
-			continue
-		}
 		if vertex.Properties == nil {
 			return false
 		}
@@ -3955,7 +3949,7 @@ func (e *Executor) applyCreateClause(ctx context.Context, tx graph.Tx, rows []Ro
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
+	if rows == nil {
 		rows = []Row{{}}
 	}
 	parts := splitTopLevelCommaSeparated(raw)
@@ -4161,7 +4155,10 @@ func (e *Executor) applyCreatePattern(ctx context.Context, tx graph.Tx, rows []R
 		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge, createEdgeDirectionReverse)
 	}
 	if m := createEdgePatternUndirectedRE.FindStringSubmatch(raw); len(m) == 10 {
-		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "RequiresDirectedRelationship"}
+		if !merge {
+			return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "RequiresDirectedRelationship"}
+		}
+		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge, createEdgeDirectionUndirected)
 	}
 	if chain, ok := parseCreateChainPattern(raw); ok {
 		return e.applyCreateChainPattern(ctx, tx, rows, chain, params, tenant, merge)

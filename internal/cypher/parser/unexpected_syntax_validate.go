@@ -66,6 +66,7 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"size":                      {},
 	"startnode":                 {},
 	"split":                     {},
+	"sqrt":                      {},
 	"substring":                 {},
 	"sum":                       {},
 	"tail":                      {},

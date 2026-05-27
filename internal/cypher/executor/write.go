@@ -7983,6 +7983,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "abs"); ok {
 		return evalAbsFunction(arg, row, params)
 	}
+	if arg, ok := parseFunctionCall(raw, "sqrt"); ok {
+		return evalSqrtFunction(arg, row, params)
+	}
 	if arg, ok := parseFunctionCall(raw, "nodes"); ok {
 		return evalNodesFunction(arg, row, params)
 	}
@@ -9783,6 +9786,30 @@ func evalAbsFunction(arg string, row Row, params Params) (any, error) {
 		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
 	}
 	return json.Number(formatFloatResult(math.Abs(f))), nil
+}
+
+func evalSqrtFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "sqrt() requires one argument", nil)
+	}
+
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+
+	f, ok := numericValue(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
+	}
+	return json.Number(formatFloatResult(math.Sqrt(f))), nil
 }
 
 func evalNodesFunction(arg string, row Row, params Params) (any, error) {

@@ -636,7 +636,7 @@ func TestParseStatementAllowsKnownFunctionInReturnProjection(t *testing.T) {
 }
 
 func TestParseStatementAllowsPassAFunctionSurfaceInReturnProjection(t *testing.T) {
-	_, err := ParseStatement("MATCH (n) RETURN keys(n), head([1,2]), tail([1,2,3]), abs(-2)")
+	_, err := ParseStatement("MATCH (n) RETURN keys(n), head([1,2]), tail([1,2,3]), abs(-2), sqrt(12.96)")
 	if err != nil {
 		t.Fatalf("ParseStatement() unexpected error: %v", err)
 	}

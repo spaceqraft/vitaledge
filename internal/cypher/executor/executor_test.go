@@ -3795,7 +3795,7 @@ func TestExecuteReturnPassAFunctionSurface(t *testing.T) {
 		t.Fatalf("execute seed failed: %v", err)
 	}
 
-	stmt, err = parser.ParseStatement("MATCH (n:K) RETURN keys(n) AS nk, keys({b: 1, a: 2}) AS mk, head([10, 20]) AS h, head([]) AS hn, tail([10, 20, 30]) AS t, tail([10]) AS te, abs(-3) AS ai, abs(-1.5) AS af")
+	stmt, err = parser.ParseStatement("MATCH (n:K) RETURN keys(n) AS nk, keys({b: 1, a: 2}) AS mk, head([10, 20]) AS h, head([]) AS hn, tail([10, 20, 30]) AS t, tail([10]) AS te, abs(-3) AS ai, abs(-1.5) AS af, sqrt(12.96) AS sq")
 	if err != nil {
 		t.Fatalf("parse query failed: %v", err)
 	}
@@ -3831,6 +3831,9 @@ func TestExecuteReturnPassAFunctionSurface(t *testing.T) {
 	}
 	if got := res.Rows[0]["af"]; got != json.Number("1.5") {
 		t.Fatalf("expected af=1.5, got %#v", got)
+	}
+	if got := res.Rows[0]["sq"]; got != json.Number("3.6") {
+		t.Fatalf("expected sq=3.6, got %#v", got)
 	}
 }
 

@@ -5741,6 +5741,8 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		funcName string
 		count    int
 		sum      float64
+		intSum   int64
+		intOnly  bool
 		min      any
 		max      any
 		values   []float64
@@ -5948,7 +5950,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 			if item.AggFunc != "" {
 				agg := group.aggs[idx]
 				if agg == nil {
-					agg = &projectionAggregate{funcName: item.AggFunc}
+					agg = &projectionAggregate{funcName: item.AggFunc, intOnly: true}
 					group.aggs[idx] = agg
 				}
 				switch item.AggFunc {
@@ -5965,6 +5967,14 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 						continue
 					}
 					agg.sum += n
+					if agg.intOnly {
+						integer, ok := exactIntegerAggregateValue(value)
+						if ok && !isFloatLikeNumeric(value) {
+							agg.intSum += integer
+						} else {
+							agg.intOnly = false
+						}
+					}
 					agg.count++
 					agg.hasValue = true
 				case "min":
@@ -6124,7 +6134,11 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 				}
 				switch item.AggFunc {
 				case "sum":
-					projected[key] = agg.sum
+					if agg.intOnly {
+						projected[key] = agg.intSum
+					} else {
+						projected[key] = agg.sum
+					}
 				case "avg":
 					if agg.count == 0 {
 						projected[key] = nil
@@ -13969,6 +13983,48 @@ func numericValue(v any) (float64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func exactIntegerAggregateValue(v any) (int64, bool) {
+	switch typed := v.(type) {
+	case int:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case int32:
+		return int64(typed), true
+	case uint:
+		return int64(typed), true
+	case uint64:
+		if typed > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(typed), true
+	case uint32:
+		return int64(typed), true
+	case json.Number:
+		s := strings.TrimSpace(typed.String())
+		if s == "" || strings.ContainsAny(s, ".eE") {
+			return 0, false
+		}
+		parsed, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	case string:
+		s := strings.TrimSpace(typed)
+		if s == "" || strings.ContainsAny(s, ".eE") {
+			return 0, false
+		}
+		parsed, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }
 
 func comparableNumericValue(v any) (float64, bool) {

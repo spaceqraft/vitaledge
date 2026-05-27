@@ -2864,9 +2864,9 @@ func TestExecuteWithDistinctOrderByLimitOnProjectedVariable(t *testing.T) {
 
 	exec := New(store, Options{})
 	for _, tc := range []struct {
-		name string
+		name  string
 		query string
-		want any
+		want  any
 	}{
 		{
 			name:  "asc",
@@ -2896,6 +2896,44 @@ func TestExecuteWithDistinctOrderByLimitOnProjectedVariable(t *testing.T) {
 				t.Fatalf("unexpected x: %#v", got)
 			}
 		})
+	}
+}
+
+func TestExecuteSumPreservesLargeIntegerResult(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("UNWIND range(1000000, 2000000) AS i WITH i LIMIT 3000 RETURN sum(i) AS total")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+
+	got := res.Rows[0]["total"]
+	switch typed := got.(type) {
+	case int:
+		if typed != 3004498500 {
+			t.Fatalf("unexpected integer sum: %v", typed)
+		}
+	case int64:
+		if typed != 3004498500 {
+			t.Fatalf("unexpected integer sum: %v", typed)
+		}
+	case json.Number:
+		if typed.String() != "3004498500" {
+			t.Fatalf("unexpected numeric sum: %v", typed)
+		}
+	default:
+		t.Fatalf("unexpected sum type/value: %T %#v", got, got)
 	}
 }
 

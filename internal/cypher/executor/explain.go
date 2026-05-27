@@ -96,7 +96,7 @@ func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params
 			"statementKind": string(stmt.Statement.Kind()),
 			"tenant":        tenantFromParams(params),
 			"params":        parameterNamesForStatement(stmt.Statement),
-			"options":       buildExplainQueryOptions(stmt.Statement, params),
+			"options":       buildExplainQueryOptions(stmt.Statement),
 		},
 		"summary": map[string]any{
 			"dryRun":              true,
@@ -636,7 +636,7 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNod
 	return warnings
 }
 
-func buildExplainQueryOptions(stmt ast.Statement, params Params) map[string]any {
+func buildExplainQueryOptions(stmt ast.Statement) map[string]any {
 	projectionClauses := explainQueryProjectionClauses(stmt)
 	if len(projectionClauses) == 0 {
 		return nil
@@ -1069,15 +1069,6 @@ func parameterNamesForStatement(stmt ast.Statement) []string {
 	}
 	sort.Strings(names)
 	return names
-}
-
-func isWriteClauseKind(kind ast.ClauseKind) bool {
-	switch kind {
-	case ast.ClauseKindCreate, ast.ClauseKindMerge, ast.ClauseKindSet, ast.ClauseKindRemove, ast.ClauseKindDelete:
-		return true
-	default:
-		return false
-	}
 }
 
 func explainFingerprint(stmt *ast.ExplainStatement) string {

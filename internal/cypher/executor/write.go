@@ -207,7 +207,7 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 			rows, stepErr = e.applyUnwindClause(rows, clause, params)
 			resultColumns = appendUniqueColumns(resultColumns, inferColumnsFromRows(rows)...)
 		case ast.ClauseKindWith:
-			rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns, false)
+			rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns)
 		case ast.ClauseKindCreate:
 			rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, false)
 		case ast.ClauseKindMerge:
@@ -215,11 +215,11 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 		case ast.ClauseKindSet:
 			rows, stepErr = e.applySetClause(ctx, tx, rows, clause, params)
 		case ast.ClauseKindRemove:
-			rows, stepErr = e.applyRemoveClause(ctx, tx, rows, clause, params)
+			rows, stepErr = e.applyRemoveClause(ctx, tx, rows, clause)
 		case ast.ClauseKindDelete:
 			rows, stepErr = e.applyDeleteClause(ctx, tx, rows, clause, params)
 		case ast.ClauseKindReturn:
-			rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns, true)
+			rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns)
 			returnSeen = true
 			if stepErr != nil {
 				return nil, nil, false, stepErr
@@ -271,15 +271,6 @@ func hasWriteClause(part ast.QueryPart) bool {
 		}
 	}
 	return false
-}
-
-func rowsAreEmpty(rows []Row) bool {
-	for _, row := range rows {
-		if len(row) > 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
@@ -597,18 +588,6 @@ func parseBoundPathPattern(raw string) (string, string, bool) {
 	return "", "", false
 }
 
-func attachBoundPathValues(rows []Row, pathVar, leftVar, edgeVar, rightVar, direction string) {
-	if pathVar == "" {
-		return
-	}
-	for _, row := range rows {
-		left := vertexFromRowBinding(row, leftVar)
-		edge := edgeFromRowBinding(row, edgeVar)
-		right := vertexFromRowBinding(row, rightVar)
-		row[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: right, Direction: direction}
-	}
-}
-
 func attachRelationshipPathValues(rows []Row, pathVar, leftVar, edgeVar, rightVar, direction string) {
 	if pathVar == "" {
 		return
@@ -657,7 +636,8 @@ func renderPathNode(v *graph.Vertex) string {
 	b := strings.Builder{}
 	b.WriteString("(")
 	for _, label := range labels {
-		b.WriteString(":" + label)
+		b.WriteString(":")
+		b.WriteString(label)
 	}
 	if len(v.Properties) > 0 {
 		parts := make([]string, 0, len(v.Properties))
@@ -668,7 +648,9 @@ func renderPathNode(v *graph.Vertex) string {
 		if len(labels) > 0 {
 			b.WriteString(" ")
 		}
-		b.WriteString("{" + strings.Join(parts, ", ") + "}")
+		b.WriteString("{")
+		b.WriteString(strings.Join(parts, ", "))
+		b.WriteString("}")
 	}
 	b.WriteString(")")
 	return b.String()
@@ -681,7 +663,8 @@ func renderPathEdge(e *graph.Edge) string {
 	b := strings.Builder{}
 	b.WriteString("[")
 	if strings.TrimSpace(e.Type) != "" {
-		b.WriteString(":" + e.Type)
+		b.WriteString(":")
+		b.WriteString(e.Type)
 	}
 	if len(e.Properties) > 0 {
 		parts := make([]string, 0, len(e.Properties))
@@ -692,7 +675,9 @@ func renderPathEdge(e *graph.Edge) string {
 		if strings.TrimSpace(e.Type) != "" {
 			b.WriteString(" ")
 		}
-		b.WriteString("{" + strings.Join(parts, ", ") + "}")
+		b.WriteString("{")
+		b.WriteString(strings.Join(parts, ", "))
+		b.WriteString("}")
 	}
 	b.WriteString("]")
 	return b.String()
@@ -3500,11 +3485,17 @@ func (p multiHopCypherPath) String() string {
 		edgeStr := renderPathEdge(edge)
 		switch dir {
 		case "reverse":
-			b.WriteString("<-" + edgeStr + "-")
+			b.WriteString("<-")
+			b.WriteString(edgeStr)
+			b.WriteString("-")
 		case "undirected":
-			b.WriteString("-" + edgeStr + "-")
+			b.WriteString("-")
+			b.WriteString(edgeStr)
+			b.WriteString("-")
 		default:
-			b.WriteString("-" + edgeStr + "->")
+			b.WriteString("-")
+			b.WriteString(edgeStr)
+			b.WriteString("->")
 		}
 		if i+1 < len(p.Nodes) {
 			b.WriteString(renderPathNode(p.Nodes[i+1]))
@@ -5346,7 +5337,7 @@ func decodePropertyMap(raw map[string][]byte) map[string]any {
 	return decoded
 }
 
-func (e *Executor) applyRemoveClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
+func (e *Executor) applyRemoveClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause) ([]Row, error) {
 	raw := normalizeClauseBody(clause.Raw)
 	raw = stripNormalizedPrefix(raw, "REMOVE")
 	items := splitTopLevelCommaSeparated(raw)
@@ -5527,9 +5518,9 @@ func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, deta
 	case deletedVertexBinding, deletedEdgeBinding:
 		return typed, nil
 	case cypherPathValue:
-		return e.deletePathValue(ctx, tx, typed, detach)
+		return e.deletePathValue(ctx, tx, typed)
 	case multiHopCypherPath:
-		return e.deletePathValue(ctx, tx, typed, detach)
+		return e.deletePathValue(ctx, tx, typed)
 	case []any:
 		for _, item := range typed {
 			if _, err := e.deleteValue(ctx, tx, item, detach); err != nil {
@@ -5551,7 +5542,7 @@ func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, deta
 	}
 }
 
-func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any, detach bool) (any, error) {
+func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any) (any, error) {
 	deleteEdge := func(edge *graph.Edge) error {
 		if edge == nil {
 			return nil
@@ -5631,7 +5622,7 @@ func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Param
 	return out, nil
 }
 
-func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, priorColumns []string, final bool) ([]Row, []string, error) {
+func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, priorColumns []string) ([]Row, []string, error) {
 	params = withProjectionEvalRuntime(ctx, tx, params, e)
 	projection, err := projectionClauseSpecFromClause(clause)
 	if err != nil {
@@ -9201,64 +9192,6 @@ func splitTopLevelCompressedBoolean(raw, keyword string) (string, string, bool) 
 	return "", "", false
 }
 
-func compressedKeywordHasBoundaries(raw string, idx, kwLen int) bool {
-	if idx < 0 || kwLen <= 0 || idx+kwLen > len(raw) {
-		return false
-	}
-	beforeIsIdent := idx > 0 && isIdentifierByte(raw[idx-1])
-	afterPos := idx + kwLen
-	afterIsIdent := afterPos < len(raw) && isIdentifierByte(raw[afterPos])
-	return !beforeIsIdent && !afterIsIdent
-}
-
-func isIdentifierByte(ch byte) bool {
-	if ch == '_' {
-		return true
-	}
-	if ch >= 'a' && ch <= 'z' {
-		return true
-	}
-	if ch >= 'A' && ch <= 'Z' {
-		return true
-	}
-	return ch >= '0' && ch <= '9'
-}
-
-func isCompressedBooleanOperandShape(left, right string) bool {
-	left = strings.TrimSpace(left)
-	right = strings.TrimSpace(right)
-	if left == "" || right == "" {
-		return false
-	}
-	if strings.ContainsAny(left, " \t\n\r()[]{}.,:+-*/%<>=") || strings.ContainsAny(right, " \t\n\r()[]{}.,:+-*/%<>=") {
-		return false
-	}
-	if len(left) == 1 && len(right) == 1 {
-		return true
-	}
-	if len(left) == 1 && containsCompressedBooleanKeyword(right) {
-		return true
-	}
-	if len(right) == 1 && containsCompressedBooleanKeyword(left) {
-		return true
-	}
-	return false
-}
-
-func containsCompressedBooleanKeyword(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return false
-	}
-	upper := strings.ToUpper(raw)
-	for _, keyword := range []string{"AND", "OR", "XOR"} {
-		if strings.Contains(upper, keyword) {
-			return true
-		}
-	}
-	return false
-}
-
 func splitTopLevelSuffixKeyword(raw, suffix string) (string, bool) {
 	raw = strings.TrimSpace(raw)
 	suffix = strings.ToUpper(strings.TrimSpace(suffix))
@@ -10575,7 +10508,7 @@ func (e *Executor) evalExistsQueryBody(ctx context.Context, tx graph.Tx, body st
 			return false, true, err
 		}
 		var stepErr error
-		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, withClause, params, resultColumns, false)
+		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, withClause, params, resultColumns)
 		if stepErr != nil {
 			return false, true, stepErr
 		}
@@ -10588,7 +10521,7 @@ func (e *Executor) evalExistsQueryBody(ctx context.Context, tx graph.Tx, body st
 			return false, true, err
 		}
 		var stepErr error
-		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, returnClause, params, resultColumns, true)
+		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, returnClause, params, resultColumns)
 		if stepErr != nil {
 			return false, true, stepErr
 		}
@@ -11933,62 +11866,6 @@ func findTopLevelEqualsIndex(raw string) int {
 		}
 	}
 	return -1
-}
-
-func parseSimpleUndirectedPathComprehension(raw string) (pathVar string, sourceVar string, projectionExpr string, direction string, ok bool) {
-	raw = strings.TrimSpace(raw)
-	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
-		return "", "", "", "", false
-	}
-	body := strings.TrimSpace(raw[1 : len(raw)-1])
-	pipeIdx := findTopLevelPipeIndex(body)
-	if pipeIdx <= 0 {
-		return "", "", "", "", false
-	}
-	left := strings.TrimSpace(body[:pipeIdx])
-	projectionExpr = strings.TrimSpace(body[pipeIdx+1:])
-	eqIdx := strings.Index(left, "=")
-	pattern := left
-	if eqIdx > 0 {
-		pathVar = strings.TrimSpace(left[:eqIdx])
-		pattern = strings.TrimSpace(left[eqIdx+1:])
-		if !isIdentifierLike(pathVar) {
-			return "", "", "", "", false
-		}
-	}
-	if projectionExpr == "" {
-		return "", "", "", "", false
-	}
-	pattern = strings.ReplaceAll(pattern, " ", "")
-	if !strings.HasPrefix(pattern, "(") || !strings.HasSuffix(pattern, ")") {
-		return "", "", "", "", false
-	}
-	if !strings.Contains(pattern, "--") || strings.Contains(pattern, "[") || strings.Contains(pattern, "]") {
-		return "", "", "", "", false
-	}
-	if !strings.HasPrefix(pattern, "(") {
-		return "", "", "", "", false
-	}
-	closeIdx := strings.Index(pattern, ")")
-	if closeIdx <= 1 {
-		return "", "", "", "", false
-	}
-	sourceVar = strings.TrimSpace(pattern[1:closeIdx])
-	if !isIdentifierLike(sourceVar) {
-		return "", "", "", "", false
-	}
-	remainder := pattern[closeIdx:]
-	switch remainder {
-	case ")--()":
-		direction = "any"
-	case ")-->()":
-		direction = "out"
-	case ")<--()":
-		direction = "in"
-	default:
-		return "", "", "", "", false
-	}
-	return pathVar, sourceVar, projectionExpr, direction, true
 }
 
 func findTopLevelPipeIndex(raw string) int {
@@ -13531,9 +13408,7 @@ func parseDateParts(raw string) (int, int, int, bool) {
 		}
 		year *= sign
 		dayOfWeek := 1
-		if strings.HasPrefix(rest, "-") {
-			rest = rest[1:]
-		}
+		rest = strings.TrimPrefix(rest, "-")
 		weekPart := rest
 		if dash := strings.Index(rest, "-"); dash >= 0 {
 			weekPart = rest[:dash]
@@ -14663,11 +14538,6 @@ func durationComponentsFromMap(value map[string]any) durationComponents {
 		days:    days,
 		seconds: seconds,
 	}
-}
-
-func canonicalizeDurationComponents(dur durationComponents) durationComponents {
-	years, months, days, seconds := decomposeDuration(dur)
-	return durationComponents{months: float64(years*12 + months), days: float64(days), seconds: seconds}
 }
 
 func mapFloat(value map[string]any, key string) float64 {

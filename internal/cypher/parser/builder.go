@@ -541,14 +541,6 @@ func spanFromContext(seg statementSegment, fullQuery string, ctx antlr.ParserRul
 	}
 }
 
-func unsupported(seg statementSegment, fullQuery string, token antlr.Token, message string) error {
-	line, col := lineColAtOffset(fullQuery, seg.startOffset)
-	if token != nil {
-		line, col = localToGlobal(seg, fullQuery, token.GetLine(), token.GetColumn())
-	}
-	return &ParseError{Kind: ParseErrorUnsupported, Message: message, Line: line, Column: col, Statement: seg.index}
-}
-
 func internalError(seg statementSegment, message string) error {
 	return &ParseError{Kind: ParseErrorInternal, Message: message, Statement: seg.index}
 }

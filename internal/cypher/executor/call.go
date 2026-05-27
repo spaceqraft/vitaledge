@@ -400,11 +400,11 @@ func procedureValueEqual(a, b any) bool {
 }
 
 func isIntegerValue(v any) bool {
-	switch v.(type) {
+	switch v := v.(type) {
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return true
 	case json.Number:
-		_, err := v.(json.Number).Int64()
+		_, err := v.Int64()
 		return err == nil
 	default:
 		return false
@@ -412,11 +412,11 @@ func isIntegerValue(v any) bool {
 }
 
 func isFloatValue(v any) bool {
-	switch v.(type) {
+	switch v := v.(type) {
 	case float32, float64:
 		return true
 	case json.Number:
-		num := v.(json.Number)
+		num := v
 		if _, err := num.Int64(); err == nil {
 			return false
 		}

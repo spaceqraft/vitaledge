@@ -214,6 +214,88 @@ func TestParseBatchProjectionMetadataForWithAndReturnClauses(t *testing.T) {
 	}
 }
 
+func TestParseBatchMatchClauseMetadataForQueryStatement(t *testing.T) {
+	batch, err := ParseBatch("WITH 1 AS one OPTIONAL MATCH (n:Person)-[:KNOWS]->(m) WHERE m.name = $name RETURN m")
+	if err != nil {
+		t.Fatalf("ParseBatch() unexpected error: %v", err)
+	}
+	stmt, ok := batch.Statements[0].(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected *ast.QueryStatement, got %T", batch.Statements[0])
+	}
+	if len(stmt.Parts) != 1 || len(stmt.Parts[0].Clauses) < 3 {
+		t.Fatalf("expected with, optional match, and return clauses, got %#v", stmt.Parts)
+	}
+	matchClause := stmt.Parts[0].Clauses[1]
+	if matchClause.Kind != ast.ClauseKindOptionalMatch {
+		t.Fatalf("expected OPTIONAL_MATCH clause, got %s", matchClause.Kind)
+	}
+	if !matchClause.MatchOptional {
+		t.Fatalf("expected MatchOptional metadata")
+	}
+	if strings.TrimSpace(matchClause.MatchPattern) != "(n:Person)-[:KNOWS]->(m)" {
+		t.Fatalf("unexpected MatchPattern metadata: %q", matchClause.MatchPattern)
+	}
+	whereRaw := ""
+	if matchClause.Where != nil {
+		whereRaw = strings.ReplaceAll(strings.TrimSpace(matchClause.Where.Raw), " ", "")
+	}
+	if whereRaw != "m.name=$name" {
+		t.Fatalf("expected WHERE metadata on match clause, got %#v", matchClause.Where)
+	}
+}
+
+func TestParseBatchMergeClauseMetadataForQueryStatement(t *testing.T) {
+	batch, err := ParseBatch("MATCH (a {name:'A'}), (b {name:'B'}) MERGE (a)-[r:TYPE]->(b) ON CREATE SET r.name='foo' ON MATCH SET r.name='bar' RETURN r")
+	if err != nil {
+		t.Fatalf("ParseBatch() unexpected error: %v", err)
+	}
+	stmt, ok := batch.Statements[0].(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected *ast.QueryStatement, got %T", batch.Statements[0])
+	}
+	if len(stmt.Parts) != 1 || len(stmt.Parts[0].Clauses) < 3 {
+		t.Fatalf("expected match, merge, return clauses, got %#v", stmt.Parts)
+	}
+	mergeClause := stmt.Parts[0].Clauses[1]
+	if mergeClause.Kind != ast.ClauseKindMerge {
+		t.Fatalf("expected MERGE clause, got %s", mergeClause.Kind)
+	}
+	if strings.TrimSpace(mergeClause.MergePattern) != "(a)-[r:TYPE]->(b)" {
+		t.Fatalf("unexpected merge pattern metadata: %q", mergeClause.MergePattern)
+	}
+	if strings.TrimSpace(mergeClause.MergeOnCreate) != "r.name='foo'" {
+		t.Fatalf("unexpected merge on-create metadata: %q", mergeClause.MergeOnCreate)
+	}
+	if strings.TrimSpace(mergeClause.MergeOnMatch) != "r.name='bar'" {
+		t.Fatalf("unexpected merge on-match metadata: %q", mergeClause.MergeOnMatch)
+	}
+}
+
+func TestParseStatementMergeClauseMetadataBeforeSetClause(t *testing.T) {
+	stmtAny, err := ParseStatement("MERGE (u { id: $id }) SET u.name = $name")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+	stmt, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected *ast.QueryStatement, got %T", stmtAny)
+	}
+	if len(stmt.Parts) != 1 || len(stmt.Parts[0].Clauses) != 2 {
+		t.Fatalf("expected merge+set clauses, got %#v", stmt.Parts)
+	}
+	mergeClause := stmt.Parts[0].Clauses[0]
+	if mergeClause.Kind != ast.ClauseKindMerge {
+		t.Fatalf("expected MERGE clause, got %s", mergeClause.Kind)
+	}
+	if strings.TrimSpace(mergeClause.MergePattern) != "(u { id: $id })" {
+		t.Fatalf("unexpected merge pattern metadata: %q", mergeClause.MergePattern)
+	}
+	if strings.TrimSpace(mergeClause.MergeOnCreate) != "" || strings.TrimSpace(mergeClause.MergeOnMatch) != "" {
+		t.Fatalf("expected empty merge action metadata, got onCreate=%q onMatch=%q", mergeClause.MergeOnCreate, mergeClause.MergeOnMatch)
+	}
+}
+
 func TestParseBatchUnionSupported(t *testing.T) {
 	batch, err := ParseBatch("MATCH (n:Person) RETURN n UNION ALL MATCH (m:Movie) RETURN m")
 	if err != nil {
@@ -570,6 +652,24 @@ func TestParseStatementRejectsUndefinedVariableInReturnProjection(t *testing.T) 
 
 func TestParseStatementRejectsUndefinedVariableInCreatePatternPropertyMap(t *testing.T) {
 	_, err := ParseStatement("MATCH (a) CREATE (a)-[:KNOWS]->(b {name: missing}) RETURN b")
+	if err == nil {
+		t.Fatalf("expected undefined variable parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "UndefinedVariable" {
+		t.Fatalf("expected UndefinedVariable message, got %q", parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsUndefinedVariableInMergeOnCreateAction(t *testing.T) {
+	_, err := ParseStatement("MERGE (a {id: '1'}) ON CREATE SET missing.name = 'x' RETURN a")
 	if err == nil {
 		t.Fatalf("expected undefined variable parse error")
 	}

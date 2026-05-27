@@ -277,6 +277,93 @@ Implementation status for current EXPLAIN slice set:
 4. Warning/fallback diagnostics: completed (specific warning codes emitted for full scans, missing indexes, estimate-only signals, missing tenant context, and write dry-run behavior).
 5. Documentation: completed (README and DESIGN include concrete EXPLAIN interpretation guidance and warning semantics).
 
+#### Query Pipeline slice-by-slice execution plan (next)
+
+Execution style mirrors the completed EXPLAIN track: one narrow slice at a time, each ending with focused tests, docs/schema deltas (if any), and a green regression gate before moving on.
+
+Current status:
+
+1. QP-0 baseline and guardrails: completed.
+2. QP-1 ORDER BY, SKIP, LIMIT migration: completed.
+3. QP-2 DISTINCT and projection forms migration: completed.
+4. QP-3 MATCH/OPTIONAL MATCH pattern and edge-structure migration: completed.
+5. QP-4 MERGE action blocks and write-action sequencing migration: completed.
+6. QP-5 cleanup, hardening, and parity closeout: completed.
+
+Slice QP-0: baseline and guardrails
+
+1. Define and pin the pipeline handoff contracts in code comments/types where needed (parse output, semantic model, logical plan, physical execution input).
+2. Add/refresh focused regression tests for currently supported query shapes so behavior is frozen before refactors.
+3. Add a guardrail checklist in tests/review notes for "no raw-text semantic recovery" in migrated paths.
+
+Exit gate:
+
+1. Focused parser/executor/TCP tests are green.
+2. Existing EXPLAIN tests remain green.
+
+Slice QP-1: ORDER BY, SKIP, LIMIT migration
+
+1. Promote ordering/pagination intent into structured stage artifacts consumed by planner/executor.
+2. Remove or bypass regex/raw-clause recovery for these forms in migrated paths.
+3. Keep EXPLAIN operator output aligned (`SORT`, `SKIP`, `LIMIT`) with the new pipeline artifacts.
+
+Exit gate:
+
+1. Existing ORDER/SKIP/LIMIT tests pass with no behavior regressions.
+2. New tests assert stage-artifact usage (not raw text) for these clauses.
+
+Slice QP-2: DISTINCT and projection forms
+
+1. Move projection item shaping, DISTINCT behavior, and alias handling fully through semantic model + logical plan.
+2. Ensure planner/executor consume structured projection intent only.
+3. Keep EXPLAIN projection/query-options output stable while sourcing from migrated artifacts.
+
+Exit gate:
+
+1. Projection/DISTINCT correctness tests pass for MATCH and WITH/RETURN forms.
+2. EXPLAIN query-options and plan-node projections remain stable in tests.
+
+Slice QP-3: MATCH and OPTIONAL MATCH pattern/edge structure
+
+1. Promote pattern/edge structure used for scans/expands/filters into planner-facing artifacts.
+2. Reduce executor-local pattern regex recovery in migrated query shapes.
+3. Keep index candidate/access-path behavior stable or improve with explicit planner inputs.
+
+Exit gate:
+
+1. MATCH/OPTIONAL MATCH coverage passes for supported pattern forms.
+2. EXPLAIN operator/access-path/index-decision outputs remain stable.
+
+Slice QP-4: MERGE action blocks and write-action sequencing
+
+1. Encode MERGE action blocks (`ON MATCH` / `ON CREATE`) and write sequencing as structured execution inputs.
+2. Remove raw-text fallback for migrated MERGE sequencing paths.
+3. Preserve dry-run behavior under EXPLAIN for write-shaped statements.
+
+Exit gate:
+
+1. MERGE sequencing and mutation correctness tests pass.
+2. EXPLAIN write-dry-run and warning diagnostics remain correct.
+
+Slice QP-5: cleanup, hardening, and parity closeout
+
+1. Remove replaced regex/raw-text paths once migrated parity is proven.
+2. Add any missing semantic-stage error-path assertions for representative invalid queries.
+3. Run benchmark non-regression checks against Phase 1 baselines for migrated query families.
+
+Exit gate:
+
+1. Query Pipeline exit evidence list is satisfied.
+2. No supported migrated form requires executor-side raw-text semantic recovery.
+
+Per-slice execution checklist:
+
+1. Implement smallest vertical change.
+2. Add or tighten focused unit/integration tests.
+3. Run focused parser/executor/TCP tests.
+4. Update docs/contracts only where changed.
+5. Merge only on green tests and stable EXPLAIN outputs.
+
 Milestones:
 
 1. Strengthen query-engine phase boundaries.

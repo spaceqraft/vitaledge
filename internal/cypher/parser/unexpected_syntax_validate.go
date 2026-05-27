@@ -248,38 +248,8 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						recordWithValueKinds(clause.Raw, valueKinds)
 					}
 				case ast.ClauseKindSet:
-					expressions := extractSetValueExpressions(clause.Raw)
-					for _, expr := range expressions {
-						if hasUndefinedWhereIdentifier(expr, bound) {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
-						}
-						if containsForbiddenPatternExpression(expr) {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
-						}
-						if hasInvalidInLiteralRHS(expr) {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
-						}
-						if hasInvalidAggregationInListComprehension(expr) {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
-						}
-						if name, ok := firstUnknownFunctionCall(expr); ok {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
-						}
-						if literal, ok := firstOverflowingHexOrOctalLiteral(expr); ok {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
-						}
-						if literal, ok := firstOverflowingDecimalIntegerLiteral(expr); ok {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
-						}
-						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
-						}
-						if isInvalidTypeArgumentExpression(expr, bound) || isInvalidLabelsArgumentExpression(expr, bound) {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
-						}
-						if isInvalidLengthArgumentExpression(expr, bound) || isInvalidSizeArgumentExpression(expr, bound) {
-							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
-						}
+					if err := validateSetAssignmentsAndExpressions(clause.Raw, bound, seg); err != nil {
+						return err
 					}
 				case ast.ClauseKindDelete:
 					if err := validateDeleteClauseExpressions(clause.Raw, bound, seg); err != nil {
@@ -342,6 +312,14 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 								return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
 							}
 						}
+						if clause.Kind == ast.ClauseKindMerge {
+							if err := validateSetAssignmentsAndExpressions("SET "+strings.TrimSpace(clause.MergeOnCreate), scope, seg); err != nil {
+								return err
+							}
+							if err := validateSetAssignmentsAndExpressions("SET "+strings.TrimSpace(clause.MergeOnMatch), scope, seg); err != nil {
+								return err
+							}
+						}
 					}
 					for name, role := range clauseBound {
 						bound[name] = role
@@ -376,6 +354,179 @@ func validateDeleteClauseExpressions(raw string, bound map[string]patternVarRole
 		}
 	}
 	return nil
+}
+
+func validateSetAssignmentsAndExpressions(raw string, bound map[string]patternVarRole, seg statementSegment) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "SET") {
+		return nil
+	}
+
+	for _, target := range extractSetAssignmentTargets(raw) {
+		if target == "" {
+			continue
+		}
+		if _, ok := bound[target]; !ok {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+		}
+	}
+
+	expressions := extractSetValueExpressions(raw)
+	for _, expr := range expressions {
+		if hasUndefinedWhereIdentifier(expr, bound) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+		}
+		if containsForbiddenPatternExpression(expr) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
+		}
+		if hasInvalidInLiteralRHS(expr) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+		}
+		if hasInvalidAggregationInListComprehension(expr) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
+		}
+		if name, ok := firstUnknownFunctionCall(expr); ok {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
+		}
+		if literal, ok := firstOverflowingHexOrOctalLiteral(expr); ok {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
+		}
+		if literal, ok := firstOverflowingDecimalIntegerLiteral(expr); ok {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
+		}
+		if literal, ok := firstOverflowingFloatLiteral(expr); ok {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
+		}
+		if isInvalidTypeArgumentExpression(expr, bound) || isInvalidLabelsArgumentExpression(expr, bound) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+		}
+		if isInvalidLengthArgumentExpression(expr, bound) || isInvalidSizeArgumentExpression(expr, bound) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+		}
+	}
+
+	return nil
+}
+
+func extractSetAssignmentTargets(raw string) []string {
+	text := strings.TrimSpace(raw)
+	upper := strings.ToUpper(text)
+	if strings.HasPrefix(upper, "SET") {
+		text = strings.TrimSpace(text[len("SET"):])
+	}
+	if text == "" {
+		return nil
+	}
+
+	targets := make([]string, 0)
+	for _, item := range splitTopLevelComma(text) {
+		entry := strings.TrimSpace(item)
+		if entry == "" {
+			continue
+		}
+
+		lhs := ""
+		if idx := indexTopLevelEquals(entry); idx >= 0 {
+			lhs = strings.TrimSpace(entry[:idx])
+		} else if idx := indexTopLevelColonForLabelSet(entry); idx >= 0 {
+			lhs = strings.TrimSpace(entry[:idx])
+		}
+		if lhs == "" {
+			continue
+		}
+		if root := extractSetAssignmentRoot(lhs); root != "" {
+			targets = append(targets, root)
+		}
+	}
+
+	return targets
+}
+
+func extractSetAssignmentRoot(lhs string) string {
+	lhs = strings.TrimSpace(lhs)
+	if lhs == "" {
+		return ""
+	}
+	if idx := strings.Index(lhs, "."); idx >= 0 {
+		lhs = strings.TrimSpace(lhs[:idx])
+	}
+	if idx := strings.Index(lhs, "["); idx >= 0 {
+		lhs = strings.TrimSpace(lhs[:idx])
+	}
+	if !isSetAssignmentIdentifier(lhs) {
+		return ""
+	}
+	return lhs
+}
+
+func isSetAssignmentIdentifier(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if i == 0 {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_') {
+				return false
+			}
+			continue
+		}
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func indexTopLevelColonForLabelSet(raw string) int {
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle, inDouble := false, false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case ':':
+			if depthParen == 0 && depthBracket == 0 && depthBrace == 0 {
+				if i > 0 && raw[i-1] == ':' {
+					continue
+				}
+				if i+1 < len(raw) && raw[i+1] == ':' {
+					continue
+				}
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func extractDeleteTargetExpressions(raw string) ([]string, bool) {
@@ -2345,7 +2496,7 @@ func isInvalidSizeArgumentExpression(expr string, bound map[string]patternVarRol
 	if !exists {
 		return false
 	}
-	return role == patternRoleNode || role == patternRoleRel || role == patternRolePath
+	return role == patternRoleNode || role == patternRolePath
 }
 
 func isInvalidTypeArgumentExpression(expr string, bound map[string]patternVarRole) bool {

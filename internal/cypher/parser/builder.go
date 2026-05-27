@@ -2,11 +2,17 @@ package parser
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/antlr4-go/antlr/v4"
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	cyphergen "github.com/paegun/vitaledge/internal/cypher/grammar/generated"
+)
+
+var (
+	mergeOnCreateSetRE = regexp.MustCompile(`(?i)\bON\s*CREATE\s*SET\b`)
+	mergeOnMatchSetRE  = regexp.MustCompile(`(?i)\bON\s*MATCH\s*SET\b`)
 )
 
 func buildStatement(root cyphergen.IOC_CypherContext, seg statementSegment, fullQuery string) (ast.Statement, error) {
@@ -230,10 +236,21 @@ func buildQueryPartFromChildren(children []antlr.Tree, seg statementSegment, ful
 func buildReadingClause(c cyphergen.IOC_ReadingClauseContext, seg statementSegment, fullQuery string) (ast.Clause, error) {
 	if m := c.OC_Match(); m != nil {
 		kind := ast.ClauseKindMatch
+		optional := false
 		if m.OPTIONAL() != nil {
 			kind = ast.ClauseKindOptionalMatch
+			optional = true
 		}
-		return buildClause(kind, m, seg, fullQuery), nil
+		clause := buildClause(kind, m, seg, fullQuery)
+		if m.OC_Pattern() != nil {
+			clause.MatchPattern = strings.TrimSpace(m.OC_Pattern().GetText())
+		}
+		clause.MatchOptional = optional
+		if where := m.OC_Where(); where != nil {
+			expr := expressionFromContext(seg, fullQuery, where.OC_Expression())
+			clause.Where = &expr
+		}
+		return clause, nil
 	}
 	if u := c.OC_Unwind(); u != nil {
 		return buildClause(ast.ClauseKindUnwind, u, seg, fullQuery), nil
@@ -250,7 +267,12 @@ func buildUpdatingClause(c cyphergen.IOC_UpdatingClauseContext, seg statementSeg
 		return buildClause(ast.ClauseKindCreate, create, seg, fullQuery), nil
 	}
 	if merge := c.OC_Merge(); merge != nil {
-		return buildClause(ast.ClauseKindMerge, merge, seg, fullQuery), nil
+		clause := buildClause(ast.ClauseKindMerge, merge, seg, fullQuery)
+		pattern, onCreateSet, onMatchSet := splitMergePatternAndActions(clause.Raw)
+		clause.MergePattern = pattern
+		clause.MergeOnCreate = onCreateSet
+		clause.MergeOnMatch = onMatchSet
+		return clause, nil
 	}
 	if del := c.OC_Delete(); del != nil {
 		return buildClause(ast.ClauseKindDelete, del, seg, fullQuery), nil
@@ -366,6 +388,88 @@ func expressionFromContext(seg statementSegment, fullQuery string, ctx cyphergen
 		Parameters: collectParameters(seg, fullQuery, ctx),
 		Span:       spanFromContext(seg, fullQuery, ctx),
 	}
+}
+
+func splitMergePatternAndActions(raw string) (pattern string, onCreateSet string, onMatchSet string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", ""
+	}
+	raw = stripLeadingKeywordInsensitive(raw, "MERGE")
+	if raw == "" {
+		return "", "", ""
+	}
+
+	createMatch := mergeOnCreateSetRE.FindStringIndex(raw)
+	matchMatch := mergeOnMatchSetRE.FindStringIndex(raw)
+	createIdx := -1
+	createLen := 0
+	if len(createMatch) == 2 {
+		createIdx = createMatch[0]
+		createLen = createMatch[1] - createMatch[0]
+	}
+	matchIdx := -1
+	matchLen := 0
+	if len(matchMatch) == 2 {
+		matchIdx = matchMatch[0]
+		matchLen = matchMatch[1] - matchMatch[0]
+	}
+	firstIdx := minPositiveIndex(createIdx, matchIdx)
+	if firstIdx < 0 {
+		return raw, "", ""
+	}
+
+	pattern = strings.TrimSpace(raw[:firstIdx])
+	if createIdx >= 0 {
+		end := len(raw)
+		if matchIdx > createIdx {
+			end = matchIdx
+		}
+		onCreateSet = strings.TrimSpace(raw[createIdx+createLen : end])
+	}
+	if matchIdx >= 0 {
+		end := len(raw)
+		if createIdx > matchIdx {
+			end = createIdx
+		}
+		onMatchSet = strings.TrimSpace(raw[matchIdx+matchLen : end])
+	}
+	return pattern, onCreateSet, onMatchSet
+}
+
+func stripLeadingKeywordInsensitive(raw string, keyword string) string {
+	raw = strings.TrimSpace(raw)
+	keyword = strings.TrimSpace(keyword)
+	if raw == "" || keyword == "" {
+		return raw
+	}
+	if len(raw) < len(keyword) {
+		return raw
+	}
+	if !strings.EqualFold(raw[:len(keyword)], keyword) {
+		return raw
+	}
+	if len(raw) == len(keyword) {
+		return ""
+	}
+	next := raw[len(keyword)]
+	if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9') || next == '_' {
+		return raw
+	}
+	return strings.TrimSpace(raw[len(keyword):])
+}
+
+func minPositiveIndex(values ...int) int {
+	best := -1
+	for _, value := range values {
+		if value < 0 {
+			continue
+		}
+		if best < 0 || value < best {
+			best = value
+		}
+	}
+	return best
 }
 
 func collectParameters(seg statementSegment, fullQuery string, tree antlr.Tree) []ast.ParameterRef {

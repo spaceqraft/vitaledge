@@ -1407,19 +1407,6 @@ func TestExecuteMergeOnMatchAndOnCreateLabels(t *testing.T) {
 	}
 }
 
-func TestSplitMergePatternAndActionsMatchThenCreate(t *testing.T) {
-	pattern, onCreateSet, onMatchSet := splitMergePatternAndActions("(a:L)ONMATCHSETa:M1ONCREATESETa:M2")
-	if pattern != "(a:L)" {
-		t.Fatalf("unexpected pattern %q", pattern)
-	}
-	if onMatchSet != "a:M1" {
-		t.Fatalf("unexpected ON MATCH set %q", onMatchSet)
-	}
-	if onCreateSet != "a:M2" {
-		t.Fatalf("unexpected ON CREATE set %q", onCreateSet)
-	}
-}
-
 func TestExecuteCreateEdgePattern(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -4116,7 +4103,7 @@ func TestProjectionClauseSpecFromClausePrefersStructuredProjectionMetadata(t *te
 		},
 	}
 
-	spec, err := projectionClauseSpecFromClause(clause, nil)
+	spec, err := projectionClauseSpecFromClause(clause)
 	if err != nil {
 		t.Fatalf("projectionClauseSpecFromClause failed: %v", err)
 	}
@@ -4128,21 +4115,15 @@ func TestProjectionClauseSpecFromClausePrefersStructuredProjectionMetadata(t *te
 	}
 }
 
-func TestProjectionClauseSpecFromClauseAllowsCompactNormalizedFallback(t *testing.T) {
+func TestProjectionClauseSpecFromClauseRejectsCompactRawFallbackWithoutMetadata(t *testing.T) {
 	clause := ast.Clause{
 		Kind: ast.ClauseKindReturn,
 		Raw:  "RETURNnORDERBYnDESCSKIP1LIMIT1",
 	}
 
-	spec, err := projectionClauseSpecFromClause(clause, []string{"n"})
-	if err != nil {
-		t.Fatalf("projectionClauseSpecFromClause failed: %v", err)
-	}
-	if spec.SkipRaw != "1" || spec.LimitRaw != "1" {
-		t.Fatalf("expected compact fallback skip/limit parsing, got skip=%q limit=%q", spec.SkipRaw, spec.LimitRaw)
-	}
-	if len(spec.OrderBy) != 1 {
-		t.Fatalf("expected one ORDER BY item from compact fallback, got %d", len(spec.OrderBy))
+	_, err := projectionClauseSpecFromClause(clause)
+	if err == nil {
+		t.Fatalf("expected structured-projection error when metadata is unavailable")
 	}
 }
 
@@ -4152,9 +4133,56 @@ func TestProjectionClauseSpecFromClauseRejectsNonCompactRawFallback(t *testing.T
 		Raw:  "RETURN n ORDER BY n DESC SKIP 1 LIMIT 1",
 	}
 
-	_, err := projectionClauseSpecFromClause(clause, nil)
+	_, err := projectionClauseSpecFromClause(clause)
 	if err == nil {
 		t.Fatalf("expected structured-projection error when metadata is unavailable")
+	}
+}
+
+func TestParseProjectionItemsDoesNotSplitIdentifiersContainingAS(t *testing.T) {
+	items, err := parseProjectionItems("a.name, a.age, a.seasons")
+	if err != nil {
+		t.Fatalf("parseProjectionItems failed: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 projection items, got %d", len(items))
+	}
+	if items[0].Expression != "a.name" || items[0].Alias != "" {
+		t.Fatalf("unexpected first projection item: %#v", items[0])
+	}
+	if items[1].Expression != "a.age" || items[1].Alias != "" {
+		t.Fatalf("unexpected second projection item: %#v", items[1])
+	}
+	if items[2].Expression != "a.seasons" || items[2].Alias != "" {
+		t.Fatalf("unexpected third projection item: %#v", items[2])
+	}
+}
+
+func TestExecuteCreateAnonymousNodesWithSameIDPropertyDoNotOverwrite(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("CREATE (:A {id: 1}), (:A {id: 2}), (:B {id: 2}), (:B {id: 3})")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	joinStmt, err := parser.ParseStatement("MATCH (a:A), (b:B) WHERE a.id = b.id RETURN a, b")
+	if err != nil {
+		t.Fatalf("join parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, joinStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("join execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one joined row, got %d (%#v)", len(res.Rows), res.Rows)
 	}
 }
 

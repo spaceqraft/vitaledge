@@ -67,12 +67,17 @@ type Batch struct {
 
 // Clause is a generic top-level query clause.
 type Clause struct {
-	Kind       ClauseKind
-	Raw        string
-	Projection *ReturnClause
-	Where      *Expression
-	Parameters []ParameterRef
-	Span       Span
+	Kind          ClauseKind
+	Raw           string
+	MatchPattern  string
+	MatchOptional bool
+	MergePattern  string
+	MergeOnCreate string
+	MergeOnMatch  string
+	Projection    *ReturnClause
+	Where         *Expression
+	Parameters    []ParameterRef
+	Span          Span
 }
 
 // QueryPart is one single query between UNION boundaries.

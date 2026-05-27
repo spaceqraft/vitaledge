@@ -149,9 +149,6 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 	if len(stmt.MatchClauses) == 0 {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "at least one MATCH clause is required", nil)
 	}
-	if !shouldUseProjectionEngineForReturn(stmt.Return) {
-		return e.executeMatchQueryLegacy(ctx, stmt, params)
-	}
 
 	rows := []Row{{}}
 	resultColumns := []string{}
@@ -162,13 +159,13 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 			if match.Optional {
 				kind = ast.ClauseKindOptionalMatch
 			}
-			matchClause := ast.Clause{Kind: kind, Raw: renderMatchClauseRaw(match)}
+			matchClause := ast.Clause{Kind: kind, Raw: renderMatchClauseRaw(match), MatchPattern: strings.TrimSpace(match.Pattern), MatchOptional: match.Optional, Where: match.Where}
 			nextRows, err := e.applyMatchClause(ctx, tx, rows, matchClause, params)
 			if err != nil {
 				return err
 			}
 			rows = nextRows
-			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(matchClause.Raw)...)
+			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumnsForClause(matchClause)...)
 		}
 
 		projectedRows, cols, err := e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: renderReturnClauseRaw(stmt.Return), Projection: &stmt.Return}, params, resultColumns, true)
@@ -186,29 +183,6 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 	result := &Result{Columns: resultColumns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}
 	result.Rows = normalizeResultRows(result.Rows)
 	return result, nil
-}
-
-func shouldUseProjectionEngineForReturn(ret ast.ReturnClause) bool {
-	if ret.IncludeAll || ret.Distinct || len(ret.OrderBy) > 0 {
-		return true
-	}
-	for _, item := range ret.Items {
-		rawExpr := strings.TrimSpace(item.Expression.Raw)
-		if strings.ContainsAny(rawExpr, " \t\n\r") {
-			return true
-		}
-		raw := strings.ToUpper(strings.TrimSpace(item.Expression.Raw))
-		if raw == "" {
-			continue
-		}
-		if strings.Contains(raw, "DISTINCT") {
-			return true
-		}
-		if strings.Contains(raw, "COLLECT(") || strings.Contains(raw, "COUNT(") || strings.Contains(raw, "SUM(") || strings.Contains(raw, "AVG(") || strings.Contains(raw, "MIN(") || strings.Contains(raw, "MAX(") {
-			return true
-		}
-	}
-	return false
 }
 
 func appendUniqueColumns(columns []string, candidates ...string) []string {
@@ -277,6 +251,29 @@ func inferMatchScopeColumns(clauseRaw string) []string {
 	}
 
 	return columns
+}
+
+func inferMatchScopeColumnsForClause(clause ast.Clause) []string {
+	if strings.TrimSpace(clause.MatchPattern) != "" {
+		pattern := strings.TrimSpace(clause.MatchPattern)
+		columns := []string{}
+		if pathVar, innerPattern, ok := parseBoundPathPattern(pattern); ok {
+			columns = appendUniqueColumns(columns, pathVar)
+			pattern = strings.TrimSpace(innerPattern)
+		}
+		for _, match := range patternNodeVarRE.FindAllStringSubmatch(pattern, -1) {
+			if len(match) > 1 {
+				columns = appendUniqueColumns(columns, match[1])
+			}
+		}
+		for _, match := range patternEdgeVarRE.FindAllStringSubmatch(pattern, -1) {
+			if len(match) > 1 {
+				columns = appendUniqueColumns(columns, match[1])
+			}
+		}
+		return columns
+	}
+	return inferMatchScopeColumns(clause.Raw)
 }
 
 func (e *Executor) executeMatchQueryLegacy(ctx context.Context, stmt *ast.MatchQueryStatement, params Params) (*Result, error) {

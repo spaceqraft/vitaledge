@@ -199,10 +199,10 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 		switch clause.Kind {
 		case ast.ClauseKindMatch:
 			rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
-			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(clause.Raw)...)
+			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumnsForClause(clause)...)
 		case ast.ClauseKindOptionalMatch:
 			rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
-			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(clause.Raw)...)
+			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumnsForClause(clause)...)
 		case ast.ClauseKindUnwind:
 			rows, stepErr = e.applyUnwindClause(rows, clause, params)
 			resultColumns = appendUniqueColumns(resultColumns, inferColumnsFromRows(rows)...)
@@ -283,7 +283,7 @@ func rowsAreEmpty(rows []Row) bool {
 }
 
 func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
-	spec, err := parseAnchoredMatchClauseRaw(clause.Raw)
+	spec, err := anchoredMatchSpecFromClause(clause)
 	if err != nil {
 		return nil, err
 	}
@@ -346,7 +346,7 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 			return nil, matchErr
 		}
 		if pathVar != "" {
-			attachBoundPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "forward")
+			attachRelationshipPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "forward")
 			for _, merged := range matched {
 				for _, key := range cleanupVars {
 					delete(merged, key)
@@ -383,7 +383,7 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 			return nil, matchErr
 		}
 		if pathVar != "" {
-			attachBoundPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "reverse")
+			attachRelationshipPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "reverse")
 			for _, merged := range matched {
 				for _, key := range cleanupVars {
 					delete(merged, key)
@@ -420,7 +420,7 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 			return nil, matchErr
 		}
 		if pathVar != "" {
-			attachBoundPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "undirected")
+			attachRelationshipPathValues(matched, pathVar, leftVar, edgeVar, rightVar, "undirected")
 			for _, merged := range matched {
 				for _, key := range cleanupVars {
 					delete(merged, key)
@@ -475,6 +475,20 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	return e.expandAnchoredMatch(ctx, tx, rows, expansionSpec, params, pathVar)
 }
 
+func anchoredMatchSpecFromClause(clause ast.Clause) (anchoredMatchSpec, error) {
+	if strings.TrimSpace(clause.MatchPattern) != "" {
+		spec := anchoredMatchSpec{
+			Optional: clause.MatchOptional || clause.Kind == ast.ClauseKindOptionalMatch,
+			Pattern:  strings.TrimSpace(clause.MatchPattern),
+		}
+		if clause.Where != nil {
+			spec.Where = strings.TrimSpace(clause.Where.Raw)
+		}
+		return spec, nil
+	}
+	return parseAnchoredMatchClauseRaw(clause.Raw)
+}
+
 func (e *Executor) expandCompositeMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, parts []string, params Params) ([]Row, error) {
 	if len(rows) == 0 {
 		rows = []Row{{}}
@@ -494,7 +508,7 @@ func (e *Executor) expandCompositeMatch(ctx context.Context, tx graph.Tx, rows [
 			if part == "" {
 				continue
 			}
-			next, err := e.applyMatchClause(ctx, tx, partials, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + part}, params)
+			next, err := e.applyMatchClause(ctx, tx, partials, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + part, MatchPattern: part, MatchOptional: false}, params)
 			if err != nil {
 				return nil, err
 			}
@@ -591,6 +605,22 @@ func attachBoundPathValues(rows []Row, pathVar, leftVar, edgeVar, rightVar, dire
 		left := vertexFromRowBinding(row, leftVar)
 		edge := edgeFromRowBinding(row, edgeVar)
 		right := vertexFromRowBinding(row, rightVar)
+		row[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: right, Direction: direction}
+	}
+}
+
+func attachRelationshipPathValues(rows []Row, pathVar, leftVar, edgeVar, rightVar, direction string) {
+	if pathVar == "" {
+		return
+	}
+	for _, row := range rows {
+		edge := edgeFromRowBinding(row, edgeVar)
+		right := vertexFromRowBinding(row, rightVar)
+		if edge == nil || right == nil {
+			row[pathVar] = nil
+			continue
+		}
+		left := vertexFromRowBinding(row, leftVar)
 		row[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: right, Direction: direction}
 	}
 }
@@ -3966,9 +3996,11 @@ func (e *Executor) applyCreateClause(ctx context.Context, tx graph.Tx, rows []Ro
 		onCreateSet := ""
 		onMatchSet := ""
 		if merge {
-			patternRaw, onCreateSet, onMatchSet = splitMergePatternAndActions(part)
+			patternRaw = normalizeClauseBody(stripCypherLineComments(clause.MergePattern))
+			onCreateSet = normalizeClauseBody(stripCypherLineComments(clause.MergeOnCreate))
+			onMatchSet = normalizeClauseBody(stripCypherLineComments(clause.MergeOnMatch))
 			if patternRaw == "" {
-				return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("CREATE/MERGE pattern %q is not yet supported", part), nil)
+				return nil, graph.NewError(graph.ErrKindUnsupported, "MERGE clause requires structured pattern metadata", nil)
 			}
 		}
 
@@ -3988,37 +4020,6 @@ func (e *Executor) applyCreateClause(ctx context.Context, tx graph.Tx, rows []Ro
 	}
 	out = clearMergeCreatedMarker(out)
 	return out, nil
-}
-
-func splitMergePatternAndActions(raw string) (pattern string, onCreateSet string, onMatchSet string) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", "", ""
-	}
-
-	createIdx := findTopLevelKeywordIndex(raw, "ONCREATESET")
-	matchIdx := findTopLevelKeywordIndex(raw, "ONMATCHSET")
-	firstIdx := minPositiveIndex(createIdx, matchIdx)
-	if firstIdx < 0 {
-		return raw, "", ""
-	}
-
-	pattern = strings.TrimSpace(raw[:firstIdx])
-	if createIdx >= 0 {
-		end := len(raw)
-		if matchIdx > createIdx {
-			end = matchIdx
-		}
-		onCreateSet = strings.TrimSpace(raw[createIdx+len("ONCREATESET") : end])
-	}
-	if matchIdx >= 0 {
-		end := len(raw)
-		if createIdx > matchIdx {
-			end = createIdx
-		}
-		onMatchSet = strings.TrimSpace(raw[matchIdx+len("ONMATCHSET") : end])
-	}
-	return pattern, onCreateSet, onMatchSet
 }
 
 func (e *Executor) applyMergeActions(ctx context.Context, tx graph.Tx, rows []Row, onCreateSet string, onMatchSet string, params Params) ([]Row, error) {
@@ -4381,6 +4382,11 @@ func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows 
 		}
 		normalizedProps := normalizeVertexProperties(props)
 		vertexID := ""
+		if strings.TrimSpace(varName) != "" {
+			if derivedID, ok := vertexIDFromPatternProperties(props); ok {
+				vertexID = derivedID
+			}
+		}
 		if vertexID == "" {
 			if varName != "" {
 				if existing, ok := row[varName].(*graph.Vertex); ok {
@@ -4820,9 +4826,21 @@ func createOrMergeEdge(ctx context.Context, tx graph.Tx, leftVertex, rightVertex
 		}
 	}
 
+	edgeID := ""
+	if merge {
+		edgeID = nextAutoEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
+	} else {
+		edgeID = syntheticEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
+		if _, err := tx.GetEdge(ctx, srcVertex.Tenant, edgeID); err == nil {
+			edgeID = nextAutoEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
+		} else if !graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil, false, err
+		}
+	}
+
 	edge := &graph.Edge{
 		Tenant:     srcVertex.Tenant,
-		ID:         nextAutoEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID),
+		ID:         edgeID,
 		Type:       edgeType,
 		SrcID:      srcVertex.ID,
 		DstID:      dstVertex.ID,
@@ -5615,7 +5633,7 @@ func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Param
 
 func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, priorColumns []string, final bool) ([]Row, []string, error) {
 	params = withProjectionEvalRuntime(ctx, tx, params, e)
-	projection, err := projectionClauseSpecFromClause(clause, inferColumnsFromRows(rows))
+	projection, err := projectionClauseSpecFromClause(clause)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -6249,39 +6267,15 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 	return out, columns, nil
 }
 
-func projectionClauseSpecFromClause(clause ast.Clause, scopeVars []string) (projectionClauseSpec, error) {
+func projectionClauseSpecFromClause(clause ast.Clause) (projectionClauseSpec, error) {
 	if clause.Projection != nil {
 		return projectionClauseSpecFromAST(clause.Projection, clause.Where), nil
 	}
 	if clause.Kind == ast.ClauseKindWith || clause.Kind == ast.ClauseKindReturn {
-		structured, err := buildStructuredProjectionClause(clause.Kind, clause.Raw, scopeVars)
-		if err == nil && structured.Projection != nil {
-			return projectionClauseSpecFromAST(structured.Projection, structured.Where), nil
-		}
-		compactClauseRaw := strings.IndexFunc(strings.TrimSpace(clause.Raw), unicode.IsSpace) < 0
-		raw := strings.TrimSpace(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
-		if compactClauseRaw || isCompactNormalizedProjectionRaw(raw) {
-			return parseProjectionClauseSpec(raw)
-		}
-		if err != nil {
-			return projectionClauseSpec{}, err
-		}
 		return projectionClauseSpec{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("%s clause projection metadata is unavailable", clause.Kind), nil)
 	}
 	raw := strings.TrimSpace(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
 	return parseProjectionClauseSpec(raw)
-}
-
-func isCompactNormalizedProjectionRaw(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return false
-	}
-	if strings.IndexFunc(raw, unicode.IsSpace) >= 0 {
-		return false
-	}
-	upper := strings.ToUpper(raw)
-	return strings.Contains(upper, "ORDERBY") || strings.Contains(upper, "SKIP") || strings.Contains(upper, "LIMIT") || strings.Contains(upper, "DISTINCT")
 }
 
 func projectionClauseSpecFromAST(ret *ast.ReturnClause, where *ast.Expression) projectionClauseSpec {
@@ -7338,6 +7332,13 @@ func findTopLevelAliasIndex(raw string) int {
 			continue
 		}
 		if upper[i:i+2] != "AS" {
+			continue
+		}
+		if i == 0 || !strings.ContainsAny(string(raw[i-1]), " \t\n\r") {
+			continue
+		}
+		after := i + 2
+		if after >= len(raw) || !strings.ContainsAny(string(raw[after]), " \t\n\r") {
 			continue
 		}
 		candidates = append(candidates, i)
@@ -10489,7 +10490,7 @@ func (e *Executor) evalExistsSubquery(ctx context.Context, tx graph.Tx, body str
 		return result, err
 	}
 	if patternBody, whereBody, ok := splitExistsPatternBody(body); ok {
-		matches, err := e.applyMatchClause(ctx, tx, []Row{cloneRow(row)}, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + patternBody}, params)
+		matches, err := e.applyMatchClause(ctx, tx, []Row{cloneRow(row)}, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + patternBody, MatchPattern: patternBody, MatchOptional: false}, params)
 		if err != nil {
 			return false, err
 		}
@@ -10519,10 +10520,12 @@ func (e *Executor) evalExistsSubquery(ctx context.Context, tx graph.Tx, body str
 }
 
 func (e *Executor) evalExistsQueryBody(ctx context.Context, tx graph.Tx, body string, row Row, params Params) (bool, bool, error) {
-	body = normalizeClauseBody(stripCypherLineComments(body))
+	body = strings.TrimSpace(stripCypherLineComments(body))
 	upper := strings.ToUpper(body)
 	matchKeyword := ""
-	if strings.HasPrefix(upper, "OPTIONALMATCH") {
+	if strings.HasPrefix(upper, "OPTIONAL MATCH") {
+		matchKeyword = "OPTIONAL MATCH"
+	} else if strings.HasPrefix(upper, "OPTIONALMATCH") {
 		matchKeyword = "OPTIONALMATCH"
 	} else if strings.HasPrefix(upper, "MATCH") {
 		matchKeyword = "MATCH"
@@ -10545,7 +10548,7 @@ func (e *Executor) evalExistsQueryBody(ctx context.Context, tx graph.Tx, body st
 	}
 	matchRaw := "MATCH " + matchExpr
 	matchKind := ast.ClauseKindMatch
-	if matchKeyword == "OPTIONALMATCH" {
+	if matchKeyword == "OPTIONALMATCH" || matchKeyword == "OPTIONAL MATCH" {
 		matchRaw = "OPTIONAL MATCH " + matchExpr
 		matchKind = ast.ClauseKindOptionalMatch
 	}
@@ -10567,8 +10570,12 @@ func (e *Executor) evalExistsQueryBody(ctx context.Context, tx graph.Tx, body st
 			withRaw = strings.TrimSpace(remaining[:returnIdx])
 			next = strings.TrimSpace(remaining[returnIdx:])
 		}
+		withClause, err := buildStructuredProjectionClause(ast.ClauseKindWith, withRaw, inferColumnsFromRows(rows))
+		if err != nil {
+			return false, true, err
+		}
 		var stepErr error
-		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindWith, Raw: withRaw}, params, resultColumns, false)
+		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, withClause, params, resultColumns, false)
 		if stepErr != nil {
 			return false, true, stepErr
 		}
@@ -10576,8 +10583,12 @@ func (e *Executor) evalExistsQueryBody(ctx context.Context, tx graph.Tx, body st
 		upperRemaining = strings.ToUpper(remaining)
 	}
 	if strings.HasPrefix(upperRemaining, "RETURN") {
+		returnClause, err := buildStructuredProjectionClause(ast.ClauseKindReturn, remaining, inferColumnsFromRows(rows))
+		if err != nil {
+			return false, true, err
+		}
 		var stepErr error
-		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: remaining}, params, resultColumns, true)
+		rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, returnClause, params, resultColumns, true)
 		if stepErr != nil {
 			return false, true, stepErr
 		}
@@ -10614,7 +10625,21 @@ func buildStructuredProjectionClause(kind ast.ClauseKind, raw string, scopeVars 
 
 	stmt, err := parser.ParseStatement(query)
 	if err != nil {
-		return ast.Clause{}, err
+		compactBody := strings.TrimSpace(stripLeadingClauseKeyword(raw, string(kind)))
+		spec, parseErr := parseProjectionClauseSpec(compactBody)
+		if parseErr != nil {
+			return ast.Clause{}, err
+		}
+		projection, convErr := projectionClauseFromSpec(spec)
+		if convErr != nil {
+			return ast.Clause{}, convErr
+		}
+		clause := ast.Clause{Kind: kind, Raw: raw, Projection: &projection}
+		if kind == ast.ClauseKindWith && strings.TrimSpace(spec.WhereRaw) != "" {
+			expr := ast.Expression{Raw: strings.TrimSpace(spec.WhereRaw)}
+			clause.Where = &expr
+		}
+		return clause, nil
 	}
 	typed, ok := stmt.(*ast.QueryStatement)
 	if !ok || len(typed.Parts) == 0 || len(typed.Parts[0].Clauses) == 0 {
@@ -10630,6 +10655,41 @@ func buildStructuredProjectionClause(kind ast.ClauseKind, raw string, scopeVars 
 	}
 
 	return ast.Clause{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("projection clause kind %s not found", kind), nil)
+}
+
+func projectionClauseFromSpec(spec projectionClauseSpec) (ast.ReturnClause, error) {
+	items, err := parseProjectionItems(spec.ProjectionRaw)
+	if err != nil {
+		return ast.ReturnClause{}, err
+	}
+	out := ast.ReturnClause{Distinct: spec.Distinct, Items: make([]ast.ProjectionItem, 0, len(items)), OrderBy: make([]ast.SortItem, 0, len(spec.OrderBy))}
+	for _, item := range items {
+		expr := strings.TrimSpace(item.Expression)
+		if expr == "" {
+			continue
+		}
+		if expr == "*" {
+			out.IncludeAll = true
+			continue
+		}
+		out.Items = append(out.Items, ast.ProjectionItem{Expression: ast.Expression{Raw: expr}, Alias: strings.TrimSpace(item.Alias)})
+	}
+	for _, order := range spec.OrderBy {
+		direction := ast.SortDirectionAsc
+		if order.Descending {
+			direction = ast.SortDirectionDesc
+		}
+		out.OrderBy = append(out.OrderBy, ast.SortItem{Expression: ast.Expression{Raw: strings.TrimSpace(order.Expression)}, Direction: direction})
+	}
+	if raw := strings.TrimSpace(spec.SkipRaw); raw != "" {
+		expr := ast.Expression{Raw: raw}
+		out.Skip = &expr
+	}
+	if raw := strings.TrimSpace(spec.LimitRaw); raw != "" {
+		expr := ast.Expression{Raw: raw}
+		out.Limit = &expr
+	}
+	return out, nil
 }
 
 func buildProjectionScopePrelude(scopeVars []string) string {
@@ -12044,6 +12104,11 @@ func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row 
 	}
 
 	vertexID := ""
+	if strings.TrimSpace(varName) != "" {
+		if derivedID, ok := vertexIDFromPatternProperties(props); ok {
+			vertexID = derivedID
+		}
+	}
 	if vertexID == "" {
 		if merge {
 			matches, err := findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
@@ -12070,6 +12135,23 @@ func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row 
 		return nil, false, err
 	}
 	return vertex, true, nil
+}
+
+func vertexIDFromPatternProperties(props map[string]any) (string, bool) {
+	for key, value := range props {
+		if !strings.EqualFold(strings.TrimSpace(key), "id") {
+			continue
+		}
+		if value == nil {
+			return "", false
+		}
+		id := strings.TrimSpace(fmt.Sprint(value))
+		if id == "" {
+			return "", false
+		}
+		return id, true
+	}
+	return "", false
 }
 
 func nextAutoVertexID(varName string) string {

@@ -25,6 +25,59 @@ Constraints and priorities:
 2. Storage model: direct property-graph storage on embedded LSM KV (Pebble) for v1.
 3. Distribution strategy: introduce Raft-based replication and range partitioning after single-node correctness/perf are stable.
 
+## MVP Envelope (Explicit Minimum)
+
+The MVP line is intentionally broad, but the following capabilities are treated as required minimum scope:
+
+1. Single-node operation as the default production shape.
+2. Cypher-compliant behavior for the implemented language surface (guarded by openCypher TCK).
+3. CLI workflow that supports:
+   - setting variables/parameters,
+   - submitting Cypher statements,
+   - rendering result sets as tables,
+   - reporting output statistics.
+4. Benchmark comparison against Neo4j and TigerGraph using equivalent dataset and workload definitions.
+5. Observability baseline with Prometheus metrics export and Grafana dashboarding.
+6. Manual index tuning workflow including EXPLAIN, planner statistics, and query cost estimation.
+
+These capabilities should be treated as delivery constraints for near-term planning, even when exact phase boundaries remain intentionally flexible.
+
+## Post-TCK Reflection
+
+Achieving full openCypher TCK compliance was a major architectural checkpoint, not just a feature milestone.
+
+What it validated:
+
+- The local-first, single-node-first phase ordering was correct. Semantics and graph correctness could be stabilized before distributed complexity.
+- Keeping Cypher parsing and storage internals decoupled was still the right top-level direction.
+- Compatibility work paid off as a forcing function for correctness across MATCH/OPTIONAL MATCH, WITH, ORDER BY, aggregation, writes, temporal values, and error classification.
+
+What it revealed:
+
+- Cypher compliance was primarily a semantic and phase-boundary problem, not a grammar problem.
+- The intended `scan -> parse -> execute -> result` progression is currently too text-driven in places. Several supported forms required raw-clause reinterpretation and regex-based recovery inside executor paths.
+- The parser/executor boundary is too leaky for some clause families. SKIP/LIMIT, ORDER BY, DISTINCT, MERGE actions, and pattern forms sometimes required the executor to rediscover intent from normalized text rather than consume a sufficiently rich representation.
+- Regex use in executor pattern handling was an effective delivery tactic, but it is now a clear debt marker. Edge patterns are a core graph/operator concept, closer to join structure than incidental syntax, and should not remain primarily encoded as executor-local string heuristics.
+- In this domain, semantic continuity across phases matters more than textbook component isolation. Overly narrow component seams can force downstream phases to reconstruct meaning that should have been preserved structurally.
+
+## Query Engine Direction After TCK
+
+The next architectural step is not broader Cypher surface area by default. It is stronger representation fidelity between phases.
+
+Direction:
+
+1. Preserve explicit phase boundaries, but pass richer structured artifacts across them.
+   - Parsing should produce enough clause and expression structure that later phases do not need to re-parse normalized text.
+   - Semantic validation should be treated as a first-class stage between parse and execution.
+2. Reduce executor dependence on regex and raw-clause recovery.
+   - Prioritize pattern clauses, projection clauses, ORDER BY, SKIP/LIMIT, and write-action blocks.
+3. Make pattern and edge structure first-class in planning.
+   - Edge and path semantics should be represented as durable intermediate forms suitable for logical and physical planning.
+4. Treat current compliance as a correctness baseline that refactors must preserve.
+   - TCK and focused executor/parser regressions should remain the guardrail for any query-engine restructuring.
+
+This shifts Phase 2 emphasis from "more supported syntax" toward "cleaner phase handoff, explainability, and semantics-preserving execution architecture."
+
 ## Decision 1: Local/Distributed Architecture
 
 ### Decision
@@ -175,6 +228,8 @@ Keep a centralized port map as multi-node and production features are introduced
    - Mitigation: ingestion profiles, rate-limited compaction tuning, and benchmark gates.
 3. Risk: distributed complexity too early.
    - Mitigation: enforce phase gates (correctness and perf SLOs before cluster features).
+4. Risk: query semantics remain encoded in executor-local regex/string heuristics.
+   - Mitigation: promote clause/pattern/projection structure into parser and planner artifacts before adding major new query-engine surface.
 
 ## Out of Scope (For This Decision)
 
@@ -188,7 +243,7 @@ Execution detail is tracked in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 Key encoding details are tracked in [GRAPH_KEYSPACE.md](GRAPH_KEYSPACE.md).
 Benchmark dataset contracts are tracked in [benchmarks/DATASETS.md](benchmarks/DATASETS.md).
 
-1. Build a storage abstraction with Pebble-backed implementation (`GraphStore`).
-2. Implement vertex/edge CRUD plus adjacency indexes.
-3. Add benchmark suite for three target workloads (research load, log ingest, ReBAC checks).
-4. Define phase gates and success criteria for moving from local to replicated mode.
+1. Preserve the full TCK compliance baseline while reducing executor regex/raw-clause dependence.
+2. Introduce richer intermediate representations for patterns, projections, ordering, pagination, and write actions.
+3. Add explainable logical/physical planning artifacts for currently supported query shapes.
+4. Carry the resulting engine contracts forward into replicated and partitioned phases without changing visible semantics.

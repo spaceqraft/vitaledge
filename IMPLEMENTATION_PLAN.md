@@ -19,6 +19,15 @@ In scope:
 - Benchmarks for research, log detection, and ReBAC workloads.
 - Replication and partitioning phases.
 
+MVP envelope requirements (explicit minimum):
+
+- Single-node operation.
+- Cypher-compliant behavior for the implemented surface (TCK-validated).
+- CLI support for setting variables, submitting Cypher, rendering tabular result sets, and showing output statistics.
+- Comparative benchmark evidence versus Neo4j and TigerGraph.
+- Metrics pipeline via Prometheus with Grafana dashboards.
+- Manual index tuning workflow: EXPLAIN, planner statistics, and query cost estimation.
+
 Out of scope for this plan version:
 
 - UI tooling and visual graph exploration.
@@ -96,6 +105,13 @@ Remaining Phase 1 gaps before close:
 - Cypher compatibility backlog (non-blocking for Phase 1 close): path-variable capture and return (example: `MATCH path = ()-[:ACTED_IN]->(movie:Movie) RETURN path`) remains deferred.
 - Planner/explainability backlog (Phase 2): explain-plan output coverage is still listed as a Phase 2 deliverable and is not yet evidenced for all supported query forms.
 
+MVP-critical items not yet complete:
+
+- CLI polish for first-class variable management, table rendering ergonomics, and explicit output statistics UX.
+- Cross-engine benchmark parity runs and published comparison methodology/results for VitalEdge vs Neo4j vs TigerGraph.
+- Prometheus scrape endpoint and baseline Grafana dashboard set wired as supported operational path.
+- Manual index tuning loop completed end-to-end: EXPLAIN output, planner/runtime statistics, and query cost estimation surfaced for operator decisions.
+
 Milestones:
 
 1. Pebble-backed GraphStore implementation.
@@ -133,6 +149,11 @@ Current gate assessment:
 - Performance: passing on current local benchmark evidence.
 - Operability: passing for Phase 1 baseline (metrics exposed through in-process collectors and runtime reporting).
 
+Additional closure evidence captured after the benchmark checkpoint:
+
+- Full openCypher TCK compliance achieved: `3897/3897 scenarios`, `16006/16006 steps`.
+- This milestone should be interpreted as semantic-compatibility maturity for the currently supported Cypher surface, not just clause-count completion.
+
 ### Phase 1 closure evidence (captured 2026-05-22)
 
 Command and outputs:
@@ -154,20 +175,38 @@ Target comparison:
 - ReBAC p95 target (`<= 10 ms`): pass (`2.241 ms`).
 - Structured ingest target (`>= 50k edges/min`): pass (`8,056,885 edges/min`).
 
+### Phase 1 architectural learnings from TCK completion (captured 2026-05-26)
+
+1. Grammar coverage was necessary but not sufficient.
+   - Most of the remaining work to reach compliance lived in semantic validation, error classification, null behavior, projection semantics, and scope propagation.
+2. Parser/executor boundaries need stronger contracts.
+   - Several fixes depended on normalized raw-clause recovery in executor paths for ORDER BY, SKIP/LIMIT, DISTINCT, MERGE actions, and pattern forms.
+   - This was an effective tactical bridge, but it is now a clear architectural debt marker.
+3. Pattern and edge handling should become more structurally represented.
+   - Edge semantics are central graph execution structure and should not remain primarily encoded as executor-local regex heuristics.
+4. The next maturity step is representation fidelity across phases.
+   - The engine should preserve more intent through parse -> semantic validation -> logical plan -> physical execution -> result normalization, rather than reconstructing intent from text in later stages.
+5. Phase 1 is therefore complete in a stronger sense than originally framed.
+   - Single-node correctness now includes standards-credible Cypher behavior for the implemented language surface.
+
 ## Phase 2: Hardening and Optimization (Single-node)
 
-Objective: make Phase 1 robust and cost-efficient before cluster complexity.
+Objective: make Phase 1 robust, explainable, and less text-driven before cluster complexity.
 
 Milestones:
 
-1. Query planner improvements (predicate pushdown, index-first plans).
-2. Compaction and write amplification tuning profiles.
-3. Memory and cache strategy (block cache, iterator bounds).
-4. Fault-injection and chaos-style local durability tests.
+1. Strengthen query-engine phase boundaries.
+   - Promote normalized raw-clause behavior into explicit parser/planner representations for patterns, projections, ORDER BY, SKIP/LIMIT, and write actions.
+2. Query planner improvements (predicate pushdown, index-first plans, explainable operator shapes).
+3. Compaction and write amplification tuning profiles.
+4. Memory and cache strategy (block cache, iterator bounds).
+5. Fault-injection and chaos-style local durability tests.
 
 Deliverables:
 
 - Planner explain output for observability.
+- Reduced executor dependence on regex/string recovery for currently supported Cypher forms.
+- Clear semantic handoff between parser validation, planning, and execution.
 - Tuning profiles for ingest-heavy vs read-heavy workloads.
 - Long-run soak test suite.
 
@@ -176,6 +215,7 @@ Exit Criteria:
 - 24h soak test with no correctness regressions.
 - p95 latency and ingest throughput improve by agreed target over Phase 1 baseline.
 - Explain output available for all supported query forms.
+- Supported query forms no longer require executor-side reconstruction of core clause semantics from normalized raw text.
 
 ## Phase 3: Replicated Multi-node (Raft)
 
@@ -263,13 +303,15 @@ Quality gates:
 
 Primary outputs:
 
-- Logical plan from AST.
+- Semantic-validation outputs that preserve scope, projection, ordering, pagination, and write-action intent.
+- Logical plan from AST/semantic artifacts.
 - Physical operators for pattern expansion, filtering, projection, updates.
 
 Quality gates:
 
 - Plan determinism tests.
 - Explain-plan coverage in integration tests.
+- Regression coverage proving supported query forms do not rely on executor regex/raw-text rediscovery for core semantics.
 
 ### WS3: Indexing and Performance
 
@@ -339,12 +381,15 @@ For each milestone, track:
 1. Scope drift in query execution breadth before storage hardening.
 2. Performance regressions from over-indexing.
 3. Premature distributed complexity before single-node maturity.
+4. Architectural drift from tactical regex/raw-clause recovery becoming a permanent execution dependency.
 
 ## Recommended Immediate Next Sprint
 
-1. Capture and record benchmark exit evidence against Phase 1 targets (ReBAC p95 and ingest throughput) on reference hardware.
-2. Close operability evidence gap by wiring metrics export/sink integration and documenting alertable signals.
-3. Advance Cypher compatibility on deferred items, prioritizing path-variable capture/return and any remaining projection edge cases.
-4. Begin Phase 2 explainability by introducing EXPLAIN output for currently supported query shapes.
+1. Define the target query-engine phase contract explicitly: parse, semantic validation, logical plan, physical execution, result normalization.
+2. Remove the highest-value executor regex/raw-clause dependencies by promoting clause structure into parser/planner artifacts.
+3. Deliver MVP operator loop for manual index tuning: EXPLAIN + planner/runtime statistics + query cost estimation for supported query shapes.
+4. Stand up Prometheus/Grafana as the default metrics path and publish dashboard/query examples.
+5. Finalize CLI UX for variables, table output, and statement statistics.
+6. Run and publish benchmark comparisons against Neo4j and TigerGraph using documented workload parity rules.
 
 Back to [DESIGN.md](DESIGN.md) and [README.md](README.md).

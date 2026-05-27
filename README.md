@@ -105,6 +105,104 @@ Index-decision interpretation:
 
 This is the recommended entry point when deciding whether a property should be indexed or when checking whether an existing index is actually being chosen by the planner.
 
+### Reproducible Manual Tuning Examples
+
+Use this loop for each query family:
+
+1. Run baseline `EXPLAIN`.
+2. Capture `indexDecisions`, `costEstimate`, `runtimeStats`, and `warnings`.
+3. Apply index change (or parameter-binding change for estimate-quality signals).
+4. Re-run `EXPLAIN` and compare the same fields.
+
+Suggested comparison view:
+
+```json
+{
+	"indexDecisions": "selected/recommendation/quality/accessPath",
+	"costEstimate": "value + components",
+	"runtimeStats": "index(candidates/selected/missing), cardinality(rowsRead/rowsOutput)",
+	"warnings": "fallback and missing-index signals"
+}
+```
+
+Example 1: Point lookup on missing index -> create index
+
+Before:
+
+```cypher
+EXPLAIN MATCH (n:Person {email: $email}) RETURN n.id AS id
+```
+
+Observed baseline signals:
+
+- `indexDecisions[*].selected=false`
+- `indexDecisions[*].recommendation=create-index` or `consider-index`
+- warning includes `MISSING_PROPERTY_INDEX`
+- `runtimeStats.index.missing > 0`
+
+After adding property index (`Person.email`) and re-running EXPLAIN:
+
+- `indexDecisions[*].selected=true`
+- `indexDecisions[*].recommendation=keep-index`
+- scan node `accessPath=property_index`
+- `runtimeStats.index.selected` increases and `runtimeStats.index.missing` drops
+- `costEstimate.value` drops sharply on the same graph snapshot
+
+Example 2: Estimate-quality signal -> exact-quality signal via parameter binding
+
+Before (parameter omitted in EXPLAIN invocation):
+
+```cypher
+EXPLAIN MATCH (n:Device {serial: $serial}) RETURN n
+```
+
+Observed baseline signals:
+
+- index decision `quality=estimate`
+- access path can remain non-indexed (`label(Device)`) when parameter is unbound
+- selectivity and index quality are less actionable than the bound-parameter case
+
+After re-running with bound parameter values:
+
+- index decision `quality=exact`
+- access path shifts to `property_index(Device.serial)`
+- `matchedCount`, `estimatedSelectivity`, and cardinality fields become actionable for tuning
+
+Example 3: Traversal entry-point tuning
+
+Before:
+
+```cypher
+EXPLAIN MATCH (u:User {region: $region})-[:MEMBER_OF]->(g:Group) RETURN g.id AS gid
+```
+
+Observed baseline signals when `User.region` is not indexed:
+
+- scan operator uses label access (`label(User)`)
+- index decision is unselected and `runtimeStats.index.missing > 0`
+- warning includes `MISSING_PROPERTY_INDEX`
+
+After adding property index (`User.region`) and re-running EXPLAIN:
+
+- index decision becomes selected
+- `accessPath=property_index(User.region)` on index-decision entry
+- `runtimeStats.index.missing` drops to zero
+- `costEstimate.value` drops materially on the same data snapshot
+
+Local evidence snapshot (deterministic fixture run):
+
+| Example | Before (selected / access / quality / missing / cost) | After (selected / access / quality / missing / cost) |
+| --- | --- | --- |
+| 1. Person email lookup | `false / label(Person) / exact / 1 / 102` | `true / property_index(Person.email) / exact / 0 / 2` |
+| 2. Device serial parameter binding | `true / label(Device) / estimate / 0 / 2` | `true / property_index(Device.serial) / exact / 0 / 2` |
+| 3. User region traversal entry-point | `false / label(User) / exact / 1 / 22` | `true / property_index(User.region) / exact / 0 / 2` |
+
+Notes for reproducibility:
+
+- Keep the same dataset snapshot when comparing before/after plans.
+- Compare one change at a time (single index or single parameter-binding change).
+- For config-backed indexes, update the index schema config and restart the server before the after-run.
+
 ## TCP Query Execution
 
 TCP messages are treated as Cypher statements and executed by the server.

@@ -118,7 +118,9 @@ Current concrete diagnostics and tuning signals:
 1. Operator-shaped plan nodes for scan/filter/project/distinct/sort/skip/limit/write/call forms.
 2. Access-path annotations on scan operators (`property_index`, label scan, or all-nodes scan).
 3. Index decisions including recommendation and impact fields (`recommendation`, `tuningImpact`, `estimatedRowsSaved`, and `quality`).
-4. Warning diagnostics keyed by explicit fallback conditions (`MISSING_PROPERTY_INDEX`, `FULL_SCAN_FALLBACK`, `ESTIMATE_ONLY_INDEX_SIGNAL`, `WRITE_QUERY_DRY_RUN`, `MISSING_TENANT_CONTEXT`).
+4. Query-level cost estimate (`costEstimate`) for deterministic before/after tuning comparisons.
+5. Runtime planning counters (`runtimeStats`) for store/plan/index/cardinality summaries.
+6. Warning diagnostics keyed by explicit fallback conditions (`MISSING_PROPERTY_INDEX`, `FULL_SCAN_FALLBACK`, `ESTIMATE_ONLY_INDEX_SIGNAL`, `WRITE_QUERY_DRY_RUN`, `MISSING_TENANT_CONTEXT`).
 
 ### Cardinality quality policy
 

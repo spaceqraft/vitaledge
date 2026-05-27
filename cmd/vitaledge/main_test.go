@@ -409,6 +409,34 @@ func TestTCPExplainQueryReturnsExplainPayload(t *testing.T) {
 	if cardinality, ok := explain["cardinality"].([]any); !ok || len(cardinality) == 0 {
 		t.Fatalf("expected cardinality to be populated, got %#v", explain["cardinality"])
 	}
+	costEstimate, ok := explain["costEstimate"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected costEstimate map, got %T", explain["costEstimate"])
+	}
+	if unit, _ := costEstimate["unit"].(string); unit != "work_units" {
+		t.Fatalf("expected costEstimate unit work_units, got %#v", costEstimate["unit"])
+	}
+	if quality, _ := costEstimate["quality"].(string); quality != "estimate" {
+		t.Fatalf("expected costEstimate quality estimate, got %#v", costEstimate["quality"])
+	}
+	runtimeStats, ok := explain["runtimeStats"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats map, got %T", explain["runtimeStats"])
+	}
+	if _, ok := runtimeStats["store"].(map[string]any); !ok {
+		t.Fatalf("expected runtimeStats.store map, got %#v", runtimeStats["store"])
+	}
+	if _, ok := runtimeStats["plan"].(map[string]any); !ok {
+		t.Fatalf("expected runtimeStats.plan map, got %#v", runtimeStats["plan"])
+	}
+	if _, ok := runtimeStats["index"].(map[string]any); !ok {
+		t.Fatalf("expected runtimeStats.index map, got %#v", runtimeStats["index"])
+	}
+	if cardinalityStats, ok := runtimeStats["cardinality"].(map[string]any); !ok {
+		t.Fatalf("expected runtimeStats.cardinality map, got %#v", runtimeStats["cardinality"])
+	} else if quality, _ := cardinalityStats["quality"].(string); quality != "estimate" {
+		t.Fatalf("expected runtimeStats.cardinality quality estimate, got %#v", cardinalityStats["quality"])
+	}
 	warnings, ok := explain["warnings"].([]any)
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("expected warnings to be populated, got %#v", explain["warnings"])

@@ -102,7 +102,6 @@ Remaining Phase 1 gaps before close:
 
 - Phase 1 performance evidence has now been captured in this document (see Phase 1 closure evidence below).
 - Operability baseline for Phase 1 is satisfied via in-process metrics collectors and periodic metrics/recommendation reporting; production sink/export wiring remains a Phase 2+ hardening task.
-- Cypher compatibility backlog (non-blocking for Phase 1 close): path-variable capture and return (example: `MATCH path = ()-[:ACTED_IN]->(movie:Movie) RETURN path`) remains deferred.
 - Planner/explainability backlog (Phase 2): explain-plan output coverage is still listed as a Phase 2 deliverable and is not yet evidenced for all supported query forms.
 
 MVP-critical items not yet complete:

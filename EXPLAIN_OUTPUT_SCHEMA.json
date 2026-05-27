@@ -13,6 +13,8 @@
     "physicalPlan",
     "influencers",
     "cardinality",
+    "costEstimate",
+    "runtimeStats",
     "indexDecisions",
     "warnings"
   ],
@@ -43,6 +45,12 @@
       "items": {
         "$ref": "#/$defs/cardinalityEntry"
       }
+    },
+    "costEstimate": {
+      "$ref": "#/$defs/costEstimate"
+    },
+    "runtimeStats": {
+      "$ref": "#/$defs/runtimeStats"
     },
     "indexDecisions": {
       "type": "array",
@@ -427,6 +435,179 @@
         "sampleSize": {
           "type": "integer",
           "minimum": 0
+        }
+      }
+    },
+    "costEstimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "value",
+        "unit",
+        "quality",
+        "components"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "unit": {
+          "type": "string",
+          "const": "work_units"
+        },
+        "quality": {
+          "$ref": "#/$defs/quality"
+        },
+        "components": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "scanRows",
+            "outputRows",
+            "missingIndexPenalty"
+          ],
+          "properties": {
+            "scanRows": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "outputRows": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "missingIndexPenalty": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "runtimeStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "store",
+        "plan",
+        "index",
+        "cardinality"
+      ],
+      "properties": {
+        "store": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "verticesScanned",
+            "edgesScanned"
+          ],
+          "properties": {
+            "verticesScanned": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "edgesScanned": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "plan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "totalNodes",
+            "scanNodes",
+            "filterNodes",
+            "projectionNodes",
+            "sortNodes",
+            "paginationNodes",
+            "writeNodes",
+            "warningCount"
+          ],
+          "properties": {
+            "totalNodes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "scanNodes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "filterNodes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "projectionNodes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sortNodes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "paginationNodes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "writeNodes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "warningCount": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "index": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "candidates",
+            "selected",
+            "missing"
+          ],
+          "properties": {
+            "candidates": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "selected": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "missing": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "cardinality": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rowsRead",
+            "rowsOutput",
+            "quality"
+          ],
+          "properties": {
+            "rowsRead": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "rowsOutput": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "quality": {
+              "$ref": "#/$defs/quality"
+            }
+          }
         }
       }
     },

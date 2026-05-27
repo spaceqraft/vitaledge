@@ -312,6 +312,67 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if rowsOut, _ := cardinality[0]["rowsOut"].(int); rowsOut != 1 {
 		t.Fatalf("expected first cardinality rowsOut=1, got %#v", cardinality[0]["rowsOut"])
 	}
+	costEstimate, ok := explainPayload["costEstimate"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected costEstimate map, got %T", explainPayload["costEstimate"])
+	}
+	if unit, _ := costEstimate["unit"].(string); unit != "work_units" {
+		t.Fatalf("expected costEstimate unit work_units, got %#v", costEstimate["unit"])
+	}
+	if quality, _ := costEstimate["quality"].(string); quality != "estimate" {
+		t.Fatalf("expected costEstimate quality estimate, got %#v", costEstimate["quality"])
+	}
+	if value, _ := costEstimate["value"].(int); value < 1 {
+		t.Fatalf("expected costEstimate value >= 1, got %#v", costEstimate["value"])
+	}
+	components, ok := costEstimate["components"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected costEstimate components map, got %T", costEstimate["components"])
+	}
+	if _, ok := components["scanRows"].(int); !ok {
+		t.Fatalf("expected scanRows component, got %#v", components["scanRows"])
+	}
+	if _, ok := components["outputRows"].(int); !ok {
+		t.Fatalf("expected outputRows component, got %#v", components["outputRows"])
+	}
+	if _, ok := components["missingIndexPenalty"].(int); !ok {
+		t.Fatalf("expected missingIndexPenalty component, got %#v", components["missingIndexPenalty"])
+	}
+	runtimeStats, ok := explainPayload["runtimeStats"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats map, got %T", explainPayload["runtimeStats"])
+	}
+	storeStats, ok := runtimeStats["store"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.store map, got %T", runtimeStats["store"])
+	}
+	if _, ok := storeStats["verticesScanned"].(int); !ok {
+		t.Fatalf("expected verticesScanned int, got %#v", storeStats["verticesScanned"])
+	}
+	if _, ok := storeStats["edgesScanned"].(int); !ok {
+		t.Fatalf("expected edgesScanned int, got %#v", storeStats["edgesScanned"])
+	}
+	planStats, ok := runtimeStats["plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.plan map, got %T", runtimeStats["plan"])
+	}
+	if totalNodes, _ := planStats["totalNodes"].(int); totalNodes < 1 {
+		t.Fatalf("expected totalNodes >= 1, got %#v", planStats["totalNodes"])
+	}
+	indexStats, ok := runtimeStats["index"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.index map, got %T", runtimeStats["index"])
+	}
+	if _, ok := indexStats["candidates"].(int); !ok {
+		t.Fatalf("expected index candidates int, got %#v", indexStats["candidates"])
+	}
+	cardinalityStats, ok := runtimeStats["cardinality"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.cardinality map, got %T", runtimeStats["cardinality"])
+	}
+	if quality, _ := cardinalityStats["quality"].(string); quality != "estimate" {
+		t.Fatalf("expected runtimeStats.cardinality quality estimate, got %#v", cardinalityStats["quality"])
+	}
 }
 
 func TestExecuteExplainIndexTuningSignalsForMissingIndex(t *testing.T) {

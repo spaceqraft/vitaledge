@@ -20,6 +20,8 @@ type explainAnalysis struct {
 	predicateSignals []map[string]any
 	indexDecisions   []map[string]any
 	cardinality      []map[string]any
+	costEstimate     map[string]any
+	runtimeStats     map[string]any
 	warnings         []map[string]any
 	source           string
 	capturedAt       string
@@ -76,7 +78,9 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	planNodes := buildExplainPlanNodes(stmt, e.indexCatalog, tenant, params)
 	analysis.indexDecisions = buildExplainIndexDecisions(stmt, params, e.indexCatalog, tenant, stats, planNodes)
 	analysis.cardinality = buildExplainCardinalityFromPlanNodes(planNodes, params)
+	analysis.costEstimate = buildExplainCostEstimate(planNodes, analysis.cardinality, analysis.indexDecisions)
 	analysis.warnings = buildExplainWarnings(stmt, analysis, planNodes, tenant)
+	analysis.runtimeStats = buildExplainRuntimeStats(planNodes, analysis.cardinality, analysis.indexDecisions, analysis.warnings, stats)
 	return analysis, nil
 }
 
@@ -123,6 +127,8 @@ func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params
 			},
 		},
 		"cardinality":    analysis.cardinality,
+		"costEstimate":   analysis.costEstimate,
+		"runtimeStats":   analysis.runtimeStats,
 		"indexDecisions": analysis.indexDecisions,
 		"warnings":       analysis.warnings,
 		"metadata": map[string]any{
@@ -555,6 +561,139 @@ func buildExplainCardinalityFromPlanNodes(nodes []map[string]any, params Params)
 		rows = rowsOut
 	}
 	return entries
+}
+
+func buildExplainCostEstimate(planNodes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any) map[string]any {
+	rowsOutByNode := map[string]int{}
+	for _, entry := range cardinality {
+		nodeID, _ := entry["nodeId"].(string)
+		if strings.TrimSpace(nodeID) == "" {
+			continue
+		}
+		rowsOut, _ := entry["rowsOut"].(int)
+		rowsOutByNode[nodeID] = rowsOut
+	}
+
+	scanRows := 0
+	outputRows := 0
+	for _, node := range planNodes {
+		nodeID, _ := node["id"].(string)
+		op, _ := node["op"].(string)
+		rowsOut := rowsOutByNode[nodeID]
+		if isScanOperator(op) {
+			scanRows += rowsOut
+		}
+		outputRows = rowsOut
+	}
+
+	missingIndexPenalty := 0
+	for _, decision := range indexDecisions {
+		selected, _ := decision["selected"].(bool)
+		if selected {
+			continue
+		}
+		impact, _ := decision["tuningImpact"].(string)
+		switch impact {
+		case "high":
+			missingIndexPenalty += 100
+		case "medium":
+			missingIndexPenalty += 50
+		case "low":
+			missingIndexPenalty += 20
+		default:
+			missingIndexPenalty += 10
+		}
+	}
+
+	total := scanRows + outputRows + missingIndexPenalty
+	if total < 1 {
+		total = 1
+	}
+
+	return map[string]any{
+		"model":   "heuristic-v1",
+		"value":   total,
+		"unit":    "work_units",
+		"quality": "estimate",
+		"components": map[string]any{
+			"scanRows":            scanRows,
+			"outputRows":          outputRows,
+			"missingIndexPenalty": missingIndexPenalty,
+		},
+	}
+}
+
+func buildExplainRuntimeStats(planNodes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any, warnings []map[string]any, stats explainStoreStats) map[string]any {
+	scanNodes := 0
+	filterNodes := 0
+	projectionNodes := 0
+	sortNodes := 0
+	paginationNodes := 0
+	writeNodes := 0
+
+	for _, node := range planNodes {
+		op, _ := node["op"].(string)
+		if isScanOperator(op) {
+			scanNodes++
+		}
+		switch op {
+		case "FILTER":
+			filterNodes++
+		case "PROJECT", "AGGREGATE":
+			projectionNodes++
+		case "SORT":
+			sortNodes++
+		case "SKIP", "LIMIT":
+			paginationNodes++
+		case "CREATE", "MERGE", "SET", "REMOVE", "DELETE", "DETACH_DELETE":
+			writeNodes++
+		}
+	}
+
+	indexCandidates := len(indexDecisions)
+	indexSelected := 0
+	for _, decision := range indexDecisions {
+		selected, _ := decision["selected"].(bool)
+		if selected {
+			indexSelected++
+		}
+	}
+
+	rowsRead := 0
+	rowsOutput := 0
+	for _, entry := range cardinality {
+		rowsIn, _ := entry["rowsIn"].(int)
+		rowsOut, _ := entry["rowsOut"].(int)
+		rowsRead += rowsIn
+		rowsOutput = rowsOut
+	}
+
+	return map[string]any{
+		"store": map[string]any{
+			"verticesScanned": stats.vertexTotal,
+			"edgesScanned":    stats.edgeTotal,
+		},
+		"plan": map[string]any{
+			"totalNodes":      len(planNodes),
+			"scanNodes":       scanNodes,
+			"filterNodes":     filterNodes,
+			"projectionNodes": projectionNodes,
+			"sortNodes":       sortNodes,
+			"paginationNodes": paginationNodes,
+			"writeNodes":      writeNodes,
+			"warningCount":    len(warnings),
+		},
+		"index": map[string]any{
+			"candidates": indexCandidates,
+			"selected":   indexSelected,
+			"missing":    indexCandidates - indexSelected,
+		},
+		"cardinality": map[string]any{
+			"rowsRead":   rowsRead,
+			"rowsOutput": rowsOutput,
+			"quality":    "estimate",
+		},
+	}
 }
 
 func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNodes []map[string]any, tenant string) []map[string]any {

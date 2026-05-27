@@ -132,6 +132,12 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 				if containsInvalidExistsSubqueryClause(match.Where.Raw) {
 					return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidClauseComposition", Statement: seg.index}
 				}
+				if hasInvalidWherePathPropertyAccess(match.Where.Raw, scope) {
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+				}
+				if containsAggregateFunctionCall(stripExistsSubqueryBodies(match.Where.Raw)) {
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
+				}
 				if hasUndefinedWhereIdentifier(match.Where.Raw, scope) {
 					return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
 				}
@@ -311,6 +317,12 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						}
 						if containsInvalidExistsSubqueryClause(whereExpr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidClauseComposition", Statement: seg.index}
+						}
+						if hasInvalidWherePathPropertyAccess(whereExpr, scope) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+						}
+						if containsAggregateFunctionCall(stripExistsSubqueryBodies(whereExpr)) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
 						}
 						if hasUndefinedWhereIdentifier(whereExpr, scope) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
@@ -1128,6 +1140,23 @@ func hasUndefinedWhereIdentifier(expr string, bound map[string]patternVarRole) b
 			continue
 		}
 		if _, exists := bound[root]; !exists {
+			return true
+		}
+	}
+	return false
+}
+
+func hasInvalidWherePathPropertyAccess(expr string, bound map[string]patternVarRole) bool {
+	for _, ref := range extractIdentifierPropertyReferences(stripExistsSubqueryBodies(expr)) {
+		idx := strings.Index(ref, ".")
+		if idx <= 0 {
+			continue
+		}
+		root := strings.TrimSpace(ref[:idx])
+		if root == "" {
+			continue
+		}
+		if role, exists := bound[root]; exists && role == patternRolePath {
 			return true
 		}
 	}

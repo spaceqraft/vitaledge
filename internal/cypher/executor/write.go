@@ -4383,10 +4383,12 @@ func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows 
 			return nil, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
 		}
 		normalizedProps := normalizeVertexProperties(props)
-		vertexID := stringFromProperty(props, "id")
+		vertexID := ""
 		if vertexID == "" {
-			if existing, ok := row[varName].(*graph.Vertex); ok {
-				vertexID = existing.ID
+			if varName != "" {
+				if existing, ok := row[varName].(*graph.Vertex); ok {
+					vertexID = existing.ID
+				}
 			}
 		}
 
@@ -11840,7 +11842,7 @@ func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row 
 		return nil, false, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
 	}
 
-	vertexID := stringFromProperty(props, "id")
+	vertexID := ""
 	if vertexID == "" {
 		if merge {
 			matches, err := findMergeVerticesByPattern(ctx, tx, tenant, labels, props)

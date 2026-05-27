@@ -11525,18 +11525,30 @@ func evalUnwindValues(raw string, params Params, row Row) ([]any, error) {
 		if !ok {
 			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("missing parameter %q", name), nil)
 		}
+		if value == nil {
+			return []any{}, nil
+		}
 		return flattenListValue(value)
 	}
 	if row != nil {
 		if value, ok := row[raw]; ok {
+			if value == nil {
+				return []any{}, nil
+			}
 			return flattenListValue(value)
 		}
 	}
 	if value, err := evalExpressionWithScope(raw, row, params); err == nil {
+		if value == nil {
+			return []any{}, nil
+		}
 		return flattenListValue(value)
 	}
 	value, err := evalWriteValue(raw, params, row)
 	if err == nil {
+		if value == nil {
+			return []any{}, nil
+		}
 		return []any{value}, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("UNWIND expression %q is not yet supported", raw), nil)

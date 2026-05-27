@@ -316,12 +316,13 @@ func recordUnwindBinding(raw string, bound map[string]patternVarRole) {
 	if idx < 0 {
 		return
 	}
+	expr := strings.TrimSpace(text[:idx])
 	aliasRaw := strings.TrimSpace(text[idx+len("AS"):])
 	alias, _, ok := readIdentifier(aliasRaw, 0)
 	if !ok || alias == "" {
 		return
 	}
-	bound[alias] = patternRoleValue
+	bound[alias] = roleForUnwindExpr(expr, bound)
 }
 
 func parseProjectionAlias(item string) (alias string, expr string, ok bool) {
@@ -413,6 +414,9 @@ func roleForProjectionExpr(expr string, bound map[string]patternVarRole) pattern
 	if role, ok := roleForCoalesceExpr(expr, bound); ok {
 		return role
 	}
+	if role, ok := roleForCollectExpr(expr, bound); ok {
+		return role
+	}
 	name, next, ok := readIdentifier(expr, 0)
 	if ok {
 		next = skipSpaces(expr, next)
@@ -423,6 +427,55 @@ func roleForProjectionExpr(expr string, bound map[string]patternVarRole) pattern
 		}
 	}
 	return patternRoleValue
+}
+
+func roleForUnwindExpr(expr string, bound map[string]patternVarRole) patternVarRole {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return patternRoleValue
+	}
+	if role, ok := roleForCollectExpr(expr, bound); ok {
+		return role
+	}
+	name, next, ok := readIdentifier(expr, 0)
+	if ok {
+		next = skipSpaces(expr, next)
+		if next == len(expr) {
+			if prev, exists := bound[name]; exists {
+				return prev
+			}
+		}
+	}
+	return patternRoleValue
+}
+
+func roleForCollectExpr(expr string, bound map[string]patternVarRole) (patternVarRole, bool) {
+	trimmed := strings.TrimSpace(expr)
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, "COLLECT(") || !strings.HasSuffix(trimmed, ")") {
+		return "", false
+	}
+	openIdx := strings.Index(trimmed, "(")
+	if openIdx < 0 {
+		return "", false
+	}
+	arg := strings.TrimSpace(trimmed[openIdx+1 : len(trimmed)-1])
+	if arg == "" {
+		return "", false
+	}
+	name, next, ok := readIdentifier(arg, 0)
+	if !ok {
+		return "", false
+	}
+	next = skipSpaces(arg, next)
+	if next != len(arg) {
+		return "", false
+	}
+	role, exists := bound[name]
+	if !exists {
+		return "", false
+	}
+	return role, true
 }
 
 func roleForCoalesceExpr(expr string, bound map[string]patternVarRole) (patternVarRole, bool) {

@@ -6,6 +6,10 @@ TCK_ROOT := $(TCK_CACHE_DIR)/tck
 TCK_FEATURES := $(TCK_ROOT)/features
 TCK_FEATURES_ABS := $(abspath $(TCK_FEATURES))
 CYPHER_COMPLIANCE_LOG := $(TCK_CACHE_DIR)/cypher-compliance.log
+BENCH_OUT_DIR ?= $(HOME)/.cache/vitaledge-benchmarks
+BENCH_THREAT_ITERS ?= 20000
+BENCH_RESEARCH_ITERS ?= 5000
+BENCH_REBAC_ITERS ?= 5000
 
 run: build
 	./bin/vitaledge
@@ -28,6 +32,16 @@ bench-smoke:
 
 bench-graph-store:
 	go test ./internal/graph/store/pebble -run '^$$' -bench 'BenchmarkEdgeMutation' -benchmem -benchtime=200ms
+
+bench-milestone: build
+	@mkdir -p $(BENCH_OUT_DIR)
+	@ts=$$(date +%Y%m%d-%H%M%S); \
+	outfile="$(BENCH_OUT_DIR)/milestone-$${ts}.jsonl"; \
+	echo "Writing benchmark baseline to $$outfile"; \
+	./bin/vitaledge-bench -json -scenario threat -iterations $(BENCH_THREAT_ITERS) > "$$outfile"; \
+	./bin/vitaledge-bench -json -scenario research -iterations $(BENCH_RESEARCH_ITERS) >> "$$outfile"; \
+	./bin/vitaledge-bench -json -scenario rebac -iterations $(BENCH_REBAC_ITERS) >> "$$outfile"; \
+	echo "Saved: $$outfile"
 
 cover:
 	go test -coverpkg=./... -covermode=atomic -coverprofile=coverage.txt -tags ci,memoryprotection -race -timeout 15m -count=1 ./...

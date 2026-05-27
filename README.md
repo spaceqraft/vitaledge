@@ -36,6 +36,13 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Summarize last compliance run log: `make cypher-compliance-summary`
 - Smoke benchmark: `make bench-smoke`
 - Graph store benchmark baseline: `make bench-graph-store`
+- Milestone benchmark baseline (local JSONL snapshot): `make bench-milestone`
+
+`vitaledge-bench` supports repeatability-oriented flags:
+
+- `-iterations N`: operation count for the scenario loop.
+- `-seed-size N`: explicit seed graph size override for seeded scenarios (`research`, `rebac`).
+- `-json`: machine-readable output for baseline capture.
 
 ## Startup Index Schema Config
 

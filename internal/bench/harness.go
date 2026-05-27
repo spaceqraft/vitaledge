@@ -19,6 +19,7 @@ import (
 type Config struct {
 	DatasetPath string
 	Iterations  int
+	SeedSize    int
 }
 
 // Result captures benchmark execution output.
@@ -157,9 +158,9 @@ func runThreat(ctx context.Context, cfg Config) (Result, error) {
 	opsPerSec := 0.0
 	edgesPerMin := 0.0
 	if dur > 0 {
-		opс := float64(iters) / dur.Seconds()
-		opsPerSec = opс
-		edgesPerMin = opс * 60
+		ops := float64(iters) / dur.Seconds()
+		opsPerSec = ops
+		edgesPerMin = ops * 60
 	}
 
 	return Result{
@@ -167,8 +168,11 @@ func runThreat(ctx context.Context, cfg Config) (Result, error) {
 		Operations: iters,
 		Duration:   dur,
 		Metrics: map[string]float64{
-			"ops_per_sec":   opsPerSec,
-			"edges_per_min": edgesPerMin,
+			"ops_per_sec":        opsPerSec,
+			"edges_per_min":      edgesPerMin,
+			"seed_vertices":      float64(iters + 1),
+			"seed_edges":         float64(iters),
+			"seed_relationships": float64(iters),
 		},
 	}, nil
 }
@@ -185,7 +189,12 @@ func runReBAC(ctx context.Context, cfg Config) (Result, error) {
 	}
 	defer cleanup()
 
-	if err := seedReBACGraph(ctx, store, 100); err != nil {
+	fanout := cfg.SeedSize
+	if fanout <= 0 {
+		fanout = scaleFromIterations(iters, 10, 100, 20_000)
+	}
+
+	if err := seedReBACGraph(ctx, store, fanout); err != nil {
 		return Result{}, err
 	}
 
@@ -222,9 +231,13 @@ func runReBAC(ctx context.Context, cfg Config) (Result, error) {
 		Operations: iters,
 		Duration:   dur,
 		Metrics: map[string]float64{
-			"ops_per_sec": opsPerSec,
-			"p95_ms":      percentile(latencies, 95),
-			"avg_ms":      average(latencies),
+			"ops_per_sec":        opsPerSec,
+			"p95_ms":             percentile(latencies, 95),
+			"avg_ms":             average(latencies),
+			"seed_fanout":        float64(fanout),
+			"seed_vertices":      float64(1 + (fanout * 2)),
+			"seed_edges":         float64(fanout * 2),
+			"seed_relationships": float64(fanout * 2),
 		},
 	}, nil
 }
@@ -241,7 +254,12 @@ func runResearch(ctx context.Context, cfg Config) (Result, error) {
 	}
 	defer cleanup()
 
-	if err := seedDenseResearchGraph(ctx, store, 500); err != nil {
+	papers := cfg.SeedSize
+	if papers <= 0 {
+		papers = scaleFromIterations(iters, 50, 500, 50_000)
+	}
+
+	if err := seedDenseResearchGraph(ctx, store, papers); err != nil {
 		return Result{}, err
 	}
 
@@ -278,11 +296,39 @@ func runResearch(ctx context.Context, cfg Config) (Result, error) {
 		Operations: iters,
 		Duration:   dur,
 		Metrics: map[string]float64{
-			"ops_per_sec": opsPerSec,
-			"p95_ms":      percentile(latencies, 95),
-			"avg_ms":      average(latencies),
+			"ops_per_sec":        opsPerSec,
+			"p95_ms":             percentile(latencies, 95),
+			"avg_ms":             average(latencies),
+			"seed_papers":        float64(papers),
+			"seed_vertices":      float64(papers),
+			"seed_edges":         float64(papers - 1),
+			"seed_relationships": float64(papers - 1),
 		},
 	}, nil
+}
+
+func scaleFromIterations(iterations, min, divisor, max int) int {
+	if iterations <= 0 {
+		iterations = min * divisor
+	}
+	if min <= 0 {
+		min = 1
+	}
+	if divisor <= 0 {
+		divisor = 1
+	}
+	if max < min {
+		max = min
+	}
+
+	scaled := iterations / divisor
+	if scaled < min {
+		return min
+	}
+	if scaled > max {
+		return max
+	}
+	return scaled
 }
 
 func openTempStore() (graph.GraphStore, func(), error) {

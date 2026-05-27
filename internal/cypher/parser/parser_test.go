@@ -468,6 +468,24 @@ func TestParseStatementRejectsUndefinedVariableInReturnProjection(t *testing.T) 
 	}
 }
 
+func TestParseStatementRejectsUndefinedVariableInCreatePatternPropertyMap(t *testing.T) {
+	_, err := ParseStatement("MATCH (a) CREATE (a)-[:KNOWS]->(b {name: missing}) RETURN b")
+	if err == nil {
+		t.Fatalf("expected undefined variable parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "UndefinedVariable" {
+		t.Fatalf("expected UndefinedVariable message, got %q", parseErr.Message)
+	}
+}
+
 func TestParseStatementRejectsUnaliasedWithExpression(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) WITH n.age + 1 RETURN *")
 	if err == nil {

@@ -259,11 +259,14 @@ func recordWithBindings(raw string, bound map[string]patternVarRole) {
 		return
 	}
 	text = strings.TrimSpace(text[len("WITH"):])
+	if strings.HasPrefix(strings.ToUpper(text), "DISTINCT") {
+		text = strings.TrimSpace(text[len("DISTINCT"):])
+	}
 
 	if idx := indexTopLevelKeyword(text, "WHERE"); idx >= 0 {
 		text = strings.TrimSpace(text[:idx])
 	}
-	if idx := indexTopLevelKeyword(text, "ORDERBY"); idx >= 0 {
+	if idx := indexTopLevelOrderBy(text); idx >= 0 {
 		text = strings.TrimSpace(text[:idx])
 	}
 	if idx := indexTopLevelKeyword(text, "SKIP"); idx >= 0 {

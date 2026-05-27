@@ -2857,6 +2857,48 @@ func TestExecuteWithForwardingNullPreservesStarColumns(t *testing.T) {
 	}
 }
 
+func TestExecuteWithDistinctOrderByLimitOnProjectedVariable(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	for _, tc := range []struct {
+		name string
+		query string
+		want any
+	}{
+		{
+			name:  "asc",
+			query: "UNWIND [0, 2, 1, 2, 0, 1] AS x WITH DISTINCT x ORDER BY x ASC LIMIT 1 RETURN x",
+			want:  0,
+		},
+		{
+			name:  "desc",
+			query: "UNWIND [0, 2, 1, 2, 0, 1] AS x WITH DISTINCT x ORDER BY x DESC LIMIT 1 RETURN x",
+			want:  2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := parser.ParseStatement(tc.query)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+
+			res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+			if err != nil {
+				t.Fatalf("execute failed: %v", err)
+			}
+			if len(res.Rows) != 1 {
+				t.Fatalf("expected 1 row, got %d", len(res.Rows))
+			}
+			if got := res.Rows[0]["x"]; got != tc.want {
+				t.Fatalf("unexpected x: %#v", got)
+			}
+		})
+	}
+}
+
 func TestExecuteMatchCommaSeparatedPatternsWithForwardedBinding(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

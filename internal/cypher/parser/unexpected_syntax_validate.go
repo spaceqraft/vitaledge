@@ -328,6 +328,20 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
 						}
 					}
+					if clause.Kind == ast.ClauseKindCreate || clause.Kind == ast.ClauseKindMerge {
+						scope := map[string]patternVarRole{}
+						for name, role := range bound {
+							scope[name] = role
+						}
+						for name, role := range clauseBound {
+							scope[name] = role
+						}
+						for _, expr := range extractPatternPropertyMapExpressions(patternRaw) {
+							if hasUndefinedWhereIdentifier(expr, scope) {
+								return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+							}
+						}
+					}
 					for name, role := range clauseBound {
 						bound[name] = role
 					}
@@ -1778,6 +1792,64 @@ func extractSetValueExpressions(raw string) []string {
 		rhs := strings.TrimSpace(item[idx+1:])
 		if rhs != "" {
 			expressions = append(expressions, rhs)
+		}
+	}
+	return expressions
+}
+
+func extractPatternPropertyMapExpressions(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	mapBodies := make([]string, 0)
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	start := -1
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '{':
+			if depthBrace == 0 {
+				start = i + 1
+			}
+			depthBrace++
+		case '}':
+			if depthBrace == 0 {
+				continue
+			}
+			depthBrace--
+			if depthBrace == 0 && start >= 0 && start <= i {
+				mapBodies = append(mapBodies, raw[start:i])
+				start = -1
+			}
+		}
+	}
+
+	expressions := make([]string, 0)
+	for _, body := range mapBodies {
+		for _, pair := range splitTopLevelComma(body) {
+			idx := strings.Index(pair, ":")
+			if idx < 0 {
+				continue
+			}
+			expr := strings.TrimSpace(pair[idx+1:])
+			if expr != "" {
+				expressions = append(expressions, expr)
+			}
 		}
 	}
 	return expressions

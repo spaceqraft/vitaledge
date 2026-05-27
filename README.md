@@ -65,6 +65,16 @@ Index recommendation metrics logging is enabled by default and configurable:
 - flag: `--metrics-report-interval 30s`
 - env: `VITALEDGE_METRICS_REPORT_INTERVAL=30s`
 
+Prometheus metrics endpoint is optional and configurable:
+
+- flag: `--metrics-listen :9100`
+- env: `VITALEDGE_METRICS_LISTEN=:9100`
+
+When enabled, the process serves:
+
+- `GET /metrics` (Prometheus text exposition)
+- `GET /healthz` (simple liveness check)
+
 If set to `0`, periodic recommendation logging is disabled.
 
 ## EXPLAIN For Index Tuning
@@ -104,6 +114,54 @@ Index-decision interpretation:
 - `recommendation=optional-index`: low-impact candidate.
 
 This is the recommended entry point when deciding whether a property should be indexed or when checking whether an existing index is actually being chosen by the planner.
+
+## Prometheus and Grafana Baseline
+
+Baseline observability assets are published under `tools/observability`:
+
+- Prometheus scrape config: `tools/observability/prometheus.yml`
+- Docker Compose stack: `tools/observability/docker-compose.yml`
+- Grafana dashboard: `tools/observability/grafana/vitaledge-overview.json`
+
+One-command local stack (Prometheus + Grafana):
+
+```bash
+make observability-up
+```
+
+Then open:
+
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3000` (default login: `admin` / `admin`)
+
+To stop the stack:
+
+```bash
+make observability-down
+```
+
+Quick start:
+
+1. Start VitalEdge with metrics endpoint enabled:
+
+```bash
+go run ./cmd/vitaledge --metrics-listen :9100
+```
+
+2. Run Prometheus with the provided config:
+
+```bash
+prometheus --config.file=tools/observability/prometheus.yml
+```
+
+3. In Grafana, add your Prometheus datasource and import `tools/observability/grafana/vitaledge-overview.json`.
+
+Dashboard coverage includes:
+
+- statement throughput and average statement duration,
+- rows-returned rate,
+- index lookup outcomes,
+- top unindexed index-candidate observations.
 
 ### Reproducible Manual Tuning Examples
 

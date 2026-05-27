@@ -12,10 +12,10 @@ BENCH_RESEARCH_ITERS ?= 5000
 BENCH_REBAC_ITERS ?= 5000
 
 run: build
-	./bin/vitaledge
+	./bin/vitaledge --metrics-listen :9100
 
 build:
-	go build -o bin/vitaledge ./cmd/vitaledge/main.go 
+	go build -o bin/vitaledge ./cmd/vitaledge
 	go build -o bin/vitaledge-bench ./cmd/vitaledge-bench/main.go
 
 generate-cypher-parser:
@@ -77,3 +77,9 @@ cypher-compliance-report: cypher-compliance-fetch
 
 cypher-compliance-summary:
 	@bash scripts/summarize_cypher_compliance.sh $(CYPHER_COMPLIANCE_LOG)
+
+observability-up:
+	@docker compose -f tools/observability/docker-compose.yml up -d
+
+observability-down:
+	@docker compose -f tools/observability/docker-compose.yml down

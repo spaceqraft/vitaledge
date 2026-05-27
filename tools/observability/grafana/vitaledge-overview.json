@@ -1,0 +1,90 @@
+{
+  "title": "VitalEdge Overview",
+  "uid": "vitaledge-overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Statement Throughput (1m)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(vitaledge_executor_statements_total[1m])) by (kind, outcome)",
+          "legendFormat": "{{kind}} {{outcome}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "title": "Statement Duration (avg ms, 5m)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "1000 * sum(rate(vitaledge_executor_statement_duration_seconds_total[5m])) by (kind) / clamp_min(sum(rate(vitaledge_executor_statements_total[5m])) by (kind), 1)",
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "id": 3,
+      "title": "Rows Returned (1m rate)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "rate(vitaledge_executor_rows_returned_total[1m])",
+          "legendFormat": "rows/s"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+    },
+    {
+      "id": 4,
+      "title": "Index Lookup Outcomes (5m)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(vitaledge_executor_index_lookups_total[5m])) by (strategy, outcome)",
+          "legendFormat": "{{strategy}} {{outcome}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+    },
+    {
+      "id": 5,
+      "title": "Top Unindexed Candidates",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "topk(10, vitaledge_executor_unindexed_candidate_observations)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 16}
+    }
+  ]
+}

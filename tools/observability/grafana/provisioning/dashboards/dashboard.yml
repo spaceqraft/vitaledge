@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: VitalEdge
+    orgId: 1
+    folder: VitalEdge
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards

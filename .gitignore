@@ -1,5 +1,7 @@
 dist/
-tools/
+tools/*
+!tools/observability/
+!tools/observability/**
 data/
 .vscode/settings.json
 .env.local

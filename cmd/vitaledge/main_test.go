@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/cypher/executor"
 	"github.com/paegun/vitaledge/internal/cypher/indexschema"
 	"github.com/paegun/vitaledge/internal/graph"
@@ -580,4 +582,42 @@ func openTestStore(t *testing.T) graph.GraphStore {
 	}
 
 	return store
+}
+
+func TestWritePrometheusMetricsFromCollector(t *testing.T) {
+	collector := executor.NewCollector()
+	collector.ObserveStatement(ast.StatementKindQuery, "ok", 25*time.Millisecond)
+	collector.ObserveRowsReturned(3)
+	collector.ObserveIndexCandidate("acme", "User", "email", false)
+	collector.ObserveIndexLookup("property_index", "hit", 2)
+
+	recorder := httptest.NewRecorder()
+	writePrometheusMetrics(recorder, collector)
+
+	body := recorder.Body.String()
+	expectedSubstrings := []string{
+		"# HELP vitaledge_executor_statements_total",
+		"vitaledge_executor_statements_total{kind=\"QUERY\",outcome=\"ok\"} 1",
+		"vitaledge_executor_statement_duration_seconds_total{kind=\"QUERY\",outcome=\"ok\"}",
+		"vitaledge_executor_rows_returned_total 3",
+		"vitaledge_executor_index_candidates_total{tenant=\"acme\",schema=\"User\",property=\"email\",indexed=\"false\"} 1",
+		"vitaledge_executor_unindexed_candidate_observations{tenant=\"acme\",schema=\"User\",property=\"email\"} 1",
+		"vitaledge_executor_index_lookups_total{strategy=\"property_index\",outcome=\"hit\"} 1",
+		"vitaledge_executor_index_lookup_matches_total{strategy=\"property_index\",outcome=\"hit\"} 2",
+	}
+	for _, expected := range expectedSubstrings {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("expected metrics output to contain %q; body=%s", expected, body)
+		}
+	}
+}
+
+func TestWritePrometheusMetricsWithNilCollector(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writePrometheusMetrics(recorder, nil)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "vitaledge_executor_rows_returned_total 0") {
+		t.Fatalf("expected rows counter line in nil-collector output, got: %s", body)
+	}
 }

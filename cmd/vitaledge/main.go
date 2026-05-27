@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,7 @@ const defaultMetricsReportInterval = 30 * time.Second
 
 const indexSchemaConfigEnv = "VITALEDGE_INDEX_SCHEMA_CONFIG"
 const metricsReportIntervalEnv = "VITALEDGE_METRICS_REPORT_INTERVAL"
+const metricsListenEnv = "VITALEDGE_METRICS_LISTEN"
 const graphPathEnv = "VITALEDGE_GRAPH_PATH"
 const defaultTenantEnv = "VITALEDGE_DEFAULT_TENANT"
 
@@ -38,6 +40,7 @@ type Config struct {
 	IndexCatalog          *indexschema.Catalog
 	ExecutorMetrics       *executor.Collector
 	MetricsReportInterval time.Duration
+	MetricsListenAddress  string
 	Store                 graph.GraphStore
 	Executor              *executor.Executor
 }
@@ -51,6 +54,7 @@ type Server struct {
 	msgCh     chan tcp.PeerMessage
 	metrics   *executor.Collector
 	executor  *executor.Executor
+	metricsSV *http.Server
 }
 
 type wireStats struct {
@@ -92,6 +96,15 @@ func (s *Server) Start() error {
 	s.ln = ln
 
 	log.Printf("Server is listening on %s", s.ListenAddress)
+	if strings.TrimSpace(s.MetricsListenAddress) != "" {
+		metricsServer, err := startMetricsServer(s.MetricsListenAddress, s.metrics)
+		if err != nil {
+			_ = s.ln.Close()
+			return err
+		}
+		s.metricsSV = metricsServer
+		log.Printf("Metrics endpoint is listening on %s/metrics", s.MetricsListenAddress)
+	}
 	if s.metrics != nil && s.MetricsReportInterval > 0 {
 		go s.reportMetricsLoop(s.MetricsReportInterval)
 	}
@@ -219,12 +232,14 @@ func loadConfigFromStartup() (Config, error) {
 	var tenant string
 	var indexConfigPath string
 	var metricsReportInterval time.Duration
+	var metricsListenAddress string
 
 	flag.StringVar(&listenAddress, "listen", defaultListenAddress, "Listen address")
 	flag.StringVar(&graphPath, "graph-path", defaultGraphPath, "Path to graph store directory")
 	flag.StringVar(&tenant, "tenant", defaultTenant, "Default tenant used for query execution")
 	flag.StringVar(&indexConfigPath, "index-schema-config", "", "Path to index schema configuration JSON file")
 	flag.DurationVar(&metricsReportInterval, "metrics-report-interval", defaultMetricsReportInterval, "Interval for logging index recommendation metrics")
+	flag.StringVar(&metricsListenAddress, "metrics-listen", "", "Optional HTTP listen address for Prometheus metrics endpoint (for example :9100)")
 	flag.Parse()
 
 	if strings.TrimSpace(indexConfigPath) == "" {
@@ -243,6 +258,9 @@ func loadConfigFromStartup() (Config, error) {
 		}
 		metricsReportInterval = parsed
 	}
+	if env := strings.TrimSpace(os.Getenv(metricsListenEnv)); env != "" {
+		metricsListenAddress = env
+	}
 
 	cfg := Config{
 		ListenAddress:         listenAddress,
@@ -250,6 +268,7 @@ func loadConfigFromStartup() (Config, error) {
 		DefaultTenant:         tenant,
 		IndexConfigPath:       indexConfigPath,
 		MetricsReportInterval: metricsReportInterval,
+		MetricsListenAddress:  metricsListenAddress,
 		ExecutorMetrics:       executor.NewCollector(),
 	}
 	if strings.TrimSpace(indexConfigPath) == "" {

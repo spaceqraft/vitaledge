@@ -195,9 +195,22 @@ func buildQueryPartFromChildren(children []antlr.Tree, seg statementSegment, ful
 			}
 			part.Clauses = append(part.Clauses, clause)
 		case cyphergen.IOC_WithContext:
-			part.Clauses = append(part.Clauses, buildClause(ast.ClauseKindWith, c, seg, fullQuery))
+			projection, where, err := buildWithProjectionClause(c, seg, fullQuery)
+			if err != nil {
+				return ast.QueryPart{}, err
+			}
+			clause := buildClause(ast.ClauseKindWith, c, seg, fullQuery)
+			clause.Projection = &projection
+			clause.Where = where
+			part.Clauses = append(part.Clauses, clause)
 		case cyphergen.IOC_ReturnContext:
-			part.Clauses = append(part.Clauses, buildClause(ast.ClauseKindReturn, c, seg, fullQuery))
+			projection, err := buildReturnClause(c, seg, fullQuery)
+			if err != nil {
+				return ast.QueryPart{}, err
+			}
+			clause := buildClause(ast.ClauseKindReturn, c, seg, fullQuery)
+			clause.Projection = &projection
+			part.Clauses = append(part.Clauses, clause)
 		case cyphergen.IOC_SinglePartQueryContext:
 			nested, err := buildQueryPartFromChildren(c.GetChildren(), seg, fullQuery)
 			if err != nil {
@@ -266,7 +279,29 @@ func buildReturnClause(r cyphergen.IOC_ReturnContext, seg statementSegment, full
 		return ast.ReturnClause{}, internalErrorValue("nil return clause")
 	}
 
-	body := r.OC_ProjectionBody()
+	return buildProjectionBody(r.OC_ProjectionBody(), seg, fullQuery, r)
+}
+
+func buildWithProjectionClause(w cyphergen.IOC_WithContext, seg statementSegment, fullQuery string) (ast.ReturnClause, *ast.Expression, error) {
+	if w == nil {
+		return ast.ReturnClause{}, nil, internalErrorValue("nil with clause")
+	}
+
+	projection, err := buildProjectionBody(w.OC_ProjectionBody(), seg, fullQuery, w)
+	if err != nil {
+		return ast.ReturnClause{}, nil, err
+	}
+
+	var whereExpr *ast.Expression
+	if where := w.OC_Where(); where != nil {
+		expr := expressionFromContext(seg, fullQuery, where.OC_Expression())
+		whereExpr = &expr
+	}
+
+	return projection, whereExpr, nil
+}
+
+func buildProjectionBody(body cyphergen.IOC_ProjectionBodyContext, seg statementSegment, fullQuery string, spanCtx antlr.ParserRuleContext) (ast.ReturnClause, error) {
 	if body == nil {
 		return ast.ReturnClause{}, internalErrorValue("missing projection body")
 	}
@@ -281,7 +316,7 @@ func buildReturnClause(r cyphergen.IOC_ReturnContext, seg statementSegment, full
 		IncludeAll: itemsCtx.GetStart().GetTokenType() == cyphergen.CypherParserT__4,
 		Items:      make([]ast.ProjectionItem, 0, len(itemsCtx.AllOC_ProjectionItem())),
 		OrderBy:    []ast.SortItem{},
-		Span:       spanFromContext(seg, fullQuery, r),
+		Span:       spanFromContext(seg, fullQuery, spanCtx),
 	}
 
 	for _, itemCtx := range itemsCtx.AllOC_ProjectionItem() {

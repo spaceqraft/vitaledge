@@ -67,6 +67,27 @@ Index recommendation metrics logging is enabled by default and configurable:
 
 If set to `0`, periodic recommendation logging is disabled.
 
+## EXPLAIN For Index Tuning
+
+Use `EXPLAIN` when you want to inspect how VitalEdge would plan a query without mutating data. The output is returned as JSON in the `explain` column, and it includes the query shape, `query.options`, logical and physical plans, influencer counts, cardinality estimates, and index decisions.
+
+Example:
+
+```cypher
+EXPLAIN MATCH (n:Person {name: $name}) RETURN DISTINCT n.name AS name ORDER BY name ASC SKIP 1 LIMIT $maxLimit
+```
+
+What to look at:
+
+- `query.options`: captures projection modifiers such as `distinct`, `orderBy`, `skip`, and `limit`.
+- `influencers.nodeCounts`: shows label counts observed in the current graph snapshot.
+- `influencers.edgeCounts`: shows edge-type counts that may affect traversal choices.
+- `influencers.predicateSignals`: highlights predicate clauses and the number of matching rows or vertices.
+- `indexDecisions`: reports candidate indexes, whether one was selected, and why.
+- `cardinality`: shows per-plan-node row estimates and their quality (`exact`, `estimate`, or `sample`).
+
+This is the recommended entry point when deciding whether a property should be indexed or when checking whether an existing index is actually being chosen by the planner.
+
 ## TCP Query Execution
 
 TCP messages are treated as Cypher statements and executed by the server.

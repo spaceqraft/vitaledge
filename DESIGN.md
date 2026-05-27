@@ -78,6 +78,55 @@ Direction:
 
 This shifts Phase 2 emphasis from "more supported syntax" toward "cleaner phase handoff, explainability, and semantics-preserving execution architecture."
 
+## EXPLAIN Specification Decision
+
+### Decision
+
+Treat `EXPLAIN` as a dry-run planning command that executes parse, semantic validation, and planning, but does not execute result production or apply writes.
+
+### EXPLAIN semantics
+
+1. `EXPLAIN` must not mutate graph state.
+2. `EXPLAIN` must emit the selected plan and plan-influencing details.
+3. `EXPLAIN` may read planner metadata and bounded cardinality signals used by planning.
+4. `EXPLAIN` output should be deterministic for the same query and the same stats/catalog snapshot.
+
+### Planning stages executed under EXPLAIN
+
+1. Parse: query text to typed AST.
+2. Semantic validation: scope/type checks and error classification.
+3. Logical planning: operator graph construction.
+4. Physical planning: operator/access-path selection.
+
+### EXPLAIN output contract
+
+`EXPLAIN` output must include:
+
+1. Logical plan operators.
+2. Physical plan operators and access paths.
+3. Plan-influencing details:
+   - relevant node counts by label,
+   - relevant edge counts by type/direction,
+   - predicate-related cardinality signals,
+   - index candidate and index-selection reasoning.
+4. Per-node cardinality entries with quality metadata: `exact`, `estimate`, or `sample`.
+5. Warnings for missing stats, full scans, unsupported optimization, or fallback decisions.
+6. Query shape/fingerprint metadata.
+
+### Cardinality quality policy
+
+1. Values from exact maintained stats are marked `exact`.
+2. Heuristic values are marked `estimate`.
+3. Sampled/probed values are marked `sample` and should include sampling context when available.
+
+### Transport and representation policy
+
+1. Runtime transport direction is gRPC/protobuf.
+2. During current query-engine iteration, EXPLAIN request/response will continue to use Cypher text input and JSON output for faster iteration.
+3. The JSON structure is treated as the canonical short-term contract and will be mapped to protobuf messages when the gRPC layer is wired.
+
+Reference schema: [EXPLAIN_OUTPUT_SCHEMA.json](EXPLAIN_OUTPUT_SCHEMA.json).
+
 ## Decision 1: Local/Distributed Architecture
 
 ### Decision

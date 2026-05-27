@@ -109,6 +109,13 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 	}()
 
 	switch s := stmt.(type) {
+	case *ast.ExplainStatement:
+		res, execErr := e.executeExplainStatement(ctx, s, params)
+		if execErr != nil {
+			return nil, execErr
+		}
+		e.metrics.ObserveRowsReturned(len(res.Rows))
+		return res, nil
 	case *ast.MatchQueryStatement:
 		res, execErr := e.executeMatchQuery(ctx, s, params)
 		if execErr != nil {
@@ -164,7 +171,7 @@ func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQuerySt
 			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumns(matchClause.Raw)...)
 		}
 
-		projectedRows, cols, err := e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: renderReturnClauseRaw(stmt.Return)}, params, resultColumns, true)
+		projectedRows, cols, err := e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: renderReturnClauseRaw(stmt.Return), Projection: &stmt.Return}, params, resultColumns, true)
 		if err != nil {
 			return err
 		}

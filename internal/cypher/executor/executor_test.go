@@ -76,6 +76,206 @@ func TestExecuteMatchReturnLimitParam(t *testing.T) {
 	}
 }
 
+func TestExecuteExplainDryRunWriteQueryDoesNotMutate(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("EXPLAIN CREATE (n:Person {id: 'dry-run'}) RETURN n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Columns) != 1 || res.Columns[0] != "explain" {
+		t.Fatalf("unexpected columns: %#v", res.Columns)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %d", len(res.Rows))
+	}
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	summary, ok := explainPayload["summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected summary map, got %T", explainPayload["summary"])
+	}
+	if writesDetected, _ := summary["writesDetected"].(bool); !writesDetected {
+		t.Fatalf("expected writesDetected=true, got %#v", summary["writesDetected"])
+	}
+	if readOnly, _ := summary["readOnly"].(bool); !readOnly {
+		t.Fatalf("expected readOnly=true, got %#v", summary["readOnly"])
+	}
+
+	verifyStmt, err := parser.ParseStatement("MATCH (n:Person {id: 'dry-run'}) RETURN n")
+	if err != nil {
+		t.Fatalf("verification parse failed: %v", err)
+	}
+	verifyRes, err := exec.ExecuteStatement(ctx, verifyStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("verification execute failed: %v", err)
+	}
+	if len(verifyRes.Rows) != 0 {
+		t.Fatalf("expected dry-run to avoid mutations, got rows: %#v", verifyRes.Rows)
+	}
+}
+
+func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-neo",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Neo")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-trinity",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Trinity")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant: "acme",
+			ID:     "m-matrix",
+			Labels: []string{"Movie"},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-1", Type: "ACTED_IN", SrcID: "p-neo", DstID: "m-matrix"}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "Person",
+			Property:    "name",
+			Value:       []byte("Neo"),
+			EntityID:    "p-neo",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "Person", "name")
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:Person {name: $name}) RETURN DISTINCT n.name AS name ORDER BY name ASC SKIP 1 LIMIT $maxLimit")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{IndexCatalog: catalog})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "Neo", "maxLimit": 5})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	query, ok := explainPayload["query"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected query map, got %T", explainPayload["query"])
+	}
+	params, ok := query["params"].([]string)
+	if !ok {
+		t.Fatalf("expected query.params []string, got %T", query["params"])
+	}
+	if !reflect.DeepEqual(params, []string{"maxLimit", "name"}) {
+		t.Fatalf("unexpected params: %#v", params)
+	}
+	options, ok := query["options"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected query.options map, got %T", query["options"])
+	}
+	if distinct, _ := options["distinct"].(bool); !distinct {
+		t.Fatalf("expected distinct query option")
+	}
+	if skip, _ := options["skip"].(string); skip != "1" {
+		t.Fatalf("expected skip=1, got %#v", options["skip"])
+	}
+	if limit, _ := options["limit"].(string); limit != "$maxLimit" {
+		t.Fatalf("expected limit parameter, got %#v", options["limit"])
+	}
+	if orderBy, _ := options["orderBy"].([]string); !reflect.DeepEqual(orderBy, []string{"name ASC"}) {
+		t.Fatalf("unexpected orderBy: %#v", options["orderBy"])
+	}
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	nodes, ok := logicalPlan["nodes"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan.nodes []map[string]any, got %T", logicalPlan["nodes"])
+	}
+	if len(nodes) == 0 {
+		t.Fatalf("expected non-empty logical plan nodes")
+	}
+	if rootNodeID, _ := logicalPlan["rootNodeId"].(string); rootNodeID == "" {
+		t.Fatalf("expected non-empty rootNodeId")
+	}
+	influencers, ok := explainPayload["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
+	}
+	nodeCounts, ok := influencers["nodeCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected nodeCounts []map[string]any, got %T", influencers["nodeCounts"])
+	}
+	if len(nodeCounts) == 0 {
+		t.Fatalf("expected non-empty nodeCounts")
+	}
+	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
+	}
+	if len(edgeCounts) == 0 {
+		t.Fatalf("expected non-empty edgeCounts")
+	}
+	predicateSignals, ok := influencers["predicateSignals"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected predicateSignals []map[string]any, got %T", influencers["predicateSignals"])
+	}
+	if len(predicateSignals) == 0 {
+		t.Fatalf("expected non-empty predicateSignals")
+	}
+	indexDecisions, ok := explainPayload["indexDecisions"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected indexDecisions []map[string]any, got %T", explainPayload["indexDecisions"])
+	}
+	if len(indexDecisions) == 0 {
+		t.Fatalf("expected non-empty indexDecisions")
+	}
+	if selected, _ := indexDecisions[0]["selected"].(bool); !selected {
+		t.Fatalf("expected indexed decision to be selected")
+	}
+	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected cardinality []map[string]any, got %T", explainPayload["cardinality"])
+	}
+	if len(cardinality) != len(nodes) {
+		t.Fatalf("expected cardinality entries to match nodes, got %d and %d", len(cardinality), len(nodes))
+	}
+	if rowsOut, _ := cardinality[0]["rowsOut"].(int); rowsOut != 1 {
+		t.Fatalf("expected first cardinality rowsOut=1, got %#v", cardinality[0]["rowsOut"])
+	}
+}
+
 func TestExecuteMatchUsesPropertyIndexPlanner(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -306,6 +506,90 @@ func TestExecuteMatchWhereNotExistsSubquery(t *testing.T) {
 	}
 	if got := res.Rows[0]["movieTitle"]; got != "Apocalypse Now" {
 		t.Fatalf("unexpected movieTitle: %#v", got)
+	}
+}
+
+func TestExecuteMatchWhereExistsSubqueryWithOrderedPagination(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-martin", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Martin Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-wall", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-apoc", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Apocalypse Now")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "ACTED_IN", SrcID: "p-martin", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "ACTED_IN", SrcID: "p-martin", DstID: "m-apoc"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (martin:Person) WHERE martin.name = 'Martin Sheen' AND EXISTS { MATCH (martin)-[:ACTED_IN]->(movie:Movie) WITH movie ORDER BY movie.title ASC SKIP 1 LIMIT 1 RETURN movie } RETURN martin.name AS name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["name"]; got != "Martin Sheen" {
+		t.Fatalf("unexpected name: %#v", got)
+	}
+}
+
+func TestExecuteMatchWhereNotExistsSubqueryWithOrderedPagination(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-martin", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Martin Sheen")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-wall", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Wall Street")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-apoc", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Apocalypse Now")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "ACTED_IN", SrcID: "p-martin", DstID: "m-wall"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "ACTED_IN", SrcID: "p-martin", DstID: "m-apoc"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (martin:Person) WHERE martin.name = 'Martin Sheen' AND NOT EXISTS { MATCH (martin)-[:ACTED_IN]->(movie:Movie) WITH movie ORDER BY movie.title ASC SKIP 2 LIMIT 1 RETURN movie } RETURN martin.name AS name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["name"]; got != "Martin Sheen" {
+		t.Fatalf("unexpected name: %#v", got)
 	}
 }
 
@@ -3690,6 +3974,104 @@ func TestApplySkipLimitLimitZeroReturnsNoRows(t *testing.T) {
 	trimmed := applySkipLimit(rows, 0, 0, true)
 	if len(trimmed) != 0 {
 		t.Fatalf("expected empty rows for LIMIT 0, got %#v", trimmed)
+	}
+}
+
+func TestProjectionClauseSpecFromClausePrefersStructuredProjectionMetadata(t *testing.T) {
+	clause := ast.Clause{
+		Kind: ast.ClauseKindReturn,
+		Raw:  "RETURN n ORDER BY wrong DESC SKIP 99 LIMIT 88",
+		Projection: &ast.ReturnClause{
+			Items: []ast.ProjectionItem{{Expression: ast.Expression{Raw: "n"}}},
+			OrderBy: []ast.SortItem{{
+				Expression: ast.Expression{Raw: "n"},
+				Direction:  ast.SortDirectionAsc,
+			}},
+			Skip:  &ast.Expression{Raw: "1"},
+			Limit: &ast.Expression{Raw: "2"},
+		},
+	}
+
+	spec, err := projectionClauseSpecFromClause(clause, nil)
+	if err != nil {
+		t.Fatalf("projectionClauseSpecFromClause failed: %v", err)
+	}
+	if spec.SkipRaw != "1" || spec.LimitRaw != "2" {
+		t.Fatalf("expected structured skip/limit to win, got skip=%q limit=%q", spec.SkipRaw, spec.LimitRaw)
+	}
+	if len(spec.OrderBy) != 1 || spec.OrderBy[0].Expression != "n" || spec.OrderBy[0].Descending {
+		t.Fatalf("expected structured order by metadata, got %#v", spec.OrderBy)
+	}
+}
+
+func TestProjectionClauseSpecFromClauseAllowsCompactNormalizedFallback(t *testing.T) {
+	clause := ast.Clause{
+		Kind: ast.ClauseKindReturn,
+		Raw:  "RETURNnORDERBYnDESCSKIP1LIMIT1",
+	}
+
+	spec, err := projectionClauseSpecFromClause(clause, []string{"n"})
+	if err != nil {
+		t.Fatalf("projectionClauseSpecFromClause failed: %v", err)
+	}
+	if spec.SkipRaw != "1" || spec.LimitRaw != "1" {
+		t.Fatalf("expected compact fallback skip/limit parsing, got skip=%q limit=%q", spec.SkipRaw, spec.LimitRaw)
+	}
+	if len(spec.OrderBy) != 1 {
+		t.Fatalf("expected one ORDER BY item from compact fallback, got %d", len(spec.OrderBy))
+	}
+}
+
+func TestProjectionClauseSpecFromClauseRejectsNonCompactRawFallback(t *testing.T) {
+	clause := ast.Clause{
+		Kind: ast.ClauseKindReturn,
+		Raw:  "RETURN n ORDER BY n DESC SKIP 1 LIMIT 1",
+	}
+
+	_, err := projectionClauseSpecFromClause(clause, nil)
+	if err == nil {
+		t.Fatalf("expected structured-projection error when metadata is unavailable")
+	}
+}
+
+func TestBuildStructuredProjectionClauseWith(t *testing.T) {
+	clause, err := buildStructuredProjectionClause(ast.ClauseKindWith, "WITH n AS v ORDER BY v DESC SKIP 1 LIMIT 2", []string{"n"})
+	if err != nil {
+		t.Fatalf("buildStructuredProjectionClause failed: %v", err)
+	}
+	if clause.Kind != ast.ClauseKindWith {
+		t.Fatalf("expected WITH clause, got %s", clause.Kind)
+	}
+	if clause.Projection == nil {
+		t.Fatalf("expected structured projection on WITH clause")
+	}
+	if clause.Projection.Skip == nil || clause.Projection.Skip.Raw != "1" {
+		t.Fatalf("expected WITH SKIP metadata")
+	}
+	if clause.Projection.Limit == nil || clause.Projection.Limit.Raw != "2" {
+		t.Fatalf("expected WITH LIMIT metadata")
+	}
+	if len(clause.Projection.OrderBy) != 1 || clause.Projection.OrderBy[0].Direction != ast.SortDirectionDesc {
+		t.Fatalf("expected WITH ORDER BY DESC metadata")
+	}
+}
+
+func TestBuildStructuredProjectionClauseReturnWithScopePrelude(t *testing.T) {
+	clause, err := buildStructuredProjectionClause(ast.ClauseKindReturn, "RETURN n ORDER BY n SKIP 1 LIMIT 2", []string{"n"})
+	if err != nil {
+		t.Fatalf("buildStructuredProjectionClause failed: %v", err)
+	}
+	if clause.Kind != ast.ClauseKindReturn {
+		t.Fatalf("expected RETURN clause, got %s", clause.Kind)
+	}
+	if clause.Projection == nil {
+		t.Fatalf("expected structured projection on RETURN clause")
+	}
+	if clause.Projection.Skip == nil || clause.Projection.Skip.Raw != "1" {
+		t.Fatalf("expected RETURN SKIP metadata")
+	}
+	if clause.Projection.Limit == nil || clause.Projection.Limit.Raw != "2" {
+		t.Fatalf("expected RETURN LIMIT metadata")
 	}
 }
 

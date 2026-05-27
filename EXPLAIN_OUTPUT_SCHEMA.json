@@ -1,0 +1,465 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vitaledge.dev/schema/explain-output/v1",
+  "title": "VitalEdge EXPLAIN Output",
+  "description": "Dry-run planning output for Cypher EXPLAIN.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "query",
+    "summary",
+    "logicalPlan",
+    "physicalPlan",
+    "influencers",
+    "cardinality",
+    "indexDecisions",
+    "warnings"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version for EXPLAIN output.",
+      "const": "v1"
+    },
+    "query": {
+      "$ref": "#/$defs/query"
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "logicalPlan": {
+      "$ref": "#/$defs/plan"
+    },
+    "physicalPlan": {
+      "$ref": "#/$defs/plan"
+    },
+    "influencers": {
+      "$ref": "#/$defs/influencers"
+    },
+    "cardinality": {
+      "type": "array",
+      "description": "Per-plan-node cardinality entries.",
+      "items": {
+        "$ref": "#/$defs/cardinalityEntry"
+      }
+    },
+    "indexDecisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/indexDecision"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/warning"
+      }
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    }
+  },
+  "$defs": {
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text",
+        "fingerprint",
+        "statementKind",
+        "tenant"
+      ],
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string",
+          "description": "Stable query-shape fingerprint suitable for grouping and comparisons."
+        },
+        "statementKind": {
+          "type": "string"
+        },
+        "tenant": {
+          "type": "string"
+        },
+        "params": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "options": {
+          "$ref": "#/$defs/queryOptions"
+        }
+      }
+    },
+    "queryOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "distinct": {
+          "type": "boolean"
+        },
+        "includeAll": {
+          "type": "boolean"
+        },
+        "orderBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skip": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "string"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dryRun",
+        "readOnly",
+        "writesDetected",
+        "semanticPhaseStatus",
+        "planningPhaseStatus"
+      ],
+      "properties": {
+        "dryRun": {
+          "type": "boolean",
+          "const": true
+        },
+        "readOnly": {
+          "type": "boolean"
+        },
+        "writesDetected": {
+          "type": "boolean"
+        },
+        "semanticPhaseStatus": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "error"
+          ]
+        },
+        "planningPhaseStatus": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "error"
+          ]
+        }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rootNodeId",
+        "nodes"
+      ],
+      "properties": {
+        "rootNodeId": {
+          "type": "string"
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/planNode"
+          }
+        }
+      }
+    },
+    "planNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "op",
+        "children"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "op": {
+          "type": "string"
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "accessPath": {
+          "type": "string"
+        },
+        "predicate": {
+          "type": "string"
+        },
+        "projection": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ordering": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pagination": {
+          "$ref": "#/$defs/pagination"
+        },
+        "writeAction": {
+          "type": "string"
+        }
+      }
+    },
+    "pagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "skip": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "string"
+        }
+      }
+    },
+    "influencers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeCounts",
+        "edgeCounts",
+        "predicateSignals",
+        "statsSnapshot"
+      ],
+      "properties": {
+        "nodeCounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/nodeCount"
+          }
+        },
+        "edgeCounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/edgeCount"
+          }
+        },
+        "predicateSignals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/predicateSignal"
+          }
+        },
+        "statsSnapshot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "capturedAt"
+          ],
+          "properties": {
+            "source": {
+              "type": "string",
+              "description": "Source of statistics used by planning, for example runtime catalog, sampled probes, or static defaults."
+            },
+            "capturedAt": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        }
+      }
+    },
+    "nodeCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "count",
+        "quality"
+      ],
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quality": {
+          "$ref": "#/$defs/quality"
+        }
+      }
+    },
+    "edgeCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "direction",
+        "count",
+        "quality"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "out",
+            "in",
+            "undirected"
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quality": {
+          "$ref": "#/$defs/quality"
+        }
+      }
+    },
+    "predicateSignal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expression",
+        "matchedCount",
+        "quality"
+      ],
+      "properties": {
+        "expression": {
+          "type": "string"
+        },
+        "matchedCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quality": {
+          "$ref": "#/$defs/quality"
+        }
+      }
+    },
+    "cardinalityEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeId",
+        "rowsIn",
+        "rowsOut",
+        "quality"
+      ],
+      "properties": {
+        "nodeId": {
+          "type": "string"
+        },
+        "rowsIn": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rowsOut": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quality": {
+          "$ref": "#/$defs/quality"
+        },
+        "sampleSize": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "indexDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeId",
+        "schema",
+        "property",
+        "candidate",
+        "selected",
+        "reason"
+      ],
+      "properties": {
+        "nodeId": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "property": {
+          "type": "string"
+        },
+        "candidate": {
+          "type": "boolean"
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "estimatedSelectivity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "nodeId": {
+          "type": "string"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engineVersion": {
+          "type": "string"
+        },
+        "transport": {
+          "type": "string",
+          "description": "Current serialization transport for this output; JSON is used for rapid iteration before protobuf/gRPC mapping."
+        }
+      }
+    },
+    "quality": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "estimate",
+        "sample"
+      ]
+    }
+  }
+}

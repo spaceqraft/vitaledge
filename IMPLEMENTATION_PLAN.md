@@ -193,6 +193,82 @@ Target comparison:
 
 Objective: make Phase 1 robust, explainable, and less text-driven before cluster complexity.
 
+### Phase 2 Focus: Query Pipeline
+
+Primary focus for this phase is a strict pipeline for all supported query shapes:
+
+1. Parse
+2. Semantic validation
+3. Logical planning
+4. Physical execution
+
+The implementation intent is to preserve semantics and scope as structured artifacts between stages so the executor does not need to recover intent from normalized raw text.
+
+#### Stage contracts
+
+1. Parse stage contract
+   - Input: query text + parameters.
+   - Output: typed AST + source locations + normalized clause ordering metadata.
+   - Must not perform execution-time rewrites.
+2. Semantic validation stage contract
+   - Input: AST + schema/index catalog view + parameter values.
+   - Output: semantic query model (scopes, symbol table, typed expressions, clause constraints, projection/pagination intent).
+   - Responsible for user-facing semantic errors and category mapping.
+3. Logical planning stage contract
+   - Input: semantic query model + planner statistics/index metadata.
+   - Output: deterministic logical operator graph (scan/match/expand/filter/project/aggregate/sort/limit/update).
+   - Responsible for index candidate selection and explain-visible operator shapes.
+4. Physical execution stage contract
+   - Input: logical plan + runtime context (tenant, transaction, params).
+   - Output: result stream/set + execution stats + diagnostics hooks.
+   - Must not reinterpret clauses from raw text to recover core semantics.
+
+#### First refactor targets (in order)
+
+1. ORDER BY, SKIP, LIMIT
+2. DISTINCT and projection forms
+3. Pattern/edge clause structure used by MATCH/OPTIONAL MATCH
+4. MERGE action blocks and write-action sequencing
+
+#### Query Pipeline exit evidence
+
+1. Explain output parity: all supported query forms produce stable explain plans.
+2. Regression guardrail: parser/executor tests proving no regex/raw-text reconstruction for core semantics in supported forms.
+3. Error-path consistency: semantic errors are produced in semantic stage for representative invalid queries.
+4. Performance non-regression: no material regressions against Phase 1 benchmark baselines.
+
+#### EXPLAIN contract for Phase 2
+
+Objective: deliver a stable dry-run planning interface for manual index tuning and planner diagnostics.
+
+Execution behavior:
+
+1. EXPLAIN runs parse, semantic validation, logical planning, and physical planning.
+2. EXPLAIN does not execute the physical plan for result production.
+3. EXPLAIN does not apply writes or mutate persisted graph state.
+
+Required output:
+
+1. Logical and physical plan nodes.
+2. Plan-influencing details used by planning:
+   - node/edge cardinality facts relevant to query predicates and expansions,
+   - index candidates and chosen access path rationale,
+   - predicate cardinality signals.
+3. Cardinality entries with quality classification: `exact`, `estimate`, `sample`.
+4. Warnings and fallback diagnostics.
+
+Schema and transport policy:
+
+1. Canonical short-term EXPLAIN output schema is JSON, defined in [EXPLAIN_OUTPUT_SCHEMA.json](EXPLAIN_OUTPUT_SCHEMA.json).
+2. gRPC/protobuf remains the target external transport; JSON output is retained in this phase to accelerate contract iteration.
+3. Protobuf mapping must preserve field semantics and cardinality quality annotations.
+
+Exit evidence additions for EXPLAIN:
+
+1. Integration tests proving EXPLAIN is read-only for write-shaped queries.
+2. Golden-output tests for representative query families (match/filter/projection/order/pagination/write-shaped dry run).
+3. Regression tests proving stable emission of plan-influencing details.
+
 Milestones:
 
 1. Strengthen query-engine phase boundaries.
@@ -385,11 +461,27 @@ For each milestone, track:
 
 ## Recommended Immediate Next Sprint
 
+Theme: Query Pipeline foundation sprint.
+
 1. Define the target query-engine phase contract explicitly: parse, semantic validation, logical plan, physical execution, result normalization.
 2. Remove the highest-value executor regex/raw-clause dependencies by promoting clause structure into parser/planner artifacts.
 3. Deliver MVP operator loop for manual index tuning: EXPLAIN + planner/runtime statistics + query cost estimation for supported query shapes.
 4. Stand up Prometheus/Grafana as the default metrics path and publish dashboard/query examples.
 5. Finalize CLI UX for variables, table output, and statement statistics.
 6. Run and publish benchmark comparisons against Neo4j and TigerGraph using documented workload parity rules.
+
+EXPLAIN-focused deliverables for current sprint track:
+
+1. Introduce EXPLAIN dry-run command handling and response envelope.
+2. Emit logical/physical operator nodes for supported query forms.
+3. Emit plan influencers (node/edge counts, predicate signals, index decisions) with quality tags.
+4. Validate output against [EXPLAIN_OUTPUT_SCHEMA.json](EXPLAIN_OUTPUT_SCHEMA.json).
+
+Suggested implementation order for this sprint:
+
+1. Add explicit semantic-model types for projection, ordering, pagination, and write actions.
+2. Wire planner inputs to consume semantic model rather than normalized clause text for those forms.
+3. Add explain-plan coverage tests for each newly migrated form.
+4. Remove replaced regex/raw-text paths after test parity is green.
 
 Back to [DESIGN.md](DESIGN.md) and [README.md](README.md).

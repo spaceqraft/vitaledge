@@ -2,6 +2,7 @@ package parser
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
@@ -153,6 +154,66 @@ func TestParseBatchMultiPartQuerySupported(t *testing.T) {
 	}
 }
 
+func TestParseBatchProjectionMetadataForWithAndReturnClauses(t *testing.T) {
+	query := "MATCH (n:Person) WITH n.name AS name ORDER BY name DESC SKIP 1 LIMIT 2 RETURN name AS value ORDER BY value ASC SKIP 3 LIMIT 4"
+	batch, err := ParseBatch(query)
+	if err != nil {
+		t.Fatalf("ParseBatch() unexpected error: %v", err)
+	}
+
+	stmt, ok := batch.Statements[0].(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected *ast.QueryStatement, got %T", batch.Statements[0])
+	}
+	if len(stmt.Parts) != 1 {
+		t.Fatalf("expected 1 query part, got %d", len(stmt.Parts))
+	}
+	clauses := stmt.Parts[0].Clauses
+	if len(clauses) != 3 {
+		t.Fatalf("expected 3 clauses, got %d", len(clauses))
+	}
+
+	withClause := clauses[1]
+	if withClause.Kind != ast.ClauseKindWith {
+		t.Fatalf("expected WITH clause, got %s", withClause.Kind)
+	}
+	if withClause.Projection == nil {
+		t.Fatalf("expected WITH projection metadata")
+	}
+	if withClause.Where != nil {
+		t.Fatalf("did not expect WITH WHERE metadata")
+	}
+	if len(withClause.Projection.OrderBy) != 1 {
+		t.Fatalf("expected 1 WITH ORDER BY item, got %d", len(withClause.Projection.OrderBy))
+	}
+	if withClause.Projection.Skip == nil || strings.TrimSpace(withClause.Projection.Skip.Raw) != "1" {
+		t.Fatalf("expected WITH SKIP 1 metadata")
+	}
+	if withClause.Projection.Limit == nil || strings.TrimSpace(withClause.Projection.Limit.Raw) != "2" {
+		t.Fatalf("expected WITH LIMIT 2 metadata")
+	}
+
+	returnClause := clauses[2]
+	if returnClause.Kind != ast.ClauseKindReturn {
+		t.Fatalf("expected RETURN clause, got %s", returnClause.Kind)
+	}
+	if returnClause.Projection == nil {
+		t.Fatalf("expected RETURN projection metadata")
+	}
+	if returnClause.Where != nil {
+		t.Fatalf("did not expect RETURN WHERE metadata")
+	}
+	if len(returnClause.Projection.OrderBy) != 1 {
+		t.Fatalf("expected 1 RETURN ORDER BY item, got %d", len(returnClause.Projection.OrderBy))
+	}
+	if returnClause.Projection.Skip == nil || strings.TrimSpace(returnClause.Projection.Skip.Raw) != "3" {
+		t.Fatalf("expected RETURN SKIP 3 metadata")
+	}
+	if returnClause.Projection.Limit == nil || strings.TrimSpace(returnClause.Projection.Limit.Raw) != "4" {
+		t.Fatalf("expected RETURN LIMIT 4 metadata")
+	}
+}
+
 func TestParseBatchUnionSupported(t *testing.T) {
 	batch, err := ParseBatch("MATCH (n:Person) RETURN n UNION ALL MATCH (m:Movie) RETURN m")
 	if err != nil {
@@ -184,6 +245,45 @@ func TestParseStatementStandaloneCallSupported(t *testing.T) {
 	}
 	if call.Call.Kind != ast.ClauseKindStandaloneCall {
 		t.Fatalf("expected STANDALONE_CALL clause kind, got %s", call.Call.Kind)
+	}
+}
+
+func TestParseStatementExplainWrapsInnerStatement(t *testing.T) {
+	stmt, err := ParseStatement("EXPLAIN MATCH (n:Person) RETURN n.name AS name")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+
+	explain, ok := stmt.(*ast.ExplainStatement)
+	if !ok {
+		t.Fatalf("expected *ast.ExplainStatement, got %T", stmt)
+	}
+	if explain.Kind() != ast.StatementKindExplain {
+		t.Fatalf("expected EXPLAIN kind, got %s", explain.Kind())
+	}
+	if strings.TrimSpace(explain.Query) != "MATCH (n:Person) RETURN n.name AS name" {
+		t.Fatalf("unexpected explain query payload: %q", explain.Query)
+	}
+	if explain.Statement == nil {
+		t.Fatalf("expected wrapped statement")
+	}
+	if explain.Statement.Kind() != ast.StatementKindMatchQuery {
+		t.Fatalf("expected wrapped MATCH_QUERY statement, got %s", explain.Statement.Kind())
+	}
+}
+
+func TestParseStatementExplainRequiresInnerQuery(t *testing.T) {
+	_, err := ParseStatement("EXPLAIN")
+	if err == nil {
+		t.Fatalf("expected semantic parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorSemantic {
+		t.Fatalf("expected semantic parse error kind, got %s", parseErr.Kind)
 	}
 }
 

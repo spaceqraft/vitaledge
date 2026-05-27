@@ -48,6 +48,20 @@ func ParseStatement(query string) (ast.Statement, error) {
 }
 
 func parseSegment(seg statementSegment, fullQuery string) (ast.Statement, error) {
+	if inner, offset, ok := splitExplainPrefix(seg.text); ok {
+		if strings.TrimSpace(inner) == "" {
+			return nil, &ParseError{Kind: ParseErrorSemantic, Message: "EXPLAIN requires a query", Statement: seg.index}
+		}
+		innerSeg := seg
+		innerSeg.text = inner
+		innerSeg.startOffset += offset
+		innerStmt, err := parseSegment(innerSeg, fullQuery)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.ExplainStatement{Raw: strings.TrimSpace(seg.text), Query: strings.TrimSpace(inner), Statement: innerStmt, SourceSpan: innerStmt.Span()}, nil
+	}
+
 	rewrite := rewriteExistsBlocks(seg.text)
 	input := antlr.NewInputStream(rewrite.text)
 	lexer := cyphergen.NewCypherLexer(input)
@@ -80,6 +94,30 @@ func parseSegment(seg statementSegment, fullQuery string) (ast.Statement, error)
 		return nil, err
 	}
 	return stmt, nil
+}
+
+func splitExplainPrefix(raw string) (inner string, offset int, ok bool) {
+	start := 0
+	for start < len(raw) && unicode.IsSpace(rune(raw[start])) {
+		start++
+	}
+	if start+len("EXPLAIN") > len(raw) {
+		return "", 0, false
+	}
+	if !strings.EqualFold(raw[start:start+len("EXPLAIN")], "EXPLAIN") {
+		return "", 0, false
+	}
+	end := start + len("EXPLAIN")
+	if end < len(raw) {
+		r := rune(raw[end])
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			return "", 0, false
+		}
+	}
+	for end < len(raw) && unicode.IsSpace(rune(raw[end])) {
+		end++
+	}
+	return raw[end:], end, true
 }
 
 type existsRewrite struct {

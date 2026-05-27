@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/paegun/vitaledge/internal/cypher/executor"
+	"github.com/paegun/vitaledge/internal/cypher/indexschema"
 	"github.com/paegun/vitaledge/internal/graph"
 	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
 )
@@ -233,6 +234,117 @@ func TestTCPQueryExecutionSlowMultilineMatchLabelAlternation(t *testing.T) {
 	}
 	if len(response.Rows) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(response.Rows))
+	}
+}
+
+func TestTCPExplainQueryReturnsExplainPayload(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(context.Background(), func(tx graph.Tx) error {
+		if err := tx.PutVertex(context.Background(), &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-neo",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Neo")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(context.Background(), &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "m-matrix",
+			Labels:     []string{"Movie"},
+			Properties: graph.PropertyMap{"title": []byte("The Matrix")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(context.Background(), &graph.Edge{
+			Tenant: "acme",
+			ID:     "e-1",
+			Type:   "ACTED_IN",
+			SrcID:  "p-neo",
+			DstID:  "m-matrix",
+		}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(context.Background(), &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "Person",
+			Property:    "name",
+			Value:       []byte("Neo"),
+			EntityID:    "p-neo",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "Person", "name")
+	server := NewServer(Config{
+		DefaultTenant:         "acme",
+		Executor:              executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: catalog}),
+		ExecutorMetrics:       executor.NewCollector(),
+		MetricsReportInterval: 0,
+	})
+	defer close(server.quitCh)
+	go server.loop()
+
+	conn := openServerPeerConnection(t, server)
+	defer conn.Close()
+
+	response := sendTCPQuery(t, conn, "EXPLAIN MATCH (n:Person {name: $name}) RETURN DISTINCT n.name AS name ORDER BY name ASC SKIP 1 LIMIT $maxLimit")
+	if !response.OK {
+		t.Fatalf("expected ok response, got error: %s", response.Error)
+	}
+	if len(response.Columns) != 1 || response.Columns[0] != "explain" {
+		t.Fatalf("unexpected columns: %#v", response.Columns)
+	}
+	if len(response.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %d", len(response.Rows))
+	}
+
+	explain, ok := response.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", response.Rows[0]["explain"])
+	}
+	query, ok := explain["query"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected query map, got %T", explain["query"])
+	}
+	if query["statementKind"] != "MATCH_QUERY" {
+		t.Fatalf("unexpected statementKind: %#v", query["statementKind"])
+	}
+	options, ok := query["options"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected query.options map, got %T", query["options"])
+	}
+	if distinct, _ := options["distinct"].(bool); !distinct {
+		t.Fatalf("expected distinct option to be true")
+	}
+	if skip, _ := options["skip"].(string); skip != "1" {
+		t.Fatalf("expected skip option to equal 1, got %#v", options["skip"])
+	}
+	if limit, _ := options["limit"].(string); limit != "$maxLimit" {
+		t.Fatalf("expected limit option to preserve parameter reference, got %#v", options["limit"])
+	}
+	if orderBy, _ := options["orderBy"].([]any); len(orderBy) != 1 || orderBy[0] != "name ASC" {
+		t.Fatalf("unexpected orderBy option: %#v", options["orderBy"])
+	}
+
+	influencers, ok := explain["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explain["influencers"])
+	}
+	if nodeCounts, ok := influencers["nodeCounts"].([]any); !ok || len(nodeCounts) == 0 {
+		t.Fatalf("expected nodeCounts to be populated, got %#v", influencers["nodeCounts"])
+	}
+	if edgeCounts, ok := influencers["edgeCounts"].([]any); !ok || len(edgeCounts) == 0 {
+		t.Fatalf("expected edgeCounts to be populated, got %#v", influencers["edgeCounts"])
+	}
+	if cardinality, ok := explain["cardinality"].([]any); !ok || len(cardinality) == 0 {
+		t.Fatalf("expected cardinality to be populated, got %#v", explain["cardinality"])
 	}
 }
 

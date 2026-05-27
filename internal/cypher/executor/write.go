@@ -5615,8 +5615,7 @@ func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Param
 
 func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, priorColumns []string, final bool) ([]Row, []string, error) {
 	params = withProjectionEvalRuntime(ctx, tx, params, e)
-	raw := strings.TrimSpace(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
-	projection, err := parseProjectionClauseSpec(raw)
+	projection, err := projectionClauseSpecFromClause(clause, inferColumnsFromRows(rows))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -6248,6 +6247,88 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		out = trimProjectionRows(out, columns)
 	}
 	return out, columns, nil
+}
+
+func projectionClauseSpecFromClause(clause ast.Clause, scopeVars []string) (projectionClauseSpec, error) {
+	if clause.Projection != nil {
+		return projectionClauseSpecFromAST(clause.Projection, clause.Where), nil
+	}
+	if clause.Kind == ast.ClauseKindWith || clause.Kind == ast.ClauseKindReturn {
+		structured, err := buildStructuredProjectionClause(clause.Kind, clause.Raw, scopeVars)
+		if err == nil && structured.Projection != nil {
+			return projectionClauseSpecFromAST(structured.Projection, structured.Where), nil
+		}
+		compactClauseRaw := strings.IndexFunc(strings.TrimSpace(clause.Raw), unicode.IsSpace) < 0
+		raw := strings.TrimSpace(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
+		if compactClauseRaw || isCompactNormalizedProjectionRaw(raw) {
+			return parseProjectionClauseSpec(raw)
+		}
+		if err != nil {
+			return projectionClauseSpec{}, err
+		}
+		return projectionClauseSpec{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("%s clause projection metadata is unavailable", clause.Kind), nil)
+	}
+	raw := strings.TrimSpace(stripLeadingClauseKeyword(clause.Raw, string(clause.Kind)))
+	return parseProjectionClauseSpec(raw)
+}
+
+func isCompactNormalizedProjectionRaw(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.IndexFunc(raw, unicode.IsSpace) >= 0 {
+		return false
+	}
+	upper := strings.ToUpper(raw)
+	return strings.Contains(upper, "ORDERBY") || strings.Contains(upper, "SKIP") || strings.Contains(upper, "LIMIT") || strings.Contains(upper, "DISTINCT")
+}
+
+func projectionClauseSpecFromAST(ret *ast.ReturnClause, where *ast.Expression) projectionClauseSpec {
+	out := projectionClauseSpec{Distinct: ret.Distinct, ProjectionRaw: projectionItemsRawFromAST(ret), OrderBy: projectionOrderByFromAST(ret.OrderBy)}
+	if where != nil {
+		out.WhereRaw = strings.TrimSpace(where.Raw)
+	}
+	if ret.Skip != nil {
+		out.SkipRaw = strings.TrimSpace(ret.Skip.Raw)
+	}
+	if ret.Limit != nil {
+		out.LimitRaw = strings.TrimSpace(ret.Limit.Raw)
+	}
+	return out
+}
+
+func projectionItemsRawFromAST(ret *ast.ReturnClause) string {
+	parts := make([]string, 0, len(ret.Items)+1)
+	if ret.IncludeAll {
+		parts = append(parts, "*")
+	}
+	for _, item := range ret.Items {
+		expr := strings.TrimSpace(item.Expression.Raw)
+		if expr == "" {
+			continue
+		}
+		if alias := strings.TrimSpace(item.Alias); alias != "" {
+			expr += " AS " + alias
+		}
+		parts = append(parts, expr)
+	}
+	return strings.TrimSpace(strings.Join(parts, ", "))
+}
+
+func projectionOrderByFromAST(sortItems []ast.SortItem) []projectionOrderBySpec {
+	if len(sortItems) == 0 {
+		return nil
+	}
+	out := make([]projectionOrderBySpec, 0, len(sortItems))
+	for _, item := range sortItems {
+		expr := strings.TrimSpace(item.Expression.Raw)
+		if expr == "" {
+			continue
+		}
+		out = append(out, projectionOrderBySpec{Expression: expr, Descending: item.Direction == ast.SortDirectionDesc})
+	}
+	return out
 }
 
 type projectionSpec struct {
@@ -10247,6 +10328,13 @@ func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw str
 
 	if hasLogicalNotPrefix(raw) {
 		operand := strings.TrimSpace(raw[3:])
+		if body, ok := parseExistsSubqueryBody(operand); ok {
+			matched, err := e.evalExistsSubquery(ctx, tx, body, row, params)
+			if err != nil {
+				return false, err
+			}
+			return !matched, nil
+		}
 		if matched, handled, err := e.evalWhereRelationshipPatternPredicate(ctx, tx, operand, row, params); handled {
 			if err != nil {
 				return false, err
@@ -10499,6 +10587,69 @@ func (e *Executor) evalExistsQueryBody(ctx context.Context, tx graph.Tx, body st
 		return false, true, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("EXISTS subquery %q is not yet supported", body), nil)
 	}
 	return len(rows) > 0, true, nil
+}
+
+func buildStructuredProjectionClause(kind ast.ClauseKind, raw string, scopeVars []string) (ast.Clause, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ast.Clause{}, graph.NewError(graph.ErrKindInvalidInput, "projection clause is required", nil)
+	}
+
+	query := raw
+	prelude := buildProjectionScopePrelude(scopeVars)
+	switch kind {
+	case ast.ClauseKindWith:
+		if !strings.HasPrefix(strings.ToUpper(query), "WITH") {
+			query = "WITH " + query
+		}
+		query = prelude + query + " RETURN 1"
+	case ast.ClauseKindReturn:
+		if !strings.HasPrefix(strings.ToUpper(query), "RETURN") {
+			query = "RETURN " + query
+		}
+		query = prelude + query
+	default:
+		return ast.Clause{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("projection clause kind %s is not supported", kind), nil)
+	}
+
+	stmt, err := parser.ParseStatement(query)
+	if err != nil {
+		return ast.Clause{}, err
+	}
+	typed, ok := stmt.(*ast.QueryStatement)
+	if !ok || len(typed.Parts) == 0 || len(typed.Parts[0].Clauses) == 0 {
+		return ast.Clause{}, graph.NewError(graph.ErrKindUnsupported, "unable to build structured projection clause", nil)
+	}
+
+	for i := len(typed.Parts[0].Clauses) - 1; i >= 0; i-- {
+		clause := typed.Parts[0].Clauses[i]
+		if clause.Kind == kind {
+			clause.Raw = raw
+			return clause, nil
+		}
+	}
+
+	return ast.Clause{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("projection clause kind %s not found", kind), nil)
+}
+
+func buildProjectionScopePrelude(scopeVars []string) string {
+	decls := make([]string, 0, len(scopeVars))
+	seen := map[string]struct{}{}
+	for _, raw := range scopeVars {
+		name := strings.TrimSpace(raw)
+		if !isIdentifierLike(name) {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		decls = append(decls, "0 AS "+name)
+	}
+	if len(decls) == 0 {
+		return ""
+	}
+	return "WITH " + strings.Join(decls, ", ") + " "
 }
 
 func splitExistsPatternBody(body string) (patternRaw string, whereRaw string, ok bool) {

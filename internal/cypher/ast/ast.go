@@ -7,6 +7,7 @@ const (
 	StatementKindMatchQuery StatementKind = "MATCH_QUERY"
 	StatementKindQuery      StatementKind = "QUERY"
 	StatementKindCall       StatementKind = "CALL"
+	StatementKindExplain    StatementKind = "EXPLAIN"
 )
 
 // ClauseKind identifies a normalized top-level clause.
@@ -68,6 +69,8 @@ type Batch struct {
 type Clause struct {
 	Kind       ClauseKind
 	Raw        string
+	Projection *ReturnClause
+	Where      *Expression
 	Parameters []ParameterRef
 	Span       Span
 }
@@ -172,4 +175,22 @@ func (*MatchQueryStatement) Kind() StatementKind {
 
 func (m *MatchQueryStatement) Span() Span {
 	return m.SourceSpan
+}
+
+// ExplainStatement wraps another statement for dry-run planning output.
+type ExplainStatement struct {
+	Raw        string
+	Query      string
+	Statement  Statement
+	SourceSpan Span
+}
+
+func (*ExplainStatement) statementNode() {}
+
+func (*ExplainStatement) Kind() StatementKind {
+	return StatementKindExplain
+}
+
+func (e *ExplainStatement) Span() Span {
+	return e.SourceSpan
 }

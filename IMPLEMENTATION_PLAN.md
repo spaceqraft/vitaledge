@@ -556,27 +556,46 @@ For each milestone, track:
 
 ## Recommended Immediate Next Sprint
 
-Theme: Query Pipeline foundation sprint.
+Theme: MVP closeout sprint (post-Query-Pipeline).
 
-1. Define the target query-engine phase contract explicitly: parse, semantic validation, logical plan, physical execution, result normalization.
-2. Remove the highest-value executor regex/raw-clause dependencies by promoting clause structure into parser/planner artifacts.
-3. Deliver MVP operator loop for manual index tuning: EXPLAIN + planner/runtime statistics + query cost estimation for supported query shapes.
-4. Stand up Prometheus/Grafana as the default metrics path and publish dashboard/query examples.
-5. Finalize CLI UX for variables, table output, and statement statistics.
-6. Run and publish benchmark comparisons against Neo4j and TigerGraph using documented workload parity rules.
+1. Complete the manual index tuning loop end-to-end for supported query shapes:
+   - stable EXPLAIN output,
+   - planner/runtime statistics surfaced to operators,
+   - actionable query cost estimation.
+2. Stand up Prometheus/Grafana as the default metrics path and publish dashboard/query examples.
+3. Finalize CLI UX for variables, table output, and statement statistics.
+4. Run and publish benchmark comparisons against Neo4j and TigerGraph using documented workload parity rules.
 
-EXPLAIN-focused deliverables for current sprint track:
+Sprint deliverables:
 
-1. Introduce EXPLAIN dry-run command handling and response envelope.
-2. Emit logical/physical operator nodes for supported query forms.
-3. Emit plan influencers (node/edge counts, predicate signals, index decisions) with quality tags.
-4. Validate output against [EXPLAIN_OUTPUT_SCHEMA.json](EXPLAIN_OUTPUT_SCHEMA.json).
+1. Manual index tuning evidence:
+   - at least three representative query tuning examples (before/after index and observed plan/stat changes),
+   - stable explain-plan emission for supported query families,
+   - documented operator guidance for interpreting planner/runtime signals.
+2. Metrics path readiness:
+   - Prometheus scrape endpoint wired and documented,
+   - baseline Grafana dashboard set committed,
+   - dashboard coverage includes latency, throughput, index usage, and error signals.
+3. CLI usability closure:
+   - variable management flow (`SET`/list/update/unset) is consistent,
+   - tabular rendering behaves predictably for wide/null-heavy results,
+   - statement output includes clear execution statistics.
+4. Comparative benchmark publication:
+   - workload parity methodology documented,
+   - reproducible benchmark invocation scripts captured,
+   - result summary published in repo docs.
 
 Suggested implementation order for this sprint:
 
-1. Add explicit semantic-model types for projection, ordering, pagination, and write actions.
-2. Wire planner inputs to consume semantic model rather than normalized clause text for those forms.
-3. Add explain-plan coverage tests for each newly migrated form.
-4. Remove replaced regex/raw-text paths after test parity is green.
+1. Manual index tuning loop and EXPLAIN/runtime stats packaging for operator workflows.
+2. Prometheus/Grafana wiring and baseline dashboard publication.
+3. CLI UX polish and output-statistics ergonomics.
+4. Cross-engine benchmark runs and documentation publication.
+
+Sprint exit criteria:
+
+1. MVP-critical gaps listed in this plan are closed or explicitly tracked with owner/date as follow-on work.
+2. Full test sweep remains green after each deliverable set.
+3. Documentation is sufficient for an external contributor to reproduce dashboards and benchmark comparisons.
 
 Back to [DESIGN.md](DESIGN.md) and [README.md](README.md).

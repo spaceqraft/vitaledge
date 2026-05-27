@@ -586,6 +586,7 @@ Sprint deliverables:
    - tabular rendering behaves predictably for wide/null-heavy results,
    - statement output includes clear execution statistics,
    - CLI sends requests only after local parse-completeness checks.
+   - status: complete (gRPC CLI implements variable commands, client-side binding, table truncation/null handling, stats output, and local completeness gating before RPC).
 5. SDK phase-1 delivery:
    - Python and Go clients support raw Cypher and prepared-query request paths,
    - client-side parse-completeness validation for interactive/scripted usage,

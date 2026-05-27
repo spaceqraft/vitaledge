@@ -20,8 +20,9 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 
 ## Repository Layout
 
-- [cmd/vitaledge/main.go](cmd/vitaledge/main.go): TCP server entrypoint
-- [internal/tcp/protocol.go](internal/tcp/protocol.go): protocol-to-parser bridge
+- [cmd/vitaledge/main.go](cmd/vitaledge/main.go): gRPC server entrypoint
+- [cmd/vitaledge-cli/main.go](cmd/vitaledge-cli/main.go): gRPC interactive CLI/client entrypoint
+- [cmd/vitaledge/grpc_server.go](cmd/vitaledge/grpc_server.go): QueryService gRPC handler and transport wiring
 - [internal/cypher/grammar/Cypher.g4](internal/cypher/grammar/Cypher.g4): pinned openCypher grammar source
 - [internal/cypher/parser/parser.go](internal/cypher/parser/parser.go): parse entrypoints
 - [internal/cypher/ast/ast.go](internal/cypher/ast/ast.go): typed AST models
@@ -69,6 +70,11 @@ Prometheus metrics endpoint is optional and configurable:
 
 - flag: `--metrics-listen :9100`
 - env: `VITALEDGE_METRICS_LISTEN=:9100`
+
+gRPC query endpoint is enabled by default:
+
+- flag: `--grpc-listen :7443`
+- env: `VITALEDGE_GRPC_LISTEN=:7443`
 
 When enabled, the process serves:
 
@@ -261,19 +267,48 @@ Notes for reproducibility:
 - Compare one change at a time (single index or single parameter-binding change).
 - For config-backed indexes, update the index schema config and restart the server before the after-run.
 
-## TCP Query Execution
+## gRPC CLI
 
-TCP messages are treated as Cypher statements and executed by the server.
-Each response is emitted as one JSON line:
+Build and run the CLI against the gRPC endpoint:
 
-```json
-{"ok":true,"columns":["dstID"],"rows":[{"dstID":"g1"}],"stats":{"rowsReturned":1,"durationMs":0}}
+```bash
+make build
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme
 ```
 
-On errors:
+Interactive commands:
 
-```json
-{"ok":false,"error":"..."}
+- `SET name=<scalar>`: set or update a client-side variable (`null`, booleans, numbers, or quoted strings).
+- `SET` (or `LIST`/`VARS`): list all variables.
+- `UNSET name`: remove one variable.
+- `:quit` / `:exit`: leave the CLI.
+
+Execution behavior:
+
+- Statements are sent only after local parse-completeness checks pass.
+- Variable bindings are applied client-side from `$name` placeholders.
+- Multiline statements are buffered until complete (for example `MATCH` + `WHERE` + `RETURN`).
+- Result sets are rendered in a capped-width table:
+	- column width is computed from the column header and scanned row values,
+	- width is capped by `--max-column-width` (default `80`).
+- Returned graph values use Cypher-like rendering:
+	- nodes: `(id:Label {"k":"v"})` (auto-generated ids suppressed, first label shown),
+	- edges: `[id:TYPE {"k":"v"}]` (internal auto-generated composite ids suppressed),
+	- paths: node/edge chains with directionality (`->`, `<-`).
+- Each request prints execution stats (`rows`, `durationMs`).
+
+Common CLI flags:
+
+- `--grpc-target 127.0.0.1:7443`
+- `--tenant acme`
+- `--timeout 5s`
+- `--max-column-width 80`
+- `--execute "<cypher>"` for one-shot mode.
+
+One-shot mode:
+
+```bash
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme --execute "MATCH (n:Seed) RETURN n.id AS id"
 ```
 
 Example config:

@@ -1,0 +1,1167 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
+	"github.com/paegun/vitaledge/internal/cypher"
+	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+const (
+	defaultGRPCTarget     = "127.0.0.1:7443"
+	defaultTenant         = "default"
+	defaultMaxColumnWidth = 80
+)
+
+type cliConfig struct {
+	grpcTarget     string
+	tenant         string
+	timeout        time.Duration
+	execute        string
+	maxColumnWidth int
+}
+
+type cliState struct {
+	variables map[string]any
+}
+
+func main() {
+	cfg := loadCLIConfig()
+	if err := run(cfg, os.Stdin, os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func loadCLIConfig() cliConfig {
+	var cfg cliConfig
+	flag.StringVar(&cfg.grpcTarget, "grpc-target", defaultGRPCTarget, "gRPC address for QueryService")
+	flag.StringVar(&cfg.tenant, "tenant", defaultTenant, "tenant for query execution")
+	flag.DurationVar(&cfg.timeout, "timeout", 5*time.Second, "request timeout")
+	flag.StringVar(&cfg.execute, "execute", "", "optional one-shot statement (non-interactive)")
+	flag.IntVar(&cfg.maxColumnWidth, "max-column-width", defaultMaxColumnWidth, "maximum width for rendered table columns")
+	flag.Parse()
+	if cfg.maxColumnWidth < 3 {
+		cfg.maxColumnWidth = 3
+	}
+	return cfg
+}
+
+func run(cfg cliConfig, in io.Reader, out io.Writer, stderr io.Writer) error {
+	conn, err := grpc.NewClient(cfg.grpcTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("grpc dial failed: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	client := v1.NewQueryServiceClient(conn)
+	state := cliState{variables: map[string]any{}}
+
+	if strings.TrimSpace(cfg.execute) != "" {
+		return runStatement(context.Background(), client, cfg, state, strings.TrimSpace(cfg.execute), out, stderr)
+	}
+
+	fmt.Fprintln(out, "(v:Vital)ﮩ٨ـﮩﮩ٨ـ[e:Edge]ﮩ٨ـﮩﮩ٨ـ()")
+	fmt.Fprintln(out, "Commands: SET name=<scalar>, SET (list), UNSET name, :quit")
+	return runInteractiveLoop(client, cfg, &state, in, out, stderr)
+}
+
+func runInteractiveLoop(client v1.QueryServiceClient, cfg cliConfig, state *cliState, in io.Reader, out io.Writer, stderr io.Writer) error {
+	scanner := bufio.NewScanner(in)
+	buf := make([]byte, 0, 1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	var statementBuilder strings.Builder
+
+	for {
+		if statementBuilder.Len() == 0 {
+			fmt.Fprint(out, "vitaledge> ")
+		} else {
+			fmt.Fprint(out, "       -> ")
+		}
+
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return err
+			}
+			fmt.Fprintln(out)
+			return nil
+		}
+		line := scanner.Text()
+		if statementBuilder.Len() == 0 {
+			handled, err := handleCLICommand(strings.TrimSpace(line), state, out)
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					fmt.Fprintln(out, "bye")
+					return nil
+				}
+				fmt.Fprintf(stderr, "%v\n", err)
+				continue
+			}
+			if handled {
+				continue
+			}
+		}
+
+		statementBuilder.WriteString(line)
+		statementBuilder.WriteString("\n")
+		candidate := statementBuilder.String()
+
+		ready, parseErr := statementReady(candidate, state.variables)
+		if !ready {
+			continue
+		}
+
+		if parseErr != nil {
+			fmt.Fprintf(stderr, "parse error: %v\n", parseErr)
+			statementBuilder.Reset()
+			continue
+		}
+
+		query := strings.TrimSpace(candidate)
+		statementBuilder.Reset()
+		if err := runStatement(context.Background(), client, cfg, *state, query, out, stderr); err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+		}
+	}
+}
+
+func runStatement(parent context.Context, client v1.QueryServiceClient, cfg cliConfig, state cliState, query string, out io.Writer, stderr io.Writer) error {
+	ready, _ := statementReady(query, state.variables)
+	if !ready {
+		return errors.New("statement is incomplete; check for unclosed quotes, comments, or delimiters")
+	}
+
+	boundQuery, err := bindVariables(query, state.variables)
+	if err != nil {
+		return err
+	}
+
+	if _, err := cypher.ParseBatch(boundQuery); err != nil {
+		return fmt.Errorf("parse error: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(parent, cfg.timeout)
+	defer cancel()
+
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(boundQuery)), "EXPLAIN ") {
+		return runExplain(ctx, client, cfg.tenant, boundQuery, out)
+	}
+	return runExecute(ctx, client, cfg.tenant, boundQuery, cfg.maxColumnWidth, out, stderr)
+}
+
+func runExecute(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, maxColumnWidth int, out io.Writer, stderr io.Writer) error {
+	resp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: tenant,
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: query}},
+		Options: &v1.RequestOptions{
+			IncludeStats:    true,
+			IncludeWarnings: true,
+		},
+		Client: &v1.ClientContext{SdkLanguage: "cli", SdkVersion: "mvp", ProtocolVersion: "v1"},
+	})
+	if err != nil {
+		return err
+	}
+
+	renderTable(out, resp.GetColumns(), resp.GetRows(), maxColumnWidth)
+	if len(resp.GetWarnings()) > 0 {
+		for _, warning := range resp.GetWarnings() {
+			fmt.Fprintf(stderr, "warning [%s]: %s\n", warning.GetCode(), warning.GetMessage())
+		}
+	}
+	stats := resp.GetStats()
+	if stats != nil {
+		fmt.Fprintf(out, "stats: rows=%d durationMs=%d\n", stats.GetRowsReturned(), stats.GetDurationMs())
+	}
+	return nil
+}
+
+func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, out io.Writer) error {
+	resp, err := client.Explain(ctx, &v1.QueryRequest{
+		Tenant: tenant,
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: query}},
+		Options: &v1.RequestOptions{
+			IncludeStats:    true,
+			IncludeWarnings: true,
+		},
+		Client: &v1.ClientContext{SdkLanguage: "cli", SdkVersion: "mvp", ProtocolVersion: "v1"},
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(resp.GetExplainJson()) > 0 {
+		var decoded any
+		if err := json.Unmarshal(resp.GetExplainJson(), &decoded); err == nil {
+			pretty, _ := json.MarshalIndent(decoded, "", "  ")
+			fmt.Fprintln(out, string(pretty))
+		} else {
+			fmt.Fprintln(out, string(resp.GetExplainJson()))
+		}
+	}
+	if stats := resp.GetStats(); stats != nil {
+		fmt.Fprintf(out, "stats: rows=%d durationMs=%d\n", stats.GetRowsReturned(), stats.GetDurationMs())
+	}
+	return nil
+}
+
+func handleCLICommand(line string, state *cliState, out io.Writer) (bool, error) {
+	normalized := strings.TrimSpace(line)
+	if normalized == "" {
+		return true, nil
+	}
+	if strings.EqualFold(normalized, ":quit") || strings.EqualFold(normalized, ":exit") {
+		return false, io.EOF
+	}
+	if strings.EqualFold(normalized, "SET") || strings.EqualFold(normalized, "LIST") || strings.EqualFold(normalized, "VARS") {
+		renderVariables(out, state.variables)
+		return true, nil
+	}
+	if strings.HasPrefix(strings.ToUpper(normalized), "UNSET ") {
+		name := strings.TrimSpace(normalized[len("UNSET "):])
+		if !isValidVarName(name) {
+			return true, fmt.Errorf("invalid variable name: %q", name)
+		}
+		delete(state.variables, name)
+		fmt.Fprintf(out, "unset $%s\n", name)
+		return true, nil
+	}
+	if strings.HasPrefix(strings.ToUpper(normalized), "SET ") {
+		name, valueRaw, ok := strings.Cut(strings.TrimSpace(normalized[len("SET "):]), "=")
+		if !ok {
+			return true, errors.New("SET syntax: SET name=<scalar value>")
+		}
+		name = strings.TrimSpace(name)
+		valueRaw = strings.TrimSpace(valueRaw)
+		if !isValidVarName(name) {
+			return true, fmt.Errorf("invalid variable name: %q", name)
+		}
+		value, err := parseVariableScalar(valueRaw)
+		if err != nil {
+			return true, err
+		}
+		state.variables[name] = value
+		fmt.Fprintf(out, "set $%s = %s\n", name, formatCypherLiteral(value))
+		return true, nil
+	}
+	return false, nil
+}
+
+func renderVariables(out io.Writer, variables map[string]any) {
+	if len(variables) == 0 {
+		fmt.Fprintln(out, "(no variables)")
+		return
+	}
+	names := make([]string, 0, len(variables))
+	for name := range variables {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(out, "$%s = %s\n", name, formatCypherLiteral(variables[name]))
+	}
+}
+
+func parseVariableScalar(raw string) (any, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, errors.New("variable value cannot be empty")
+	}
+
+	lower := strings.ToLower(trimmed)
+	switch lower {
+	case "null":
+		return nil, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+
+	if i, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return i, nil
+	}
+	if f, err := strconv.ParseFloat(trimmed, 64); err == nil {
+		return f, nil
+	}
+
+	if len(trimmed) >= 2 {
+		first := trimmed[0]
+		last := trimmed[len(trimmed)-1]
+		if first == '\'' && last == '\'' {
+			inner := trimmed[1 : len(trimmed)-1]
+			inner = strings.ReplaceAll(inner, `\\`, `\`)
+			inner = strings.ReplaceAll(inner, `\'`, `'`)
+			return inner, nil
+		}
+		if first == '"' && last == '"' {
+			unquoted, err := strconv.Unquote(trimmed)
+			if err != nil {
+				return nil, fmt.Errorf("invalid quoted scalar %q: %w", raw, err)
+			}
+			return unquoted, nil
+		}
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.UseNumber()
+	var parsed any
+	if err := decoder.Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("invalid scalar value %q", raw)
+	}
+	switch v := parsed.(type) {
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i, nil
+		}
+		if f, err := v.Float64(); err == nil {
+			return f, nil
+		}
+		return nil, fmt.Errorf("invalid numeric scalar %q", raw)
+	case string, bool, nil:
+		return v, nil
+	default:
+		return nil, fmt.Errorf("SET only supports scalar values (string/number/bool/null)")
+	}
+}
+
+func isValidVarName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 {
+			if !unicode.IsLetter(r) && r != '_' {
+				return false
+			}
+			continue
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func statementReady(raw string, variables map[string]any) (bool, error) {
+	if strings.TrimSpace(raw) == "" {
+		return false, nil
+	}
+	if !lexicallyComplete(raw) {
+		return false, nil
+	}
+	if hasContinuationSuffix(raw) {
+		return false, nil
+	}
+	if matchLikelyNeedsContinuation(raw) {
+		return false, nil
+	}
+	probeQuery, err := bindVariablesForReadiness(raw, variables)
+	if err != nil {
+		return true, err
+	}
+	_, err = cypher.ParseBatch(probeQuery)
+	if err == nil {
+		return true, nil
+	}
+	if likelyIncompleteParseError(err) {
+		return false, nil
+	}
+	return true, err
+}
+
+func hasContinuationSuffix(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	return strings.HasSuffix(trimmed, ",")
+}
+
+func matchLikelyNeedsContinuation(raw string) bool {
+	words := extractUpperWords(raw)
+	if !words["MATCH"] {
+		return false
+	}
+	if words["RETURN"] || words["WITH"] || words["DELETE"] || words["DETACH"] || words["SET"] || words["REMOVE"] || words["MERGE"] || words["CREATE"] || words["CALL"] || words["UNWIND"] {
+		return false
+	}
+	return true
+}
+
+func extractUpperWords(raw string) map[string]bool {
+	var builder strings.Builder
+	builder.Grow(len(raw))
+	for _, r := range raw {
+		if unicode.IsLetter(r) {
+			builder.WriteRune(unicode.ToUpper(r))
+			continue
+		}
+		builder.WriteByte(' ')
+	}
+	words := map[string]bool{}
+	for _, word := range strings.Fields(builder.String()) {
+		words[word] = true
+	}
+	return words
+}
+
+func likelyIncompleteParseError(err error) bool {
+	var parseErr *parser.ParseError
+	if errors.As(err, &parseErr) {
+		msg := strings.ToLower(parseErr.Message)
+		if strings.Contains(msg, "<eof>") || strings.Contains(msg, "unterminated") {
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "<eof>") || strings.Contains(msg, "unterminated")
+}
+
+func lexicallyComplete(query string) bool {
+	var (
+		inSingle       bool
+		inDouble       bool
+		inBacktick     bool
+		inLineComment  bool
+		inBlockComment bool
+		escaped        bool
+		parenDepth     int
+		bracketDepth   int
+		braceDepth     int
+	)
+
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && i+1 < len(query) && query[i+1] == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+		if inSingle {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		if ch == '/' && i+1 < len(query) {
+			next := query[i+1]
+			if next == '/' {
+				inLineComment = true
+				i++
+				continue
+			}
+			if next == '*' {
+				inBlockComment = true
+				i++
+				continue
+			}
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case '`':
+			inBacktick = true
+		case '(':
+			parenDepth++
+		case ')':
+			parenDepth--
+		case '[':
+			bracketDepth++
+		case ']':
+			bracketDepth--
+		case '{':
+			braceDepth++
+		case '}':
+			braceDepth--
+		}
+	}
+
+	return !inSingle && !inDouble && !inBacktick && !inBlockComment && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0
+}
+
+func bindVariables(query string, variables map[string]any) (string, error) {
+	return bindVariablesWithPolicy(query, variables, false)
+}
+
+func bindVariablesForReadiness(query string, variables map[string]any) (string, error) {
+	return bindVariablesWithPolicy(query, variables, true)
+}
+
+func bindVariablesWithPolicy(query string, variables map[string]any, fillMissingWithNull bool) (string, error) {
+	if len(variables) == 0 && !fillMissingWithNull {
+		return query, nil
+	}
+
+	var out strings.Builder
+	out.Grow(len(query) + 32)
+
+	var (
+		inSingle       bool
+		inDouble       bool
+		inBacktick     bool
+		inLineComment  bool
+		inBlockComment bool
+		escaped        bool
+	)
+
+	missing := map[string]struct{}{}
+
+	for i := 0; i < len(query); i++ {
+		ch := query[i]
+		if inLineComment {
+			out.WriteByte(ch)
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			out.WriteByte(ch)
+			if ch == '*' && i+1 < len(query) && query[i+1] == '/' {
+				out.WriteByte('/')
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+		if inSingle {
+			out.WriteByte(ch)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			out.WriteByte(ch)
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			out.WriteByte(ch)
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		if ch == '/' && i+1 < len(query) {
+			next := query[i+1]
+			if next == '/' {
+				out.WriteString("//")
+				inLineComment = true
+				i++
+				continue
+			}
+			if next == '*' {
+				out.WriteString("/*")
+				inBlockComment = true
+				i++
+				continue
+			}
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			out.WriteByte(ch)
+			continue
+		case '"':
+			inDouble = true
+			out.WriteByte(ch)
+			continue
+		case '`':
+			inBacktick = true
+			out.WriteByte(ch)
+			continue
+		case '$':
+			start := i + 1
+			end := start
+			for end < len(query) {
+				r := rune(query[end])
+				if end == start {
+					if !unicode.IsLetter(r) && r != '_' {
+						break
+					}
+				} else if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+					break
+				}
+				end++
+			}
+			if end == start {
+				out.WriteByte(ch)
+				continue
+			}
+			name := query[start:end]
+			value, ok := variables[name]
+			if !ok {
+				if fillMissingWithNull {
+					out.WriteString("null")
+					i = end - 1
+					continue
+				}
+				missing[name] = struct{}{}
+				out.WriteString("$")
+				out.WriteString(name)
+				i = end - 1
+				continue
+			}
+			out.WriteString(formatCypherLiteral(value))
+			i = end - 1
+			continue
+		}
+
+		out.WriteByte(ch)
+	}
+
+	if len(missing) > 0 {
+		names := make([]string, 0, len(missing))
+		for name := range missing {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return "", fmt.Errorf("missing variable values for: %s", strings.Join(names, ", "))
+	}
+
+	return out.String(), nil
+}
+
+func formatCypherLiteral(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return "null"
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case json.Number:
+		return v.String()
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case int, int8, int16, int32, int64:
+		return fmt.Sprintf("%d", v)
+	case uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%d", v)
+	case string:
+		return quoteCypherString(v)
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			parts = append(parts, formatCypherLiteral(item))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			parts = append(parts, key+": "+formatCypherLiteral(v[key]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	default:
+		return quoteCypherString(fmt.Sprintf("%v", value))
+	}
+}
+
+func quoteCypherString(raw string) string {
+	replacer := strings.NewReplacer(`\\`, `\\\\`, `'`, `\\'`)
+	return "'" + replacer.Replace(raw) + "'"
+}
+
+func renderTable(out io.Writer, columns []string, rows []*v1.Row, maxColumnWidth int) {
+	if len(columns) == 0 {
+		fmt.Fprintf(out, "(rows=%d)\n", len(rows))
+		return
+	}
+	if maxColumnWidth < 3 {
+		maxColumnWidth = 3
+	}
+
+	widths := make([]int, len(columns))
+	for i, column := range columns {
+		widths[i] = min(max(3, len(column)), maxColumnWidth)
+	}
+
+	grid := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		cells := make([]string, len(columns))
+		for i, column := range columns {
+			value := "NULL"
+			if row != nil {
+				if protoVal, ok := row.GetValues()[column]; ok {
+					value = formatProtoValue(protoVal)
+				}
+			}
+			cells[i] = truncateCell(value, maxColumnWidth)
+			if len(cells[i]) > widths[i] {
+				widths[i] = len(cells[i])
+			}
+		}
+		grid = append(grid, cells)
+	}
+
+	for i, column := range columns {
+		fmt.Fprintf(out, "%-*s", widths[i], truncateCell(column, widths[i]))
+		if i < len(columns)-1 {
+			fmt.Fprint(out, " | ")
+		}
+	}
+	fmt.Fprintln(out)
+
+	for i, width := range widths {
+		fmt.Fprint(out, strings.Repeat("-", width))
+		if i < len(widths)-1 {
+			fmt.Fprint(out, "-+-")
+		}
+	}
+	fmt.Fprintln(out)
+
+	for _, row := range grid {
+		for i, cell := range row {
+			fmt.Fprintf(out, "%-*s", widths[i], cell)
+			if i < len(row)-1 {
+				fmt.Fprint(out, " | ")
+			}
+		}
+		fmt.Fprintln(out)
+	}
+
+	fmt.Fprintf(out, "(%d rows)\n", len(rows))
+}
+
+func formatProtoValue(value *v1.Value) string {
+	if value == nil || value.GetKind() == nil {
+		return "NULL"
+	}
+	switch kind := value.GetKind().(type) {
+	case *v1.Value_NullValue:
+		return "NULL"
+	case *v1.Value_BoolValue:
+		if kind.BoolValue {
+			return "true"
+		}
+		return "false"
+	case *v1.Value_IntValue:
+		return strconv.FormatInt(kind.IntValue, 10)
+	case *v1.Value_DoubleValue:
+		return strconv.FormatFloat(kind.DoubleValue, 'f', -1, 64)
+	case *v1.Value_StringValue:
+		return kind.StringValue
+	case *v1.Value_BytesValue:
+		if utf8.Valid(kind.BytesValue) {
+			return string(kind.BytesValue)
+		}
+		return fmt.Sprintf("0x%x", kind.BytesValue)
+	case *v1.Value_ListValue:
+		parts := make([]string, 0, len(kind.ListValue.GetValues()))
+		for _, item := range kind.ListValue.GetValues() {
+			parts = append(parts, formatProtoValue(item))
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	case *v1.Value_MapValue:
+		if node, ok := formatProtoNode(kind.MapValue.GetValues()); ok {
+			return node
+		}
+		if edge, ok := formatProtoEdge(kind.MapValue.GetValues()); ok {
+			return edge
+		}
+		if path, ok := formatProtoPath(kind.MapValue.GetValues()); ok {
+			return path
+		}
+		keys := make([]string, 0, len(kind.MapValue.GetValues()))
+		for key := range kind.MapValue.GetValues() {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			parts = append(parts, key+": "+formatProtoValue(kind.MapValue.GetValues()[key]))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	default:
+		return "NULL"
+	}
+}
+
+func formatProtoPath(values map[string]*v1.Value) (string, bool) {
+	if values == nil {
+		return "", false
+	}
+	pathFlag, hasPath := values["__path__"]
+	if !hasPath {
+		return "", false
+	}
+	if bv, ok := pathFlag.GetKind().(*v1.Value_BoolValue); !ok || !bv.BoolValue {
+		return "", false
+	}
+
+	nodesVal := values["nodes"]
+	edgesVal := values["edges"]
+	dirsVal := values["directions"]
+
+	var nodeStrs []string
+	if nodesVal != nil {
+		if lv, ok := nodesVal.GetKind().(*v1.Value_ListValue); ok {
+			for _, item := range lv.ListValue.GetValues() {
+				if mv, ok := item.GetKind().(*v1.Value_MapValue); ok {
+					if s, ok := formatProtoNode(mv.MapValue.GetValues()); ok {
+						nodeStrs = append(nodeStrs, s)
+					} else {
+						nodeStrs = append(nodeStrs, "()")
+					}
+				} else {
+					nodeStrs = append(nodeStrs, "()")
+				}
+			}
+		}
+	}
+
+	var edgeStrs []string
+	if edgesVal != nil {
+		if lv, ok := edgesVal.GetKind().(*v1.Value_ListValue); ok {
+			for _, item := range lv.ListValue.GetValues() {
+				if mv, ok := item.GetKind().(*v1.Value_MapValue); ok {
+					if s, ok := formatProtoEdge(mv.MapValue.GetValues()); ok {
+						edgeStrs = append(edgeStrs, s)
+					} else {
+						edgeStrs = append(edgeStrs, "[]")
+					}
+				} else {
+					edgeStrs = append(edgeStrs, "[]")
+				}
+			}
+		}
+	}
+
+	var dirs []string
+	if dirsVal != nil {
+		dirs = protoValueToStringList(dirsVal)
+	}
+
+	if len(nodeStrs) == 0 {
+		return "", false
+	}
+
+	var b strings.Builder
+	b.WriteString(nodeStrs[0])
+	for i, edgeStr := range edgeStrs {
+		dir := "forward"
+		if i < len(dirs) {
+			dir = dirs[i]
+		}
+		nextNode := "()"
+		if i+1 < len(nodeStrs) {
+			nextNode = nodeStrs[i+1]
+		}
+		switch dir {
+		case "reverse":
+			b.WriteString("<-")
+			b.WriteString(edgeStr)
+			b.WriteString("-")
+		case "undirected":
+			b.WriteString("-")
+			b.WriteString(edgeStr)
+			b.WriteString("-")
+		default: // forward
+			b.WriteString("-")
+			b.WriteString(edgeStr)
+			b.WriteString("->")
+		}
+		b.WriteString(nextNode)
+	}
+
+	return b.String(), true
+}
+
+func formatProtoNode(values map[string]*v1.Value) (string, bool) {
+	if values == nil {
+		return "", false
+	}
+	propsValue, hasProps := values["properties"]
+	_, hasLabels := values["labels"]
+	if !hasProps || !hasLabels {
+		return "", false
+	}
+
+	properties, ok := protoValueToMap(propsValue)
+	if !ok {
+		return "", false
+	}
+	labels := protoValueToStringList(values["labels"])
+	id := protoValueToString(values["id"])
+
+	var b strings.Builder
+	b.WriteByte('(')
+	if id != "" && !strings.HasPrefix(id, "auto-") {
+		b.WriteString(toCypherIdentifier(id))
+	}
+	if len(labels) > 0 && strings.TrimSpace(labels[0]) != "" {
+		b.WriteByte(':')
+		b.WriteString(toCypherIdentifier(labels[0]))
+	}
+	if len(properties) > 0 {
+		encoded, err := json.Marshal(properties)
+		if err == nil {
+			b.WriteByte(' ')
+			b.Write(encoded)
+		}
+	}
+	b.WriteByte(')')
+
+	return b.String(), true
+}
+
+func formatProtoEdge(values map[string]*v1.Value) (string, bool) {
+	if values == nil {
+		return "", false
+	}
+	propsValue, hasProps := values["properties"]
+	typeValue, hasType := values["type"]
+	if !hasProps || !hasType {
+		return "", false
+	}
+
+	properties, ok := protoValueToMap(propsValue)
+	if !ok {
+		return "", false
+	}
+	edgeType := protoValueToString(typeValue)
+	id := protoValueToString(values["id"])
+
+	var b strings.Builder
+	b.WriteByte('[')
+	if id != "" && !strings.Contains(id, "|") {
+		b.WriteString(toCypherIdentifier(id))
+	}
+	if strings.TrimSpace(edgeType) != "" {
+		b.WriteByte(':')
+		b.WriteString(toCypherIdentifier(edgeType))
+	}
+	if len(properties) > 0 {
+		encoded, err := json.Marshal(properties)
+		if err == nil {
+			b.WriteByte(' ')
+			b.Write(encoded)
+		}
+	}
+	b.WriteByte(']')
+
+	return b.String(), true
+}
+
+func toCypherIdentifier(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	for i, r := range trimmed {
+		if i == 0 {
+			if !unicode.IsLetter(r) && r != '_' {
+				return "`" + strings.ReplaceAll(trimmed, "`", "``") + "`"
+			}
+			continue
+		}
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+			return "`" + strings.ReplaceAll(trimmed, "`", "``") + "`"
+		}
+	}
+	return trimmed
+}
+
+func protoValueToString(value *v1.Value) string {
+	if value == nil || value.GetKind() == nil {
+		return ""
+	}
+	switch kind := value.GetKind().(type) {
+	case *v1.Value_StringValue:
+		return kind.StringValue
+	case *v1.Value_BytesValue:
+		if utf8.Valid(kind.BytesValue) {
+			return string(kind.BytesValue)
+		}
+		return ""
+	default:
+		return ""
+	}
+}
+
+func protoValueToStringList(value *v1.Value) []string {
+	if value == nil || value.GetKind() == nil {
+		return nil
+	}
+	switch kind := value.GetKind().(type) {
+	case *v1.Value_ListValue:
+		items := make([]string, 0, len(kind.ListValue.GetValues()))
+		for _, item := range kind.ListValue.GetValues() {
+			if str := protoValueToString(item); str != "" {
+				items = append(items, str)
+			}
+		}
+		return items
+	case *v1.Value_StringValue:
+		if strings.TrimSpace(kind.StringValue) == "" {
+			return nil
+		}
+		return []string{kind.StringValue}
+	default:
+		return nil
+	}
+}
+
+func protoValueToMap(value *v1.Value) (map[string]any, bool) {
+	if value == nil || value.GetKind() == nil {
+		return nil, false
+	}
+	kind, ok := value.GetKind().(*v1.Value_MapValue)
+	if !ok || kind.MapValue == nil {
+		return nil, false
+	}
+	out := make(map[string]any, len(kind.MapValue.GetValues()))
+	for key, item := range kind.MapValue.GetValues() {
+		out[key] = protoValueToAny(item)
+	}
+	return out, true
+}
+
+func protoValueToAny(value *v1.Value) any {
+	if value == nil || value.GetKind() == nil {
+		return nil
+	}
+	switch kind := value.GetKind().(type) {
+	case *v1.Value_NullValue:
+		return nil
+	case *v1.Value_BoolValue:
+		return kind.BoolValue
+	case *v1.Value_IntValue:
+		return kind.IntValue
+	case *v1.Value_DoubleValue:
+		return kind.DoubleValue
+	case *v1.Value_StringValue:
+		return kind.StringValue
+	case *v1.Value_BytesValue:
+		if utf8.Valid(kind.BytesValue) {
+			return string(kind.BytesValue)
+		}
+		return fmt.Sprintf("0x%x", kind.BytesValue)
+	case *v1.Value_ListValue:
+		items := make([]any, 0, len(kind.ListValue.GetValues()))
+		for _, item := range kind.ListValue.GetValues() {
+			items = append(items, protoValueToAny(item))
+		}
+		return items
+	case *v1.Value_MapValue:
+		out := make(map[string]any, len(kind.MapValue.GetValues()))
+		for key, item := range kind.MapValue.GetValues() {
+			out[key] = protoValueToAny(item)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func truncateCell(value string, width int) string {
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width <= 3 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-3]) + "..."
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

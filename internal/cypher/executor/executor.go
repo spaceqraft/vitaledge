@@ -860,6 +860,40 @@ func normalizeResultValue(value any) any {
 		return vertexToMap(typed)
 	case *graph.Edge:
 		return edgeToMap(typed)
+	case cypherPathValue:
+		nodes := []any{vertexToMap(typed.Left)}
+		edges := []any{}
+		directions := []any{}
+		if typed.Edge != nil && typed.Right != nil {
+			edges = append(edges, edgeToMap(typed.Edge))
+			directions = append(directions, typed.Direction)
+			nodes = append(nodes, vertexToMap(typed.Right))
+		}
+		return map[string]any{
+			"__path__":   true,
+			"nodes":      nodes,
+			"edges":      edges,
+			"directions": directions,
+		}
+	case multiHopCypherPath:
+		nodes := make([]any, len(typed.Nodes))
+		for i, v := range typed.Nodes {
+			nodes[i] = vertexToMap(v)
+		}
+		edges := make([]any, len(typed.Edges))
+		for i, e := range typed.Edges {
+			edges[i] = edgeToMap(e)
+		}
+		directions := make([]any, len(typed.Directions))
+		for i, d := range typed.Directions {
+			directions[i] = d
+		}
+		return map[string]any{
+			"__path__":   true,
+			"nodes":      nodes,
+			"edges":      edges,
+			"directions": directions,
+		}
 	case []byte:
 		return string(typed)
 	case string:

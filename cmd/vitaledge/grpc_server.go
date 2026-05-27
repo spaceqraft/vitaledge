@@ -224,6 +224,12 @@ func grpcAnyToProtoValue(raw any) (*v1.Value, error) {
 		return &v1.Value{Kind: &v1.Value_StringValue{StringValue: typed}}, nil
 	case []byte:
 		return &v1.Value{Kind: &v1.Value_BytesValue{BytesValue: typed}}, nil
+	case []string:
+		values := make([]*v1.Value, 0, len(typed))
+		for _, item := range typed {
+			values = append(values, &v1.Value{Kind: &v1.Value_StringValue{StringValue: item}})
+		}
+		return &v1.Value{Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: values}}}, nil
 	case []any:
 		values := make([]*v1.Value, 0, len(typed))
 		for _, item := range typed {

@@ -16,6 +16,7 @@ run: build
 
 build:
 	go build -o bin/vitaledge ./cmd/vitaledge
+	go build -o bin/vitaledge-cli ./cmd/vitaledge-cli
 	go build -o bin/vitaledge-bench ./cmd/vitaledge-bench/main.go
 
 generate-cypher-parser:

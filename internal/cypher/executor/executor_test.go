@@ -226,6 +226,29 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if len(nodes) == 0 {
 		t.Fatalf("expected non-empty logical plan nodes")
 	}
+	if firstOp, _ := nodes[0]["op"].(string); firstOp != "INDEX_SCAN" {
+		t.Fatalf("expected first logical node to be INDEX_SCAN, got %#v", nodes[0]["op"])
+	}
+	if accessPath, _ := nodes[0]["accessPath"].(string); accessPath == "" {
+		t.Fatalf("expected first logical node to include accessPath")
+	}
+	foundProject := false
+	foundSort := false
+	foundLimit := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "PROJECT":
+			foundProject = true
+		case "SORT":
+			foundSort = true
+		case "LIMIT":
+			foundLimit = true
+		}
+	}
+	if !foundProject || !foundSort || !foundLimit {
+		t.Fatalf("expected operator-shaped plan to include PROJECT/SORT/LIMIT, got nodes %#v", nodes)
+	}
 	if rootNodeID, _ := logicalPlan["rootNodeId"].(string); rootNodeID == "" {
 		t.Fatalf("expected non-empty rootNodeId")
 	}
@@ -264,6 +287,21 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if selected, _ := indexDecisions[0]["selected"].(bool); !selected {
 		t.Fatalf("expected indexed decision to be selected")
 	}
+	if recommendation, _ := indexDecisions[0]["recommendation"].(string); recommendation != "keep-index" {
+		t.Fatalf("expected recommendation keep-index for selected index, got %#v", indexDecisions[0]["recommendation"])
+	}
+	if tuningImpact, _ := indexDecisions[0]["tuningImpact"].(string); tuningImpact != "none" {
+		t.Fatalf("expected tuningImpact none for selected index, got %#v", indexDecisions[0]["tuningImpact"])
+	}
+	if accessPath, _ := indexDecisions[0]["accessPath"].(string); accessPath == "" {
+		t.Fatalf("expected index decision to include accessPath")
+	}
+	if quality, _ := indexDecisions[0]["quality"].(string); quality != "exact" {
+		t.Fatalf("expected index decision quality exact, got %#v", indexDecisions[0]["quality"])
+	}
+	if scanPopulation, _ := indexDecisions[0]["scanPopulation"].(int); scanPopulation < 1 {
+		t.Fatalf("expected scanPopulation >= 1, got %#v", indexDecisions[0]["scanPopulation"])
+	}
 	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
 	if !ok {
 		t.Fatalf("expected cardinality []map[string]any, got %T", explainPayload["cardinality"])
@@ -273,6 +311,92 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	}
 	if rowsOut, _ := cardinality[0]["rowsOut"].(int); rowsOut != 1 {
 		t.Fatalf("expected first cardinality rowsOut=1, got %#v", cardinality[0]["rowsOut"])
+	}
+}
+
+func TestExecuteExplainIndexTuningSignalsForMissingIndex(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-neo",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Neo")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-trinity",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Trinity")},
+		}); err != nil {
+			return err
+		}
+		for i := 0; i < 18; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{
+				Tenant:     "acme",
+				ID:         fmt.Sprintf("p-extra-%d", i),
+				Labels:     []string{"Person"},
+				Properties: graph.PropertyMap{"name": []byte(fmt.Sprintf("Extra%d", i))},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:Person {name: $name}) RETURN n.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "Neo"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	indexDecisions, ok := explainPayload["indexDecisions"].([]map[string]any)
+	if !ok || len(indexDecisions) == 0 {
+		t.Fatalf("expected non-empty indexDecisions, got %#v", explainPayload["indexDecisions"])
+	}
+	decision := indexDecisions[0]
+	if selected, _ := decision["selected"].(bool); selected {
+		t.Fatalf("expected selected=false for missing index")
+	}
+	if recommendation, _ := decision["recommendation"].(string); recommendation != "create-index" {
+		t.Fatalf("expected recommendation create-index for high-impact missing index, got %#v", decision["recommendation"])
+	}
+	if tuningImpact, _ := decision["tuningImpact"].(string); tuningImpact != "high" {
+		t.Fatalf("expected tuningImpact high, got %#v", decision["tuningImpact"])
+	}
+	if suggestedIndex, _ := decision["suggestedIndex"].(string); suggestedIndex != "Person.name" {
+		t.Fatalf("expected suggestedIndex Person.name, got %#v", decision["suggestedIndex"])
+	}
+	warnings, ok := explainPayload["warnings"].([]map[string]any)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected warnings to be populated for missing-index fallback, got %#v", explainPayload["warnings"])
+	}
+	foundMissingIndexWarning := false
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "MISSING_PROPERTY_INDEX" {
+			foundMissingIndexWarning = true
+			break
+		}
+	}
+	if !foundMissingIndexWarning {
+		t.Fatalf("expected MISSING_PROPERTY_INDEX warning, got %#v", warnings)
 	}
 }
 

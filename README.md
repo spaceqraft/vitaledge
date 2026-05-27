@@ -83,8 +83,25 @@ What to look at:
 - `influencers.nodeCounts`: shows label counts observed in the current graph snapshot.
 - `influencers.edgeCounts`: shows edge-type counts that may affect traversal choices.
 - `influencers.predicateSignals`: highlights predicate clauses and the number of matching rows or vertices.
-- `indexDecisions`: reports candidate indexes, whether one was selected, and why.
+- `indexDecisions`: reports candidate indexes, whether one was selected, chosen access path, estimated scan savings/selectivity, and recommendation (`keep-index`, `create-index`, or `consider-index`).
 - `cardinality`: shows per-plan-node row estimates and their quality (`exact`, `estimate`, or `sample`).
+- `warnings`: emits fallback diagnostics (for example missing index, full-scan fallback, and estimate-only tuning signals) to highlight when planning signals are partial.
+
+Warning codes currently emitted:
+
+- `WRITE_QUERY_DRY_RUN`: write clauses were detected but EXPLAIN performed no mutations.
+- `MISSING_TENANT_CONTEXT`: tenant was not supplied, so influencer stats are from an empty snapshot.
+- `FULL_SCAN_FALLBACK`: planner selected an all-nodes scan access path.
+- `MISSING_PROPERTY_INDEX`: a property predicate has no selected property index.
+- `ESTIMATE_ONLY_INDEX_SIGNAL`: index recommendation is based on estimate-quality signals (for example unbound parameters).
+- `PLAN_ANALYSIS_PARTIAL`: catch-all fallback when no more specific diagnostics apply.
+
+Index-decision interpretation:
+
+- `recommendation=keep-index`: planner selected an existing property index.
+- `recommendation=create-index`: high-impact missing-index candidate.
+- `recommendation=consider-index`: medium-impact candidate or estimate-quality signal.
+- `recommendation=optional-index`: low-impact candidate.
 
 This is the recommended entry point when deciding whether a property should be indexed or when checking whether an existing index is actually being chosen by the planner.
 

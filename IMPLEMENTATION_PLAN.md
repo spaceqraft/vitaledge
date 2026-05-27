@@ -269,6 +269,14 @@ Exit evidence additions for EXPLAIN:
 2. Golden-output tests for representative query families (match/filter/projection/order/pagination/write-shaped dry run).
 3. Regression tests proving stable emission of plan-influencing details.
 
+Implementation status for current EXPLAIN slice set:
+
+1. Query-options completeness: completed (`query.options` and per-clause projection options are emitted).
+2. Operator-shape fidelity: completed (plan nodes emit explicit scan/filter/project/sort/skip/limit/write/call operators).
+3. Index-tuning signals: completed (index decisions include recommendation, impact, selectivity, and access-path context).
+4. Warning/fallback diagnostics: completed (specific warning codes emitted for full scans, missing indexes, estimate-only signals, missing tenant context, and write dry-run behavior).
+5. Documentation: completed (README and DESIGN include concrete EXPLAIN interpretation guidance and warning semantics).
+
 Milestones:
 
 1. Strengthen query-engine phase boundaries.

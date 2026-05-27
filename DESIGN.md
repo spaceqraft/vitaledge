@@ -113,6 +113,13 @@ Treat `EXPLAIN` as a dry-run planning command that executes parse, semantic vali
 5. Warnings for missing stats, full scans, unsupported optimization, or fallback decisions.
 6. Query shape/fingerprint metadata.
 
+Current concrete diagnostics and tuning signals:
+
+1. Operator-shaped plan nodes for scan/filter/project/distinct/sort/skip/limit/write/call forms.
+2. Access-path annotations on scan operators (`property_index`, label scan, or all-nodes scan).
+3. Index decisions including recommendation and impact fields (`recommendation`, `tuningImpact`, `estimatedRowsSaved`, and `quality`).
+4. Warning diagnostics keyed by explicit fallback conditions (`MISSING_PROPERTY_INDEX`, `FULL_SCAN_FALLBACK`, `ESTIMATE_ONLY_INDEX_SIGNAL`, `WRITE_QUERY_DRY_RUN`, `MISSING_TENANT_CONTEXT`).
+
 ### Cardinality quality policy
 
 1. Values from exact maintained stats are marked `exact`.

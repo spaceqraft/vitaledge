@@ -294,7 +294,7 @@ func TestTCPExplainQueryReturnsExplainPayload(t *testing.T) {
 	conn := openServerPeerConnection(t, server)
 	defer conn.Close()
 
-	response := sendTCPQuery(t, conn, "EXPLAIN MATCH (n:Person {name: $name}) RETURN DISTINCT n.name AS name ORDER BY name ASC SKIP 1 LIMIT $maxLimit")
+	response := sendTCPQuery(t, conn, "EXPLAIN MATCH (n:Person {name: $name}) WITH n.name AS alias ORDER BY alias DESC SKIP 1 LIMIT 2 RETURN DISTINCT alias AS name ORDER BY name ASC LIMIT $maxLimit")
 	if !response.OK {
 		t.Fatalf("expected ok response, got error: %s", response.Error)
 	}
@@ -313,7 +313,7 @@ func TestTCPExplainQueryReturnsExplainPayload(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected query map, got %T", explain["query"])
 	}
-	if query["statementKind"] != "MATCH_QUERY" {
+	if query["statementKind"] != "QUERY" {
 		t.Fatalf("unexpected statementKind: %#v", query["statementKind"])
 	}
 	options, ok := query["options"].(map[string]any)
@@ -323,8 +323,8 @@ func TestTCPExplainQueryReturnsExplainPayload(t *testing.T) {
 	if distinct, _ := options["distinct"].(bool); !distinct {
 		t.Fatalf("expected distinct option to be true")
 	}
-	if skip, _ := options["skip"].(string); skip != "1" {
-		t.Fatalf("expected skip option to equal 1, got %#v", options["skip"])
+	if _, ok := options["skip"]; ok {
+		t.Fatalf("did not expect a top-level skip option from the final RETURN clause, got %#v", options["skip"])
 	}
 	if limit, _ := options["limit"].(string); limit != "$maxLimit" {
 		t.Fatalf("expected limit option to preserve parameter reference, got %#v", options["limit"])
@@ -332,10 +332,59 @@ func TestTCPExplainQueryReturnsExplainPayload(t *testing.T) {
 	if orderBy, _ := options["orderBy"].([]any); len(orderBy) != 1 || orderBy[0] != "name ASC" {
 		t.Fatalf("unexpected orderBy option: %#v", options["orderBy"])
 	}
+	projectionClauses, ok := options["projectionClauses"].([]any)
+	if !ok {
+		t.Fatalf("expected query.options.projectionClauses array, got %T", options["projectionClauses"])
+	}
+	if len(projectionClauses) != 2 {
+		t.Fatalf("expected 2 projection clauses, got %#v", options["projectionClauses"])
+	}
+	withClause, ok := projectionClauses[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected WITH clause map, got %T", projectionClauses[0])
+	}
+	if withClause["kind"] != "WITH" {
+		t.Fatalf("expected first projection clause to be WITH, got %#v", withClause["kind"])
+	}
+	if withProjection, _ := withClause["projection"].([]any); len(withProjection) != 1 || withProjection[0] != "n.name AS alias" {
+		t.Fatalf("unexpected WITH projection: %#v", withClause["projection"])
+	}
+	if withOrderBy, _ := withClause["orderBy"].([]any); len(withOrderBy) != 1 || withOrderBy[0] != "alias DESC" {
+		t.Fatalf("unexpected WITH orderBy: %#v", withClause["orderBy"])
+	}
+	returnClause, ok := projectionClauses[1].(map[string]any)
+	if !ok {
+		t.Fatalf("expected RETURN clause map, got %T", projectionClauses[1])
+	}
+	if returnClause["kind"] != "RETURN" {
+		t.Fatalf("expected second projection clause to be RETURN, got %#v", returnClause["kind"])
+	}
+	if returnProjection, _ := returnClause["projection"].([]any); len(returnProjection) != 1 || returnProjection[0] != "alias AS name" {
+		t.Fatalf("unexpected RETURN projection: %#v", returnClause["projection"])
+	}
 
 	influencers, ok := explain["influencers"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected influencers map, got %T", explain["influencers"])
+	}
+	logicalPlan, ok := explain["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explain["logicalPlan"])
+	}
+	nodes, ok := logicalPlan["nodes"].([]any)
+	if !ok || len(nodes) == 0 {
+		t.Fatalf("expected logicalPlan.nodes to be populated, got %#v", logicalPlan["nodes"])
+	}
+	firstNode, ok := nodes[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first logical node map, got %T", nodes[0])
+	}
+	firstOp, _ := firstNode["op"].(string)
+	if firstOp != "INDEX_SCAN" && firstOp != "LABEL_SCAN" && firstOp != "ALL_NODES_SCAN" && firstOp != "OPTIONAL_INDEX_SCAN" && firstOp != "OPTIONAL_LABEL_SCAN" && firstOp != "OPTIONAL_ALL_NODES_SCAN" {
+		t.Fatalf("expected first logical node to be a scan-family operator, got %#v", firstNode["op"])
+	}
+	if accessPath, _ := firstNode["accessPath"].(string); accessPath == "" {
+		t.Fatalf("expected first logical node accessPath, got %#v", firstNode["accessPath"])
 	}
 	if nodeCounts, ok := influencers["nodeCounts"].([]any); !ok || len(nodeCounts) == 0 {
 		t.Fatalf("expected nodeCounts to be populated, got %#v", influencers["nodeCounts"])
@@ -343,8 +392,41 @@ func TestTCPExplainQueryReturnsExplainPayload(t *testing.T) {
 	if edgeCounts, ok := influencers["edgeCounts"].([]any); !ok || len(edgeCounts) == 0 {
 		t.Fatalf("expected edgeCounts to be populated, got %#v", influencers["edgeCounts"])
 	}
+	indexDecisions, ok := explain["indexDecisions"].([]any)
+	if !ok || len(indexDecisions) == 0 {
+		t.Fatalf("expected indexDecisions to be populated, got %#v", explain["indexDecisions"])
+	}
+	firstDecision, ok := indexDecisions[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected first index decision map, got %T", indexDecisions[0])
+	}
+	if recommendation, _ := firstDecision["recommendation"].(string); recommendation == "" {
+		t.Fatalf("expected index decision recommendation, got %#v", firstDecision["recommendation"])
+	}
+	if quality, _ := firstDecision["quality"].(string); quality != "exact" && quality != "estimate" {
+		t.Fatalf("expected index decision quality exact or estimate, got %#v", firstDecision["quality"])
+	}
 	if cardinality, ok := explain["cardinality"].([]any); !ok || len(cardinality) == 0 {
 		t.Fatalf("expected cardinality to be populated, got %#v", explain["cardinality"])
+	}
+	warnings, ok := explain["warnings"].([]any)
+	if !ok || len(warnings) == 0 {
+		t.Fatalf("expected warnings to be populated, got %#v", explain["warnings"])
+	}
+	foundWarningCode := false
+	for _, warning := range warnings {
+		entry, ok := warning.(map[string]any)
+		if !ok {
+			continue
+		}
+		code, _ := entry["code"].(string)
+		if code == "PLAN_ANALYSIS_PARTIAL" || code == "ESTIMATE_ONLY_INDEX_SIGNAL" || code == "MISSING_PROPERTY_INDEX" || code == "FULL_SCAN_FALLBACK" {
+			foundWarningCode = true
+			break
+		}
+	}
+	if !foundWarningCode {
+		t.Fatalf("expected at least one fallback warning code, got %#v", warnings)
 	}
 }
 

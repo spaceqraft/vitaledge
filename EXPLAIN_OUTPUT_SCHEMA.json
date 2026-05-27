@@ -99,11 +99,57 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "projectionClauses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/queryProjectionClause"
+          }
+        },
         "distinct": {
           "type": "boolean"
         },
         "includeAll": {
           "type": "boolean"
+        },
+        "orderBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skip": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "string"
+        }
+      }
+    },
+    "queryProjectionClause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "WITH",
+            "RETURN"
+          ]
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "includeAll": {
+          "type": "boolean"
+        },
+        "projection": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "orderBy": {
           "type": "array",
@@ -418,6 +464,45 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1
+        },
+        "accessPath": {
+          "type": "string"
+        },
+        "recommendation": {
+          "type": "string",
+          "enum": [
+            "keep-index",
+            "create-index",
+            "consider-index",
+            "optional-index"
+          ]
+        },
+        "tuningImpact": {
+          "type": "string",
+          "enum": [
+            "none",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "scanPopulation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "matchedCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "estimatedRowsSaved": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quality": {
+          "$ref": "#/$defs/quality"
+        },
+        "suggestedIndex": {
+          "type": "string"
         }
       }
     },

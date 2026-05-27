@@ -11,19 +11,19 @@ Back link: [Q-001](COMPREHENSION-Q.md#q-001)
 
 <a id="a-002"></a>
 ### A-002
-A local-first, single-binary approach minimizes operational complexity, enables edge/offline deployments, and lets the team validate correctness and performance before layering on distributed features.
+A single-node, local-first, single-binary focus minimizes operational complexity, enables edge/offline deployments, and lets the team validate correctness and performance before adding distributed features.
 Back link: [Q-002](COMPREHENSION-Q.md#q-002)
 
 <a id="a-003"></a>
 ### A-003
-It means graph primitives are stored and queried directly in the KV store, avoiding forced mapping through unrelated relational or translation layers that add latency and complexity.
+It means storing and querying graph primitives directly in the KV store, avoiding forced mapping through unrelated relational or translation layers that add latency and complexity.
 Back link: [Q-003](COMPREHENSION-Q.md#q-003)
 
-## Topic 2: Phased Architecture and Evolution
+## Topic 2: Architecture Phases and Evolution
 
 <a id="a-004"></a>
 ### A-004
-Phase 1: single-node local engine for correctness and baseline performance; Phase 2: hardening and optimization; Phase 3: replicated multi-node clusters with partitioning and rebalancing.
+Phase 1: single-node local engine for correctness and baseline performance; Phase 2: hardening and optimization (explainability, phase boundaries, planner improvements); Phase 3: replicated multi-node clusters with partitioning and rebalancing.
 Back link: [Q-004](COMPREHENSION-Q.md#q-004)
 
 <a id="a-005"></a>
@@ -33,7 +33,7 @@ Back link: [Q-005](COMPREHENSION-Q.md#q-005)
 
 <a id="a-006"></a>
 ### A-006
-The single-node model uses serializable transactions with write conflict checks and WAL durability, which later map to per-range Raft replication and a distributed transaction coordinator for multi-range ops.
+The single-node model uses serializable transactions with write conflict checks and WAL durability, which later map to per-range Raft replication and a distributed transaction coordinator for multi-range operations.
 Back link: [Q-006](COMPREHENSION-Q.md#q-006)
 
 ## Topic 3: Storage Engine and Keyspace
@@ -72,102 +72,107 @@ Back link: [Q-012](COMPREHENSION-Q.md#q-012)
 
 <a id="a-013"></a>
 ### A-013
-Recent improvements: richer relationship pattern support, chained MATCH with shared bindings, EXISTS subqueries in WHERE, and enhanced projection/aggregation (count, collect, labels, type).
+Recent improvements: richer relationship pattern support (directed, undirected, alternation, properties), chained MATCH with shared bindings, EXISTS subqueries in WHERE, and enhanced projection/aggregation (count, collect, labels, type).
 Back link: [Q-013](COMPREHENSION-Q.md#q-013)
 
 <a id="a-014"></a>
 ### A-014
-Path-variable capture and return is deferred; it's non-blocking for Phase 1 since core correctness, performance, and operability gates are prioritized over full Cypher completeness.
+Path-variable capture and return is deferred; its absence is not blocking for Phase 1 since core correctness, performance, and operability gates are prioritized over full Cypher completeness.
 Back link: [Q-014](COMPREHENSION-Q.md#q-014)
-
-## Topic 5: Index Management and Planner Behavior
 
 <a id="a-015"></a>
 ### A-015
-Property indexes are declared via configuration and loaded into a runtime catalog, ensuring deterministic planner behavior and operational simplicity in Phase 1.
+TCK compliance revealed that executor reliance on regex and raw-clause recovery is architectural debt; the plan is to promote richer clause and pattern structure into parser/planner artifacts, reducing text-driven execution.
 Back link: [Q-015](COMPREHENSION-Q.md#q-015)
+
+## Topic 5: Index Management and Planner Behavior
 
 <a id="a-016"></a>
 ### A-016
-Automatic indexing risks index explosion, write amplification, and unpredictable planner behavior; explicit config-based indexes and usage tracking mitigate these risks.
+Property indexes are declared via configuration and loaded into a runtime catalog, ensuring deterministic planner behavior and operational simplicity in Phase 1.
 Back link: [Q-016](COMPREHENSION-Q.md#q-016)
 
 <a id="a-017"></a>
 ### A-017
-Planned features: Cypher index DDL, policy-guarded adaptive indexing, explain output distinguishing baseline vs adaptive indexes, and offline index build pipelines.
+Automatic indexing risks index explosion, write amplification, and unpredictable planner behavior; explicit config-based indexes and usage tracking mitigate these risks.
 Back link: [Q-017](COMPREHENSION-Q.md#q-017)
-
-## Topic 6: Reliability, Operability, and Performance
 
 <a id="a-018"></a>
 ### A-018
-Phase 1 exit criteria: correctness (concurrent CRUD, restart durability), performance (ReBAC p95 ≤ 10ms, ingest ≥ 50k edges/min), and operability (metrics for reads/writes/compactions/txn conflicts).
+Planned features: Cypher index DDL, policy-guarded adaptive indexing, explain output distinguishing baseline vs adaptive indexes, and offline index build pipelines.
 Back link: [Q-018](COMPREHENSION-Q.md#q-018)
+
+## Topic 6: Reliability, Operability, and Performance
 
 <a id="a-019"></a>
 ### A-019
-Benchmarks show ReBAC p95 at 2.2ms (target ≤ 10ms) and ingest at ~8M edges/min (target ≥ 50k), both exceeding Phase 1 requirements.
+Phase 1 exit criteria: correctness (concurrent CRUD, restart durability), performance (ReBAC p95 ≤ 10ms, ingest ≥ 50k edges/min), and operability (metrics for reads/writes/compactions/txn conflicts).
 Back link: [Q-019](COMPREHENSION-Q.md#q-019)
 
 <a id="a-020"></a>
 ### A-020
-Operability baseline means in-process metrics collection and reporting are present and usable for local operation; production-grade export/integration is deferred to later phases.
+Benchmarks show ReBAC p95 at 2.2ms (target ≤ 10ms) and ingest at ~8M edges/min (target ≥ 50k), both exceeding Phase 1 requirements.
 Back link: [Q-020](COMPREHENSION-Q.md#q-020)
-
-## Topic 7: Networking and Productionization
 
 <a id="a-021"></a>
 ### A-021
-A centralized port map prevents drift, clarifies trust boundaries, and supports secure, predictable deployment as services and cluster features are added.
+Operability baseline means in-process metrics collection and reporting are present and usable for local operation; production-grade export/integration is deferred to later phases.
 Back link: [Q-021](COMPREHENSION-Q.md#q-021)
+
+## Topic 7: Networking and Productionization
 
 <a id="a-022"></a>
 ### A-022
-Externally exposed: client TCP (6379), gRPC API (7443), Admin UI (8080), Node health (8081), Prometheus (9464), Otel OTLP (4327); Internal: RAFT control plane (2380), Cluster replication (2381).
+A centralized port map prevents drift, clarifies trust boundaries, and supports secure, predictable deployment as services and cluster features are added.
 Back link: [Q-022](COMPREHENSION-Q.md#q-022)
 
 <a id="a-023"></a>
 ### A-023
-mTLS is required for internal control-plane and replication ports to secure node-to-node and cluster communication; public endpoints may have separate policies.
+Externally exposed: client TCP (6379), gRPC API (7443), Admin UI (8080), Node health (8081), Prometheus (9464), Otel OTLP (4327); Internal: RAFT control plane (2380), Cluster replication (2381).
 Back link: [Q-023](COMPREHENSION-Q.md#q-023)
-
-## Topic 8: Multi-node Readiness and Next Steps
 
 <a id="a-024"></a>
 ### A-024
-Before Phase 2, the system must show stable semantics, repeatable benchmark evidence, and sufficient observability for diagnosing regressions.
+mTLS is required for internal control-plane and replication ports to secure node-to-node and cluster communication; public endpoints may have separate policies.
 Back link: [Q-024](COMPREHENSION-Q.md#q-024)
+
+## Topic 8: Multi-node Readiness and Next Steps
 
 <a id="a-025"></a>
 ### A-025
-Phase 3 prerequisites: range/replication abstraction, failover semantics, health and replication metrics, and test coverage for node loss and consistency.
+Before Phase 2, the system must show stable semantics, repeatable benchmark evidence, and sufficient observability for diagnosing regressions.
 Back link: [Q-025](COMPREHENSION-Q.md#q-025)
 
 <a id="a-026"></a>
 ### A-026
-Reviewers should check for: design intent alignment, keyspace and transaction impact, observability and security boundary changes, and migration/rollback strategy.
+Phase 3 prerequisites: range/replication abstraction, failover semantics, health and replication metrics, and test coverage for node loss and consistency.
 Back link: [Q-026](COMPREHENSION-Q.md#q-026)
-
-## Optional Add-on Prompts
 
 <a id="a-027"></a>
 ### A-027
-Re-validate key prefixing, scan/iterator behavior, transaction and durability semantics, and benchmark targets if the storage backend changes.
+Reviewers should check for: design intent alignment, keyspace and transaction impact, observability and security boundary changes, and migration/rollback strategy.
 Back link: [Q-027](COMPREHENSION-Q.md#q-027)
+
+## Optional Add-on Prompts
 
 <a id="a-028"></a>
 ### A-028
-Require catalog migration semantics, index build lifecycle controls, safe rollout/rollback, planner explainability, and resource guardrails before enabling Cypher index DDL.
+Re-validate key prefixing, scan/iterator behavior, transaction and durability semantics, and benchmark targets if the storage backend changes.
 Back link: [Q-028](COMPREHENSION-Q.md#q-028)
 
 <a id="a-029"></a>
 ### A-029
-Test node loss, split-brain prevention, leader change, read consistency under failover, and recovery/catch-up correctness as first distributed failure scenarios.
+Require catalog migration semantics, index build lifecycle controls, safe rollout/rollback, planner explainability, and resource guardrails before enabling Cypher index DDL.
 Back link: [Q-029](COMPREHENSION-Q.md#q-029)
 
 <a id="a-030"></a>
 ### A-030
-Build an edge-first property graph engine with deterministic semantics and a clear path to distributed and partitioned operation.
+Test node loss, split-brain prevention, leader change, read consistency under failover, and recovery/catch-up correctness as first distributed failure scenarios.
 Back link: [Q-030](COMPREHENSION-Q.md#q-030)
+
+<a id="a-031"></a>
+### A-031
+Build an edge-first property graph engine with deterministic semantics and a clear path to distributed and partitioned operation.
+Back link: [Q-031](COMPREHENSION-Q.md#q-031)
 
 ---

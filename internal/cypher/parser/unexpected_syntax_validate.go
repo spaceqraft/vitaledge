@@ -156,6 +156,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if literal, ok := firstOverflowingHexOrOctalLiteral(item.Expression.Raw); ok {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
 			}
+			if literal, ok := firstOverflowingDecimalIntegerLiteral(item.Expression.Raw); ok {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
+			}
 			if literal, ok := firstOverflowingFloatLiteral(item.Expression.Raw); ok {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 			}
@@ -220,6 +223,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 						if literal, ok := firstOverflowingHexOrOctalLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
 						}
+						if literal, ok := firstOverflowingDecimalIntegerLiteral(expr); ok {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
+						}
 						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("floating point overflow in literal %q", literal), Statement: seg.index}
 						}
@@ -253,6 +259,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("unknown function %q", name), Statement: seg.index}
 						}
 						if literal, ok := firstOverflowingHexOrOctalLiteral(expr); ok {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
+						}
+						if literal, ok := firstOverflowingDecimalIntegerLiteral(expr); ok {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: fmt.Sprintf("integer overflow in literal %q", literal), Statement: seg.index}
 						}
 						if literal, ok := firstOverflowingFloatLiteral(expr); ok {
@@ -597,6 +606,10 @@ func validateProjectionSemanticItems(items []projectionSemanticItem, kind ast.Cl
 
 		if hasNestedAggregateFunctionCall(expr) {
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "NestedAggregation", Statement: seg.index}
+		}
+
+		if hasUndefinedInlineMapValueIdentifier(expr, bound) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
 		}
 	}
 
@@ -2650,6 +2663,120 @@ func firstOverflowingHexOrOctalLiteral(expr string) (string, bool) {
 	}
 
 	return "", false
+}
+
+func firstOverflowingDecimalIntegerLiteral(expr string) (string, bool) {
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+
+	for i := 0; i < len(expr); i++ {
+		ch := expr[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || expr[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || expr[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		}
+
+		start := i
+		signed := false
+		if ch == '-' {
+			if i+1 >= len(expr) || expr[i+1] < '0' || expr[i+1] > '9' || !hasUnaryMinusBeforeLiteral(expr, i+1) {
+				continue
+			}
+			start = i
+			signed = true
+			i++
+			ch = expr[i]
+		}
+
+		if ch < '0' || ch > '9' {
+			continue
+		}
+		if !signed && hasUnaryMinusBeforeLiteral(expr, i) {
+			continue
+		}
+		if !isNumericLiteralBoundaryBefore(expr, start) {
+			continue
+		}
+
+		j := i
+		for j < len(expr) && expr[j] >= '0' && expr[j] <= '9' {
+			j++
+		}
+		if j < len(expr) && (expr[j] == '.' || expr[j] == 'e' || expr[j] == 'E') {
+			i = j
+			continue
+		}
+		if !isNumericLiteralBoundaryAfter(expr, j) {
+			i = j
+			continue
+		}
+
+		lit := expr[start:j]
+		if _, err := strconv.ParseInt(lit, 10, 64); err != nil {
+			if numErr, ok := err.(*strconv.NumError); ok && numErr.Err == strconv.ErrRange {
+				return lit, true
+			}
+		}
+		i = j
+	}
+
+	return "", false
+}
+
+func hasUndefinedInlineMapValueIdentifier(expr string, bound map[string]patternVarRole) bool {
+	trimmed := strings.TrimSpace(expr)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return false
+	}
+	body := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	if body == "" {
+		return false
+	}
+	for _, pair := range splitTopLevelComma(body) {
+		parts := strings.SplitN(pair, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		valueExpr := strings.TrimSpace(parts[1])
+		if valueExpr == "" {
+			continue
+		}
+		ident, ok := simpleIdentifierExpression(valueExpr)
+		if !ok || isCypherLiteralKeyword(ident) {
+			continue
+		}
+		if _, exists := bound[ident]; !exists {
+			return true
+		}
+	}
+	return false
 }
 
 func isHexOrOctalPrefixAt(expr string, idx int) bool {

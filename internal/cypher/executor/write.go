@@ -12106,9 +12106,17 @@ func parseListLiteral(raw string, params Params, row Row) ([]any, error) {
 	out := make([]any, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
-		value, err := evalExpressionWithScope(part, row, params)
-		if err != nil {
+		var (
+			value any
+			err   error
+		)
+		if isQuotedCypherString(part) {
 			value, err = evalWriteValue(part, params, row)
+		} else {
+			value, err = evalExpressionWithScope(part, row, params)
+			if err != nil {
+				value, err = evalWriteValue(part, params, row)
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -12116,6 +12124,18 @@ func parseListLiteral(raw string, params Params, row Row) ([]any, error) {
 		out = append(out, value)
 	}
 	return out, nil
+}
+
+func isQuotedCypherString(raw string) bool {
+	if len(raw) < 2 {
+		return false
+	}
+	first := raw[0]
+	last := raw[len(raw)-1]
+	if first != last {
+		return false
+	}
+	return first == '\'' || first == '"'
 }
 
 func parseInlineMapLiteral(raw string, params Params, row Row) (map[string]any, error) {

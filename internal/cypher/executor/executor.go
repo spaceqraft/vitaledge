@@ -1185,7 +1185,6 @@ func renderTemporalValue(value map[string]any) (string, bool) {
 }
 
 func parseStoredListString(raw string) ([]any, bool) {
-	raw = strings.TrimSpace(raw)
 	if !strings.HasPrefix(raw, "[") || !strings.HasSuffix(raw, "]") {
 		return nil, false
 	}

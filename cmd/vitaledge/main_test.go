@@ -14,11 +14,16 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/cypher/executor"
 	"github.com/paegun/vitaledge/internal/cypher/indexschema"
 	"github.com/paegun/vitaledge/internal/graph"
 	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func TestTCPQueryExecutionSuccess(t *testing.T) {
@@ -619,5 +624,117 @@ func TestWritePrometheusMetricsWithNilCollector(t *testing.T) {
 	body := recorder.Body.String()
 	if !strings.Contains(body, "vitaledge_executor_rows_returned_total 0") {
 		t.Fatalf("expected rows counter line in nil-collector output, got: %s", body)
+	}
+}
+
+func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+	capResp, err := client.GetCapabilities(ctx, &v1.CapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("GetCapabilities failed: %v", err)
+	}
+	if capResp.GetProtocolVersion() != "v1" {
+		t.Fatalf("unexpected protocolVersion: %#v", capResp.GetProtocolVersion())
+	}
+	if capResp.GetParameterBinding() != "client_side_only" {
+		t.Fatalf("unexpected parameterBinding: %#v", capResp.GetParameterBinding())
+	}
+	if !capResp.GetPreparedQuerySupported() {
+		t.Fatalf("expected prepared query support to be true")
+	}
+
+	execResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+
+	if len(execResp.GetColumns()) != 1 || execResp.GetColumns()[0] != "id" {
+		t.Fatalf("unexpected columns: %#v", execResp.GetColumns())
+	}
+	if len(execResp.GetRows()) != 1 {
+		t.Fatalf("unexpected rows: %#v", execResp.GetRows())
+	}
+	rowValue := execResp.GetRows()[0].GetValues()["id"]
+	if rowValue == nil {
+		t.Fatalf("missing row value for id")
+	}
+	if rowValue.GetStringValue() != "seed" {
+		t.Fatalf("unexpected row value: %#v", rowValue)
+	}
+
+	preparedResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: &v1.PreparedQuery{
+			ParserVersion: "cypher-m23",
+			IrVersion:     "query-pipeline-v1",
+			Payload:       []byte("MATCH (n:Seed) RETURN n.id AS id"),
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("prepared Execute failed: %v", err)
+	}
+	if len(preparedResp.GetRows()) != 1 {
+		t.Fatalf("unexpected prepared rows: %#v", preparedResp.GetRows())
+	}
+	preparedRowValue := preparedResp.GetRows()[0].GetValues()["id"]
+	if preparedRowValue == nil || preparedRowValue.GetStringValue() != "seed" {
+		t.Fatalf("unexpected prepared row value: %#v", preparedRowValue)
+	}
+
+	_, err = client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: &v1.PreparedQuery{
+			ParserVersion: "cypher-m99",
+			IrVersion:     "query-pipeline-v99",
+			Payload:       []byte("MATCH (n:Seed) RETURN n.id AS id"),
+		}}},
+	})
+	if err == nil {
+		t.Fatalf("expected version mismatch error for prepared query without fallback")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+
+	fallbackResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: &v1.PreparedQuery{
+			ParserVersion:  "cypher-m99",
+			IrVersion:      "query-pipeline-v99",
+			Payload:        []byte("MATCH (n:Never) RETURN n.id AS id"),
+			FallbackCypher: "MATCH (n:Seed) RETURN n.id AS id",
+		}}},
+		Options: &v1.RequestOptions{AllowFallbackToCypher: true},
+	})
+	if err != nil {
+		t.Fatalf("expected fallback execution to succeed, got: %v", err)
+	}
+	fallbackRowValue := fallbackResp.GetRows()[0].GetValues()["id"]
+	if fallbackRowValue == nil || fallbackRowValue.GetStringValue() != "seed" {
+		t.Fatalf("unexpected fallback row value: %#v", fallbackRowValue)
 	}
 }

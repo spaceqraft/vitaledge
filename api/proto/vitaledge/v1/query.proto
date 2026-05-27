@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package vitaledge.v1;
+
+option go_package = "github.com/paegun/vitaledge/api/proto/vitaledge/v1;v1";
+
+service QueryService {
+  rpc Execute(QueryRequest) returns (QueryResponse);
+  rpc Explain(QueryRequest) returns (ExplainResponse);
+  rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+}
+
+message QueryRequest {
+  string tenant = 1;
+  QueryInput input = 2;
+  RequestOptions options = 3;
+  ClientContext client = 4;
+}
+
+message QueryInput {
+  oneof kind {
+    string cypher = 1;
+    PreparedQuery prepared = 2;
+  }
+}
+
+message PreparedQuery {
+  string parser_version = 1;
+  string ir_version = 2;
+  string fingerprint = 3;
+  bytes payload = 4;
+  string fallback_cypher = 5;
+}
+
+message RequestOptions {
+  bool read_only = 1;
+  bool include_stats = 2;
+  bool include_warnings = 3;
+  bool allow_fallback_to_cypher = 4;
+}
+
+message ClientContext {
+  string sdk_language = 1;
+  string sdk_version = 2;
+  string protocol_version = 3;
+}
+
+message QueryResponse {
+  repeated string columns = 1;
+  repeated Row rows = 2;
+  QueryStats stats = 3;
+  repeated Diagnostic warnings = 4;
+}
+
+message ExplainResponse {
+  bytes explain_json = 1;
+  QueryStats stats = 2;
+  repeated Diagnostic warnings = 3;
+}
+
+message QueryStats {
+  int64 rows_returned = 1;
+  int64 duration_ms = 2;
+}
+
+message Diagnostic {
+  string code = 1;
+  string message = 2;
+}
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+  string protocol_version = 1;
+  repeated string parser_versions = 2;
+  repeated string ir_versions = 3;
+  bool prepared_query_supported = 4;
+  string parameter_binding = 5;
+}
+
+message Row {
+  map<string, Value> values = 1;
+}
+
+message Value {
+  oneof kind {
+    bool bool_value = 1;
+    int64 int_value = 2;
+    double double_value = 3;
+    string string_value = 4;
+    bytes bytes_value = 5;
+    ListValue list_value = 6;
+    MapValue map_value = 7;
+    NullValue null_value = 8;
+  }
+}
+
+message ListValue {
+  repeated Value values = 1;
+}
+
+message MapValue {
+  map<string, Value> values = 1;
+}
+
+message NullValue {}

@@ -22,7 +22,11 @@ generate-cypher-parser:
 	@test -f $(ANTLR_JAR) || curl -L --fail https://www.antlr.org/download/antlr-4.13.1-complete.jar -o $(ANTLR_JAR)
 	java -jar $(ANTLR_JAR) -Dlanguage=Go -visitor -listener -package cyphergen -Xexact-output-dir -o internal/cypher/grammar/generated internal/cypher/grammar/Cypher.g4
 
-generate: generate-cypher-parser
+generate-proto:
+	@command -v buf >/dev/null 2>&1 || (echo "buf not found; install with: go install github.com/bufbuild/buf/cmd/buf@v1.39.0" && exit 1)
+	buf generate
+
+generate: generate-cypher-parser generate-proto
 
 test:
 	go test -v ./...

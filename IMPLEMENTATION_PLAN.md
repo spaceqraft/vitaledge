@@ -562,8 +562,9 @@ Theme: MVP closeout sprint (post-Query-Pipeline).
    - planner/runtime statistics surfaced to operators,
    - actionable query cost estimation.
 2. Stand up Prometheus/Grafana as the default metrics path and publish dashboard/query examples.
-3. Finalize CLI UX for variables, table output, and statement statistics.
-4. Run and publish benchmark comparisons against Neo4j and TigerGraph using documented workload parity rules.
+3. Establish gRPC/protobuf as the canonical programmatic interface and finalize CLI UX on top of that interface.
+4. Deliver phased language SDK clients (Python, Go, Java, C#) on the same gRPC/protobuf contract.
+5. Run and publish benchmark comparisons against Neo4j and TigerGraph using documented workload parity rules.
 
 Sprint deliverables:
 
@@ -575,11 +576,21 @@ Sprint deliverables:
    - Prometheus scrape endpoint wired and documented,
    - baseline Grafana dashboard set committed,
    - dashboard coverage includes latency, throughput, index usage, and error signals.
-3. CLI usability closure:
+3. gRPC/protobuf contract readiness:
+   - stable protobuf service/messages for query execution and explain flow,
+   - protocol compatibility/version negotiation fields included,
+   - structured error model and diagnostics mapping documented.
+   - status: complete (typed generated stubs in repo, server wiring in place, prepared-query + capability-gated fallback covered by tests).
+4. CLI usability closure:
    - variable management flow (`SET`/list/update/unset) is consistent,
    - tabular rendering behaves predictably for wide/null-heavy results,
-   - statement output includes clear execution statistics.
-4. Comparative benchmark publication:
+   - statement output includes clear execution statistics,
+   - CLI sends requests only after local parse-completeness checks.
+5. SDK phase-1 delivery:
+   - Python and Go clients support raw Cypher and prepared-query request paths,
+   - client-side parse-completeness validation for interactive/scripted usage,
+   - compatibility fallback from prepared-query to raw Cypher when required by server capability.
+6. Comparative benchmark publication:
    - workload parity methodology documented,
    - reproducible benchmark invocation scripts captured,
    - result summary published in repo docs.
@@ -588,13 +599,203 @@ Suggested implementation order for this sprint:
 
 1. Manual index tuning loop and EXPLAIN/runtime stats packaging for operator workflows.
 2. Prometheus/Grafana wiring and baseline dashboard publication.
-3. CLI UX polish and output-statistics ergonomics.
-4. Cross-engine benchmark runs and documentation publication.
+3. gRPC/protobuf service surface and server wiring.
+4. CLI UX polish and output-statistics ergonomics on top of gRPC.
+5. Phased client SDK rollout (Python, then Go, then Java, then C#).
+6. Cross-engine benchmark runs and documentation publication.
 
 Sprint exit criteria:
 
 1. MVP-critical gaps listed in this plan are closed or explicitly tracked with owner/date as follow-on work.
 2. Full test sweep remains green after each deliverable set.
 3. Documentation is sufficient for an external contributor to reproduce dashboards and benchmark comparisons.
+
+### gRPC / Protobuf Programmatic Interface Draft
+
+Objective: make gRPC/protobuf the canonical programmatic surface for CLI and SDK clients while preserving semantic correctness on the server.
+
+Design principles:
+
+1. Support both raw Cypher requests and prepared-query requests.
+2. Allow client-side parse/completeness and parameter binding work to reduce server CPU/RAM.
+3. Keep server as semantic/planning source of truth (schema/index/runtime-aware checks).
+4. Include explicit version negotiation and compatibility fallback behavior.
+
+Proposed protobuf surface (draft):
+
+```proto
+syntax = "proto3";
+
+package vitaledge.v1;
+
+service QueryService {
+   rpc Execute(QueryRequest) returns (QueryResponse);
+   rpc Explain(QueryRequest) returns (ExplainResponse);
+   rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+}
+
+message QueryRequest {
+   string tenant = 1;
+   QueryInput input = 2;
+   RequestOptions options = 3;
+   ClientContext client = 4;
+}
+
+message QueryInput {
+   oneof kind {
+      string cypher = 1; // client-submitted fully bound statement
+      PreparedQuery prepared = 2;
+   }
+}
+
+message PreparedQuery {
+   string parser_version = 1;
+   string ir_version = 2;
+   string fingerprint = 3;
+   bytes payload = 4;
+}
+
+message RequestOptions {
+   bool read_only = 1;
+   bool include_stats = 2;
+   bool include_warnings = 3;
+}
+
+message ClientContext {
+   string sdk_language = 1;
+   string sdk_version = 2;
+   string protocol_version = 3;
+}
+
+message QueryResponse {
+   repeated string columns = 1;
+   repeated Row rows = 2;
+   QueryStats stats = 3;
+   repeated Diagnostic warnings = 4;
+}
+
+message ExplainResponse {
+   bytes explain_json = 1;
+   QueryStats stats = 2;
+   repeated Diagnostic warnings = 3;
+}
+
+message QueryStats {
+   int64 rows_returned = 1;
+   int64 duration_ms = 2;
+}
+
+message Diagnostic {
+   string code = 1;
+   string message = 2;
+}
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+   string protocol_version = 1;
+   repeated string parser_versions = 2;
+   repeated string ir_versions = 3;
+   bool prepared_query_supported = 4;
+}
+
+message Row {
+   map<string, Value> values = 1;
+}
+
+message Value {
+   oneof kind {
+      bool bool_value = 1;
+      int64 int_value = 2;
+      double double_value = 3;
+      string string_value = 4;
+      bytes bytes_value = 5;
+      ListValue list_value = 6;
+      MapValue map_value = 7;
+      NullValue null_value = 8;
+   }
+}
+
+message ListValue {
+   repeated Value values = 1;
+}
+
+message MapValue {
+   map<string, Value> values = 1;
+}
+
+message NullValue {}
+```
+
+Server-side behavior rules:
+
+1. Raw `cypher` input: parse -> semantic validation -> planning -> execution.
+2. `prepared` input: validate version/fingerprint/shape -> semantic validation -> planning -> execution.
+3. On incompatible prepared input, return capability mismatch and support fallback to raw Cypher mode.
+4. Server may reject or downgrade prepared payloads if validation fails.
+
+Client-side parameter binding contract:
+
+1. Programmatic clients and CLI bind parameters client-side before RPC submission.
+2. Requests sent to gRPC contain the fully bound statement text or prepared payload; there is no separate parameter map in the wire request.
+3. Binding should be structured/typed (AST or token-aware literal insertion), not naive string replacement.
+4. SDKs must preserve Cypher literal correctness when binding strings, numerics, booleans, nulls, lists, and maps.
+
+### Phased Client SDK Plan (Priority Order)
+
+Objective: deliver consistent programmatic interface across language clients with predictable capability/fallback behavior.
+
+Phase SDK-1: Python client
+
+1. gRPC channel/client scaffolding and auth/tenant request metadata.
+2. Raw Cypher execute/explain methods.
+3. Client-side parameter binding + parse-completeness check and prepared-query request mode.
+4. Capability negotiation + fallback path from prepared-query to raw Cypher.
+
+Exit evidence:
+
+1. Integration tests for execute/explain success and error mapping.
+2. Tests for prepared-query fallback on unsupported capability.
+3. Example scripts for sync and interactive usage.
+
+Phase SDK-2: Go client
+
+1. Same contract as Python, idiomatic Go API surface.
+2. Strong typed helpers for values/rows/stats/diagnostics.
+3. Prepared-query, client-side binding, and fallback behavior parity with Python.
+
+Exit evidence:
+
+1. Cross-client parity tests against shared golden server scenarios.
+2. Benchmark check for client-side parse overhead vs server parse overhead.
+
+Phase SDK-3: Java client
+
+1. Java API parity with execute/explain/capabilities endpoints.
+2. Prepared-query path + fallback parity.
+3. Build tooling/publishing baseline for JVM environments.
+
+Exit evidence:
+
+1. Integration tests mirroring Python/Go scenario coverage.
+2. Example application snippet for service-side integration.
+
+Phase SDK-4: C# client
+
+1. .NET API parity for execute/explain/capabilities.
+2. Prepared-query path + fallback parity.
+3. Packaging and sample for standard .NET runtime targets.
+
+Exit evidence:
+
+1. Cross-language contract parity tests pass.
+2. End-to-end capability negotiation and fallback scenarios pass.
+
+### CLI dependency and behavior contract
+
+1. CLI transport is gRPC/protobuf, not TCP line framing.
+2. CLI determines statement completeness locally using parser checks before issuing RPC.
+3. CLI sends only complete statements; incomplete statements remain in local input buffer.
+4. CLI and server both show consistent banner/version identity, including: `(v:Vital)ﮩ٨ـﮩﮩ٨ـ[e:Edge]ﮩ٨ـﮩﮩ٨ـ()`.
 
 Back to [DESIGN.md](DESIGN.md) and [README.md](README.md).

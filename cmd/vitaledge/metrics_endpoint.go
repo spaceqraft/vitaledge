@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +41,9 @@ func writePrometheusMetrics(w http.ResponseWriter, collector *executor.Collector
 	if collector != nil {
 		snapshot = collector.Snapshot()
 	}
+
+	writeGoRuntimeMetrics(w)
+	writeHostMetrics(w)
 
 	writeHelpType(w, "vitaledge_executor_statements_total", "Count of executed statements by kind and outcome.", "counter")
 	stmtKeys := make([]executor.StatementMetricKey, 0, len(snapshot.Statements))
@@ -111,6 +116,143 @@ func writePrometheusMetrics(w http.ResponseWriter, collector *executor.Collector
 		fmt.Fprintf(w, "vitaledge_executor_index_lookups_total{strategy=%q,outcome=%q} %d\n", key.Strategy, key.Outcome, value.Count)
 		fmt.Fprintf(w, "vitaledge_executor_index_lookup_matches_total{strategy=%q,outcome=%q} %d\n", key.Strategy, key.Outcome, value.TotalMatches)
 	}
+}
+
+func writeGoRuntimeMetrics(w http.ResponseWriter) {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	writeHelpType(w, "vitaledge_go_goroutines", "Number of live goroutines.", "gauge")
+	fmt.Fprintf(w, "vitaledge_go_goroutines %d\n", runtime.NumGoroutine())
+
+	writeHelpType(w, "vitaledge_go_memory_heap_alloc_bytes", "Bytes of allocated heap objects.", "gauge")
+	fmt.Fprintf(w, "vitaledge_go_memory_heap_alloc_bytes %d\n", ms.HeapAlloc)
+
+	writeHelpType(w, "vitaledge_go_memory_heap_inuse_bytes", "Bytes in in-use heap spans.", "gauge")
+	fmt.Fprintf(w, "vitaledge_go_memory_heap_inuse_bytes %d\n", ms.HeapInuse)
+
+	writeHelpType(w, "vitaledge_go_memory_sys_bytes", "Bytes obtained from the OS by Go runtime.", "gauge")
+	fmt.Fprintf(w, "vitaledge_go_memory_sys_bytes %d\n", ms.Sys)
+
+	writeHelpType(w, "vitaledge_go_gc_cycles_total", "Total completed GC cycles.", "counter")
+	fmt.Fprintf(w, "vitaledge_go_gc_cycles_total %d\n", ms.NumGC)
+
+	writeHelpType(w, "vitaledge_go_gc_pause_seconds_total", "Total GC pause time in seconds.", "counter")
+	fmt.Fprintf(w, "vitaledge_go_gc_pause_seconds_total %s\n", strconv.FormatFloat(float64(ms.PauseTotalNs)/1e9, 'f', 9, 64))
+
+	writeHelpType(w, "vitaledge_go_next_gc_heap_target_bytes", "Heap size target for the next GC cycle.", "gauge")
+	fmt.Fprintf(w, "vitaledge_go_next_gc_heap_target_bytes %d\n", ms.NextGC)
+}
+
+func writeHostMetrics(w http.ResponseWriter) {
+	writeHostCPUMetrics(w)
+	writeHostMemoryMetrics(w)
+	writeHostNetworkMetrics(w)
+}
+
+func writeHostCPUMetrics(w http.ResponseWriter) {
+	buf, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(buf), "\n")
+	if len(lines) == 0 {
+		return
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return
+	}
+
+	modes := []string{"user", "nice", "system", "idle", "iowait", "irq", "softirq", "steal", "guest", "guest_nice"}
+
+	writeHelpType(w, "vitaledge_host_cpu_seconds_total", "Host CPU time spent in each mode.", "counter")
+	for i := 1; i < len(fields) && i <= len(modes); i++ {
+		ticks, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil {
+			continue
+		}
+		seconds := ticks / 100.0
+		fmt.Fprintf(w, "vitaledge_host_cpu_seconds_total{mode=%q} %s\n", modes[i-1], strconv.FormatFloat(seconds, 'f', 6, 64))
+	}
+}
+
+func writeHostMemoryMetrics(w http.ResponseWriter) {
+	buf, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return
+	}
+	memKB := map[string]uint64{}
+	for _, line := range strings.Split(string(buf), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		key := strings.TrimSuffix(fields[0], ":")
+		val, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		memKB[key] = val
+	}
+
+	totalKB, hasTotal := memKB["MemTotal"]
+	availKB, hasAvail := memKB["MemAvailable"]
+	if !hasTotal {
+		return
+	}
+
+	writeHelpType(w, "vitaledge_host_memory_total_bytes", "Total host memory in bytes.", "gauge")
+	fmt.Fprintf(w, "vitaledge_host_memory_total_bytes %d\n", totalKB*1024)
+
+	if hasAvail {
+		writeHelpType(w, "vitaledge_host_memory_available_bytes", "Available host memory in bytes.", "gauge")
+		fmt.Fprintf(w, "vitaledge_host_memory_available_bytes %d\n", availKB*1024)
+	}
+}
+
+func writeHostNetworkMetrics(w http.ResponseWriter) {
+	buf, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return
+	}
+
+	var rxTotal uint64
+	var txTotal uint64
+	lines := strings.Split(string(buf), "\n")
+	for i, line := range lines {
+		if i < 2 {
+			continue // skip headers
+		}
+		parts := strings.Split(line, ":")
+		if len(parts) != 2 {
+			continue
+		}
+		iface := strings.TrimSpace(parts[0])
+		if iface == "" {
+			continue
+		}
+		fields := strings.Fields(parts[1])
+		if len(fields) < 9 {
+			continue
+		}
+		rx, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		tx, err := strconv.ParseUint(fields[8], 10, 64)
+		if err != nil {
+			continue
+		}
+		rxTotal += rx
+		txTotal += tx
+	}
+
+	writeHelpType(w, "vitaledge_host_network_receive_bytes_total", "Total bytes received across host network interfaces.", "counter")
+	fmt.Fprintf(w, "vitaledge_host_network_receive_bytes_total %d\n", rxTotal)
+
+	writeHelpType(w, "vitaledge_host_network_transmit_bytes_total", "Total bytes transmitted across host network interfaces.", "counter")
+	fmt.Fprintf(w, "vitaledge_host_network_transmit_bytes_total %d\n", txTotal)
 }
 
 func writeHelpType(w http.ResponseWriter, name, help, metricType string) {

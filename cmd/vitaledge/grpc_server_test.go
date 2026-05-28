@@ -1,0 +1,312 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
+	"github.com/paegun/vitaledge/internal/cypher/executor"
+	"github.com/paegun/vitaledge/internal/graph"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+func TestGRPCAnyToProtoValueJSONNumberInteger(t *testing.T) {
+	converted, err := grpcAnyToProtoValue(json.Number("42"))
+	if err != nil {
+		t.Fatalf("grpcAnyToProtoValue returned error: %v", err)
+	}
+	if _, ok := converted.GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected int_value kind, got %T", converted.GetKind())
+	}
+	if got := converted.GetIntValue(); got != 42 {
+		t.Fatalf("expected int_value=42, got %d", got)
+	}
+}
+
+func TestGRPCAnyToProtoValueJSONNumberFloat(t *testing.T) {
+	converted, err := grpcAnyToProtoValue(json.Number("3.5"))
+	if err != nil {
+		t.Fatalf("grpcAnyToProtoValue returned error: %v", err)
+	}
+	if _, ok := converted.GetKind().(*v1.Value_DoubleValue); !ok {
+		t.Fatalf("expected double_value kind, got %T", converted.GetKind())
+	}
+	if got := converted.GetDoubleValue(); got != 3.5 {
+		t.Fatalf("expected double_value=3.5, got %v", got)
+	}
+}
+
+func TestGRPCAnyToProtoValueJSONNumberNestedInMapAndList(t *testing.T) {
+	input := map[string]any{
+		"avg":  json.Number("2.75"),
+		"max":  json.Number("9"),
+		"vals": []any{json.Number("1"), json.Number("1.5")},
+	}
+
+	converted, err := grpcAnyToProtoValue(input)
+	if err != nil {
+		t.Fatalf("grpcAnyToProtoValue returned error: %v", err)
+	}
+
+	mapKind, ok := converted.GetKind().(*v1.Value_MapValue)
+	if !ok || mapKind.MapValue == nil {
+		t.Fatalf("expected map_value kind, got %T", converted.GetKind())
+	}
+
+	avg := mapKind.MapValue.Values["avg"]
+	if _, ok := avg.GetKind().(*v1.Value_DoubleValue); !ok {
+		t.Fatalf("expected avg as double_value kind, got %T", avg.GetKind())
+	}
+	if got := avg.GetDoubleValue(); got != 2.75 {
+		t.Fatalf("expected avg=2.75, got %v", got)
+	}
+
+	mx := mapKind.MapValue.Values["max"]
+	if _, ok := mx.GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected max as int_value kind, got %T", mx.GetKind())
+	}
+	if got := mx.GetIntValue(); got != 9 {
+		t.Fatalf("expected max=9, got %d", got)
+	}
+
+	vals := mapKind.MapValue.Values["vals"]
+	listKind, ok := vals.GetKind().(*v1.Value_ListValue)
+	if !ok || listKind.ListValue == nil {
+		t.Fatalf("expected vals as list_value kind, got %T", vals.GetKind())
+	}
+	if len(listKind.ListValue.Values) != 2 {
+		t.Fatalf("expected 2 list values, got %d", len(listKind.ListValue.Values))
+	}
+	if _, ok := listKind.ListValue.Values[0].GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected first list value as int_value kind, got %T", listKind.ListValue.Values[0].GetKind())
+	}
+	if got := listKind.ListValue.Values[0].GetIntValue(); got != 1 {
+		t.Fatalf("expected first list value=1, got %d", got)
+	}
+	if _, ok := listKind.ListValue.Values[1].GetKind().(*v1.Value_DoubleValue); !ok {
+		t.Fatalf("expected second list value as double_value kind, got %T", listKind.ListValue.Values[1].GetKind())
+	}
+	if got := listKind.ListValue.Values[1].GetDoubleValue(); got != 1.5 {
+		t.Fatalf("expected second list value=1.5, got %v", got)
+	}
+}
+
+func TestGRPCAnyToProtoValueJSONNumberInvalid(t *testing.T) {
+	_, err := grpcAnyToProtoValue(json.Number("not-a-number"))
+	if err == nil {
+		t.Fatalf("expected error for invalid json.Number")
+	}
+}
+
+func TestGRPCExecuteIntegrationSerializesNumericAggregatesAndProperties(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(context.Background(), func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "n1", Labels: []string{"Metric"}, Properties: graph.PropertyMap{"value": []byte("1.5")}},
+			{Tenant: "acme", ID: "n2", Labels: []string{"Metric"}, Properties: graph.PropertyMap{"value": []byte("2.5")}},
+			{Tenant: "acme", ID: "n3", Labels: []string{"Metric"}, Properties: graph.PropertyMap{"value": []byte("4")}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(context.Background(), vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed metrics vertices failed: %v", err)
+	}
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+
+	aggResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Metric) RETURN count(n) AS c, avg(n.value) AS a, max(n.value) AS mx, min(n.value) AS mn"}},
+	})
+	if err != nil {
+		t.Fatalf("aggregate Execute failed: %v", err)
+	}
+	if len(aggResp.GetRows()) != 1 {
+		t.Fatalf("expected one aggregate row, got %d", len(aggResp.GetRows()))
+	}
+
+	aggRow := aggResp.GetRows()[0].GetValues()
+	if _, ok := aggRow["c"].GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected c as int_value kind, got %T", aggRow["c"].GetKind())
+	}
+	if got := aggRow["c"].GetIntValue(); got != 3 {
+		t.Fatalf("expected c=3, got %d", got)
+	}
+	if _, ok := aggRow["a"].GetKind().(*v1.Value_DoubleValue); !ok {
+		t.Fatalf("expected a as double_value kind, got %T", aggRow["a"].GetKind())
+	}
+	if got := aggRow["a"].GetDoubleValue(); got != 8.0/3.0 {
+		t.Fatalf("expected a=%v, got %v", 8.0/3.0, got)
+	}
+	if _, ok := aggRow["mx"].GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected mx as int_value kind, got %T", aggRow["mx"].GetKind())
+	}
+	if got := aggRow["mx"].GetIntValue(); got != 4 {
+		t.Fatalf("expected mx=4, got %d", got)
+	}
+	if _, ok := aggRow["mn"].GetKind().(*v1.Value_DoubleValue); !ok {
+		t.Fatalf("expected mn as double_value kind, got %T", aggRow["mn"].GetKind())
+	}
+	if got := aggRow["mn"].GetDoubleValue(); got != 1.5 {
+		t.Fatalf("expected mn=1.5, got %v", got)
+	}
+
+	propResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Metric) RETURN n.value AS v ORDER BY n.id"}},
+	})
+	if err != nil {
+		t.Fatalf("property Execute failed: %v", err)
+	}
+	if len(propResp.GetRows()) != 3 {
+		t.Fatalf("expected three property rows, got %d", len(propResp.GetRows()))
+	}
+
+	for i, row := range propResp.GetRows() {
+		value := row.GetValues()["v"]
+		switch i {
+		case 0, 1:
+			if _, ok := value.GetKind().(*v1.Value_DoubleValue); !ok {
+				t.Fatalf("expected row %d value as double_value kind, got %T", i, value.GetKind())
+			}
+			expected := []float64{1.5, 2.5}
+			if got := value.GetDoubleValue(); got != expected[i] {
+				t.Fatalf("expected row %d value=%v, got %v", i, expected[i], got)
+			}
+		case 2:
+			if _, ok := value.GetKind().(*v1.Value_IntValue); !ok {
+				t.Fatalf("expected row %d value as int_value kind, got %T", i, value.GetKind())
+			}
+			if got := value.GetIntValue(); got != 4 {
+				t.Fatalf("expected row %d value=4, got %d", i, got)
+			}
+		default:
+			t.Fatalf("unexpected row index %d", i)
+		}
+	}
+}
+
+func TestGRPCExecuteIntegrationSerializesIntegerOnlyAggregatesAndProperties(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(context.Background(), func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "i1", Labels: []string{"IntMetric"}, Properties: graph.PropertyMap{"value": []byte("1")}},
+			{Tenant: "acme", ID: "i2", Labels: []string{"IntMetric"}, Properties: graph.PropertyMap{"value": []byte("2")}},
+			{Tenant: "acme", ID: "i3", Labels: []string{"IntMetric"}, Properties: graph.PropertyMap{"value": []byte("4")}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(context.Background(), vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed integer metrics vertices failed: %v", err)
+	}
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+
+	aggResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:IntMetric) RETURN count(n) AS c, avg(n.value) AS a, max(n.value) AS mx, min(n.value) AS mn"}},
+	})
+	if err != nil {
+		t.Fatalf("aggregate Execute failed: %v", err)
+	}
+	if len(aggResp.GetRows()) != 1 {
+		t.Fatalf("expected one aggregate row, got %d", len(aggResp.GetRows()))
+	}
+
+	aggRow := aggResp.GetRows()[0].GetValues()
+	if _, ok := aggRow["c"].GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected c as int_value kind, got %T", aggRow["c"].GetKind())
+	}
+	if got := aggRow["c"].GetIntValue(); got != 3 {
+		t.Fatalf("expected c=3, got %d", got)
+	}
+	if _, ok := aggRow["a"].GetKind().(*v1.Value_DoubleValue); !ok {
+		t.Fatalf("expected a as double_value kind, got %T", aggRow["a"].GetKind())
+	}
+	if got := aggRow["a"].GetDoubleValue(); got != 7.0/3.0 {
+		t.Fatalf("expected a=%v, got %v", 7.0/3.0, got)
+	}
+	if _, ok := aggRow["mx"].GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected mx as int_value kind, got %T", aggRow["mx"].GetKind())
+	}
+	if got := aggRow["mx"].GetIntValue(); got != 4 {
+		t.Fatalf("expected mx=4, got %d", got)
+	}
+	if _, ok := aggRow["mn"].GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected mn as int_value kind, got %T", aggRow["mn"].GetKind())
+	}
+	if got := aggRow["mn"].GetIntValue(); got != 1 {
+		t.Fatalf("expected mn=1, got %d", got)
+	}
+
+	propResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:IntMetric) RETURN n.value AS v ORDER BY n.id"}},
+	})
+	if err != nil {
+		t.Fatalf("property Execute failed: %v", err)
+	}
+	if len(propResp.GetRows()) != 3 {
+		t.Fatalf("expected three property rows, got %d", len(propResp.GetRows()))
+	}
+
+	expected := []int64{1, 2, 4}
+	for i, row := range propResp.GetRows() {
+		value := row.GetValues()["v"]
+		if _, ok := value.GetKind().(*v1.Value_IntValue); !ok {
+			t.Fatalf("expected row %d value as int_value kind, got %T", i, value.GetKind())
+		}
+		if got := value.GetIntValue(); got != expected[i] {
+			t.Fatalf("expected row %d value=%d, got %d", i, expected[i], got)
+		}
+	}
+}

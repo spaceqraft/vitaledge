@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 
@@ -46,7 +47,12 @@ func (h *grpcQueryHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*
 		return nil, err
 	}
 
-	result, err := h.executeStatement(ctx, tenant, query)
+	params, err := grpcProtoParamsToExecutorParams(req.GetParameters())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid parameter value: %v", err)
+	}
+
+	result, err := h.executeStatement(ctx, tenant, query, params)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +90,12 @@ func (h *grpcQueryHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*
 		query = "EXPLAIN " + strings.TrimSpace(query)
 	}
 
-	result, err := h.executeStatement(ctx, tenant, query)
+	params, err := grpcProtoParamsToExecutorParams(req.GetParameters())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid parameter value: %v", err)
+	}
+
+	result, err := h.executeStatement(ctx, tenant, query, params)
 	if err != nil {
 		return nil, err
 	}
@@ -118,11 +129,11 @@ func (h *grpcQueryHandler) GetCapabilities(_ context.Context, _ *v1.Capabilities
 		ParserVersions:         []string{grpcSupportedParserVersion},
 		IrVersions:             []string{grpcSupportedIRVersion},
 		PreparedQuerySupported: true,
-		ParameterBinding:       "client_side_only",
+		ParameterBinding:       "server_side",
 	}, nil
 }
 
-func (h *grpcQueryHandler) executeStatement(ctx context.Context, tenant, query string) (*executor.Result, error) {
+func (h *grpcQueryHandler) executeStatement(ctx context.Context, tenant, query string, params executor.Params) (*executor.Result, error) {
 	if h == nil || h.executor == nil {
 		return nil, status.Error(codes.FailedPrecondition, "executor is not configured")
 	}
@@ -132,7 +143,12 @@ func (h *grpcQueryHandler) executeStatement(ctx context.Context, tenant, query s
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	result, err := h.executor.ExecuteStatement(ctx, stmt, executor.Params{"tenant": tenant})
+	if params == nil {
+		params = executor.Params{}
+	}
+	params["tenant"] = tenant
+
+	result, err := h.executor.ExecuteStatement(ctx, stmt, params)
 	if err != nil {
 		return nil, status.Error(codes.Unknown, err.Error())
 	}
@@ -220,6 +236,14 @@ func grpcAnyToProtoValue(raw any) (*v1.Value, error) {
 		return &v1.Value{Kind: &v1.Value_DoubleValue{DoubleValue: float64(typed)}}, nil
 	case float64:
 		return &v1.Value{Kind: &v1.Value_DoubleValue{DoubleValue: typed}}, nil
+	case json.Number:
+		if integer, err := typed.Int64(); err == nil {
+			return &v1.Value{Kind: &v1.Value_IntValue{IntValue: integer}}, nil
+		}
+		if decimal, err := typed.Float64(); err == nil {
+			return &v1.Value{Kind: &v1.Value_DoubleValue{DoubleValue: decimal}}, nil
+		}
+		return nil, fmt.Errorf("invalid json number: %q", typed.String())
 	case string:
 		return &v1.Value{Kind: &v1.Value_StringValue{StringValue: typed}}, nil
 	case []byte:
@@ -256,6 +280,69 @@ func grpcAnyToProtoValue(raw any) (*v1.Value, error) {
 		return grpcAnyToProtoValue(grpcNormalizeToGenericMap(typed))
 	default:
 		return grpcAnyToProtoValue(grpcNormalizeToGenericMap(typed))
+	}
+}
+
+func grpcProtoParamsToExecutorParams(protoParams map[string]*v1.Value) (executor.Params, error) {
+	if len(protoParams) == 0 {
+		return executor.Params{}, nil
+	}
+	params := make(executor.Params, len(protoParams))
+	for k, v := range protoParams {
+		converted, err := grpcProtoValueToAny(v)
+		if err != nil {
+			return nil, fmt.Errorf("parameter %q: %w", k, err)
+		}
+		params[k] = converted
+	}
+	return params, nil
+}
+
+func grpcProtoValueToAny(v *v1.Value) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch typed := v.GetKind().(type) {
+	case *v1.Value_NullValue:
+		return nil, nil
+	case *v1.Value_BoolValue:
+		return typed.BoolValue, nil
+	case *v1.Value_IntValue:
+		return typed.IntValue, nil
+	case *v1.Value_DoubleValue:
+		return typed.DoubleValue, nil
+	case *v1.Value_StringValue:
+		return typed.StringValue, nil
+	case *v1.Value_BytesValue:
+		return typed.BytesValue, nil
+	case *v1.Value_ListValue:
+		if typed.ListValue == nil {
+			return []any{}, nil
+		}
+		list := make([]any, 0, len(typed.ListValue.GetValues()))
+		for _, item := range typed.ListValue.GetValues() {
+			converted, err := grpcProtoValueToAny(item)
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, converted)
+		}
+		return list, nil
+	case *v1.Value_MapValue:
+		if typed.MapValue == nil {
+			return map[string]any{}, nil
+		}
+		m := make(map[string]any, len(typed.MapValue.GetValues()))
+		for k, item := range typed.MapValue.GetValues() {
+			converted, err := grpcProtoValueToAny(item)
+			if err != nil {
+				return nil, err
+			}
+			m[k] = converted
+		}
+		return m, nil
+	default:
+		return nil, fmt.Errorf("unsupported value kind: %T", typed)
 	}
 }
 

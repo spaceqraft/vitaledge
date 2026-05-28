@@ -85,6 +85,92 @@
         }
       ],
       "gridPos": {"h": 9, "w": 24, "x": 0, "y": 16}
+    },
+    {
+      "id": 6,
+      "title": "Host CPU Usage (%)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "100 * (1 - (rate(vitaledge_host_cpu_seconds_total{mode=\"idle\"}[5m]) / clamp_min(sum(rate(vitaledge_host_cpu_seconds_total[5m])), 1e-9)))",
+          "legendFormat": "cpu"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 25}
+    },
+    {
+      "id": 7,
+      "title": "Host Memory Usage (%)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "100 * (1 - (vitaledge_host_memory_available_bytes / clamp_min(vitaledge_host_memory_total_bytes, 1)))",
+          "legendFormat": "memory"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 25}
+    },
+    {
+      "id": 8,
+      "title": "Host Network Throughput (bytes/s)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "rate(vitaledge_host_network_receive_bytes_total[1m])",
+          "legendFormat": "rx"
+        },
+        {
+          "expr": "rate(vitaledge_host_network_transmit_bytes_total[1m])",
+          "legendFormat": "tx"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 33}
+    },
+    {
+      "id": 9,
+      "title": "Go Goroutines",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "vitaledge_go_goroutines",
+          "legendFormat": "goroutines"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 33}
+    },
+    {
+      "id": 10,
+      "title": "Go GC Pause (ms/s)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "1000 * rate(vitaledge_go_gc_pause_seconds_total[5m])",
+          "legendFormat": "gc pause"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 41}
+    },
+    {
+      "id": 11,
+      "title": "Go Heap Allocated (bytes)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "vitaledge_go_memory_heap_alloc_bytes",
+          "legendFormat": "heap alloc"
+        },
+        {
+          "expr": "vitaledge_go_next_gc_heap_target_bytes",
+          "legendFormat": "next gc target"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 41}
     }
   ]
 }

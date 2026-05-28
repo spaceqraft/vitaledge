@@ -27,6 +27,7 @@ type QueryRequest struct {
 	Input         *QueryInput            `protobuf:"bytes,2,opt,name=input,proto3" json:"input,omitempty"`
 	Options       *RequestOptions        `protobuf:"bytes,3,opt,name=options,proto3" json:"options,omitempty"`
 	Client        *ClientContext         `protobuf:"bytes,4,opt,name=client,proto3" json:"client,omitempty"`
+	Parameters    map[string]*Value      `protobuf:"bytes,5,rep,name=parameters,proto3" json:"parameters,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -85,6 +86,13 @@ func (x *QueryRequest) GetOptions() *RequestOptions {
 func (x *QueryRequest) GetClient() *ClientContext {
 	if x != nil {
 		return x.Client
+	}
+	return nil
+}
+
+func (x *QueryRequest) GetParameters() map[string]*Value {
+	if x != nil {
+		return x.Parameters
 	}
 	return nil
 }
@@ -1069,12 +1077,18 @@ var File_api_proto_vitaledge_v1_query_proto protoreflect.FileDescriptor
 
 const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"\n" +
-	"\"api/proto/vitaledge/v1/query.proto\x12\fvitaledge.v1\"\xc3\x01\n" +
+	"\"api/proto/vitaledge/v1/query.proto\x12\fvitaledge.v1\"\xe3\x02\n" +
 	"\fQueryRequest\x12\x16\n" +
 	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x12.\n" +
 	"\x05input\x18\x02 \x01(\v2\x18.vitaledge.v1.QueryInputR\x05input\x126\n" +
 	"\aoptions\x18\x03 \x01(\v2\x1c.vitaledge.v1.RequestOptionsR\aoptions\x123\n" +
-	"\x06client\x18\x04 \x01(\v2\x1b.vitaledge.v1.ClientContextR\x06client\"i\n" +
+	"\x06client\x18\x04 \x01(\v2\x1b.vitaledge.v1.ClientContextR\x06client\x12J\n" +
+	"\n" +
+	"parameters\x18\x05 \x03(\v2*.vitaledge.v1.QueryRequest.ParametersEntryR\n" +
+	"parameters\x1aR\n" +
+	"\x0fParametersEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12)\n" +
+	"\x05value\x18\x02 \x01(\v2\x13.vitaledge.v1.ValueR\x05value:\x028\x01\"i\n" +
 	"\n" +
 	"QueryInput\x12\x18\n" +
 	"\x06cypher\x18\x01 \x01(\tH\x00R\x06cypher\x129\n" +
@@ -1167,7 +1181,7 @@ func file_api_proto_vitaledge_v1_query_proto_rawDescGZIP() []byte {
 	return file_api_proto_vitaledge_v1_query_proto_rawDescData
 }
 
-var file_api_proto_vitaledge_v1_query_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_api_proto_vitaledge_v1_query_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_api_proto_vitaledge_v1_query_proto_goTypes = []any{
 	(*QueryRequest)(nil),         // 0: vitaledge.v1.QueryRequest
 	(*QueryInput)(nil),           // 1: vitaledge.v1.QueryInput
@@ -1185,38 +1199,41 @@ var file_api_proto_vitaledge_v1_query_proto_goTypes = []any{
 	(*ListValue)(nil),            // 13: vitaledge.v1.ListValue
 	(*MapValue)(nil),             // 14: vitaledge.v1.MapValue
 	(*NullValue)(nil),            // 15: vitaledge.v1.NullValue
-	nil,                          // 16: vitaledge.v1.Row.ValuesEntry
-	nil,                          // 17: vitaledge.v1.MapValue.ValuesEntry
+	nil,                          // 16: vitaledge.v1.QueryRequest.ParametersEntry
+	nil,                          // 17: vitaledge.v1.Row.ValuesEntry
+	nil,                          // 18: vitaledge.v1.MapValue.ValuesEntry
 }
 var file_api_proto_vitaledge_v1_query_proto_depIdxs = []int32{
 	1,  // 0: vitaledge.v1.QueryRequest.input:type_name -> vitaledge.v1.QueryInput
 	3,  // 1: vitaledge.v1.QueryRequest.options:type_name -> vitaledge.v1.RequestOptions
 	4,  // 2: vitaledge.v1.QueryRequest.client:type_name -> vitaledge.v1.ClientContext
-	2,  // 3: vitaledge.v1.QueryInput.prepared:type_name -> vitaledge.v1.PreparedQuery
-	11, // 4: vitaledge.v1.QueryResponse.rows:type_name -> vitaledge.v1.Row
-	7,  // 5: vitaledge.v1.QueryResponse.stats:type_name -> vitaledge.v1.QueryStats
-	8,  // 6: vitaledge.v1.QueryResponse.warnings:type_name -> vitaledge.v1.Diagnostic
-	7,  // 7: vitaledge.v1.ExplainResponse.stats:type_name -> vitaledge.v1.QueryStats
-	8,  // 8: vitaledge.v1.ExplainResponse.warnings:type_name -> vitaledge.v1.Diagnostic
-	16, // 9: vitaledge.v1.Row.values:type_name -> vitaledge.v1.Row.ValuesEntry
-	13, // 10: vitaledge.v1.Value.list_value:type_name -> vitaledge.v1.ListValue
-	14, // 11: vitaledge.v1.Value.map_value:type_name -> vitaledge.v1.MapValue
-	15, // 12: vitaledge.v1.Value.null_value:type_name -> vitaledge.v1.NullValue
-	12, // 13: vitaledge.v1.ListValue.values:type_name -> vitaledge.v1.Value
-	17, // 14: vitaledge.v1.MapValue.values:type_name -> vitaledge.v1.MapValue.ValuesEntry
-	12, // 15: vitaledge.v1.Row.ValuesEntry.value:type_name -> vitaledge.v1.Value
-	12, // 16: vitaledge.v1.MapValue.ValuesEntry.value:type_name -> vitaledge.v1.Value
-	0,  // 17: vitaledge.v1.QueryService.Execute:input_type -> vitaledge.v1.QueryRequest
-	0,  // 18: vitaledge.v1.QueryService.Explain:input_type -> vitaledge.v1.QueryRequest
-	9,  // 19: vitaledge.v1.QueryService.GetCapabilities:input_type -> vitaledge.v1.CapabilitiesRequest
-	5,  // 20: vitaledge.v1.QueryService.Execute:output_type -> vitaledge.v1.QueryResponse
-	6,  // 21: vitaledge.v1.QueryService.Explain:output_type -> vitaledge.v1.ExplainResponse
-	10, // 22: vitaledge.v1.QueryService.GetCapabilities:output_type -> vitaledge.v1.CapabilitiesResponse
-	20, // [20:23] is the sub-list for method output_type
-	17, // [17:20] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	16, // 3: vitaledge.v1.QueryRequest.parameters:type_name -> vitaledge.v1.QueryRequest.ParametersEntry
+	2,  // 4: vitaledge.v1.QueryInput.prepared:type_name -> vitaledge.v1.PreparedQuery
+	11, // 5: vitaledge.v1.QueryResponse.rows:type_name -> vitaledge.v1.Row
+	7,  // 6: vitaledge.v1.QueryResponse.stats:type_name -> vitaledge.v1.QueryStats
+	8,  // 7: vitaledge.v1.QueryResponse.warnings:type_name -> vitaledge.v1.Diagnostic
+	7,  // 8: vitaledge.v1.ExplainResponse.stats:type_name -> vitaledge.v1.QueryStats
+	8,  // 9: vitaledge.v1.ExplainResponse.warnings:type_name -> vitaledge.v1.Diagnostic
+	17, // 10: vitaledge.v1.Row.values:type_name -> vitaledge.v1.Row.ValuesEntry
+	13, // 11: vitaledge.v1.Value.list_value:type_name -> vitaledge.v1.ListValue
+	14, // 12: vitaledge.v1.Value.map_value:type_name -> vitaledge.v1.MapValue
+	15, // 13: vitaledge.v1.Value.null_value:type_name -> vitaledge.v1.NullValue
+	12, // 14: vitaledge.v1.ListValue.values:type_name -> vitaledge.v1.Value
+	18, // 15: vitaledge.v1.MapValue.values:type_name -> vitaledge.v1.MapValue.ValuesEntry
+	12, // 16: vitaledge.v1.QueryRequest.ParametersEntry.value:type_name -> vitaledge.v1.Value
+	12, // 17: vitaledge.v1.Row.ValuesEntry.value:type_name -> vitaledge.v1.Value
+	12, // 18: vitaledge.v1.MapValue.ValuesEntry.value:type_name -> vitaledge.v1.Value
+	0,  // 19: vitaledge.v1.QueryService.Execute:input_type -> vitaledge.v1.QueryRequest
+	0,  // 20: vitaledge.v1.QueryService.Explain:input_type -> vitaledge.v1.QueryRequest
+	9,  // 21: vitaledge.v1.QueryService.GetCapabilities:input_type -> vitaledge.v1.CapabilitiesRequest
+	5,  // 22: vitaledge.v1.QueryService.Execute:output_type -> vitaledge.v1.QueryResponse
+	6,  // 23: vitaledge.v1.QueryService.Explain:output_type -> vitaledge.v1.ExplainResponse
+	10, // 24: vitaledge.v1.QueryService.GetCapabilities:output_type -> vitaledge.v1.CapabilitiesResponse
+	22, // [22:25] is the sub-list for method output_type
+	19, // [19:22] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_vitaledge_v1_query_proto_init() }
@@ -1244,7 +1261,7 @@ func file_api_proto_vitaledge_v1_query_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_vitaledge_v1_query_proto_rawDesc), len(file_api_proto_vitaledge_v1_query_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   18,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

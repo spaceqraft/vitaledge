@@ -62,8 +62,9 @@ func parseSegment(seg statementSegment, fullQuery string) (ast.Statement, error)
 		return &ast.ExplainStatement{Raw: strings.TrimSpace(seg.text), Query: strings.TrimSpace(inner), Statement: innerStmt, SourceSpan: innerStmt.Span()}, nil
 	}
 
-	rewrite := rewriteExistsBlocks(seg.text)
-	input := antlr.NewInputStream(rewrite.text)
+	existsRewrite := rewriteExistsBlocks(seg.text)
+	reduceRewrite := rewriteReduceCalls(existsRewrite.text)
+	input := antlr.NewInputStream(reduceRewrite.text)
 	lexer := cyphergen.NewCypherLexer(input)
 	stream := antlr.NewCommonTokenStream(lexer, antlr.TokenDefaultChannel)
 	p := cyphergen.NewCypherParser(stream)
@@ -86,13 +87,14 @@ func parseSegment(seg statementSegment, fullQuery string) (ast.Statement, error)
 	if err != nil {
 		return nil, err
 	}
-	restoreExistsBlocks(stmt, rewrite.placeholders)
+	restoreExistsBlocks(stmt, existsRewrite.placeholders)
 	if err := validatePatternVariableScoping(stmt, seg); err != nil {
 		return nil, err
 	}
 	if err := validateUnexpectedSyntax(stmt, seg); err != nil {
 		return nil, err
 	}
+	restoreExistsBlocks(stmt, reduceRewrite.placeholders)
 	return stmt, nil
 }
 
@@ -143,6 +145,14 @@ func rewriteExistsBlocks(raw string) existsRewrite {
 		for j < len(raw) && unicode.IsSpace(rune(raw[j])) {
 			j++
 		}
+		if j < len(raw) && raw[j] == '(' {
+			placeholder := fmt.Sprintf("__ve_exists_fn_%d", n)
+			n++
+			placeholders[placeholder] = raw[i : i+len("EXISTS")]
+			out.WriteString(placeholder)
+			i += len("EXISTS")
+			continue
+		}
 		if j >= len(raw) || raw[j] != '{' {
 			out.WriteByte(raw[i])
 			i++
@@ -156,6 +166,45 @@ func rewriteExistsBlocks(raw string) existsRewrite {
 		}
 
 		placeholder := fmt.Sprintf("__ve_exists_%d", n)
+		n++
+		placeholders[placeholder] = raw[i : end+1]
+		out.WriteString(placeholder)
+		i = end + 1
+	}
+
+	return existsRewrite{text: out.String(), placeholders: placeholders}
+}
+
+func rewriteReduceCalls(raw string) existsRewrite {
+	placeholders := map[string]string{}
+	if raw == "" {
+		return existsRewrite{text: raw, placeholders: placeholders}
+	}
+
+	var out strings.Builder
+	n := 0
+	for i := 0; i < len(raw); {
+		if !hasWordAt(raw, i, "REDUCE") {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+		j := i + len("REDUCE")
+		for j < len(raw) && unicode.IsSpace(rune(raw[j])) {
+			j++
+		}
+		if j >= len(raw) || raw[j] != '(' {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+		end := findMatchingParen(raw, j)
+		if end < 0 {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+		placeholder := fmt.Sprintf("__ve_reduce_%d", n)
 		n++
 		placeholders[placeholder] = raw[i : end+1]
 		out.WriteString(placeholder)

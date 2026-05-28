@@ -849,6 +849,76 @@ func TestParseStatementAllowsRemainingFunctionSurfaceInReturnProjection(t *testi
 	}
 }
 
+func TestParseStatementAllowsAdditionalBuiltInFunctionSurfaceInReturnProjection(t *testing.T) {
+	_, err := ParseStatement("RETURN lower('A'), upper('a'), ceiling(1.2), left('abc',1), right('abc',1), replace('a','a','b'), trim(' x '), ltrim(' x '), rtrim(' x '), char_length('x'), character_length('x'), path_length(1), isEmpty([]), nullIf(1,2), toStringOrNull(1), toIntegerOrNull('x'), toFloatOrNull('x'), toBooleanOrNull('x')")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsMathematicalBuiltInFunctionSurface(t *testing.T) {
+	_, err := ParseStatement("RETURN floor(1.2), round(1.2, 1), exp(1), log(1), ln(1), log10(10), e(), pi(), sin(1), cos(1), tan(1), asin(1), acos(1), atan(1), atan2(1, 1), degrees(1), radians(1), cot(1), haversin(1), isNaN(0/0)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsPredicateScalarBuiltInFunctionSurface(t *testing.T) {
+	_, err := ParseStatement("RETURN exists(1), elementId({id:'1'}), id({id:'1'}), valueType(1), randomUUID(), timestamp()")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsExpandedBuiltInFunctionSurface(t *testing.T) {
+	_, err := ParseStatement("RETURN reduce(total = 0, n IN [1,2,3] | total + n), toBooleanList(['true','x']), toIntegerList(['1','x']), toFloatList(['1.5','x']), toStringList([1,true,{a:1}]), btrim('__x__', '_'), normalize('e\u0301', 'NFC'), zoned_datetime('2024-01-01T00:00:00Z'), local_datetime('2024-01-01T00:00:00'), local_time('12:34:56'), zoned_time('12:34:56Z'), duration_between(datetime('2024-01-01T00:00:00Z'), datetime('2024-01-02T00:00:00Z'))")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsSpatialPointFunctionSurface(t *testing.T) {
+	_, err := ParseStatement("RETURN point({x: 1, y: 2}), point({longitude: 12.3, latitude: 45.6})")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsSpatialDistanceFunctionSurface(t *testing.T) {
+	_, err := ParseStatement("RETURN distance(point({x: 0, y: 0}), point({x: 3, y: 4}))")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsSpatialNamespaceFunctionSurface(t *testing.T) {
+	_, err := ParseStatement("RETURN point.distance(point({x: 0, y: 0}), point({x: 3, y: 4})), point.withinBBox(point({x: 5, y: 5}), point({x: 0, y: 0}), point({x: 10, y: 10}))")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsVectorFunctionSurface(t *testing.T) {
+	_, err := ParseStatement("RETURN vector([1.0, 2.0], 2, FLOAT32), vector.similarity.cosine([1.0,0.0], [0.0,1.0]), vector.similarity.euclidean([1.0,0.0], [1.0,0.0]), vector_dimension_count(vector([1.0,2.0], 2, FLOAT32)), vector_distance([1.0,2.0], [2.0,4.0], EUCLIDEAN), vector_norm([1.0,2.0], MANHATTAN)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementAllowsAggregateAliasBuiltIns(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) RETURN stDev(n.score), stDevP(n.score), stdev_samp(n.score), stdev_pop(n.score), collect_list(n.score), percentile_cont(n.score, 0.5), percentile_disc(n.score, 0.5)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementPreservesExistsSubqueryGrammar(t *testing.T) {
+	_, err := ParseStatement("MATCH (n) WHERE EXISTS { (n)-->() } RETURN n")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementAllowsPercentileAggregateFunctions(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) RETURN percentileDisc(n.price, 0.5), percentileCont(n.price, 0.5)")
 	if err != nil {

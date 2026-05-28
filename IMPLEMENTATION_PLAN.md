@@ -90,6 +90,7 @@ Current implementation status:
 - Implemented: lightweight TCP integration tests for request parsing/execution/JSON response path.
 - Implemented: expanded Cypher compatibility for relationship patterns (directed, reverse-directed, undirected, type alternation, relationship properties), two-hop chain matching, and chained MATCH clause execution with shared bindings.
 - Implemented: projection and aggregation enhancements for `count(...)`, `collect(...)`, `labels(...)`, and `type(...)`, including WITH alias propagation and ORDER BY/LIMIT handling in projection flow.
+- Implemented: broad built-in function coverage across string, math, list, predicate/scalar, temporal, spatial, and vector families.
 - Implemented: EXISTS subquery support in WHERE for supported MATCH subquery bodies.
 
 Phase 1 deliverable status:
@@ -106,9 +107,13 @@ Remaining Phase 1 gaps before close:
 
 MVP-critical items not yet complete:
 
-- CLI polish for first-class variable management, table rendering ergonomics, and explicit output statistics UX.
-- Cross-engine benchmark parity runs and published comparison methodology/results for VitalEdge vs Neo4j vs TigerGraph.
-- Prometheus scrape endpoint and baseline Grafana dashboard set wired as supported operational path.
+- External workstream: phased SDK client repositories (Python, Go, Java, C#) on the gRPC/protobuf contract.
+- External workstream: comparative benchmark repositories plus published blog post (methodology + VitalEdge/Neo4j/TigerGraph results).
+
+MVP-critical items completed in this repository:
+
+- CLI polish for first-class variable management, table rendering ergonomics, graph/path rendering, and explicit output statistics UX.
+- Prometheus scrape endpoint and baseline Grafana dashboard set wired as supported operational path, including host hardware and Go runtime/GC metrics.
 - Manual index tuning loop completed end-to-end: EXPLAIN output, planner/runtime statistics, and query cost estimation surfaced for operator decisions.
 
 Milestones:
@@ -586,15 +591,20 @@ Sprint deliverables:
    - tabular rendering behaves predictably for wide/null-heavy results,
    - statement output includes clear execution statistics,
    - CLI sends requests only after local parse-completeness checks.
-   - status: complete (gRPC CLI implements variable commands, client-side binding, table truncation/null handling, stats output, and local completeness gating before RPC).
+   - load-generation support exists for soak execution with deterministic modes (`write`, `noop-write`, `read`) and tunable operation/seed/hop/limit/report parameters.
+   - status: complete (gRPC CLI implements variable commands, client-side binding, adaptive table width capping, graph/path rendering, stats output, completeness gating before RPC, and deterministic soak-load generation modes).
 5. SDK phase-1 delivery:
    - Python and Go clients support raw Cypher and prepared-query request paths,
    - client-side parse-completeness validation for interactive/scripted usage,
    - compatibility fallback from prepared-query to raw Cypher when required by server capability.
+   - delivery model: external repositories (not in this repo).
+   - status: pending external delivery.
 6. Comparative benchmark publication:
    - workload parity methodology documented,
    - reproducible benchmark invocation scripts captured,
    - result summary published in repo docs.
+   - delivery model: external benchmark repositories plus external blog post publication.
+   - status: pending external publication.
 
 Suggested implementation order for this sprint:
 

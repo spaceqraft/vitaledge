@@ -61,6 +61,11 @@ func TestWritePrometheusMetricsFromCollector(t *testing.T) {
 
 	body := recorder.Body.String()
 	expectedSubstrings := []string{
+		"# HELP vitaledge_go_goroutines",
+		"# HELP vitaledge_go_gc_cycles_total",
+		"# HELP vitaledge_host_cpu_seconds_total",
+		"# HELP vitaledge_host_memory_total_bytes",
+		"# HELP vitaledge_host_network_receive_bytes_total",
 		"# HELP vitaledge_executor_statements_total",
 		"vitaledge_executor_statements_total{kind=\"QUERY\",outcome=\"ok\"} 1",
 		"vitaledge_executor_statement_duration_seconds_total{kind=\"QUERY\",outcome=\"ok\"}",
@@ -116,7 +121,7 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	if capResp.GetProtocolVersion() != "v1" {
 		t.Fatalf("unexpected protocolVersion: %#v", capResp.GetProtocolVersion())
 	}
-	if capResp.GetParameterBinding() != "client_side_only" {
+	if capResp.GetParameterBinding() != "server_side" {
 		t.Fatalf("unexpected parameterBinding: %#v", capResp.GetParameterBinding())
 	}
 	if !capResp.GetPreparedQuerySupported() {

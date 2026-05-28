@@ -10,6 +10,8 @@ Cypher support is documented in [CYPHER.md](CYPHER.md), including:
 - high-level feature table
 - current guarantees and limitations
 
+That status document also summarizes the implemented built-in function surface, including string, math, list, predicate/scalar, temporal, spatial, and vector families.
+
 Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 
 ## Architecture Decisions
@@ -38,6 +40,7 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Smoke benchmark: `make bench-smoke`
 - Graph store benchmark baseline: `make bench-graph-store`
 - Milestone benchmark baseline (local JSONL snapshot): `make bench-milestone`
+- Mixed CLI soak profile (concurrent write/noop-write/read): `make soak-mixed`
 
 `vitaledge-bench` supports repeatability-oriented flags:
 
@@ -167,7 +170,9 @@ Dashboard coverage includes:
 - statement throughput and average statement duration,
 - rows-returned rate,
 - index lookup outcomes,
-- top unindexed index-candidate observations.
+- top unindexed index-candidate observations,
+- host CPU, memory, and network I/O signals,
+- Go runtime and GC behavior (goroutines, heap allocation, GC pause/cycles).
 
 ### Reproducible Manual Tuning Examples
 
@@ -304,6 +309,35 @@ Common CLI flags:
 - `--timeout 5s`
 - `--max-column-width 80`
 - `--execute "<cypher>"` for one-shot mode.
+
+Soak/load modes (deterministic, configurable, and suitable for running multiple CLI processes):
+
+- `--load-mode write`: alternates `CREATE` and `DETACH DELETE` with locally tracked ids (equal create/delete counts).
+- `--load-mode noop-write`: repeatedly `CREATE`s the same node id.
+- `--load-mode read`: repeatedly runs `MATCH p=(a)-[*N]-(b) RETURN p LIMIT <k>` with deterministic hop selection.
+
+Load flags:
+
+- `--load-ops 1000`
+- `--load-seed 1`
+- `--load-prefix soak`
+- `--load-read-min-hop 1`
+- `--load-read-max-hop 3`
+- `--load-read-limit 25`
+- `--load-report-each 100`
+
+Example soak invocations:
+
+```bash
+# Balanced write churn (create/delete pairs).
+./bin/vitaledge-cli --tenant acme --load-mode write --load-ops 20000 --load-prefix writer-a --load-seed 7
+
+# No-op write pressure.
+./bin/vitaledge-cli --tenant acme --load-mode noop-write --load-ops 50000 --load-prefix noop-a --load-seed 7
+
+# Read pressure with variable path hop counts.
+./bin/vitaledge-cli --tenant acme --load-mode read --load-ops 20000 --load-read-min-hop 1 --load-read-max-hop 4 --load-read-limit 50 --load-seed 11
+```
 
 One-shot mode:
 

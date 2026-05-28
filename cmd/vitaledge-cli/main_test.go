@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"math/rand"
 	"strings"
 	"testing"
 
@@ -354,5 +355,52 @@ func TestFormatProtoValuePathMultiHop(t *testing.T) {
 	want := `(:Person {"name":"Charlie Sheen"})-[:ACTED_IN]->(:Movie {"title":"Wall Street"})<-[:DIRECTED]-(:Person {"name":"Oliver Stone"})`
 	if got != want {
 		t.Fatalf("unexpected path rendering:\n got:  %s\n want: %s", got, want)
+	}
+}
+
+func TestNextLoadQueryWriteModeAlternatesCreateDelete(t *testing.T) {
+	cfg := cliConfig{loadPrefix: "soak"}
+	rng := rand.New(rand.NewSource(7))
+	state := &loadGenState{}
+
+	q1, k1 := nextLoadQuery(cfg, "write", 0, rng, state)
+	q2, k2 := nextLoadQuery(cfg, "write", 1, rng, state)
+
+	if k1 != "create" || !strings.Contains(q1, "CREATE (:SoakNode") || !strings.Contains(q1, "soak-write-0") {
+		t.Fatalf("unexpected first write op: kind=%s query=%s", k1, q1)
+	}
+	if k2 != "delete" || !strings.Contains(q2, "MATCH (n:SoakNode") || !strings.Contains(q2, "soak-write-0") {
+		t.Fatalf("unexpected second write op: kind=%s query=%s", k2, q2)
+	}
+}
+
+func TestNextLoadQueryNoopWriteMode(t *testing.T) {
+	cfg := cliConfig{loadPrefix: "soak"}
+	rng := rand.New(rand.NewSource(7))
+
+	query, kind := nextLoadQuery(cfg, "noop-write", 42, rng, &loadGenState{})
+	if kind != "create" {
+		t.Fatalf("expected create kind, got %s", kind)
+	}
+	if !strings.Contains(query, "CREATE (:SoakNoopNode") || !strings.Contains(query, "soak-noop") {
+		t.Fatalf("unexpected noop-write query: %s", query)
+	}
+}
+
+func TestNextLoadQueryReadModeRespectsHopBoundsAndLimit(t *testing.T) {
+	cfg := cliConfig{loadReadMinHop: 2, loadReadMaxHop: 4, loadReadLimit: 10}
+	rng := rand.New(rand.NewSource(1))
+
+	for i := 0; i < 20; i++ {
+		query, kind := nextLoadQuery(cfg, "read", i, rng, &loadGenState{})
+		if kind != "read" {
+			t.Fatalf("expected read kind, got %s", kind)
+		}
+		if !strings.Contains(query, "LIMIT 10") {
+			t.Fatalf("expected read limit in query, got %s", query)
+		}
+		if !strings.Contains(query, "-[*2]-") && !strings.Contains(query, "-[*3]-") && !strings.Contains(query, "-[*4]-") {
+			t.Fatalf("expected hop within [2,4], got %s", query)
+		}
 	}
 }

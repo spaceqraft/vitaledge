@@ -785,6 +785,12 @@ func toInt(v any) (int, error) {
 }
 
 func isInvalidTypeConversionValue(v any) bool {
+	if _, ok := spatialPointValue(v); ok {
+		return false
+	}
+	if _, ok := vectorValue(v); ok {
+		return false
+	}
 	switch v.(type) {
 	case *graph.Vertex, *graph.Edge, cypherPathValue, multiHopCypherPath,
 		deletedVertexBinding, deletedEdgeBinding, Row, map[string]any, []any:
@@ -901,6 +907,12 @@ func normalizeResultValue(value any) any {
 			if rendered, ok := renderTemporalValue(mapped); ok {
 				return rendered
 			}
+			if rendered, ok := renderVectorValue(mapped); ok {
+				return rendered
+			}
+			if rendered, ok := renderSpatialValue(mapped); ok {
+				return rendered
+			}
 		}
 		if parsed, ok := parseStoredListString(typed); ok {
 			return normalizeResultValue(parsed)
@@ -908,6 +920,12 @@ func normalizeResultValue(value any) any {
 		return typed
 	case map[string]any:
 		if rendered, ok := renderTemporalValue(typed); ok {
+			return rendered
+		}
+		if rendered, ok := renderVectorValue(typed); ok {
+			return rendered
+		}
+		if rendered, ok := renderSpatialValue(typed); ok {
 			return rendered
 		}
 		out := make(map[string]any, len(typed))
@@ -1019,6 +1037,22 @@ func renderTemporalValue(value map[string]any) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func renderSpatialValue(value map[string]any) (string, bool) {
+	point, ok := spatialPointValue(value)
+	if !ok {
+		return "", false
+	}
+	return formatSpatialPointToString(point)
+}
+
+func renderVectorValue(value map[string]any) (string, bool) {
+	vector, ok := vectorValue(value)
+	if !ok {
+		return "", false
+	}
+	return formatVectorToString(vector)
 }
 
 func parseStoredListString(raw string) ([]any, bool) {

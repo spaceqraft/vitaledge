@@ -36,6 +36,17 @@ In practical terms, the parser accepts Cypher according to the imported grammar 
 - Deterministic parser behavior tied to a pinned grammar artifact.
 - Typed statement-level and clause-kind-level AST output for broad query shapes.
 
+## Implemented Built-in Functions
+
+Current execution support includes the main Cypher built-in function families that are implemented in the executor layer:
+
+- String and scalar helpers such as `lower`, `upper`, `trim`, `replace`, `toString`, `toInteger`, and `valueType`.
+- Mathematical helpers such as `floor`, `round`, `exp`, `log`/`ln`, `log10`, `e`, `pi`, and the trigonometric family.
+- List and predicate helpers such as `size`, `range`, `reduce`, `all`, `any`, `none`, `single`, `isEmpty`, and list conversion helpers.
+- Temporal helpers such as `date`, `time`, `datetime`, `duration`, and the supported alias and namespace forms.
+- Spatial helpers such as `point`, `distance`, `point.distance`, and `point.withinBBox`.
+- Vector helpers such as `vector`, `vector.similarity.cosine`, `vector.similarity.euclidean`, `vector_distance`, `vector_dimension_count`, and `vector_norm`.
+
 ## Current Gaps
 
 - Clause-specific semantic AST for all clauses is not complete yet.

@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -15,6 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/cypher/parser"
@@ -5754,6 +5757,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		min      any
 		max      any
 		values   []float64
+		sumSq    float64
 		pValue   *float64
 		hasValue bool
 	}
@@ -5985,6 +5989,22 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					}
 					agg.count++
 					agg.hasValue = true
+				case "stdev", "stdevp":
+					value, err := evalExpressionWithScope(item.AggArg, row, params)
+					if err != nil {
+						return nil, nil, err
+					}
+					if value == nil {
+						continue
+					}
+					n, ok := numericValue(value)
+					if !ok {
+						continue
+					}
+					agg.sum += n
+					agg.sumSq += n * n
+					agg.count++
+					agg.hasValue = true
 				case "min":
 					value, err := evalExpressionWithScope(item.AggArg, row, params)
 					if err != nil {
@@ -6153,6 +6173,10 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					} else {
 						projected[key] = json.Number(formatFloatResult(agg.sum / float64(agg.count)))
 					}
+				case "stdev":
+					projected[key] = standardDeviationResult(agg.sum, agg.sumSq, agg.count, true)
+				case "stdevp":
+					projected[key] = standardDeviationResult(agg.sum, agg.sumSq, agg.count, false)
 				case "min":
 					projected[key] = agg.min
 				case "max":
@@ -6551,9 +6575,9 @@ func normalizeAggregateExprCall(call string) string {
 	call = strings.TrimSpace(call)
 	idx := strings.Index(call, "(")
 	if idx < 0 || !strings.HasSuffix(call, ")") {
-		return strings.ToLower(call)
+		return canonicalAggregateFunctionName(strings.ToLower(call))
 	}
-	fn := strings.ToLower(strings.TrimSpace(call[:idx]))
+	fn := canonicalAggregateFunctionName(strings.ToLower(strings.TrimSpace(call[:idx])))
 	arg := strings.ToLower(strings.TrimSpace(call[idx+1 : len(call)-1]))
 	return fn + "(" + arg + ")"
 }
@@ -6602,9 +6626,9 @@ func aggregateFuncNameFromCall(call string) string {
 	call = strings.TrimSpace(call)
 	idx := strings.Index(call, "(")
 	if idx < 0 || !strings.HasSuffix(call, ")") {
-		return strings.ToLower(call)
+		return canonicalAggregateFunctionName(strings.ToLower(call))
 	}
-	return strings.ToLower(strings.TrimSpace(call[:idx]))
+	return canonicalAggregateFunctionName(strings.ToLower(strings.TrimSpace(call[:idx])))
 }
 
 func extractAggregateCalls(raw string) []string {
@@ -6673,11 +6697,28 @@ func stripAggregateCalls(raw string) string {
 }
 
 func isAggregateFunctionName(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "count", "collect", "sum", "min", "max", "avg", "percentiledisc", "percentilecont":
+	switch canonicalAggregateFunctionName(strings.ToLower(strings.TrimSpace(name))) {
+	case "count", "collect", "sum", "min", "max", "avg", "percentiledisc", "percentilecont", "stdev", "stdevp":
 		return true
 	default:
 		return false
+	}
+}
+
+func canonicalAggregateFunctionName(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "collect_list":
+		return "collect"
+	case "percentile_disc":
+		return "percentiledisc"
+	case "percentile_cont":
+		return "percentilecont"
+	case "stdev_samp":
+		return "stdev"
+	case "stdev_pop":
+		return "stdevp"
+	default:
+		return strings.ToLower(strings.TrimSpace(name))
 	}
 }
 
@@ -7412,6 +7453,9 @@ func parseCountDistinctArg(raw string) (string, bool) {
 
 func parseCollectExpression(raw string) (string, bool) {
 	arg, ok := parseFunctionCall(raw, "collect")
+	if !ok {
+		arg, ok = parseFunctionCall(raw, "collect_list")
+	}
 	if !ok || arg == "" {
 		return "", false
 	}
@@ -7428,13 +7472,13 @@ func parseCollectDistinctArg(raw string) (string, bool) {
 }
 
 func parseNamedAggregateExpression(raw string) (string, string, bool) {
-	aggFuncs := []string{"sum", "min", "max", "avg", "percentileDisc", "percentileCont"}
+	aggFuncs := []string{"sum", "min", "max", "avg", "percentileDisc", "percentileCont", "percentile_disc", "percentile_cont", "stDev", "stDevP", "stdev_samp", "stdev_pop"}
 	for _, fn := range aggFuncs {
 		arg, ok := parseFunctionCall(raw, fn)
 		if !ok || strings.TrimSpace(arg) == "" {
 			continue
 		}
-		return strings.ToLower(fn), strings.TrimSpace(arg), true
+		return canonicalAggregateFunctionName(fn), strings.TrimSpace(arg), true
 	}
 	return "", "", false
 }
@@ -7748,6 +7792,30 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return rand.Float64(), nil
 	}
+	if arg, ok := parseFunctionCall(raw, "point"); ok {
+		return evalPointFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "vector"); ok {
+		return evalVectorFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "vector_dimension_count"); ok {
+		return evalVectorDimensionCountFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "vector_distance"); ok {
+		return evalVectorDistanceFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "vector_norm"); ok {
+		return evalVectorNormFunction(arg, row, params)
+	}
+	if value, ok, err := evalVectorNamespaceFunction(raw, row, params); ok {
+		return value, err
+	}
+	if value, ok, err := evalSpatialNamespaceFunction(raw, row, params); ok {
+		return value, err
+	}
+	if arg, ok := parseFunctionCall(raw, "distance"); ok {
+		return evalDistanceFunction(arg, row, params)
+	}
 	if value, ok, err := evalTemporalNamespaceFunction(raw, row, params); ok {
 		return value, err
 	}
@@ -7780,14 +7848,19 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		switch typed := value.(type) {
 		case nil:
 			return nil, nil
+		case map[string]any:
+			if vector, ok := vectorValue(typed); ok {
+				if dimension, err := toInt(vector["dimension"]); err == nil {
+					return dimension, nil
+				}
+			}
+			return len(typed), nil
 		case []any:
 			return len(typed), nil
 		case []string:
 			return len(typed), nil
 		case string:
 			return len([]rune(typed)), nil
-		case map[string]any:
-			return len(typed), nil
 		default:
 			return nil, graph.NewError(graph.ErrKindSemantic, "size() requires a list, map, or string", nil)
 		}
@@ -8030,6 +8103,20 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 		}
 		return strings.ToLower(text), nil
 	}
+	if arg, ok := parseFunctionCall(raw, "lower"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		text, ok := value.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return strings.ToLower(text), nil
+	}
 	if arg, ok := parseFunctionCall(raw, "toUpper"); ok {
 		value, err := evalExpressionWithScope(arg, row, params)
 		if err != nil {
@@ -8043,6 +8130,247 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
 		}
 		return strings.ToUpper(text), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "upper"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		text, ok := value.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return strings.ToUpper(text), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "left"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "left() expects exactly two arguments", nil)
+		}
+		input, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		lengthValue, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if input == nil || lengthValue == nil {
+			return nil, nil
+		}
+		inputStr, ok := input.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		length, err := toInt(lengthValue)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+		}
+		if length < 0 {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		runes := []rune(inputStr)
+		if length > len(runes) {
+			length = len(runes)
+		}
+		return string(runes[:length]), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "right"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "right() expects exactly two arguments", nil)
+		}
+		input, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		lengthValue, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if input == nil || lengthValue == nil {
+			return nil, nil
+		}
+		inputStr, ok := input.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		length, err := toInt(lengthValue)
+		if err != nil {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+		}
+		if length < 0 {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		runes := []rune(inputStr)
+		if length > len(runes) {
+			length = len(runes)
+		}
+		return string(runes[len(runes)-length:]), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "replace"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 3 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "replace() expects exactly three arguments", nil)
+		}
+		input, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		search, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		replacement, err := evalExpressionWithScope(parts[2], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if input == nil || search == nil || replacement == nil {
+			return nil, nil
+		}
+		inputStr, ok := input.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		searchStr, ok := search.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		replacementStr, ok := replacement.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return strings.ReplaceAll(inputStr, searchStr, replacementStr), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "ltrim"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 1 && len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "ltrim() expects one or two arguments", nil)
+		}
+		input, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if input == nil {
+			return nil, nil
+		}
+		inputStr, ok := input.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		if len(parts) == 1 {
+			return strings.TrimLeftFunc(inputStr, unicode.IsSpace), nil
+		}
+		trimChars, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if trimChars == nil {
+			return nil, nil
+		}
+		trimCharsStr, ok := trimChars.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return strings.TrimLeft(inputStr, trimCharsStr), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "rtrim"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 1 && len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "rtrim() expects one or two arguments", nil)
+		}
+		input, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if input == nil {
+			return nil, nil
+		}
+		inputStr, ok := input.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		if len(parts) == 1 {
+			return strings.TrimRightFunc(inputStr, unicode.IsSpace), nil
+		}
+		trimChars, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if trimChars == nil {
+			return nil, nil
+		}
+		trimCharsStr, ok := trimChars.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return strings.TrimRight(inputStr, trimCharsStr), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "trim"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 1 && len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "trim() expects one or two arguments", nil)
+		}
+		input, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if input == nil {
+			return nil, nil
+		}
+		inputStr, ok := input.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		if len(parts) == 1 {
+			return strings.TrimSpace(inputStr), nil
+		}
+		trimChars, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if trimChars == nil {
+			return nil, nil
+		}
+		trimCharsStr, ok := trimChars.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return strings.Trim(inputStr, trimCharsStr), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "btrim"); ok {
+		return evalTrimFunction(arg, row, params, "btrim")
+	}
+	if arg, ok := parseFunctionCall(raw, "char_length"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		text, ok := value.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return len([]rune(text)), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "character_length"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		text, ok := value.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return len([]rune(text)), nil
 	}
 	if arg, ok := parseFunctionCall(raw, "keys"); ok {
 		return evalKeysFunction(arg, row, params)
@@ -8068,6 +8396,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "length"); ok {
 		return evalLengthFunction(arg, row, params)
 	}
+	if arg, ok := parseFunctionCall(raw, "path_length"); ok {
+		return evalLengthFunction(arg, row, params)
+	}
 	if arg, ok := parseFunctionCall(raw, "last"); ok {
 		return evalLastFunction(arg, row, params)
 	}
@@ -8082,6 +8413,21 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	}
 	if arg, ok := parseFunctionCall(raw, "date.truncate"); ok {
 		return evalTemporalTruncateFunction("date", arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "duration_between"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "duration_between() expects exactly two arguments", nil)
+		}
+		args := make([]any, 0, 2)
+		for _, part := range parts {
+			value, err := evalExpressionWithScope(part, row, params)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, value)
+		}
+		return evalDurationMethod("between", args)
 	}
 	if arg, ok := parseFunctionCall(raw, "time.truncate"); ok {
 		return evalTemporalTruncateFunction("time", arg, row, params)
@@ -8103,6 +8449,497 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	}
 	if arg, ok := parseFunctionCall(raw, "properties"); ok {
 		return evalPropertiesFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "exists"); ok {
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			return nil, graph.NewError(graph.ErrKindSemantic, "exists() requires one argument", nil)
+		}
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		return value != nil, nil
+	}
+	if arg, ok := parseFunctionCall(raw, "elementId"); ok {
+		return evalElementIDFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "id"); ok {
+		return evalIDFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "valueType"); ok {
+		return evalValueTypeFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "randomUUID"); ok {
+		if strings.TrimSpace(arg) != "" {
+			return nil, graph.NewError(graph.ErrKindSemantic, "randomUUID() expects no arguments", nil)
+		}
+		return randomUUIDv4(), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "timestamp"); ok {
+		if strings.TrimSpace(arg) != "" {
+			return nil, graph.NewError(graph.ErrKindSemantic, "timestamp() expects no arguments", nil)
+		}
+		return time.Now().UnixMilli(), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "reduce"); ok {
+		return evalReduceFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "isEmpty"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		switch typed := value.(type) {
+		case string:
+			return len([]rune(typed)) == 0, nil
+		case map[string]any:
+			return len(typed) == 0, nil
+		default:
+			if list, ok := normalizeListValue(value); ok {
+				return len(list) == 0, nil
+			}
+		}
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	if arg, ok := parseFunctionCall(raw, "nullIf"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "nullIf() expects exactly two arguments", nil)
+		}
+		left, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		right, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		equal, isNull := cypherNullableEqual(left, right)
+		if isNull {
+			return left, nil
+		}
+		if equal {
+			return nil, nil
+		}
+		return left, nil
+	}
+	if arg, ok := parseFunctionCall(raw, "ceiling"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Ceil(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "floor"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Floor(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "round"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) < 1 || len(parts) > 3 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "round() expects 1 to 3 arguments", nil)
+		}
+		value, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		precision := 0
+		if len(parts) >= 2 {
+			precisionValue, err := evalExpressionWithScope(parts[1], row, params)
+			if err != nil {
+				return nil, err
+			}
+			if precisionValue == nil {
+				return nil, nil
+			}
+			precision, err = toInt(precisionValue)
+			if err != nil {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+			}
+		}
+		mode := "HALF_UP"
+		if len(parts) == 3 {
+			modeValue, err := evalExpressionWithScope(parts[2], row, params)
+			if err != nil {
+				return nil, err
+			}
+			if modeValue == nil {
+				return nil, nil
+			}
+			modeString, ok := modeValue.(string)
+			if !ok {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+			}
+			mode = strings.ToUpper(strings.TrimSpace(modeString))
+		}
+
+		scale := math.Pow(10, float64(precision))
+		shifted := numeric * scale
+		var rounded float64
+		switch mode {
+		case "UP":
+			rounded = math.Ceil(math.Abs(shifted))
+			if shifted < 0 {
+				rounded = -rounded
+			}
+		case "DOWN":
+			rounded = math.Trunc(shifted)
+		case "CEILING":
+			rounded = math.Ceil(shifted)
+		case "FLOOR":
+			rounded = math.Floor(shifted)
+		case "HALF_EVEN":
+			rounded = math.RoundToEven(shifted)
+		case "HALF_DOWN":
+			frac := math.Abs(shifted) - math.Floor(math.Abs(shifted))
+			if math.Abs(frac-0.5) <= 1e-12 {
+				rounded = math.Trunc(shifted)
+			} else {
+				rounded = math.Round(shifted)
+			}
+		case "HALF_UP", "":
+			rounded = math.Round(shifted)
+		default:
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		result := rounded / scale
+		return json.Number(formatFloatResult(result)), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "exp"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Exp(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "log"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Log(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "ln"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Log(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "log10"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Log10(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "e"); ok {
+		if strings.TrimSpace(arg) != "" {
+			return nil, graph.NewError(graph.ErrKindSemantic, "e() expects no arguments", nil)
+		}
+		return json.Number(formatFloatResult(math.E)), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "pi"); ok {
+		if strings.TrimSpace(arg) != "" {
+			return nil, graph.NewError(graph.ErrKindSemantic, "pi() expects no arguments", nil)
+		}
+		return json.Number(formatFloatResult(math.Pi)), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "isNaN"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return math.IsNaN(numeric), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "sin"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Sin(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "cos"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Cos(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "tan"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Tan(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "asin"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Asin(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "acos"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Acos(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "atan"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Atan(numeric))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "atan2"); ok {
+		parts := splitTopLevelCommaSeparated(arg)
+		if len(parts) != 2 {
+			return nil, graph.NewError(graph.ErrKindSemantic, "atan2() expects exactly two arguments", nil)
+		}
+		yRaw, err := evalExpressionWithScope(parts[0], row, params)
+		if err != nil {
+			return nil, err
+		}
+		xRaw, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if yRaw == nil || xRaw == nil {
+			return nil, nil
+		}
+		y, ok := numericValue(yRaw)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		x, ok := numericValue(xRaw)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(math.Atan2(y, x))), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "degrees"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(numeric * 180 / math.Pi)), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "radians"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult(numeric * math.Pi / 180)), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "cot"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		tan := math.Tan(numeric)
+		return json.Number(formatFloatResult(1 / tan)), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "haversin"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		numeric, ok := numericValue(value)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return json.Number(formatFloatResult((1 - math.Cos(numeric)) / 2)), nil
+	}
+	if arg, ok := parseFunctionCall(raw, "toBooleanOrNull"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		converted, convErr := evalToBooleanValue(value)
+		if convErr != nil {
+			return nil, nil
+		}
+		return converted, nil
+	}
+	if arg, ok := parseFunctionCall(raw, "toBooleanList"); ok {
+		return evalConvertedListFunction(arg, row, params, evalToBooleanValue)
+	}
+	if arg, ok := parseFunctionCall(raw, "toIntegerOrNull"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		converted, convErr := evalToIntegerValue(value)
+		if convErr != nil {
+			return nil, nil
+		}
+		return converted, nil
+	}
+	if arg, ok := parseFunctionCall(raw, "toIntegerList"); ok {
+		return evalConvertedListFunction(arg, row, params, evalToIntegerValue)
+	}
+	if arg, ok := parseFunctionCall(raw, "toFloatOrNull"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		converted, convErr := evalToFloatValue(value)
+		if convErr != nil {
+			return nil, nil
+		}
+		return converted, nil
+	}
+	if arg, ok := parseFunctionCall(raw, "toFloatList"); ok {
+		return evalConvertedListFunction(arg, row, params, evalToFloatValue)
+	}
+	if arg, ok := parseFunctionCall(raw, "toStringOrNull"); ok {
+		value, err := evalExpressionWithScope(arg, row, params)
+		if err != nil {
+			return nil, err
+		}
+		converted, convErr := evalToStringValue(value)
+		if convErr != nil {
+			return nil, nil
+		}
+		return converted, nil
+	}
+	if arg, ok := parseFunctionCall(raw, "toStringList"); ok {
+		return evalConvertedListFunction(arg, row, params, evalToStringValue)
+	}
+	if arg, ok := parseFunctionCall(raw, "normalize"); ok {
+		return evalNormalizeFunction(arg, row, params)
 	}
 	if baseExpr, indexExpr, ok := splitTrailingSubscript(raw); ok {
 		base, err := evalExpressionWithScope(baseExpr, row, params)
@@ -9367,6 +10204,11 @@ func isStringType(value any) bool {
 }
 
 func normalizeListValue(value any) ([]any, bool) {
+	if vector, ok := vectorValue(value); ok {
+		if typed, ok := vector["values"].([]any); ok {
+			return append([]any(nil), typed...), true
+		}
+	}
 	switch typed := value.(type) {
 	case []any:
 		return typed, true
@@ -9640,6 +10482,177 @@ func evalPropertiesFunction(arg string, row Row, params Params) (any, error) {
 	default:
 		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
 	}
+}
+
+func evalElementIDFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "elementId() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	switch typed := value.(type) {
+	case *graph.Vertex:
+		return typed.ID, nil
+	case *graph.Edge:
+		return typed.ID, nil
+	case deletedVertexBinding:
+		return typed.ID, nil
+	case deletedEdgeBinding:
+		return typed.ID, nil
+	case map[string]any:
+		if idValue, ok := typed["id"]; ok {
+			return fmt.Sprint(idValue), nil
+		}
+	}
+	return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+}
+
+func evalIDFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "id() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+
+	idText := ""
+	switch typed := value.(type) {
+	case *graph.Vertex:
+		idText = typed.ID
+	case *graph.Edge:
+		idText = typed.ID
+	case deletedVertexBinding:
+		idText = typed.ID
+	case deletedEdgeBinding:
+		idText = typed.ID
+	case map[string]any:
+		if idValue, ok := typed["id"]; ok {
+			idText = fmt.Sprint(idValue)
+		}
+	default:
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+
+	idText = strings.TrimSpace(idText)
+	if idText == "" {
+		return nil, nil
+	}
+	if parsed, err := strconv.ParseInt(idText, 10, 64); err == nil {
+		return parsed, nil
+	}
+	if f, ok := numericValue(idText); ok {
+		return int64(truncTowardZero(f)), nil
+	}
+	return nil, nil
+}
+
+func evalValueTypeFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "valueType() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return "NULL", nil
+	}
+
+	if temporal, ok := temporalMapValue(value); ok {
+		typeName := strings.ToUpper(strings.TrimSpace(fmt.Sprint(temporal["__temporal_type"])))
+		if typeName != "" {
+			return typeName, nil
+		}
+	}
+	if _, ok := spatialPointValue(value); ok {
+		return "POINT", nil
+	}
+	if _, ok := vectorValue(value); ok {
+		return "VECTOR", nil
+	}
+
+	switch typed := value.(type) {
+	case bool:
+		return "BOOLEAN", nil
+	case string:
+		return "STRING", nil
+	case int, int64, int32, uint, uint64, uint32:
+		return "INTEGER", nil
+	case float64, float32:
+		return "FLOAT", nil
+	case json.Number:
+		s := strings.TrimSpace(typed.String())
+		if strings.ContainsAny(s, ".eE") {
+			return "FLOAT", nil
+		}
+		return "INTEGER", nil
+	case []any, []string:
+		return "LIST", nil
+	case *graph.Vertex, deletedVertexBinding:
+		return "NODE", nil
+	case *graph.Edge, deletedEdgeBinding:
+		return "RELATIONSHIP", nil
+	case cypherPathValue, multiHopCypherPath:
+		return "PATH", nil
+	case map[string]any:
+		if _, hasLabels := typed["labels"]; hasLabels {
+			return "NODE", nil
+		}
+		if _, hasType := typed["type"]; hasType {
+			return "RELATIONSHIP", nil
+		}
+		return "MAP", nil
+	default:
+		if _, _, ok := pathComponents(value); ok {
+			return "PATH", nil
+		}
+		if _, ok := normalizeListValue(value); ok {
+			return "LIST", nil
+		}
+	}
+
+	return "ANY", nil
+}
+
+func randomUUIDv4() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// Fallback keeps function total (non-erroring), while still producing UUID-like text.
+		seed := time.Now().UnixNano()
+		for i := range b {
+			b[i] = byte(seed >> ((i % 8) * 8))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		uint32(b[0])<<24|uint32(b[1])<<16|uint32(b[2])<<8|uint32(b[3]),
+		uint16(b[4])<<8|uint16(b[5]),
+		uint16(b[6])<<8|uint16(b[7]),
+		uint16(b[8])<<8|uint16(b[9]),
+		uint64(b[10])<<40|uint64(b[11])<<32|uint64(b[12])<<24|uint64(b[13])<<16|uint64(b[14])<<8|uint64(b[15]),
+	)
 }
 
 func evalKeysFunction(arg string, row Row, params Params) (any, error) {
@@ -10090,10 +11103,1083 @@ func evalToStringValue(value any) (any, error) {
 			return rendered, nil
 		}
 	}
+	if vector, ok := vectorValue(value); ok {
+		if rendered, ok := formatVectorToString(vector); ok {
+			return rendered, nil
+		}
+	}
+	if spatial, ok := spatialPointValue(value); ok {
+		if rendered, ok := formatSpatialPointToString(spatial); ok {
+			return rendered, nil
+		}
+	}
 	if isInvalidTypeConversionValue(value) {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
 	}
 	return fmt.Sprint(normalizeResultValue(value)), nil
+}
+
+func evalPointFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "point() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	mapped, ok := value.(map[string]any)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	for _, item := range mapped {
+		if item == nil {
+			return nil, nil
+		}
+	}
+	return normalizeSpatialPointMap(mapped)
+}
+
+func evalVectorFunction(arg string, row Row, params Params) (any, error) {
+	parts := splitTopLevelCommaSeparated(arg)
+	if len(parts) != 3 {
+		return nil, graph.NewError(graph.ErrKindSemantic, "vector() expects exactly three arguments", nil)
+	}
+
+	vectorValueRaw, err := evalExpressionWithScope(parts[0], row, params)
+	if err != nil {
+		vectorValueRaw, err = evalWriteValue(parts[0], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	dimensionRaw, err := evalExpressionWithScope(parts[1], row, params)
+	if err != nil {
+		dimensionRaw, err = evalWriteValue(parts[1], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if vectorValueRaw == nil || dimensionRaw == nil {
+		return nil, nil
+	}
+
+	dimension, err := toInt(dimensionRaw)
+	if err != nil || dimension <= 0 || dimension > 4096 {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", err)
+	}
+
+	coordinateType, err := parseVectorCoordinateType(parts[2], row, params)
+	if err != nil {
+		return nil, err
+	}
+
+	values, err := vectorCoordinateList(vectorValueRaw)
+	if err != nil {
+		return nil, err
+	}
+	if len(values) != dimension {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+
+	out := map[string]any{
+		"__vector_type":  "vector",
+		"coordinateType": coordinateType,
+		"dimension":      dimension,
+		"values":         make([]any, 0, len(values)),
+	}
+	stored := out["values"].([]any)
+	for _, value := range values {
+		stored = append(stored, json.Number(formatFloatResult(value)))
+	}
+	out["values"] = stored
+	return out, nil
+}
+
+func parseVectorCoordinateType(rawArg string, row Row, params Params) (string, error) {
+	rawArg = strings.TrimSpace(rawArg)
+	if rawArg == "" {
+		return "", graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	if (strings.HasPrefix(rawArg, "'") && strings.HasSuffix(rawArg, "'")) || (strings.HasPrefix(rawArg, "\"") && strings.HasSuffix(rawArg, "\"")) {
+		unquoted := strings.TrimSpace(rawArg[1 : len(rawArg)-1])
+		if unquoted == "" {
+			return "", graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		rawArg = unquoted
+	} else if value, err := evalExpressionWithScope(rawArg, row, params); err == nil {
+		if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+			rawArg = text
+		}
+	}
+
+	coordinateType := strings.ToUpper(strings.TrimSpace(rawArg))
+	coordinateType = canonicalVectorCoordinateType(coordinateType)
+	switch coordinateType {
+	case "INTEGER64", "INTEGER32", "INTEGER16", "INTEGER8", "FLOAT64", "FLOAT32", "INTEGER", "FLOAT":
+		return coordinateType, nil
+	default:
+		return "", graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+}
+
+func canonicalVectorCoordinateType(raw string) string {
+	switch raw {
+	case "INTEGER":
+		return "INTEGER64"
+	case "FLOAT":
+		return "FLOAT64"
+	default:
+		return raw
+	}
+}
+
+func vectorCoordinateList(raw any) ([]float64, error) {
+	if raw == nil {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	if mapped, ok := vectorValue(raw); ok {
+		values, ok := normalizeListValue(mapped["values"])
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		return numericVectorValues(values)
+	}
+	if text, ok := raw.(string); ok {
+		text = strings.TrimSpace(text)
+		if strings.HasPrefix(text, "[") && strings.HasSuffix(text, "]") {
+			var parsed []any
+			if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+				return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", err)
+			}
+			return numericVectorValues(parsed)
+		}
+	}
+	list, ok := normalizeListValue(raw)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	return numericVectorValues(list)
+}
+
+func numericVectorValues(values []any) ([]float64, error) {
+	out := make([]float64, 0, len(values))
+	for _, item := range values {
+		if item == nil {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		numeric, ok := numericValue(item)
+		if !ok || math.IsNaN(numeric) || math.IsInf(numeric, 0) {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		out = append(out, numeric)
+	}
+	return out, nil
+}
+
+func evalVectorNamespaceFunction(raw string, row Row, params Params) (any, bool, error) {
+	if arg, ok := parseFunctionCall(raw, "vector.similarity.cosine"); ok {
+		value, err := evalVectorSimilarityFunction(arg, row, params, "cosine")
+		return value, true, err
+	}
+	if arg, ok := parseFunctionCall(raw, "vector.similarity.euclidean"); ok {
+		value, err := evalVectorSimilarityFunction(arg, row, params, "euclidean")
+		return value, true, err
+	}
+	return nil, false, nil
+}
+
+func evalVectorSimilarityFunction(arg string, row Row, params Params, metric string) (any, error) {
+	parts := splitTopLevelCommaSeparated(arg)
+	if len(parts) != 2 {
+		return nil, graph.NewError(graph.ErrKindSemantic, "vector similarity functions expect exactly two arguments", nil)
+	}
+
+	leftRaw, err := evalExpressionWithScope(parts[0], row, params)
+	if err != nil {
+		leftRaw, err = evalWriteValue(parts[0], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	rightRaw, err := evalExpressionWithScope(parts[1], row, params)
+	if err != nil {
+		rightRaw, err = evalWriteValue(parts[1], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if leftRaw == nil || rightRaw == nil {
+		return nil, nil
+	}
+
+	leftValues, err := vectorCoordinateList(leftRaw)
+	if err != nil {
+		return nil, err
+	}
+	rightValues, err := vectorCoordinateList(rightRaw)
+	if err != nil {
+		return nil, err
+	}
+	if len(leftValues) != len(rightValues) || len(leftValues) == 0 {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+
+	var result float64
+	switch metric {
+	case "cosine":
+		dot := 0.0
+		leftNorm := 0.0
+		rightNorm := 0.0
+		for idx := range leftValues {
+			dot += leftValues[idx] * rightValues[idx]
+			leftNorm += leftValues[idx] * leftValues[idx]
+			rightNorm += rightValues[idx] * rightValues[idx]
+		}
+		if leftNorm == 0 || rightNorm == 0 {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		cosine := dot / (math.Sqrt(leftNorm) * math.Sqrt(rightNorm))
+		result = (1 + cosine) / 2
+		if result < 0 {
+			result = 0
+		}
+		if result > 1 {
+			result = 1
+		}
+	case "euclidean":
+		sumSquares := 0.0
+		for idx := range leftValues {
+			delta := leftValues[idx] - rightValues[idx]
+			sumSquares += delta * delta
+		}
+		result = 1 / (1 + sumSquares)
+	default:
+		return nil, graph.NewError(graph.ErrKindUnsupported, "unsupported vector similarity metric", nil)
+	}
+
+	return json.Number(formatFloatResult(result)), nil
+}
+
+func evalVectorDimensionCountFunction(arg string, row Row, params Params) (any, error) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return nil, graph.NewError(graph.ErrKindSemantic, "vector_dimension_count() requires one argument", nil)
+	}
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		value, err = evalWriteValue(arg, params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	if mapped, ok := vectorValue(value); ok {
+		if dimension, err := toInt(mapped["dimension"]); err == nil {
+			return dimension, nil
+		}
+	}
+	if list, ok := normalizeListValue(value); ok {
+		return len(list), nil
+	}
+	return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+}
+
+func evalVectorDistanceFunction(arg string, row Row, params Params) (any, error) {
+	parts := splitTopLevelCommaSeparated(arg)
+	if len(parts) != 3 {
+		return nil, graph.NewError(graph.ErrKindSemantic, "vector_distance() expects exactly three arguments", nil)
+	}
+
+	leftRaw, err := evalExpressionWithScope(parts[0], row, params)
+	if err != nil {
+		leftRaw, err = evalWriteValue(parts[0], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	rightRaw, err := evalExpressionWithScope(parts[1], row, params)
+	if err != nil {
+		rightRaw, err = evalWriteValue(parts[1], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if leftRaw == nil || rightRaw == nil {
+		return nil, nil
+	}
+
+	leftValues, err := vectorCoordinateList(leftRaw)
+	if err != nil {
+		return nil, err
+	}
+	rightValues, err := vectorCoordinateList(rightRaw)
+	if err != nil {
+		return nil, err
+	}
+	if len(leftValues) != len(rightValues) || len(leftValues) == 0 {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+
+	metric, err := parseVectorDistanceMetric(parts[2], row, params)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := vectorDistanceMetricValue(leftValues, rightValues, metric)
+	if err != nil {
+		return nil, err
+	}
+	return json.Number(formatFloatResult(result)), nil
+}
+
+func evalVectorNormFunction(arg string, row Row, params Params) (any, error) {
+	parts := splitTopLevelCommaSeparated(arg)
+	if len(parts) != 2 {
+		return nil, graph.NewError(graph.ErrKindSemantic, "vector_norm() expects exactly two arguments", nil)
+	}
+
+	vectorRaw, err := evalExpressionWithScope(parts[0], row, params)
+	if err != nil {
+		vectorRaw, err = evalWriteValue(parts[0], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if vectorRaw == nil {
+		return nil, nil
+	}
+
+	values, err := vectorCoordinateList(vectorRaw)
+	if err != nil {
+		return nil, err
+	}
+	if len(values) == 0 {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+
+	metric, err := parseVectorNormMetric(parts[1], row, params)
+	if err != nil {
+		return nil, err
+	}
+
+	result := 0.0
+	switch metric {
+	case "EUCLIDEAN":
+		for _, value := range values {
+			result += value * value
+		}
+		result = math.Sqrt(result)
+	case "MANHATTAN":
+		for _, value := range values {
+			result += math.Abs(value)
+		}
+	default:
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+
+	return json.Number(formatFloatResult(result)), nil
+}
+
+func parseVectorDistanceMetric(raw string, row Row, params Params) (string, error) {
+	metric, err := parseVectorMetricToken(raw, row, params)
+	if err != nil {
+		return "", err
+	}
+	switch metric {
+	case "EUCLIDEAN", "EUCLIDEAN_SQUARED", "MANHATTAN", "COSINE", "DOT", "HAMMING":
+		return metric, nil
+	default:
+		return "", graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+}
+
+func parseVectorNormMetric(raw string, row Row, params Params) (string, error) {
+	metric, err := parseVectorMetricToken(raw, row, params)
+	if err != nil {
+		return "", err
+	}
+	switch metric {
+	case "EUCLIDEAN", "MANHATTAN":
+		return metric, nil
+	default:
+		return "", graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+}
+
+func parseVectorMetricToken(raw string, row Row, params Params) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	if (strings.HasPrefix(raw, "'") && strings.HasSuffix(raw, "'")) || (strings.HasPrefix(raw, "\"") && strings.HasSuffix(raw, "\"")) {
+		return strings.ToUpper(strings.TrimSpace(raw[1 : len(raw)-1])), nil
+	}
+	if value, err := evalExpressionWithScope(raw, row, params); err == nil {
+		if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+			return strings.ToUpper(strings.TrimSpace(text)), nil
+		}
+	}
+	return strings.ToUpper(raw), nil
+}
+
+func vectorDistanceMetricValue(leftValues []float64, rightValues []float64, metric string) (float64, error) {
+	result := 0.0
+	switch metric {
+	case "EUCLIDEAN":
+		for idx := range leftValues {
+			delta := leftValues[idx] - rightValues[idx]
+			result += delta * delta
+		}
+		return math.Sqrt(result), nil
+	case "EUCLIDEAN_SQUARED":
+		for idx := range leftValues {
+			delta := leftValues[idx] - rightValues[idx]
+			result += delta * delta
+		}
+		return result, nil
+	case "MANHATTAN":
+		for idx := range leftValues {
+			result += math.Abs(leftValues[idx] - rightValues[idx])
+		}
+		return result, nil
+	case "DOT":
+		for idx := range leftValues {
+			result += leftValues[idx] * rightValues[idx]
+		}
+		return -result, nil
+	case "COSINE":
+		dot := 0.0
+		leftNorm := 0.0
+		rightNorm := 0.0
+		for idx := range leftValues {
+			dot += leftValues[idx] * rightValues[idx]
+			leftNorm += leftValues[idx] * leftValues[idx]
+			rightNorm += rightValues[idx] * rightValues[idx]
+		}
+		if leftNorm == 0 || rightNorm == 0 {
+			return 0, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		cosine := dot / (math.Sqrt(leftNorm) * math.Sqrt(rightNorm))
+		return 1 - cosine, nil
+	case "HAMMING":
+		count := 0
+		for idx := range leftValues {
+			if leftValues[idx] != rightValues[idx] {
+				count++
+			}
+		}
+		return float64(count), nil
+	default:
+		return 0, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+}
+
+func evalDistanceFunction(arg string, row Row, params Params) (any, error) {
+	parts := splitTopLevelCommaSeparated(arg)
+	if len(parts) != 2 {
+		return nil, graph.NewError(graph.ErrKindSemantic, "distance() expects exactly two arguments", nil)
+	}
+	left, err := evalExpressionWithScope(parts[0], row, params)
+	if err != nil {
+		left, err = evalWriteValue(parts[0], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	right, err := evalExpressionWithScope(parts[1], row, params)
+	if err != nil {
+		right, err = evalWriteValue(parts[1], params, row)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if left == nil || right == nil {
+		return nil, nil
+	}
+	leftPoint, ok := spatialPointValue(left)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	rightPoint, ok := spatialPointValue(right)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	distance, err := pointDistance(leftPoint, rightPoint)
+	if err != nil {
+		return nil, err
+	}
+	return json.Number(formatFloatResult(distance)), nil
+}
+
+func normalizeSpatialPointMap(in map[string]any) (map[string]any, error) {
+	if existing, ok := spatialPointValue(in); ok {
+		out := map[string]any{}
+		for key, value := range existing {
+			out[key] = value
+		}
+		return out, nil
+	}
+	if len(in) == 0 {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+
+	out := map[string]any{"__spatial_type": "point"}
+	sridFromCRS, hasCRS, err := spatialCRSValue(in["crs"])
+	if err != nil {
+		return nil, err
+	}
+	srid, hasSRID, err := spatialSRIDValue(in["srid"])
+	if err != nil {
+		return nil, err
+	}
+	if hasCRS {
+		if hasSRID && srid != sridFromCRS {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		srid = sridFromCRS
+		hasSRID = true
+	}
+
+	hasGeographic := hasSpatialKey(in, "longitude") || hasSpatialKey(in, "latitude") || hasSpatialKey(in, "height")
+	hasCartesian := hasSpatialKey(in, "x") || hasSpatialKey(in, "y") || hasSpatialKey(in, "z")
+	if hasGeographic && hasCartesian {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+
+	targetGeographic := hasGeographic
+	if !targetGeographic && hasSRID && (srid == 4326 || srid == 4979) {
+		targetGeographic = true
+	}
+
+	if targetGeographic {
+		if hasGeographic && hasSRID && (srid == 7203 || srid == 9157) {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+		longitudeKey := "longitude"
+		latitudeKey := "latitude"
+		heightKey := "height"
+		if !hasGeographic {
+			longitudeKey = "x"
+			latitudeKey = "y"
+			heightKey = "z"
+		}
+		lon, ok, err := spatialCoordinate(in, longitudeKey)
+		if err != nil || !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", err)
+		}
+		lat, ok, err := spatialCoordinate(in, latitudeKey)
+		if err != nil || !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", err)
+		}
+		lon = wrapLongitude(lon)
+		if err := validateGeographicCoordinateRange(lon, lat); err != nil {
+			return nil, err
+		}
+		out["longitude"] = json.Number(formatFloatResult(lon))
+		out["latitude"] = json.Number(formatFloatResult(lat))
+		out["x"] = json.Number(formatFloatResult(lon))
+		out["y"] = json.Number(formatFloatResult(lat))
+		if height, ok, err := spatialCoordinate(in, heightKey); err != nil {
+			return nil, err
+		} else if ok {
+			out["height"] = json.Number(formatFloatResult(height))
+			out["z"] = json.Number(formatFloatResult(height))
+			if !hasSRID {
+				srid = 4979
+			}
+		} else if !hasSRID {
+			srid = 4326
+		}
+		if err := validateSpatialSRIDShape(srid, true, hasSpatialKey(out, "height")); err != nil {
+			return nil, err
+		}
+		out["srid"] = srid
+		out["crs"] = spatialCRSNameFromSRID(srid)
+		return out, nil
+	}
+	if hasGeographic && hasSRID {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+
+	x, ok, err := spatialCoordinate(in, "x")
+	if err != nil || !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", err)
+	}
+	y, ok, err := spatialCoordinate(in, "y")
+	if err != nil || !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", err)
+	}
+	out["x"] = json.Number(formatFloatResult(x))
+	out["y"] = json.Number(formatFloatResult(y))
+	if z, ok, err := spatialCoordinate(in, "z"); err != nil {
+		return nil, err
+	} else if ok {
+		out["z"] = json.Number(formatFloatResult(z))
+		if !hasSRID {
+			srid = 9157
+		}
+	} else if !hasSRID {
+		srid = 7203
+	}
+	if err := validateSpatialSRIDShape(srid, false, hasSpatialKey(out, "z")); err != nil {
+		return nil, err
+	}
+	out["srid"] = srid
+	out["crs"] = spatialCRSNameFromSRID(srid)
+	return out, nil
+}
+
+func wrapLongitude(value float64) float64 {
+	if value >= -180 && value <= 180 {
+		return value
+	}
+	wrapped := math.Mod(value+180, 360)
+	if wrapped < 0 {
+		wrapped += 360
+	}
+	wrapped -= 180
+	if wrapped == -180 && value > 0 {
+		return 180
+	}
+	return wrapped
+}
+
+func hasSpatialKey(in map[string]any, key string) bool {
+	_, ok := in[key]
+	return ok
+}
+
+func spatialCoordinate(in map[string]any, key string) (float64, bool, error) {
+	raw, ok := in[key]
+	if !ok || raw == nil {
+		return 0, false, nil
+	}
+	value, ok := numericValue(raw)
+	if !ok {
+		return 0, false, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	return value, true, nil
+}
+
+func spatialSRIDValue(raw any) (int, bool, error) {
+	if raw == nil {
+		return 0, false, nil
+	}
+	value, err := toInt(raw)
+	if err != nil {
+		return 0, false, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", err)
+	}
+	return value, true, nil
+}
+
+func spatialCRSValue(raw any) (int, bool, error) {
+	if raw == nil {
+		return 0, false, nil
+	}
+	text, ok := raw.(string)
+	if !ok {
+		return 0, false, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "wgs-84", "wgs-84-2d":
+		return 4326, true, nil
+	case "wgs-84-3d":
+		return 4979, true, nil
+	case "cartesian":
+		return 7203, true, nil
+	case "cartesian-3d":
+		return 9157, true, nil
+	default:
+		return 0, false, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+}
+
+func spatialCRSNameFromSRID(srid int) string {
+	switch srid {
+	case 4326:
+		return "wgs-84"
+	case 4979:
+		return "wgs-84-3d"
+	case 7203:
+		return "cartesian"
+	case 9157:
+		return "cartesian-3d"
+	default:
+		return ""
+	}
+}
+
+func spatialPointValue(v any) (map[string]any, bool) {
+	mapped, ok := v.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if strings.EqualFold(strings.TrimSpace(fmt.Sprint(mapped["__spatial_type"])), "point") {
+		return mapped, true
+	}
+	return nil, false
+}
+
+func vectorValue(v any) (map[string]any, bool) {
+	mapped, ok := v.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if strings.EqualFold(strings.TrimSpace(fmt.Sprint(mapped["__vector_type"])), "vector") {
+		return mapped, true
+	}
+	return nil, false
+}
+
+func formatVectorToString(vector map[string]any) (string, bool) {
+	if vector == nil {
+		return "", false
+	}
+	values, ok := normalizeListValue(vector["values"])
+	if !ok {
+		return "", false
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, fmt.Sprint(normalizeResultValue(value)))
+	}
+	dimension, err := toInt(vector["dimension"])
+	if err != nil || dimension <= 0 {
+		return "", false
+	}
+	coordinateType := strings.ToUpper(strings.TrimSpace(fmt.Sprint(vector["coordinateType"])))
+	if coordinateType == "" {
+		coordinateType = "FLOAT32"
+	}
+	return fmt.Sprintf("vector([%s], %d, %s)", strings.Join(parts, ", "), dimension, coordinateType), true
+}
+
+func formatSpatialPointToString(point map[string]any) (string, bool) {
+	if point == nil {
+		return "", false
+	}
+	parts := make([]string, 0, 4)
+	if srid, ok := point["srid"]; ok {
+		parts = append(parts, fmt.Sprintf("srid: %v", normalizeResultValue(srid)))
+	}
+	if x, ok := point["x"]; ok {
+		parts = append(parts, fmt.Sprintf("x: %v", normalizeResultValue(x)))
+		parts = append(parts, fmt.Sprintf("y: %v", normalizeResultValue(point["y"])))
+		if z, ok := point["z"]; ok {
+			parts = append(parts, fmt.Sprintf("z: %v", normalizeResultValue(z)))
+		}
+		return "point({" + strings.Join(parts, ", ") + "})", true
+	}
+	return "", false
+}
+
+func evalSpatialNamespaceFunction(raw string, row Row, params Params) (any, bool, error) {
+	if arg, ok := parseFunctionCall(raw, "point.distance"); ok {
+		value, err := evalDistanceFunction(arg, row, params)
+		return value, true, err
+	}
+	if arg, ok := parseFunctionCall(raw, "point.withinBBox"); ok {
+		value, err := evalWithinBBoxFunction(arg, row, params)
+		return value, true, err
+	}
+	return nil, false, nil
+}
+
+func evalWithinBBoxFunction(arg string, row Row, params Params) (any, error) {
+	parts := splitTopLevelCommaSeparated(arg)
+	if len(parts) != 3 {
+		return nil, graph.NewError(graph.ErrKindSemantic, "point.withinBBox() expects exactly three arguments", nil)
+	}
+	values := make([]any, 0, 3)
+	for _, part := range parts {
+		value, err := evalExpressionWithScope(part, row, params)
+		if err != nil {
+			value, err = evalWriteValue(part, params, row)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, nil
+		}
+		values = append(values, value)
+	}
+	point, ok := spatialPointValue(values[0])
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	lowerLeft, ok := spatialPointValue(values[1])
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	upperRight, ok := spatialPointValue(values[2])
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	within, comparable, err := pointWithinBBox(point, lowerLeft, upperRight)
+	if err != nil {
+		return nil, err
+	}
+	if !comparable {
+		return nil, nil
+	}
+	return within, nil
+}
+
+func pointWithinBBox(point, lowerLeft, upperRight map[string]any) (bool, bool, error) {
+	pointSRID, _, err := spatialSRIDValue(point["srid"])
+	if err != nil {
+		return false, false, err
+	}
+	lowerSRID, _, err := spatialSRIDValue(lowerLeft["srid"])
+	if err != nil {
+		return false, false, err
+	}
+	upperSRID, _, err := spatialSRIDValue(upperRight["srid"])
+	if err != nil {
+		return false, false, err
+	}
+	if pointSRID != lowerSRID || pointSRID != upperSRID {
+		return false, false, nil
+	}
+	if _, ok := point["longitude"]; ok {
+		return geographicPointWithinBBox(point, lowerLeft, upperRight)
+	}
+	return cartesianPointWithinBBox(point, lowerLeft, upperRight)
+}
+
+func cartesianPointWithinBBox(point, lowerLeft, upperRight map[string]any) (bool, bool, error) {
+	px, _, err := spatialCoordinate(point, "x")
+	if err != nil {
+		return false, false, err
+	}
+	py, _, err := spatialCoordinate(point, "y")
+	if err != nil {
+		return false, false, err
+	}
+	lx, _, err := spatialCoordinate(lowerLeft, "x")
+	if err != nil {
+		return false, false, err
+	}
+	ly, _, err := spatialCoordinate(lowerLeft, "y")
+	if err != nil {
+		return false, false, err
+	}
+	ux, _, err := spatialCoordinate(upperRight, "x")
+	if err != nil {
+		return false, false, err
+	}
+	uy, _, err := spatialCoordinate(upperRight, "y")
+	if err != nil {
+		return false, false, err
+	}
+	if lx > ux || ly > uy {
+		return false, true, nil
+	}
+	if pz, pok, err := spatialCoordinate(point, "z"); err != nil {
+		return false, false, err
+	} else if lz, lok, err := spatialCoordinate(lowerLeft, "z"); err != nil {
+		return false, false, err
+	} else if uz, uok, err := spatialCoordinate(upperRight, "z"); err != nil {
+		return false, false, err
+	} else if pok != lok || pok != uok {
+		return false, false, nil
+	} else if pok {
+		if lz > uz {
+			return false, true, nil
+		}
+		return px >= lx && px <= ux && py >= ly && py <= uy && pz >= lz && pz <= uz, true, nil
+	}
+	return px >= lx && px <= ux && py >= ly && py <= uy, true, nil
+}
+
+func geographicPointWithinBBox(point, lowerLeft, upperRight map[string]any) (bool, bool, error) {
+	plon, _, err := spatialCoordinate(point, "longitude")
+	if err != nil {
+		return false, false, err
+	}
+	plat, _, err := spatialCoordinate(point, "latitude")
+	if err != nil {
+		return false, false, err
+	}
+	llon, _, err := spatialCoordinate(lowerLeft, "longitude")
+	if err != nil {
+		return false, false, err
+	}
+	llat, _, err := spatialCoordinate(lowerLeft, "latitude")
+	if err != nil {
+		return false, false, err
+	}
+	ulon, _, err := spatialCoordinate(upperRight, "longitude")
+	if err != nil {
+		return false, false, err
+	}
+	ulat, _, err := spatialCoordinate(upperRight, "latitude")
+	if err != nil {
+		return false, false, err
+	}
+	if llat > ulat {
+		return false, true, nil
+	}
+	inLon := false
+	if llon <= ulon {
+		inLon = plon >= llon && plon <= ulon
+	} else {
+		inLon = plon >= llon || plon <= ulon
+	}
+	if ph, pok, err := spatialCoordinate(point, "height"); err != nil {
+		return false, false, err
+	} else if lh, lok, err := spatialCoordinate(lowerLeft, "height"); err != nil {
+		return false, false, err
+	} else if uh, uok, err := spatialCoordinate(upperRight, "height"); err != nil {
+		return false, false, err
+	} else if pok != lok || pok != uok {
+		return false, false, nil
+	} else if pok {
+		if lh > uh {
+			return false, true, nil
+		}
+		return inLon && plat >= llat && plat <= ulat && ph >= lh && ph <= uh, true, nil
+	}
+	return inLon && plat >= llat && plat <= ulat, true, nil
+}
+
+func pointDistance(left, right map[string]any) (float64, error) {
+	leftSRID, _, err := spatialSRIDValue(left["srid"])
+	if err != nil {
+		return 0, err
+	}
+	rightSRID, _, err := spatialSRIDValue(right["srid"])
+	if err != nil {
+		return 0, err
+	}
+	if leftSRID != rightSRID {
+		return 0, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	leftGeographic := hasSpatialKey(left, "longitude")
+	rightGeographic := hasSpatialKey(right, "longitude")
+	if leftGeographic != rightGeographic {
+		return 0, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	if leftGeographic {
+		return geographicPointDistance(left, right)
+	}
+	return cartesianPointDistance(left, right)
+}
+
+func validateGeographicCoordinateRange(longitude float64, latitude float64) error {
+	if longitude < -180 || longitude > 180 {
+		return graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	if latitude < -90 || latitude > 90 {
+		return graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	return nil
+}
+
+func validateSpatialSRIDShape(srid int, geographic bool, threeD bool) error {
+	switch srid {
+	case 4326:
+		if !geographic || threeD {
+			return graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+	case 4979:
+		if !geographic || !threeD {
+			return graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+	case 7203:
+		if geographic || threeD {
+			return graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+	case 9157:
+		if geographic || !threeD {
+			return graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+	default:
+		return graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	}
+	return nil
+}
+
+func cartesianPointDistance(left, right map[string]any) (float64, error) {
+	lx, _, err := spatialCoordinate(left, "x")
+	if err != nil {
+		return 0, err
+	}
+	ly, _, err := spatialCoordinate(left, "y")
+	if err != nil {
+		return 0, err
+	}
+	rx, _, err := spatialCoordinate(right, "x")
+	if err != nil {
+		return 0, err
+	}
+	ry, _, err := spatialCoordinate(right, "y")
+	if err != nil {
+		return 0, err
+	}
+	dx := lx - rx
+	dy := ly - ry
+	dz := 0.0
+	if lz, lok, err := spatialCoordinate(left, "z"); err != nil {
+		return 0, err
+	} else if rz, rok, err := spatialCoordinate(right, "z"); err != nil {
+		return 0, err
+	} else if lok != rok {
+		return 0, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	} else if lok {
+		dz = lz - rz
+	}
+	return math.Sqrt(dx*dx + dy*dy + dz*dz), nil
+}
+
+func geographicPointDistance(left, right map[string]any) (float64, error) {
+	llon, _, err := spatialCoordinate(left, "longitude")
+	if err != nil {
+		return 0, err
+	}
+	llat, _, err := spatialCoordinate(left, "latitude")
+	if err != nil {
+		return 0, err
+	}
+	rlon, _, err := spatialCoordinate(right, "longitude")
+	if err != nil {
+		return 0, err
+	}
+	rlat, _, err := spatialCoordinate(right, "latitude")
+	if err != nil {
+		return 0, err
+	}
+	lat1 := llat * math.Pi / 180
+	lat2 := rlat * math.Pi / 180
+	dLat := (rlat - llat) * math.Pi / 180
+	dLon := (rlon - llon) * math.Pi / 180
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) + math.Cos(lat1)*math.Cos(lat2)*math.Sin(dLon/2)*math.Sin(dLon/2)
+	surface := 2 * 6371008.8 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+	if lh, lok, err := spatialCoordinate(left, "height"); err != nil {
+		return 0, err
+	} else if rh, rok, err := spatialCoordinate(right, "height"); err != nil {
+		return 0, err
+	} else if lok != rok {
+		return 0, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+	} else if lok {
+		dh := lh - rh
+		return math.Sqrt(surface*surface + dh*dh), nil
+	}
+	return surface, nil
 }
 
 func evalToIntegerValue(value any) (any, error) {
@@ -10184,6 +12270,170 @@ func clonePropertyMap(props graph.PropertyMap) map[string]any {
 		out[key] = decodeStoredPropertyValue(raw)
 	}
 	return out
+}
+
+func evalConvertedListFunction(arg string, row Row, params Params, converter func(any) (any, error)) (any, error) {
+	value, err := evalExpressionWithScope(arg, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	list, ok := normalizeListValue(value)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	out := make([]any, 0, len(list))
+	for _, item := range list {
+		converted, err := converter(item)
+		if err != nil {
+			out = append(out, nil)
+			continue
+		}
+		out = append(out, converted)
+	}
+	return out, nil
+}
+
+func evalTrimFunction(arg string, row Row, params Params, name string) (any, error) {
+	parts := splitTopLevelCommaSeparated(arg)
+	if len(parts) != 1 && len(parts) != 2 {
+		return nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("%s() expects one or two arguments", name), nil)
+	}
+	input, err := evalExpressionWithScope(parts[0], row, params)
+	if err != nil {
+		return nil, err
+	}
+	if input == nil {
+		return nil, nil
+	}
+	inputStr, ok := input.(string)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	if len(parts) == 1 {
+		return strings.TrimSpace(inputStr), nil
+	}
+	trimChars, err := evalExpressionWithScope(parts[1], row, params)
+	if err != nil {
+		return nil, err
+	}
+	if trimChars == nil {
+		return nil, nil
+	}
+	trimCharsStr, ok := trimChars.(string)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	return strings.Trim(inputStr, trimCharsStr), nil
+}
+
+func evalNormalizeFunction(arg string, row Row, params Params) (any, error) {
+	parts := splitTopLevelCommaSeparated(arg)
+	if len(parts) != 1 && len(parts) != 2 {
+		return nil, graph.NewError(graph.ErrKindSemantic, "normalize() expects one or two arguments", nil)
+	}
+	value, err := evalExpressionWithScope(parts[0], row, params)
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return nil, nil
+	}
+	input, ok := value.(string)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	form := norm.NFC
+	if len(parts) == 2 {
+		formValue, err := evalExpressionWithScope(parts[1], row, params)
+		if err != nil {
+			return nil, err
+		}
+		if formValue == nil {
+			return nil, nil
+		}
+		formName, ok := formValue.(string)
+		if !ok {
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+		}
+		switch strings.ToUpper(strings.TrimSpace(formName)) {
+		case "NFC":
+			form = norm.NFC
+		case "NFD":
+			form = norm.NFD
+		case "NFKC":
+			form = norm.NFKC
+		case "NFKD":
+			form = norm.NFKD
+		default:
+			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentValue", nil)
+		}
+	}
+	return form.String(input), nil
+}
+
+func evalReduceFunction(arg string, row Row, params Params) (any, error) {
+	accumulatorName, initialExpr, variableName, listExpr, bodyExpr, ok := parseReduceFunctionArgs(arg)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindSemantic, "reduce() expects reduce(acc = initial, item IN list | expression)", nil)
+	}
+	accumulator, err := evalExpressionWithScope(initialExpr, row, params)
+	if err != nil {
+		return nil, err
+	}
+	listValue, err := evalExpressionWithScope(listExpr, row, params)
+	if err != nil {
+		return nil, err
+	}
+	if listValue == nil {
+		return nil, nil
+	}
+	list, ok := normalizeListValue(listValue)
+	if !ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	for _, item := range list {
+		scope := cloneRow(row)
+		scope[accumulatorName] = accumulator
+		scope[variableName] = item
+		accumulator, err = evalExpressionWithScope(bodyExpr, scope, params)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return accumulator, nil
+}
+
+func parseReduceFunctionArgs(raw string) (string, string, string, string, string, bool) {
+	parts := splitTopLevelCommaSeparated(raw)
+	if len(parts) != 2 {
+		return "", "", "", "", "", false
+	}
+	assign := strings.TrimSpace(parts[0])
+	idx := findTopLevelEqualsIndex(assign)
+	if idx < 0 {
+		return "", "", "", "", "", false
+	}
+	accumulatorName := strings.TrimSpace(assign[:idx])
+	initialExpr := strings.TrimSpace(assign[idx+1:])
+	if !isIdentifierLike(accumulatorName) || initialExpr == "" {
+		return "", "", "", "", "", false
+	}
+	loop := strings.TrimSpace(parts[1])
+	inIdx := findTopLevelKeywordIndex(loop, "IN")
+	pipeIdx := findTopLevelPipeIndex(loop)
+	if inIdx < 0 || pipeIdx < 0 || inIdx > pipeIdx {
+		return "", "", "", "", "", false
+	}
+	variableName := strings.TrimSpace(loop[:inIdx])
+	listExpr := strings.TrimSpace(loop[inIdx+len("IN") : pipeIdx])
+	bodyExpr := strings.TrimSpace(loop[pipeIdx+1:])
+	if !isIdentifierLike(variableName) || listExpr == "" || bodyExpr == "" {
+		return "", "", "", "", "", false
+	}
+	return accumulatorName, initialExpr, variableName, listExpr, bodyExpr, true
 }
 
 func (e *Executor) evalWhereExpression(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (bool, error) {
@@ -12113,13 +14363,25 @@ func evalWriteValue(raw string, params Params, row Row) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "time"); ok {
 		return evalTemporalConstructor("time", arg, params, row)
 	}
+	if arg, ok := parseFunctionCall(raw, "zoned_time"); ok {
+		return evalTemporalConstructor("time", arg, params, row)
+	}
 	if arg, ok := parseFunctionCall(raw, "datetime"); ok {
+		return evalTemporalConstructor("datetime", arg, params, row)
+	}
+	if arg, ok := parseFunctionCall(raw, "zoned_datetime"); ok {
 		return evalTemporalConstructor("datetime", arg, params, row)
 	}
 	if arg, ok := parseFunctionCall(raw, "localtime"); ok {
 		return evalTemporalConstructor("localtime", arg, params, row)
 	}
+	if arg, ok := parseFunctionCall(raw, "local_time"); ok {
+		return evalTemporalConstructor("localtime", arg, params, row)
+	}
 	if arg, ok := parseFunctionCall(raw, "localdatetime"); ok {
+		return evalTemporalConstructor("localdatetime", arg, params, row)
+	}
+	if arg, ok := parseFunctionCall(raw, "local_datetime"); ok {
 		return evalTemporalConstructor("localdatetime", arg, params, row)
 	}
 	if arg, ok := parseFunctionCall(raw, "duration"); ok {
@@ -14796,6 +17058,24 @@ func truncTowardZero(v float64) float64 {
 	return math.Floor(v)
 }
 
+func standardDeviationResult(sum float64, sumSq float64, count int, sample bool) any {
+	if count == 0 {
+		return nil
+	}
+	if sample && count == 1 {
+		return json.Number("0.0")
+	}
+	divisor := float64(count)
+	if sample {
+		divisor = float64(count - 1)
+	}
+	variance := (sumSq - ((sum * sum) / float64(count))) / divisor
+	if variance < 0 && variance > -1e-12 {
+		variance = 0
+	}
+	return json.Number(formatFloatResult(math.Sqrt(variance)))
+}
+
 func mapInt(value map[string]any, key string) (int, bool) {
 	raw, ok := value[key]
 	if !ok {
@@ -15220,7 +17500,8 @@ func isSupportedPropertyValue(v any) bool {
 		return true
 	case map[string]any:
 		_, temporal := typed["__temporal_type"]
-		return temporal
+		_, spatial := typed["__spatial_type"]
+		return temporal || spatial
 	case *graph.Vertex, *graph.Edge, cypherPathValue, multiHopCypherPath:
 		return false
 	case []any:

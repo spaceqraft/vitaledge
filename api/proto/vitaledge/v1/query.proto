@@ -15,6 +15,7 @@ message QueryRequest {
   QueryInput input = 2;
   RequestOptions options = 3;
   ClientContext client = 4;
+  map<string, Value> parameters = 5;
 }
 
 message QueryInput {

@@ -778,6 +778,61 @@ func TestExecuteMatchWhereNotExistsSubqueryWithOrderedPagination(t *testing.T) {
 	}
 }
 
+func TestExecuteExistsFunctionAndExistsSubqueryRemainDistinct(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-1", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Ada"), "nickname": []byte("Ace")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p-2", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("Bob")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"title": []byte("Graph Ops")}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-1", Type: "ACTED_IN", SrcID: "p-2", DstID: "m-1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:Person) WHERE exists(n.nickname) RETURN n.name AS name ORDER BY name ASC")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row for exists(n.nickname), got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["name"]; got != "Ada" {
+		t.Fatalf("unexpected exists(n.nickname) row: %#v", got)
+	}
+
+	stmt, err = parser.ParseStatement("MATCH (n:Person) WHERE EXISTS { MATCH (n)-[:ACTED_IN]->(:Movie) } RETURN n.name AS name ORDER BY name ASC")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row for EXISTS { ... }, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["name"]; got != "Bob" {
+		t.Fatalf("unexpected EXISTS { ... } row: %#v", got)
+	}
+}
+
 func TestExecuteOptionalMatchPreservesRowWhenNoMatches(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -3909,6 +3964,636 @@ func TestEvalExpressionWithScopeConversionRejectsStructuralValues(t *testing.T) 
 		if !strings.Contains(strings.ToLower(err.Error()), "invalidargumentvalue") {
 			t.Fatalf("evalExpressionWithScope(%q) error = %v, want InvalidArgumentValue", tc.expr, err)
 		}
+	}
+}
+
+func TestEvalExpressionWithScopeAdditionalBuiltInFunctions(t *testing.T) {
+	row := Row{
+		"mapv": map[string]any{"name": "Apa"},
+		"p": cypherPathValue{
+			Left:  &graph.Vertex{ID: "n1"},
+			Edge:  &graph.Edge{ID: "r1", SrcID: "n1", DstID: "n2"},
+			Right: &graph.Vertex{ID: "n2"},
+		},
+	}
+
+	tests := []struct {
+		expr string
+		want any
+	}{
+		{expr: "lower('ABC')", want: "abc"},
+		{expr: "upper('abc')", want: "ABC"},
+		{expr: "left('vitaledge', 5)", want: "vital"},
+		{expr: "right('vitaledge', 4)", want: "edge"},
+		{expr: "replace('vital-edge', '-', '_')", want: "vital_edge"},
+		{expr: "trim('  keep  ')", want: "keep"},
+		{expr: "ltrim('  keep  ')", want: "keep  "},
+		{expr: "rtrim('  keep  ')", want: "  keep"},
+		{expr: "char_length('é🙂')", want: 2},
+		{expr: "character_length('abc')", want: 3},
+		{expr: "path_length(p)", want: 1},
+		{expr: "isEmpty([])", want: true},
+		{expr: "isEmpty([1])", want: false},
+		{expr: "isEmpty('')", want: true},
+		{expr: "isEmpty('x')", want: false},
+		{expr: "nullIf(1, 1)", want: nil},
+		{expr: "nullIf(1, 2)", want: 1},
+		{expr: "toStringOrNull(mapv)", want: nil},
+		{expr: "toIntegerOrNull(mapv)", want: nil},
+		{expr: "toFloatOrNull(mapv)", want: nil},
+		{expr: "toBooleanOrNull(mapv)", want: nil},
+	}
+
+	for _, tc := range tests {
+		got, err := evalExpressionWithScope(tc.expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", tc.expr, err)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %#v", tc.expr, got, tc.want)
+		}
+	}
+
+	value, err := evalExpressionWithScope("ceiling(1.2)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(ceiling(1.2)) failed: %v", err)
+	}
+	if fmt.Sprint(value) != "2.0" {
+		t.Fatalf("evalExpressionWithScope(ceiling(1.2)) = %#v, want 2.0", value)
+	}
+}
+
+func TestEvalExpressionWithScopeMathematicalBuiltInsSecondTranche(t *testing.T) {
+	row := Row{}
+
+	tests := []struct {
+		expr string
+		want string
+	}{
+		{expr: "floor(3.9)", want: "3.0"},
+		{expr: "round(1.5)", want: "2.0"},
+		{expr: "round(15.55, 1)", want: "15.6"},
+		{expr: "round(15.55, 1, 'DOWN')", want: "15.5"},
+		{expr: "round(log(e()), 6)", want: "1.0"},
+		{expr: "round(ln(e()), 6)", want: "1.0"},
+		{expr: "log10(1000)", want: "3.0"},
+		{expr: "degrees(pi())", want: "180.0"},
+		{expr: "round(radians(180), 6)", want: "3.141593"},
+		{expr: "round(sin(pi()/2), 6)", want: "1.0"},
+		{expr: "round(cos(0), 6)", want: "1.0"},
+		{expr: "round(tan(0), 6)", want: "0.0"},
+		{expr: "round(asin(1), 6)", want: "1.570796"},
+		{expr: "acos(1)", want: "0.0"},
+		{expr: "round(atan(1), 6)", want: "0.785398"},
+		{expr: "round(atan2(0, -1), 6)", want: "3.141593"},
+		{expr: "round(cot(pi()/4), 6)", want: "1.0"},
+		{expr: "haversin(0)", want: "0.0"},
+	}
+
+	for _, tc := range tests {
+		got, err := evalExpressionWithScope(tc.expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", tc.expr, err)
+		}
+		if fmt.Sprint(got) != tc.want {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %s", tc.expr, got, tc.want)
+		}
+	}
+
+	isNaNResult, err := evalExpressionWithScope("isNaN(sqrt(-1))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(isNaN(sqrt(-1))) failed: %v", err)
+	}
+	if isNaNResult != true {
+		t.Fatalf("evalExpressionWithScope(isNaN(sqrt(-1))) = %#v, want true", isNaNResult)
+	}
+
+	nullResult, err := evalExpressionWithScope("floor(null)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(floor(null)) failed: %v", err)
+	}
+	if nullResult != nil {
+		t.Fatalf("evalExpressionWithScope(floor(null)) = %#v, want nil", nullResult)
+	}
+
+	_, err = evalExpressionWithScope("round(1.2, 0, 'UNKNOWN')", row, nil)
+	if err == nil {
+		t.Fatalf("evalExpressionWithScope(round(..., UNKNOWN)) expected error")
+	}
+	if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+		t.Fatalf("round(..., UNKNOWN) error kind = %v, want invalid input", err)
+	}
+}
+
+func TestEvalExpressionWithScopePredicateScalarBuiltInsThirdTranche(t *testing.T) {
+	row := Row{
+		"n":  &graph.Vertex{ID: "42", Labels: []string{"Person"}, Properties: graph.PropertyMap{"name": []byte("neo")}},
+		"m":  &graph.Vertex{ID: "u1"},
+		"r":  &graph.Edge{ID: "7", Type: "KNOWS", SrcID: "42", DstID: "43"},
+		"p":  cypherPathValue{Left: &graph.Vertex{ID: "42"}, Edge: &graph.Edge{ID: "7", SrcID: "42", DstID: "43"}, Right: &graph.Vertex{ID: "43"}},
+		"mn": map[string]any{"id": "99", "labels": []any{"X"}},
+		"mr": map[string]any{"id": "11", "type": "T", "src": "1", "dst": "2"},
+	}
+
+	tests := []struct {
+		expr string
+		want any
+	}{
+		{expr: "exists(n.id)", want: true},
+		{expr: "exists(null)", want: false},
+		{expr: "elementId(n)", want: "42"},
+		{expr: "elementId(r)", want: "7"},
+		{expr: "elementId(mn)", want: "99"},
+		{expr: "id(n)", want: int64(42)},
+		{expr: "id(r)", want: int64(7)},
+		{expr: "id(mn)", want: int64(99)},
+		{expr: "id(m)", want: nil},
+		{expr: "valueType(null)", want: "NULL"},
+		{expr: "valueType(true)", want: "BOOLEAN"},
+		{expr: "valueType(1)", want: "INTEGER"},
+		{expr: "valueType(1.5)", want: "FLOAT"},
+		{expr: "valueType('x')", want: "STRING"},
+		{expr: "valueType([1,2])", want: "LIST"},
+		{expr: "valueType({a:1})", want: "MAP"},
+		{expr: "valueType(n)", want: "NODE"},
+		{expr: "valueType(r)", want: "RELATIONSHIP"},
+		{expr: "valueType(p)", want: "PATH"},
+	}
+
+	for _, tc := range tests {
+		got, err := evalExpressionWithScope(tc.expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", tc.expr, err)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %#v", tc.expr, got, tc.want)
+		}
+	}
+
+	uuidValue, err := evalExpressionWithScope("randomUUID()", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(randomUUID()) failed: %v", err)
+	}
+	uuidStr, ok := uuidValue.(string)
+	if !ok {
+		t.Fatalf("randomUUID() returned %T, want string", uuidValue)
+	}
+	if len(uuidStr) != 36 || strings.Count(uuidStr, "-") != 4 {
+		t.Fatalf("randomUUID() returned invalid format: %q", uuidStr)
+	}
+
+	tsValue, err := evalExpressionWithScope("timestamp()", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(timestamp()) failed: %v", err)
+	}
+	timestampInt, ok := tsValue.(int64)
+	if !ok {
+		t.Fatalf("timestamp() returned %T, want int64", tsValue)
+	}
+	if timestampInt <= 0 {
+		t.Fatalf("timestamp() returned non-positive value: %d", timestampInt)
+	}
+}
+
+func TestEvalExpressionWithScopeExpandedBuiltIns(t *testing.T) {
+	row := Row{}
+
+	tests := []struct {
+		expr string
+		want any
+	}{
+		{expr: "reduce(total = 0, n IN [1,2,3] | total + n)", want: 6},
+		{expr: "toBooleanList(['true','false','x',null])", want: []any{true, false, nil, nil}},
+		{expr: "toStringList([1,true,{a:1}])", want: []any{"1", "true", nil}},
+		{expr: "btrim('__name__', '_')", want: "name"},
+		{expr: "normalize('e\u0301', 'NFC')", want: "é"},
+	}
+
+	for _, tc := range tests {
+		got, err := evalExpressionWithScope(tc.expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", tc.expr, err)
+		}
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %#v", tc.expr, got, tc.want)
+		}
+	}
+
+	temporalAliases := []struct {
+		aliasExpr string
+		baseExpr  string
+	}{
+		{aliasExpr: "zoned_datetime('2024-01-01T00:00:00Z')", baseExpr: "datetime('2024-01-01T00:00:00Z')"},
+		{aliasExpr: "local_datetime('2024-01-01T12:34:56')", baseExpr: "localdatetime('2024-01-01T12:34:56')"},
+		{aliasExpr: "local_time('12:34:56')", baseExpr: "localtime('12:34:56')"},
+		{aliasExpr: "zoned_time('12:34:56Z')", baseExpr: "time('12:34:56Z')"},
+	}
+
+	for _, tc := range temporalAliases {
+		got, err := evalExpressionWithScope(tc.aliasExpr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", tc.aliasExpr, err)
+		}
+		want, err := evalExpressionWithScope(tc.baseExpr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", tc.baseExpr, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %#v", tc.aliasExpr, got, want)
+		}
+	}
+
+	durationAlias, err := evalExpressionWithScope("duration_between(datetime('2024-01-01T00:00:00Z'), datetime('2024-01-02T00:00:00Z'))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(duration_between(...)) failed: %v", err)
+	}
+	durationBase, err := evalExpressionWithScope("duration.between(datetime('2024-01-01T00:00:00Z'), datetime('2024-01-02T00:00:00Z'))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(duration.between(...)) failed: %v", err)
+	}
+	if !reflect.DeepEqual(durationAlias, durationBase) {
+		t.Fatalf("duration_between(...) = %#v, want %#v", durationAlias, durationBase)
+	}
+}
+
+func TestEvalExpressionWithScopeSpatialPointBuiltIns(t *testing.T) {
+	row := Row{}
+
+	value, err := evalExpressionWithScope("point({x: 1, y: 2})", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(point({x:1,y:2})) failed: %v", err)
+	}
+	pointValue, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("point(...) returned %T, want map[string]any", value)
+	}
+	if got := fmt.Sprint(pointValue["srid"]); got != "7203" {
+		t.Fatalf("unexpected point srid: %#v", pointValue["srid"])
+	}
+	if got := fmt.Sprint(pointValue["x"]); got != "1.0" {
+		t.Fatalf("unexpected point x: %#v", pointValue["x"])
+	}
+	if got := fmt.Sprint(pointValue["y"]); got != "2.0" {
+		t.Fatalf("unexpected point y: %#v", pointValue["y"])
+	}
+
+	valueType, err := evalExpressionWithScope("valueType(point({longitude: 12.3, latitude: 45.6}))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(valueType(point(...))) failed: %v", err)
+	}
+	if valueType != "POINT" {
+		t.Fatalf("unexpected valueType(point(...)): %#v", valueType)
+	}
+
+	stringValue, err := evalExpressionWithScope("toString(point({longitude: 12.3, latitude: 45.6}))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(toString(point(...))) failed: %v", err)
+	}
+	if stringValue != "point({srid: 4326, x: 12.3, y: 45.6})" {
+		t.Fatalf("unexpected point string: %#v", stringValue)
+	}
+
+	distanceValue, err := evalExpressionWithScope("distance(point({x: 0, y: 0}), point({x: 3, y: 4}))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(distance(...)) failed: %v", err)
+	}
+	if fmt.Sprint(distanceValue) != "5.0" {
+		t.Fatalf("unexpected cartesian distance: %#v", distanceValue)
+	}
+
+	geoDistance, err := evalExpressionWithScope("distance(point({longitude: 0, latitude: 0}), point({longitude: 0, latitude: 1}))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(distance(geographic...)) failed: %v", err)
+	}
+	geoNumeric, ok := numericValue(geoDistance)
+	if !ok {
+		t.Fatalf("unexpected geographic distance type: %#v", geoDistance)
+	}
+	if geoNumeric < 111000 || geoNumeric > 112500 {
+		t.Fatalf("unexpected geographic distance magnitude: %#v", geoDistance)
+	}
+}
+
+func TestEvalExpressionWithScopeSpatialPointValidation(t *testing.T) {
+	row := Row{}
+	tests := []string{
+		"point({longitude: 12.3, latitude: 45.6, crs: 'cartesian'})",
+		"point({longitude: 12.3, latitude: 45.6, srid: 4979})",
+		"point({longitude: 0, latitude: 91})",
+		"point({x: 'NaN', y: 1})",
+		"distance(point({x: 0, y: 0, srid: 7203}), point({x: 0, y: 0, z: 1, srid: 9157}))",
+		"distance(point({longitude: 0, latitude: 0}), point({longitude: 0, latitude: 0, height: 1}))",
+	}
+
+	for _, expr := range tests {
+		_, err := evalExpressionWithScope(expr, row, nil)
+		if err == nil {
+			t.Fatalf("evalExpressionWithScope(%q) expected error", expr)
+		}
+		if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+			t.Fatalf("evalExpressionWithScope(%q) error kind = %v, want invalid input", expr, err)
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "invalidargumentvalue") {
+			t.Fatalf("evalExpressionWithScope(%q) error = %v, want InvalidArgumentValue", expr, err)
+		}
+	}
+}
+
+func TestEvalExpressionWithScopeSpatialPointAccessorsAndNamespaceFunctions(t *testing.T) {
+	row := Row{}
+
+	for expr, want := range map[string]string{
+		"point({x: 2.3, y: 4.5}).crs":                                "cartesian",
+		"point({x: 2.3, y: 4.5}).srid":                               "7203",
+		"point({longitude: 4, latitude: 3, height: 4321}).longitude": "4.0",
+		"point({longitude: 4, latitude: 3, height: 4321}).latitude":  "3.0",
+		"point({longitude: 4, latitude: 3, height: 4321}).height":    "4321.0",
+		"point({longitude: 4, latitude: 3, height: 4321}).x":         "4.0",
+		"point({longitude: 4, latitude: 3, height: 4321}).y":         "3.0",
+		"point({longitude: 4, latitude: 3, height: 4321}).z":         "4321.0",
+		"toString(point({longitude: 12.3, latitude: 45.6}))":         "point({srid: 4326, x: 12.3, y: 45.6})",
+		"toString(point({x: 2.3, y: 4.5, crs: 'WGS-84'}))":           "point({srid: 4326, x: 2.3, y: 4.5})",
+		"toString(point({longitude: 181, latitude: 0}))":             "point({srid: 4326, x: -179.0, y: 0.0})",
+	} {
+		got, err := evalExpressionWithScope(expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", expr, err)
+		}
+		if fmt.Sprint(got) != want {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %s", expr, got, want)
+		}
+	}
+
+	within, err := evalExpressionWithScope("point.withinBBox(point({x: 5, y: 5}), point({x: 0, y: 0}), point({x: 10, y: 10}))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(point.withinBBox(...)) failed: %v", err)
+	}
+	if within != true {
+		t.Fatalf("unexpected point.withinBBox result: %#v", within)
+	}
+
+	datelineWithin, err := evalExpressionWithScope("point.withinBBox(point({longitude: 180, latitude: 55.66}), point({longitude: 179, latitude: 55.66}), point({longitude: -179, latitude: 55.70}))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(point.withinBBox(dateline...)) failed: %v", err)
+	}
+	if datelineWithin != true {
+		t.Fatalf("unexpected dateline point.withinBBox result: %#v", datelineWithin)
+	}
+
+	distanceAlias, err := evalExpressionWithScope("point.distance(point({x: 0, y: 0}), point({x: 3, y: 4}))", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(point.distance(...)) failed: %v", err)
+	}
+	if fmt.Sprint(distanceAlias) != "5.0" {
+		t.Fatalf("unexpected point.distance result: %#v", distanceAlias)
+	}
+}
+
+func TestEvalExpressionWithScopeVectorBuiltIns(t *testing.T) {
+	row := Row{}
+
+	for expr, want := range map[string]string{
+		"valueType(vector([1.0, 2.0], 2, FLOAT32))":                                              "VECTOR",
+		"toString(vector([1.0, 2.0], 2, FLOAT32))":                                               "vector([1.0, 2.0], 2, FLOAT32)",
+		"vector_dimension_count(vector([1.0, 2.0, 3.0], 3, FLOAT32))":                            "3",
+		"vector_distance([1.0,2.0], [4.0,6.0], EUCLIDEAN)":                                       "5.0",
+		"vector_distance([1.0,2.0], [4.0,6.0], EUCLIDEAN_SQUARED)":                               "25.0",
+		"vector_distance([1.0,2.0], [4.0,6.0], MANHATTAN)":                                       "7.0",
+		"vector_distance([1.0,2.0], [4.0,6.0], HAMMING)":                                         "2.0",
+		"vector_distance([1.0,2.0], [4.0,6.0], DOT)":                                             "-16.0",
+		"vector_distance([1.0,0.0], [0.0,1.0], COSINE)":                                          "1.0",
+		"vector_norm([3.0,4.0], EUCLIDEAN)":                                                      "5.0",
+		"vector_norm([3.0,-4.0], MANHATTAN)":                                                     "7.0",
+		"vector.similarity.euclidean([1.0,0.0], [1.0,0.0])":                                      "1.0",
+		"vector.similarity.euclidean([1.0,0.0], [0.0,1.0])":                                      "0.3333333333333333",
+		"vector.similarity.cosine([1.0,0.0], [0.0,1.0])":                                         "0.5",
+		"vector.similarity.cosine(vector([1.0,0.0], 2, FLOAT32), vector([1.0,0.0], 2, FLOAT32))": "1.0",
+	} {
+		got, err := evalExpressionWithScope(expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", expr, err)
+		}
+		if fmt.Sprint(got) != want {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %s", expr, got, want)
+		}
+	}
+
+	nullValue, err := evalExpressionWithScope("vector.similarity.cosine(null, [1.0,0.0])", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(vector.similarity.cosine(null,...)) failed: %v", err)
+	}
+	if nullValue != nil {
+		t.Fatalf("expected null for null vector similarity input, got %#v", nullValue)
+	}
+
+	nullDistance, err := evalExpressionWithScope("vector_distance(null, [1.0,0.0], EUCLIDEAN)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(vector_distance(null,...)) failed: %v", err)
+	}
+	if nullDistance != nil {
+		t.Fatalf("expected null for null vector distance input, got %#v", nullDistance)
+	}
+
+	nullNorm, err := evalExpressionWithScope("vector_norm(null, EUCLIDEAN)", row, nil)
+	if err != nil {
+		t.Fatalf("evalExpressionWithScope(vector_norm(null,...)) failed: %v", err)
+	}
+	if nullNorm != nil {
+		t.Fatalf("expected null for null vector norm input, got %#v", nullNorm)
+	}
+
+	invalidExprs := []string{
+		"vector([1.0, null], 2, FLOAT32)",
+		"vector([1.0, 2.0], 3, FLOAT32)",
+		"vector.similarity.cosine([1.0,0.0], [1.0])",
+		"vector.similarity.cosine([0.0,0.0], [1.0,0.0])",
+		"vector_distance([1.0,0.0], [1.0], EUCLIDEAN)",
+		"vector_distance([1.0,0.0], [0.0,1.0], BOGUS)",
+		"vector_distance([0.0,0.0], [1.0,0.0], COSINE)",
+		"vector_norm([1.0,2.0], DOT)",
+	}
+	for _, expr := range invalidExprs {
+		_, err := evalExpressionWithScope(expr, row, nil)
+		if err == nil {
+			t.Fatalf("evalExpressionWithScope(%q) expected error", expr)
+		}
+		if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+			t.Fatalf("evalExpressionWithScope(%q) error kind = %v, want invalid input", expr, err)
+		}
+	}
+}
+
+func TestEvalExpressionWithScopeVectorAliasCanonicalization(t *testing.T) {
+	row := Row{}
+
+	canonicalCases := map[string]string{
+		"toString(vector([1.0, 2.0], 2, INTEGER))": "vector([1.0, 2.0], 2, INTEGER64)",
+		"toString(vector([1.0, 2.0], 2, FLOAT))":   "vector([1.0, 2.0], 2, FLOAT64)",
+	}
+	for expr, want := range canonicalCases {
+		got, err := evalExpressionWithScope(expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", expr, err)
+		}
+		if got != want {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %q", expr, got, want)
+		}
+	}
+
+	metricAliases := map[string]string{
+		"vector_distance([1.0, 2.0], [4.0, 6.0], 'euclidean')": "5.0",
+		"vector_norm([3.0, 4.0], 'manhattan')":                 "7.0",
+	}
+	for expr, want := range metricAliases {
+		got, err := evalExpressionWithScope(expr, row, nil)
+		if err != nil {
+			t.Fatalf("evalExpressionWithScope(%q) failed: %v", expr, err)
+		}
+		if fmt.Sprint(got) != want {
+			t.Fatalf("evalExpressionWithScope(%q) = %#v, want %s", expr, got, want)
+		}
+	}
+}
+
+func TestExecuteAggregateAliasBuiltIns(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("UNWIND [1,2,3] AS n RETURN stDev(n) AS sample, stDevP(n) AS population, stdev_samp(n) AS sample_alias, stdev_pop(n) AS population_alias, collect_list(n) AS collected, percentile_cont(n, 0.5) AS percentile_continuous, percentile_disc(n, 0.5) AS percentile_discrete")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	row := res.Rows[0]
+	if fmt.Sprint(row["sample"]) != "1.0" {
+		t.Fatalf("unexpected stDev(n): %#v", row["sample"])
+	}
+	if fmt.Sprint(row["population"]) != "0.816496580927726" {
+		t.Fatalf("unexpected stDevP(n): %#v", row["population"])
+	}
+	if !reflect.DeepEqual(row["sample_alias"], row["sample"]) {
+		t.Fatalf("unexpected stdev_samp alias: %#v vs %#v", row["sample_alias"], row["sample"])
+	}
+	if !reflect.DeepEqual(row["population_alias"], row["population"]) {
+		t.Fatalf("unexpected stdev_pop alias: %#v vs %#v", row["population_alias"], row["population"])
+	}
+	if !reflect.DeepEqual(row["collected"], []any{1, 2, 3}) {
+		t.Fatalf("unexpected collect_list(n): %#v", row["collected"])
+	}
+	if fmt.Sprint(row["percentile_continuous"]) != "2.0" {
+		t.Fatalf("unexpected percentile_cont(n, 0.5): %#v", row["percentile_continuous"])
+	}
+	if fmt.Sprint(row["percentile_discrete"]) != "2.0" {
+		t.Fatalf("unexpected percentile_disc(n, 0.5): %#v", row["percentile_discrete"])
+	}
+}
+
+func TestExecuteMatchWherePointWithinBBox(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+
+	seed, err := parser.ParseStatement("CREATE (:Place {name:'inside', longitude: 5.0, latitude: 5.0}), (:Place {name:'outside', longitude: 20.0, latitude: 5.0}), (:Place {name:'dateEast', longitude: 179.6, latitude: 55.67}), (:Place {name:'dateWest', longitude: -179.6, latitude: 55.67}), (:Place {name:'dateOutside', longitude: 170.0, latitude: 55.67}), (:Place {name:'missingLatitude', longitude: 6.0})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	regularBBox, err := parser.ParseStatement("MATCH (p:Place) WHERE point.withinBBox(point({longitude: p.longitude, latitude: p.latitude}), point({longitude: 0.0, latitude: 0.0}), point({longitude: 10.0, latitude: 10.0})) RETURN p.name AS name ORDER BY name ASC")
+	if err != nil {
+		t.Fatalf("regular bbox parse failed: %v", err)
+	}
+	regularRes, err := exec.ExecuteStatement(ctx, regularBBox, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("regular bbox execute failed: %v", err)
+	}
+	if len(regularRes.Rows) != 1 {
+		t.Fatalf("regular bbox expected 1 row, got %d: %#v", len(regularRes.Rows), regularRes.Rows)
+	}
+	if got := fmt.Sprint(regularRes.Rows[0]["name"]); got != "inside" {
+		t.Fatalf("regular bbox expected inside, got %q", got)
+	}
+
+	datelineBBox, err := parser.ParseStatement("MATCH (p:Place) WHERE point.withinBBox(point({longitude: p.longitude, latitude: p.latitude}), point({longitude: 179.0, latitude: 55.66}), point({longitude: -179.0, latitude: 55.70})) RETURN p.name AS name ORDER BY name ASC")
+	if err != nil {
+		t.Fatalf("dateline bbox parse failed: %v", err)
+	}
+	datelineRes, err := exec.ExecuteStatement(ctx, datelineBBox, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("dateline bbox execute failed: %v", err)
+	}
+	if len(datelineRes.Rows) != 2 {
+		t.Fatalf("dateline bbox expected 2 rows, got %d: %#v", len(datelineRes.Rows), datelineRes.Rows)
+	}
+	if got := fmt.Sprint(datelineRes.Rows[0]["name"]); got != "dateEast" {
+		t.Fatalf("dateline bbox first row mismatch: %q", got)
+	}
+	if got := fmt.Sprint(datelineRes.Rows[1]["name"]); got != "dateWest" {
+		t.Fatalf("dateline bbox second row mismatch: %q", got)
+	}
+}
+
+func TestExecuteMatchWhereVectorSimilarity(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+
+	stmt, err := parser.ParseStatement("UNWIND [[1.0,0.0],[0.9,0.1],[0.0,1.0]] AS embedding WITH embedding, vector.similarity.euclidean([1.0,0.0], embedding) AS score WHERE score >= 0.5 RETURN embedding AS embedding, score ORDER BY score DESC")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := fmt.Sprint(res.Rows[0]["score"]); got != "1.0" {
+		t.Fatalf("first score mismatch: %q", got)
+	}
+	if got := fmt.Sprint(res.Rows[1]["score"]); got != "0.9803921568627451" {
+		t.Fatalf("second score mismatch: %q", got)
+	}
+}
+
+func TestExecuteMatchWhereVectorDistance(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+
+	stmt, err := parser.ParseStatement("UNWIND [[1.0,0.0],[0.9,0.1],[0.0,1.0]] AS embedding WITH embedding, vector_distance([1.0,0.0], embedding, EUCLIDEAN) AS dist WHERE dist <= 0.15 RETURN embedding AS embedding, dist ORDER BY dist ASC")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := fmt.Sprint(res.Rows[0]["dist"]); got != "0.0" {
+		t.Fatalf("first distance mismatch: %q", got)
+	}
+	if got := fmt.Sprint(res.Rows[1]["dist"]); got != "0.1414213562373095" {
+		t.Fatalf("second distance mismatch: %q", got)
 	}
 }
 

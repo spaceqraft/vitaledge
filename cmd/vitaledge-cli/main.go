@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"sort"
 	"strconv"
@@ -35,10 +36,22 @@ type cliConfig struct {
 	timeout        time.Duration
 	execute        string
 	maxColumnWidth int
+	loadMode       string
+	loadOps        int
+	loadSeed       int64
+	loadPrefix     string
+	loadReadLimit  int
+	loadReadMinHop int
+	loadReadMaxHop int
+	loadReportEach int
 }
 
 type cliState struct {
 	variables map[string]any
+}
+
+type loadGenState struct {
+	createdIDs []string
 }
 
 func main() {
@@ -56,9 +69,32 @@ func loadCLIConfig() cliConfig {
 	flag.DurationVar(&cfg.timeout, "timeout", 5*time.Second, "request timeout")
 	flag.StringVar(&cfg.execute, "execute", "", "optional one-shot statement (non-interactive)")
 	flag.IntVar(&cfg.maxColumnWidth, "max-column-width", defaultMaxColumnWidth, "maximum width for rendered table columns")
+	flag.StringVar(&cfg.loadMode, "load-mode", "", "optional load generator mode: write|noop-write|read")
+	flag.IntVar(&cfg.loadOps, "load-ops", 1000, "number of load operations to execute")
+	flag.Int64Var(&cfg.loadSeed, "load-seed", 1, "seed for deterministic load generation")
+	flag.StringVar(&cfg.loadPrefix, "load-prefix", "soak", "prefix for generated identifiers in load mode")
+	flag.IntVar(&cfg.loadReadLimit, "load-read-limit", 25, "LIMIT value for read load queries")
+	flag.IntVar(&cfg.loadReadMinHop, "load-read-min-hop", 1, "minimum hop count for read load queries")
+	flag.IntVar(&cfg.loadReadMaxHop, "load-read-max-hop", 3, "maximum hop count for read load queries")
+	flag.IntVar(&cfg.loadReportEach, "load-report-each", 100, "emit progress every N load operations")
 	flag.Parse()
 	if cfg.maxColumnWidth < 3 {
 		cfg.maxColumnWidth = 3
+	}
+	if cfg.loadOps < 1 {
+		cfg.loadOps = 1
+	}
+	if cfg.loadReadLimit < 1 {
+		cfg.loadReadLimit = 1
+	}
+	if cfg.loadReadMinHop < 1 {
+		cfg.loadReadMinHop = 1
+	}
+	if cfg.loadReadMaxHop < cfg.loadReadMinHop {
+		cfg.loadReadMaxHop = cfg.loadReadMinHop
+	}
+	if cfg.loadReportEach < 1 {
+		cfg.loadReportEach = 1
 	}
 	return cfg
 }
@@ -72,6 +108,13 @@ func run(cfg cliConfig, in io.Reader, out io.Writer, stderr io.Writer) error {
 
 	client := v1.NewQueryServiceClient(conn)
 	state := cliState{variables: map[string]any{}}
+
+	if strings.TrimSpace(cfg.loadMode) != "" {
+		if strings.TrimSpace(cfg.execute) != "" {
+			return errors.New("--load-mode cannot be combined with --execute")
+		}
+		return runLoadLoop(client, cfg, out, stderr)
+	}
 
 	if strings.TrimSpace(cfg.execute) != "" {
 		return runStatement(context.Background(), client, cfg, state, strings.TrimSpace(cfg.execute), out, stderr)
@@ -166,16 +209,92 @@ func runStatement(parent context.Context, client v1.QueryServiceClient, cfg cliC
 	return runExecute(ctx, client, cfg.tenant, boundQuery, cfg.maxColumnWidth, out, stderr)
 }
 
+func runLoadLoop(client v1.QueryServiceClient, cfg cliConfig, out io.Writer, stderr io.Writer) error {
+	mode := strings.ToLower(strings.TrimSpace(cfg.loadMode))
+	switch mode {
+	case "write", "noop-write", "read":
+		// valid modes
+	default:
+		return fmt.Errorf("unsupported --load-mode %q (expected write|noop-write|read)", cfg.loadMode)
+	}
+	if mode == "write" && cfg.loadOps%2 != 0 {
+		return errors.New("--load-mode=write requires an even --load-ops so CREATE/DELETE counts match")
+	}
+
+	rng := rand.New(rand.NewSource(cfg.loadSeed))
+	state := &loadGenState{}
+	started := time.Now()
+	successCount := 0
+	failureCount := 0
+
+	fmt.Fprintf(out, "load-start mode=%s ops=%d seed=%d tenant=%s\n", mode, cfg.loadOps, cfg.loadSeed, cfg.tenant)
+
+	for op := 1; op <= cfg.loadOps; op++ {
+		query, opKind := nextLoadQuery(cfg, mode, op-1, rng, state)
+		opCtx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+		resp, err := executeCypher(opCtx, client, cfg.tenant, query)
+		cancel()
+		if err != nil {
+			failureCount++
+			fmt.Fprintf(stderr, "load-op=%d kind=%s error=%v\n", op, opKind, err)
+		} else {
+			successCount++
+			if len(resp.GetWarnings()) > 0 {
+				for _, warning := range resp.GetWarnings() {
+					fmt.Fprintf(stderr, "load-op=%d warning[%s]=%s\n", op, warning.GetCode(), warning.GetMessage())
+				}
+			}
+		}
+		if op%cfg.loadReportEach == 0 || op == cfg.loadOps {
+			elapsed := time.Since(started)
+			rate := float64(op) / elapsed.Seconds()
+			fmt.Fprintf(out, "load-progress completed=%d/%d success=%d failure=%d rate=%.2f ops/sec\n", op, cfg.loadOps, successCount, failureCount, rate)
+		}
+	}
+
+	elapsed := time.Since(started)
+	rate := float64(cfg.loadOps) / elapsed.Seconds()
+	fmt.Fprintf(out, "load-done mode=%s ops=%d success=%d failure=%d elapsed=%s rate=%.2f ops/sec\n", mode, cfg.loadOps, successCount, failureCount, elapsed.Truncate(time.Millisecond), rate)
+	if failureCount > 0 {
+		return fmt.Errorf("load completed with %d failed operations", failureCount)
+	}
+	return nil
+}
+
+func nextLoadQuery(cfg cliConfig, mode string, opIndex int, rng *rand.Rand, state *loadGenState) (string, string) {
+	if state == nil {
+		state = &loadGenState{}
+	}
+	switch mode {
+	case "write":
+		if opIndex%2 == 0 {
+			id := fmt.Sprintf("%s-write-%d", cfg.loadPrefix, opIndex/2)
+			state.createdIDs = append(state.createdIDs, id)
+			return fmt.Sprintf("CREATE (:SoakNode {id: %s, mode: 'write'})", quoteCypherString(id)), "create"
+		}
+		id := ""
+		if len(state.createdIDs) > 0 {
+			id = state.createdIDs[0]
+			state.createdIDs = state.createdIDs[1:]
+		}
+		return fmt.Sprintf("MATCH (n:SoakNode {id: %s}) DETACH DELETE n", quoteCypherString(id)), "delete"
+	case "noop-write":
+		id := fmt.Sprintf("%s-noop", cfg.loadPrefix)
+		return fmt.Sprintf("CREATE (:SoakNoopNode {id: %s, mode: 'noop-write'})", quoteCypherString(id)), "create"
+	case "read":
+		hop := cfg.loadReadMinHop
+		if cfg.loadReadMaxHop > cfg.loadReadMinHop {
+			hop += rng.Intn(cfg.loadReadMaxHop - cfg.loadReadMinHop + 1)
+		}
+		query := fmt.Sprintf("MATCH p=(a)-[*%d]-(b) RETURN p LIMIT %d", hop, cfg.loadReadLimit)
+		return query, "read"
+	default:
+		return "RETURN 1", "read"
+	}
+}
+
 func runExecute(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, maxColumnWidth int, out io.Writer, stderr io.Writer) error {
-	resp, err := client.Execute(ctx, &v1.QueryRequest{
-		Tenant: tenant,
-		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: query}},
-		Options: &v1.RequestOptions{
-			IncludeStats:    true,
-			IncludeWarnings: true,
-		},
-		Client: &v1.ClientContext{SdkLanguage: "cli", SdkVersion: "mvp", ProtocolVersion: "v1"},
-	})
+	resp, err := executeCypher(ctx, client, tenant, query)
 	if err != nil {
 		return err
 	}
@@ -191,6 +310,22 @@ func runExecute(ctx context.Context, client v1.QueryServiceClient, tenant string
 		fmt.Fprintf(out, "stats: rows=%d durationMs=%d\n", stats.GetRowsReturned(), stats.GetDurationMs())
 	}
 	return nil
+}
+
+func executeCypher(ctx context.Context, client v1.QueryServiceClient, tenant string, query string) (*v1.QueryResponse, error) {
+	resp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: tenant,
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: query}},
+		Options: &v1.RequestOptions{
+			IncludeStats:    true,
+			IncludeWarnings: true,
+		},
+		Client: &v1.ClientContext{SdkLanguage: "cli", SdkVersion: "mvp", ProtocolVersion: "v1"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, out io.Writer) error {

@@ -49,6 +49,9 @@ bench-smoke:
 bench-graph-store:
 	go test ./internal/graph/store/pebble -run '^$$' -bench 'BenchmarkEdgeMutation' -benchmem -benchtime=200ms
 
+bench-merge-index:
+	go test ./internal/cypher/executor -run '^$$' -bench 'BenchmarkUnwindMergeIngestIndexedVsNonIndexed' -benchmem -benchtime=1x
+
 bench-milestone: build
 	@mkdir -p $(BENCH_OUT_DIR)
 	@ts=$$(date +%Y%m%d-%H%M%S); \

@@ -12,6 +12,7 @@ import (
 	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/cypher/executor"
+	"github.com/paegun/vitaledge/internal/cypher/indexschema"
 	"github.com/paegun/vitaledge/internal/graph"
 	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
 	"google.golang.org/grpc"
@@ -127,6 +128,9 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	if !capResp.GetPreparedQuerySupported() {
 		t.Fatalf("expected prepared query support to be true")
 	}
+	if !capResp.GetIndexDdlSupported() {
+		t.Fatalf("expected index DDL support to be true")
+	}
 
 	execResp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",
@@ -201,5 +205,107 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	fallbackRowValue := fallbackResp.GetRows()[0].GetValues()["id"]
 	if fallbackRowValue == nil || fallbackRowValue.GetStringValue() != "seed" {
 		t.Fatalf("unexpected fallback row value: %#v", fallbackRowValue)
+	}
+}
+
+func TestGRPCQueryServiceCreatePropertyIndex(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(context.Background(), func(tx graph.Tx) error {
+		seed := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: graph.PropertyMap{"email": []byte("alice@example.com")}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: graph.PropertyMap{"email": []byte("bob@example.com")}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"Device"}, Properties: graph.PropertyMap{"email": []byte("ignored@example.com")}},
+		}
+		for _, vertex := range seed {
+			if err := tx.PutVertex(context.Background(), vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store failed: %v", err)
+	}
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: indexschema.NewCatalog()})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+	createResp, err := client.CreatePropertyIndex(ctx, &v1.CreatePropertyIndexRequest{
+		Tenant:      "acme",
+		Schema:      "User",
+		Property:    "email",
+		IfNotExists: false,
+	})
+	if err != nil {
+		t.Fatalf("CreatePropertyIndex failed: %v", err)
+	}
+	if !createResp.GetCreated() {
+		t.Fatalf("expected created=true")
+	}
+	if createResp.GetIndexedEntities() != 2 {
+		t.Fatalf("expected indexed_entities=2, got %d", createResp.GetIndexedEntities())
+	}
+
+	if err := store.View(context.Background(), func(tx graph.Tx) error {
+		ids := map[string]struct{}{}
+		err := tx.ScanPropertyIndex(ctx, "acme", "User", "email", []byte("alice@example.com"), 0, func(entry *graph.PropertyIndexEntry) error {
+			ids[entry.EntityID] = struct{}{}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if _, ok := ids["u1"]; !ok {
+			t.Fatalf("expected u1 to be indexed for alice@example.com")
+		}
+		if len(ids) != 1 {
+			t.Fatalf("expected one indexed entity for alice@example.com, got %d", len(ids))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verify property index failed: %v", err)
+	}
+
+	idempotentResp, err := client.CreatePropertyIndex(ctx, &v1.CreatePropertyIndexRequest{
+		Tenant:      "acme",
+		Schema:      "User",
+		Property:    "email",
+		IfNotExists: true,
+	})
+	if err != nil {
+		t.Fatalf("CreatePropertyIndex IF NOT EXISTS failed: %v", err)
+	}
+	if idempotentResp.GetCreated() {
+		t.Fatalf("expected created=false when index already exists")
+	}
+
+	_, err = client.CreatePropertyIndex(ctx, &v1.CreatePropertyIndexRequest{
+		Tenant:      "acme",
+		Schema:      "User",
+		Property:    "email",
+		IfNotExists: false,
+	})
+	if err == nil {
+		t.Fatalf("expected duplicate create without IF NOT EXISTS to fail")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.AlreadyExists {
+		t.Fatalf("expected AlreadyExists for duplicate index create, got %v", err)
 	}
 }

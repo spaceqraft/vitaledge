@@ -17,16 +17,21 @@ func NewCatalog() *Catalog {
 	return &Catalog{propertyIndexes: map[PropertyIndex]struct{}{}}
 }
 
-func (c *Catalog) AddPropertyIndex(tenant, schema, property string) {
+func (c *Catalog) AddPropertyIndex(tenant, schema, property string) bool {
 	if c == nil || tenant == "" || schema == "" || property == "" {
-		return
+		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.propertyIndexes == nil {
 		c.propertyIndexes = map[PropertyIndex]struct{}{}
 	}
-	c.propertyIndexes[PropertyIndex{Tenant: tenant, Schema: schema, Property: property}] = struct{}{}
+	key := PropertyIndex{Tenant: tenant, Schema: schema, Property: property}
+	if _, exists := c.propertyIndexes[key]; exists {
+		return false
+	}
+	c.propertyIndexes[key] = struct{}{}
+	return true
 }
 
 func (c *Catalog) HasPropertyIndex(tenant, schema, property string) bool {
@@ -37,4 +42,18 @@ func (c *Catalog) HasPropertyIndex(tenant, schema, property string) bool {
 	defer c.mu.RUnlock()
 	_, ok := c.propertyIndexes[PropertyIndex{Tenant: tenant, Schema: schema, Property: property}]
 	return ok
+}
+
+func (c *Catalog) RemovePropertyIndex(tenant, schema, property string) bool {
+	if c == nil || tenant == "" || schema == "" || property == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := PropertyIndex{Tenant: tenant, Schema: schema, Property: property}
+	if _, exists := c.propertyIndexes[key]; !exists {
+		return false
+	}
+	delete(c.propertyIndexes, key)
+	return true
 }

@@ -612,6 +612,269 @@ func TestExecuteMatchIndexMetricsRecorded(t *testing.T) {
 	}
 }
 
+func TestExecuteMergeNodePropertyIndexMetricsRecorded(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "m-existing",
+			Labels:     []string{"Movie"},
+			Properties: graph.PropertyMap{"movie_id": []byte("1"), "title": []byte("Old")},
+		}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "Movie",
+			Property:    "movie_id",
+			Value:       []byte("1"),
+			EntityID:    "m-existing",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("MERGE (m:Movie {movie_id: $movie_id}) SET m.title = $title RETURN m.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "Movie", "movie_id")
+	recorder := &executorMetricsRecorder{}
+	exec := New(store, Options{IndexCatalog: catalog, Metrics: recorder})
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "movie_id": "1", "title": "Updated"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["id"] != "m-existing" {
+		t.Fatalf("expected merge to match existing movie, got %#v", res.Rows)
+	}
+
+	if len(recorder.indexCandidates) == 0 {
+		t.Fatalf("expected index candidate metrics")
+	}
+	if len(recorder.indexLookups) == 0 {
+		t.Fatalf("expected index lookup metrics")
+	}
+
+	foundHit := false
+	for _, lookup := range recorder.indexLookups {
+		if lookup.strategy == "property_index" && lookup.outcome == "hit" {
+			foundHit = true
+			break
+		}
+	}
+	if !foundHit {
+		t.Fatalf("expected property_index hit lookup metric, got %#v", recorder.indexLookups)
+	}
+}
+
+func TestExecuteMergeMaintainsPropertyIndexEntriesForRepeatedRows(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("MERGE (m:Movie {movie_id: $movie_id}) SET m.title = $title RETURN m.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "Movie", "movie_id")
+	recorder := &executorMetricsRecorder{}
+	exec := New(store, Options{IndexCatalog: catalog, Metrics: recorder})
+
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "movie_id": "1", "title": "One"}); err != nil {
+		t.Fatalf("first merge failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "movie_id": "1", "title": "Two"}); err != nil {
+		t.Fatalf("second merge failed: %v", err)
+	}
+
+	verifyErr := store.View(ctx, func(tx graph.Tx) error {
+		count := 0
+		var found *graph.Vertex
+		if err := tx.ScanVertices(ctx, "acme", 0, func(vertex *graph.Vertex) error {
+			if !vertexHasLabel(vertex, "Movie") {
+				return nil
+			}
+			if value, ok := vertex.Properties["movie_id"]; !ok || string(value) != "1" {
+				return nil
+			}
+			count++
+			found = vertex
+			return nil
+		}); err != nil {
+			return err
+		}
+		if count != 1 {
+			return errUnexpected(fmt.Sprintf("expected one merged movie vertex, got %d", count))
+		}
+		if found == nil || string(found.Properties["title"]) != "Two" {
+			return errUnexpected(fmt.Sprintf("unexpected merged vertex state: %#v", found))
+		}
+		return nil
+	})
+	if verifyErr != nil {
+		t.Fatalf("verification failed: %v", verifyErr)
+	}
+
+	foundHit := false
+	for _, lookup := range recorder.indexLookups {
+		if lookup.strategy == "property_index" && lookup.outcome == "hit" {
+			foundHit = true
+			break
+		}
+	}
+	if !foundHit {
+		t.Fatalf("expected property_index hit lookup metric across repeated merges, got %#v", recorder.indexLookups)
+	}
+}
+
+func TestExecuteWriteContextMatchUsesPropertyIndexLookup(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "m-42",
+			Labels:     []string{"Movie"},
+			Properties: graph.PropertyMap{"movie_id": []byte("42"), "title": []byte("The Answer")},
+		}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "Movie",
+			Property:    "movie_id",
+			Value:       []byte("42"),
+			EntityID:    "m-42",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("UNWIND $rows AS r CREATE (:IngestLog {id: r.log_id}) WITH r MATCH (m:Movie {movie_id: r.movie_id}) RETURN count(m) AS matched")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "Movie", "movie_id")
+	recorder := &executorMetricsRecorder{}
+	exec := New(store, Options{IndexCatalog: catalog, Metrics: recorder})
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"rows": []any{
+			map[string]any{"movie_id": "42", "log_id": "l1"},
+			map[string]any{"movie_id": "42", "log_id": "l2"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %#v", res.Rows)
+	}
+
+	foundHit := false
+	for _, lookup := range recorder.indexLookups {
+		if lookup.strategy == "property_index" && lookup.outcome == "hit" {
+			foundHit = true
+			break
+		}
+	}
+	if !foundHit {
+		t.Fatalf("expected property_index hit for write-context MATCH, got %#v", recorder.indexLookups)
+	}
+}
+
+func TestExecuteExplainWriteContextMatchReportsIndexScan(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "m-42",
+			Labels:     []string{"Movie"},
+			Properties: graph.PropertyMap{"movie_id": []byte("42")},
+		}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "Movie",
+			Property:    "movie_id",
+			Value:       []byte("42"),
+			EntityID:    "m-42",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN UNWIND $rows AS r CREATE (:IngestLog {id: r.log_id}) WITH r MATCH (m:Movie {movie_id: r.movie_id}) RETURN m.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "Movie", "movie_id")
+	exec := New(store, Options{IndexCatalog: catalog})
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"rows":   []any{map[string]any{"movie_id": "42", "log_id": "l1"}},
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	payload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	logicalPlan, ok := payload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", payload["logicalPlan"])
+	}
+	nodes, ok := logicalPlan["nodes"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan.nodes []map[string]any, got %T", logicalPlan["nodes"])
+	}
+
+	foundIndexScan := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		if op != "INDEX_SCAN" {
+			continue
+		}
+		accessPath, _ := node["accessPath"].(string)
+		if accessPath == "property_index(Movie.movie_id)" {
+			foundIndexScan = true
+			break
+		}
+	}
+	if !foundIndexScan {
+		t.Fatalf("expected write-context MATCH to report property index scan, got nodes %#v", nodes)
+	}
+}
+
 func TestExecuteMatchWhereFiltersRows(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

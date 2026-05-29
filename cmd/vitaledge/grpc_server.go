@@ -130,6 +130,46 @@ func (h *grpcQueryHandler) GetCapabilities(_ context.Context, _ *v1.Capabilities
 		IrVersions:             []string{grpcSupportedIRVersion},
 		PreparedQuerySupported: true,
 		ParameterBinding:       "server_side",
+		IndexDdlSupported:      true,
+	}, nil
+}
+
+func (h *grpcQueryHandler) CreatePropertyIndex(ctx context.Context, req *v1.CreatePropertyIndexRequest) (*v1.CreatePropertyIndexResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+	if h == nil || h.executor == nil {
+		return nil, status.Error(codes.FailedPrecondition, "executor is not configured")
+	}
+
+	tenant := strings.TrimSpace(h.defaultTenant)
+	if override := strings.TrimSpace(req.GetTenant()); override != "" {
+		tenant = override
+	}
+	if tenant == "" {
+		return nil, status.Error(codes.InvalidArgument, "tenant is required")
+	}
+
+	created, indexedEntities, err := h.executor.CreatePropertyIndex(
+		ctx,
+		tenant,
+		strings.TrimSpace(req.GetSchema()),
+		strings.TrimSpace(req.GetProperty()),
+		req.GetIfNotExists(),
+	)
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindInvalidInput) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		if graph.IsKind(err, graph.ErrKindConflict) {
+			return nil, status.Error(codes.AlreadyExists, err.Error())
+		}
+		return nil, status.Error(codes.Unknown, err.Error())
+	}
+
+	return &v1.CreatePropertyIndexResponse{
+		Created:         created,
+		IndexedEntities: int64(indexedEntities),
 	}, nil
 }
 

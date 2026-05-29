@@ -3834,6 +3834,16 @@ func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx
 		}
 	}
 
+	if plan, ok, err := e.planNodePatternPropertyIndexLookup(tenant, pattern, params, row); err != nil {
+		return nil, err
+	} else if ok {
+		matches, err := e.lookupNodePatternCandidatesByPropertyIndex(ctx, tx, tenant, pattern, params, row, plan)
+		if err != nil {
+			return nil, err
+		}
+		return matches, nil
+	}
+
 	out := make([]*graph.Vertex, 0)
 	if err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 		if nodePatternMatches(vertex, pattern, params, row) {
@@ -3844,6 +3854,101 @@ func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx
 		return nil, err
 	}
 	return out, nil
+}
+
+type nodePropertyIndexLookupPlan struct {
+	schema   string
+	property string
+	value    any
+}
+
+func (e *Executor) planNodePatternPropertyIndexLookup(tenant string, pattern nodePattern, params Params, row Row) (nodePropertyIndexLookupPlan, bool, error) {
+	if e == nil || e.indexCatalog == nil {
+		return nodePropertyIndexLookupPlan{}, false, nil
+	}
+	if len(pattern.AllOfLabels) == 0 && len(pattern.AnyOfLabels) == 0 {
+		return nodePropertyIndexLookupPlan{}, false, nil
+	}
+
+	props, err := parsePropertyMap(pattern.PropertiesRaw, params, row)
+	if err != nil || len(props) == 0 {
+		return nodePropertyIndexLookupPlan{}, false, nil
+	}
+
+	labels := append([]string{}, pattern.AllOfLabels...)
+	if len(labels) == 0 {
+		labels = append(labels, pattern.AnyOfLabels...)
+	}
+	if len(labels) == 0 {
+		return nodePropertyIndexLookupPlan{}, false, nil
+	}
+
+	propKeys := make([]string, 0, len(props))
+	for prop := range props {
+		if strings.EqualFold(prop, "id") {
+			continue
+		}
+		propKeys = append(propKeys, prop)
+	}
+	if len(propKeys) == 0 {
+		return nodePropertyIndexLookupPlan{}, false, nil
+	}
+	sort.Strings(propKeys)
+
+	for _, label := range labels {
+		for _, prop := range propKeys {
+			indexed := e.indexCatalog.HasPropertyIndex(tenant, label, prop)
+			e.metrics.ObserveIndexCandidate(tenant, label, prop, indexed)
+			if !indexed {
+				continue
+			}
+			return nodePropertyIndexLookupPlan{schema: label, property: prop, value: props[prop]}, true, nil
+		}
+	}
+
+	return nodePropertyIndexLookupPlan{}, false, nil
+}
+
+func (e *Executor) lookupNodePatternCandidatesByPropertyIndex(ctx context.Context, tx graph.Tx, tenant string, pattern nodePattern, params Params, row Row, plan nodePropertyIndexLookupPlan) ([]*graph.Vertex, error) {
+	encoded := valueToBytes(plan.value)
+	ids := map[string]struct{}{}
+	err := tx.ScanPropertyIndex(ctx, tenant, plan.schema, plan.property, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
+		ids[entry.EntityID] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		e.metrics.ObserveIndexLookup("property_index", "error", 0)
+		return nil, err
+	}
+	if len(ids) == 0 {
+		e.metrics.ObserveIndexLookup("property_index", "miss", 0)
+		return nil, nil
+	}
+
+	matches := make([]*graph.Vertex, 0, len(ids))
+	for id := range ids {
+		vertex, err := tx.GetVertex(ctx, tenant, id)
+		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				continue
+			}
+			e.metrics.ObserveIndexLookup("property_index", "error", 0)
+			return nil, err
+		}
+		if !nodePatternMatches(vertex, pattern, params, row) {
+			continue
+		}
+		matches = append(matches, vertex)
+	}
+	if len(matches) == 0 {
+		e.metrics.ObserveIndexLookup("property_index", "miss", 0)
+		return nil, nil
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].ID < matches[j].ID
+	})
+	e.metrics.ObserveIndexLookup("property_index", "hit", len(matches))
+	return matches, nil
 }
 
 func nodePatternMatches(vertex *graph.Vertex, pattern nodePattern, params Params, row Row) bool {
@@ -4420,13 +4525,13 @@ func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows 
 		}
 
 		if merge && vertexID == "" {
-			matches, err := findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
+			matches, err := e.findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
 			if err != nil {
 				return nil, err
 			}
 			if len(matches) == 0 {
 				vertex := &graph.Vertex{Tenant: tenant, ID: nextAutoVertexID(varName), Labels: labels, Properties: normalizedProps}
-				if err := tx.PutVertex(ctx, vertex); err != nil {
+				if err := e.putVertexWithIndexes(ctx, tx, vertex); err != nil {
 					return nil, err
 				}
 				merged := cloneRow(row)
@@ -4460,7 +4565,7 @@ func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows 
 				created = false
 			}
 		}
-		if err := tx.PutVertex(ctx, vertex); err != nil {
+		if err := e.putVertexWithIndexes(ctx, tx, vertex); err != nil {
 			return nil, err
 		}
 		merged := cloneRow(row)
@@ -4484,7 +4589,70 @@ func hasNilPropertyValue(props map[string]any) bool {
 	return false
 }
 
-func findMergeVerticesByPattern(ctx context.Context, tx graph.Tx, tenant string, labels []string, props map[string]any) ([]*graph.Vertex, error) {
+func (e *Executor) findMergeVerticesByPattern(ctx context.Context, tx graph.Tx, tenant string, labels []string, props map[string]any) ([]*graph.Vertex, error) {
+	type lookupPlan struct {
+		schema   string
+		property string
+		value    any
+	}
+
+	plan := lookupPlan{}
+	hasPlan := false
+	if len(labels) > 0 && len(props) > 0 {
+		propKeys := make([]string, 0, len(props))
+		for prop := range props {
+			propKeys = append(propKeys, prop)
+		}
+		sort.Strings(propKeys)
+
+		for _, label := range labels {
+			for _, prop := range propKeys {
+				indexed := e.indexCatalog != nil && e.indexCatalog.HasPropertyIndex(tenant, label, prop)
+				e.metrics.ObserveIndexCandidate(tenant, label, prop, indexed)
+				if hasPlan || !indexed {
+					continue
+				}
+				plan = lookupPlan{schema: label, property: prop, value: props[prop]}
+				hasPlan = true
+			}
+		}
+	}
+
+	if hasPlan {
+		encoded := valueToBytes(plan.value)
+		ids := map[string]struct{}{}
+		err := tx.ScanPropertyIndex(ctx, tenant, plan.schema, plan.property, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
+			ids[entry.EntityID] = struct{}{}
+			return nil
+		})
+		if err != nil {
+			e.metrics.ObserveIndexLookup("property_index", "error", 0)
+			return nil, err
+		}
+
+		matches := make([]*graph.Vertex, 0, len(ids))
+		for id := range ids {
+			vertex, err := tx.GetVertex(ctx, tenant, id)
+			if err != nil {
+				if graph.IsKind(err, graph.ErrKindNotFound) {
+					continue
+				}
+				e.metrics.ObserveIndexLookup("property_index", "error", 0)
+				return nil, err
+			}
+			if !vertexMatchesMergePattern(vertex, labels, props) {
+				continue
+			}
+			matches = append(matches, vertex)
+		}
+		if len(matches) == 0 {
+			e.metrics.ObserveIndexLookup("property_index", "miss", 0)
+			return nil, nil
+		}
+		e.metrics.ObserveIndexLookup("property_index", "hit", len(matches))
+		return matches, nil
+	}
+
 	matches := make([]*graph.Vertex, 0)
 	err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 		if !vertexMatchesMergePattern(vertex, labels, props) {
@@ -4528,6 +4696,34 @@ func vertexMatchesMergePattern(vertex *graph.Vertex, labels []string, props map[
 		}
 	}
 	return true
+}
+
+func (e *Executor) putVertexWithIndexes(ctx context.Context, tx graph.Tx, vertex *graph.Vertex) error {
+	if err := tx.PutVertex(ctx, vertex); err != nil {
+		return err
+	}
+	if e.indexCatalog == nil || vertex == nil {
+		return nil
+	}
+	for _, label := range vertex.Labels {
+		for property, encoded := range vertex.Properties {
+			if !e.indexCatalog.HasPropertyIndex(vertex.Tenant, label, property) {
+				continue
+			}
+			valueCopy := append([]byte(nil), encoded...)
+			if err := tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+				Tenant:      vertex.Tenant,
+				Schema:      label,
+				Property:    property,
+				Value:       valueCopy,
+				EntityID:    vertex.ID,
+				EntityClass: "vertex",
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func mergePropertyValueEqual(expected, actual any) bool {
@@ -4681,7 +4877,7 @@ func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row,
 		if err != nil {
 			return nil, err
 		}
-		leftVertex, leftCreated, err := resolveOrCreateVertex(ctx, tx, tenant, workRow, leftVar, leftLabels, leftProps, merge)
+		leftVertex, leftCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, workRow, leftVar, leftLabels, leftProps, merge)
 		if err != nil {
 			return nil, err
 		}
@@ -4697,7 +4893,7 @@ func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row,
 		if err != nil {
 			return nil, err
 		}
-		rightVertex, rightCreated, err := resolveOrCreateVertex(ctx, tx, tenant, workRow, rightVar, rightLabels, rightProps, merge)
+		rightVertex, rightCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, workRow, rightVar, rightLabels, rightProps, merge)
 		if err != nil {
 			return nil, err
 		}
@@ -4778,7 +4974,7 @@ func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, row
 			if err != nil {
 				return nil, err
 			}
-			vertex, vertexCreated, err := resolveOrCreateVertex(ctx, tx, tenant, merged, node.Var, node.Labels, props, merge)
+			vertex, vertexCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, merged, node.Var, node.Labels, props, merge)
 			if err != nil {
 				return nil, err
 			}
@@ -5033,7 +5229,7 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						}
 						mutated.Properties[field] = encoded
 					}
-					if err := tx.PutVertex(ctx, mutated); err != nil {
+					if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
 						return nil, err
 					}
 					working = cloneRow(working)
@@ -5099,7 +5295,7 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						}
 						mutated.Properties[key] = encoded
 					}
-					if err := tx.PutVertex(ctx, mutated); err != nil {
+					if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
 						return nil, err
 					}
 					working = cloneRow(working)
@@ -5163,7 +5359,7 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						}
 						mutated.Properties[key] = encoded
 					}
-					if err := tx.PutVertex(ctx, mutated); err != nil {
+					if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
 						return nil, err
 					}
 					working = cloneRow(working)
@@ -5222,7 +5418,7 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						mutated.Labels = append(mutated.Labels, label)
 					}
 				}
-				if err := tx.PutVertex(ctx, mutated); err != nil {
+				if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
 					return nil, err
 				}
 				working = cloneRow(working)
@@ -5398,7 +5594,7 @@ func (e *Executor) applyRemoveClause(ctx context.Context, tx graph.Tx, rows []Ro
 					mutated := cloneVertex(typed)
 					ensureProperties(mutated)
 					delete(mutated.Properties, field)
-					if err := tx.PutVertex(ctx, mutated); err != nil {
+					if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
 						return nil, err
 					}
 					working = cloneRow(working)
@@ -5447,7 +5643,7 @@ func (e *Executor) applyRemoveClause(ctx context.Context, tx graph.Tx, rows []Ro
 					kept = append(kept, label)
 				}
 				mutated.Labels = kept
-				if err := tx.PutVertex(ctx, mutated); err != nil {
+				if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
 					return nil, err
 				}
 				working = cloneRow(working)
@@ -14452,7 +14648,7 @@ func resolvePatternSourceID(row Row, params Params, varName, paramName string) (
 	return requireStringParam(params, paramName)
 }
 
-func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row Row, varName string, labels []string, props map[string]any, merge bool) (*graph.Vertex, bool, error) {
+func (e *Executor) resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row Row, varName string, labels []string, props map[string]any, merge bool) (*graph.Vertex, bool, error) {
 	if binding, ok := row[varName]; ok {
 		if v, ok := binding.(*graph.Vertex); ok {
 			return v, false, nil
@@ -14476,7 +14672,7 @@ func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row 
 	}
 	if vertexID == "" {
 		if merge {
-			matches, err := findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
+			matches, err := e.findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
 			if err != nil {
 				return nil, false, err
 			}
@@ -14496,7 +14692,7 @@ func resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row 
 	}
 
 	vertex = &graph.Vertex{Tenant: tenant, ID: vertexID, Labels: labels, Properties: normalizeVertexProperties(props)}
-	if err := tx.PutVertex(ctx, vertex); err != nil {
+	if err := e.putVertexWithIndexes(ctx, tx, vertex); err != nil {
 		return nil, false, err
 	}
 	return vertex, true, nil

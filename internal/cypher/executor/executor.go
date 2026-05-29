@@ -61,6 +61,8 @@ type Metrics interface {
 
 type IndexCatalog interface {
 	HasPropertyIndex(tenant, schema, property string) bool
+	AddPropertyIndex(tenant, schema, property string) bool
+	RemovePropertyIndex(tenant, schema, property string) bool
 }
 
 type Options struct {

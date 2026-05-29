@@ -19,9 +19,10 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	QueryService_Execute_FullMethodName         = "/vitaledge.v1.QueryService/Execute"
-	QueryService_Explain_FullMethodName         = "/vitaledge.v1.QueryService/Explain"
-	QueryService_GetCapabilities_FullMethodName = "/vitaledge.v1.QueryService/GetCapabilities"
+	QueryService_Execute_FullMethodName             = "/vitaledge.v1.QueryService/Execute"
+	QueryService_Explain_FullMethodName             = "/vitaledge.v1.QueryService/Explain"
+	QueryService_GetCapabilities_FullMethodName     = "/vitaledge.v1.QueryService/GetCapabilities"
+	QueryService_CreatePropertyIndex_FullMethodName = "/vitaledge.v1.QueryService/CreatePropertyIndex"
 )
 
 // QueryServiceClient is the client API for QueryService service.
@@ -31,6 +32,7 @@ type QueryServiceClient interface {
 	Execute(ctx context.Context, in *QueryRequest, opts ...grpc.CallOption) (*QueryResponse, error)
 	Explain(ctx context.Context, in *QueryRequest, opts ...grpc.CallOption) (*ExplainResponse, error)
 	GetCapabilities(ctx context.Context, in *CapabilitiesRequest, opts ...grpc.CallOption) (*CapabilitiesResponse, error)
+	CreatePropertyIndex(ctx context.Context, in *CreatePropertyIndexRequest, opts ...grpc.CallOption) (*CreatePropertyIndexResponse, error)
 }
 
 type queryServiceClient struct {
@@ -71,6 +73,16 @@ func (c *queryServiceClient) GetCapabilities(ctx context.Context, in *Capabiliti
 	return out, nil
 }
 
+func (c *queryServiceClient) CreatePropertyIndex(ctx context.Context, in *CreatePropertyIndexRequest, opts ...grpc.CallOption) (*CreatePropertyIndexResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreatePropertyIndexResponse)
+	err := c.cc.Invoke(ctx, QueryService_CreatePropertyIndex_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // QueryServiceServer is the server API for QueryService service.
 // All implementations should embed UnimplementedQueryServiceServer
 // for forward compatibility.
@@ -78,6 +90,7 @@ type QueryServiceServer interface {
 	Execute(context.Context, *QueryRequest) (*QueryResponse, error)
 	Explain(context.Context, *QueryRequest) (*ExplainResponse, error)
 	GetCapabilities(context.Context, *CapabilitiesRequest) (*CapabilitiesResponse, error)
+	CreatePropertyIndex(context.Context, *CreatePropertyIndexRequest) (*CreatePropertyIndexResponse, error)
 }
 
 // UnimplementedQueryServiceServer should be embedded to have
@@ -95,6 +108,9 @@ func (UnimplementedQueryServiceServer) Explain(context.Context, *QueryRequest) (
 }
 func (UnimplementedQueryServiceServer) GetCapabilities(context.Context, *CapabilitiesRequest) (*CapabilitiesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetCapabilities not implemented")
+}
+func (UnimplementedQueryServiceServer) CreatePropertyIndex(context.Context, *CreatePropertyIndexRequest) (*CreatePropertyIndexResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreatePropertyIndex not implemented")
 }
 func (UnimplementedQueryServiceServer) testEmbeddedByValue() {}
 
@@ -170,6 +186,24 @@ func _QueryService_GetCapabilities_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _QueryService_CreatePropertyIndex_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreatePropertyIndexRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(QueryServiceServer).CreatePropertyIndex(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: QueryService_CreatePropertyIndex_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(QueryServiceServer).CreatePropertyIndex(ctx, req.(*CreatePropertyIndexRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // QueryService_ServiceDesc is the grpc.ServiceDesc for QueryService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -188,6 +222,10 @@ var QueryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetCapabilities",
 			Handler:    _QueryService_GetCapabilities_Handler,
+		},
+		{
+			MethodName: "CreatePropertyIndex",
+			Handler:    _QueryService_CreatePropertyIndex_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

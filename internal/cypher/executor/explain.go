@@ -1019,13 +1019,28 @@ func (b *explainPlanBuilder) addMatchClause(optional bool, raw string, where *as
 func (b *explainPlanBuilder) addNodeScan(optional bool, pattern nodePattern, where *ast.Expression) {
 	schema := explainPatternSchema(pattern)
 	props, err := explainPropertyMap(pattern.PropertiesRaw, b.params)
-	indexed := false
-	indexPath := ""
-	if err == nil && schema != "" {
+	propKeyMap := explainPropertyKeys(pattern.PropertiesRaw)
+	propKeys := make([]string, 0, len(propKeyMap))
+	for prop := range propKeyMap {
+		if strings.EqualFold(prop, "id") {
+			continue
+		}
+		propKeys = append(propKeys, prop)
+	}
+	if err == nil {
+		propKeys = propKeys[:0]
 		for prop := range props {
 			if strings.EqualFold(prop, "id") {
 				continue
 			}
+			propKeys = append(propKeys, prop)
+		}
+	}
+	sort.Strings(propKeys)
+	indexed := false
+	indexPath := ""
+	if schema != "" {
+		for _, prop := range propKeys {
 			if b.catalog != nil && b.catalog.HasPropertyIndex(b.tenant, schema, prop) {
 				indexed = true
 				indexPath = fmt.Sprintf("property_index(%s.%s)", schema, prop)
@@ -1047,8 +1062,11 @@ func (b *explainPlanBuilder) addNodeScan(optional bool, pattern nodePattern, whe
 		op = "OPTIONAL_" + op
 	}
 	attrs := map[string]any{"accessPath": indexPath}
-	if indexed && pattern.PropertiesRaw != "" {
+	if indexed && strings.TrimSpace(pattern.PropertiesRaw) != "" {
 		attrs["predicate"] = strings.TrimSpace(pattern.PropertiesRaw)
+		if err != nil {
+			attrs["predicateQuality"] = "estimate"
+		}
 	}
 	b.add(op, attrs)
 	if !indexed && strings.TrimSpace(pattern.PropertiesRaw) != "" {

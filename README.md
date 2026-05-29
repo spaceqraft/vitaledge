@@ -39,6 +39,7 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Summarize last compliance run log: `make cypher-compliance-summary`
 - Smoke benchmark: `make bench-smoke`
 - Graph store benchmark baseline: `make bench-graph-store`
+- Cypher ingest benchmark (indexed vs non-indexed UNWIND..MERGE): `make bench-merge-index`
 - Milestone benchmark baseline (local JSONL snapshot): `make bench-milestone`
 - Mixed CLI soak profile (concurrent write/noop-write/read): `make soak-mixed`
 
@@ -56,6 +57,14 @@ The server can load configuration-based index DDL at startup:
 - env: `VITALEDGE_INDEX_SCHEMA_CONFIG=/path/to/indexes.json`
 
 If both are provided, the flag value is used.
+
+Property indexes can also be created at runtime through gRPC index DDL:
+
+- RPC: `CreatePropertyIndex(CreatePropertyIndexRequest)`
+- Request fields: `tenant`, `schema`, `property`, `if_not_exists`
+- Response fields: `created`, `indexed_entities`
+
+Runtime index DDL backfills existing vertices for the requested `(tenant, schema, property)` tuple so index-backed lookups become available immediately.
 
 Graph store and tenant defaults are configurable at startup:
 
@@ -173,6 +182,32 @@ Dashboard coverage includes:
 - top unindexed index-candidate observations,
 - host CPU, memory, and network I/O signals,
 - Go runtime and GC behavior (goroutines, heap allocation, GC pause/cycles).
+
+### Benchmark: UNWIND..MERGE Index Tuning
+
+Use this benchmark to compare batch ingest behavior with and without property indexes on:
+
+- `Movie.movie_id`
+- `User.user_id`
+- `Genre.genre`
+
+Run:
+
+```bash
+make bench-merge-index
+```
+
+The benchmark executes a representative three-step ingest workload:
+
+1. `UNWIND $movies ... MERGE (mov:Movie {movie_id: ...})`
+2. `UNWIND $pairs ... MATCH (mov:Movie {movie_id: ...}) MERGE (g:Genre {genre: ...})`
+3. `UNWIND $ratings ... MERGE (u:User {user_id: ...}) ... MATCH (mov:Movie {movie_id: ...})`
+
+Interpretation guidance:
+
+- `with_property_indexes` should show higher `rows/s` and lower `ns/op` than `without_property_indexes` as graph size grows.
+- If the gap is small, verify index DDL and backfill for the target tenant/schema/property tuples.
+- Pair this benchmark with Prometheus/Grafana panels for `vitaledge_executor_index_lookups_total` and `vitaledge_executor_unindexed_candidate_observations` to confirm runtime index usage.
 
 ### Reproducible Manual Tuning Examples
 

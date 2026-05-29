@@ -8,6 +8,7 @@ service QueryService {
   rpc Execute(QueryRequest) returns (QueryResponse);
   rpc Explain(QueryRequest) returns (ExplainResponse);
   rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc CreatePropertyIndex(CreatePropertyIndexRequest) returns (CreatePropertyIndexResponse);
 }
 
 message QueryRequest {
@@ -77,6 +78,19 @@ message CapabilitiesResponse {
   repeated string ir_versions = 3;
   bool prepared_query_supported = 4;
   string parameter_binding = 5;
+  bool index_ddl_supported = 6;
+}
+
+message CreatePropertyIndexRequest {
+  string tenant = 1;
+  string schema = 2;
+  string property = 3;
+  bool if_not_exists = 4;
+}
+
+message CreatePropertyIndexResponse {
+  bool created = 1;
+  int64 indexed_entities = 2;
 }
 
 message Row {

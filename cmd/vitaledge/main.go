@@ -181,6 +181,7 @@ func loadConfigFromStartup() (Config, error) {
 		GraphPath:             graphPath,
 		DefaultTenant:         tenant,
 		IndexConfigPath:       indexConfigPath,
+		IndexCatalog:          indexschema.NewCatalog(),
 		MetricsReportInterval: metricsReportInterval,
 		MetricsListenAddress:  metricsListenAddress,
 		GRPCListenAddress:     grpcListenAddress,

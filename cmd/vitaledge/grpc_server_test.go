@@ -310,3 +310,117 @@ func TestGRPCExecuteIntegrationSerializesIntegerOnlyAggregatesAndProperties(t *t
 		}
 	}
 }
+
+func TestGRPCExecuteIntegrationParameterizedThresholdAndLimit(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(context.Background(), func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "host-1", Labels: []string{"Host"}, Properties: graph.PropertyMap{"ip": []byte("10.0.0.1")}},
+			{Tenant: "acme", ID: "host-2", Labels: []string{"Host"}, Properties: graph.PropertyMap{"ip": []byte("10.0.0.2")}},
+			{Tenant: "acme", ID: "flow-1", Labels: []string{"Flow"}, Properties: graph.PropertyMap{"threat_score": []byte("0.95"), "detected_malicious": []byte("true")}},
+			{Tenant: "acme", ID: "flow-2", Labels: []string{"Flow"}, Properties: graph.PropertyMap{"threat_score": []byte("0.98"), "detected_malicious": []byte("true")}},
+			{Tenant: "acme", ID: "flow-3", Labels: []string{"Flow"}, Properties: graph.PropertyMap{"threat_score": []byte("0.92"), "detected_malicious": []byte("true")}},
+			{Tenant: "acme", ID: "flow-4", Labels: []string{"Flow"}, Properties: graph.PropertyMap{"threat_score": []byte("0.40"), "detected_malicious": []byte("false")}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(context.Background(), vertex); err != nil {
+				return err
+			}
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "sent-1", Type: "SENT", SrcID: "host-1", DstID: "flow-1"},
+			{Tenant: "acme", ID: "sent-2", Type: "SENT", SrcID: "host-1", DstID: "flow-2"},
+			{Tenant: "acme", ID: "sent-3", Type: "SENT", SrcID: "host-2", DstID: "flow-3"},
+			{Tenant: "acme", ID: "sent-4", Type: "SENT", SrcID: "host-2", DstID: "flow-4"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(context.Background(), edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed host/flow graph failed: %v", err)
+	}
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+
+	thresholdResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (f:Flow) WHERE f.threat_score >= $threshold RETURN count(f) AS ct"}},
+		Parameters: map[string]*v1.Value{
+			"threshold": {Kind: &v1.Value_DoubleValue{DoubleValue: 0.93}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("threshold Execute failed: %v", err)
+	}
+	if len(thresholdResp.GetRows()) != 1 {
+		t.Fatalf("expected one threshold row, got %d", len(thresholdResp.GetRows()))
+	}
+	thresholdRow := thresholdResp.GetRows()[0].GetValues()
+	if _, ok := thresholdRow["ct"].GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected ct as int_value kind, got %T", thresholdRow["ct"].GetKind())
+	}
+	if got := thresholdRow["ct"].GetIntValue(); got != 2 {
+		t.Fatalf("expected threshold count=2, got %d", got)
+	}
+
+	limitQuery := "MATCH (src:Host)-[:SENT]->(f:Flow) WHERE f.detected_malicious = true RETURN src.ip AS source_ip, count(f) AS suspicious_flows, avg(f.threat_score) AS avg_score, max(f.threat_score) AS max_score ORDER BY suspicious_flows DESC, avg_score DESC LIMIT $limit_value"
+	limitResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: limitQuery}},
+		Parameters: map[string]*v1.Value{
+			"limit_value": {Kind: &v1.Value_IntValue{IntValue: 1}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("limit Execute failed: %v", err)
+	}
+	if len(limitResp.GetRows()) != 1 {
+		t.Fatalf("expected one limited row, got %d", len(limitResp.GetRows()))
+	}
+
+	row := limitResp.GetRows()[0].GetValues()
+	if got := row["source_ip"].GetStringValue(); got != "10.0.0.1" {
+		t.Fatalf("expected source_ip=10.0.0.1, got %q", got)
+	}
+	if _, ok := row["suspicious_flows"].GetKind().(*v1.Value_IntValue); !ok {
+		t.Fatalf("expected suspicious_flows as int_value kind, got %T", row["suspicious_flows"].GetKind())
+	}
+	if got := row["suspicious_flows"].GetIntValue(); got != 2 {
+		t.Fatalf("expected suspicious_flows=2, got %d", got)
+	}
+	if _, ok := row["avg_score"].GetKind().(*v1.Value_DoubleValue); !ok {
+		t.Fatalf("expected avg_score as double_value kind, got %T", row["avg_score"].GetKind())
+	}
+	if got := row["avg_score"].GetDoubleValue(); got != 0.965 {
+		t.Fatalf("expected avg_score=0.965, got %v", got)
+	}
+	if _, ok := row["max_score"].GetKind().(*v1.Value_DoubleValue); !ok {
+		t.Fatalf("expected max_score as double_value kind, got %T", row["max_score"].GetKind())
+	}
+	if got := row["max_score"].GetDoubleValue(); got != 0.98 {
+		t.Fatalf("expected max_score=0.98, got %v", got)
+	}
+}

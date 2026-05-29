@@ -4619,6 +4619,52 @@ func TestExecuteAggregateAliasBuiltIns(t *testing.T) {
 	}
 }
 
+func TestExecuteSumCaseWhenAggregation(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("UNWIND [0,1,2,3] AS n RETURN sum(CASE WHEN n >= 2 THEN 1 ELSE 0 END) AS highCount")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := fmt.Sprint(res.Rows[0]["highCount"]); got != "2" && got != "2.0" {
+		t.Fatalf("sum(CASE WHEN ...) = %q, want 2", got)
+	}
+}
+
+func TestExecuteCompositeAggregateCaseExpression(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("UNWIND [0,1,2,3] AS n RETURN coalesce(sum(CASE WHEN n >= 2 THEN 1 ELSE 0 END), 0) * 1.0 / count(*) AS ratio")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := fmt.Sprint(res.Rows[0]["ratio"]); got != "0.5" {
+		t.Fatalf("coalesce(sum(CASE WHEN ...),0)/count(*) = %q, want 0.5", got)
+	}
+}
+
 func TestExecuteMatchWherePointWithinBBox(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

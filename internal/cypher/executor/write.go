@@ -5804,6 +5804,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		aggExprCountSeen   map[string]map[string]struct{}
 		aggExprCollects    map[string][]any
 		aggExprCollectSeen map[string]map[string]struct{}
+		aggExprAggs        map[string]*projectionAggregate
 	}
 
 	nonAggregateCount := 0
@@ -5847,7 +5848,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 		groupKey := string(keyBytes)
 		group, ok := groups[groupKey]
 		if !ok {
-			group = &projectionGroup{projected: projected, source: cloneRow(row), counts: map[int]int{}, countSeen: map[int]map[string]struct{}{}, collects: map[int][]any{}, collectSeen: map[int]map[string]struct{}{}, aggs: map[int]*projectionAggregate{}, aggExprCounts: map[string]int{}, aggExprCountSeen: map[string]map[string]struct{}{}, aggExprCollects: map[string][]any{}, aggExprCollectSeen: map[string]map[string]struct{}{}}
+			group = &projectionGroup{projected: projected, source: cloneRow(row), counts: map[int]int{}, countSeen: map[int]map[string]struct{}{}, collects: map[int][]any{}, collectSeen: map[int]map[string]struct{}{}, aggs: map[int]*projectionAggregate{}, aggExprCounts: map[string]int{}, aggExprCountSeen: map[string]map[string]struct{}{}, aggExprCollects: map[string][]any{}, aggExprCollectSeen: map[string]map[string]struct{}{}, aggExprAggs: map[string]*projectionAggregate{}}
 			groups[groupKey] = group
 			groupOrder = append(groupOrder, groupKey)
 		}
@@ -5863,13 +5864,13 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 					}
 					seenCalls[normalized] = struct{}{}
 					fn := aggregateFuncNameFromCall(call)
+					rawArg, ok := parseAggregateCallArg(call)
+					if !ok {
+						continue
+					}
 					switch fn {
 					case "count":
-						arg, ok := parseFunctionCall(call, "count")
-						if !ok {
-							continue
-						}
-						arg = strings.TrimSpace(arg)
+						arg := strings.TrimSpace(rawArg)
 						if arg == "*" {
 							group.aggExprCounts[normalized]++
 							continue
@@ -5901,11 +5902,7 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 						}
 						group.aggExprCounts[normalized]++
 					case "collect":
-						arg, ok := parseFunctionCall(call, "collect")
-						if !ok {
-							continue
-						}
-						collectExpr, collectDistinct := parseCollectDistinctArg(arg)
+						collectExpr, collectDistinct := parseCollectDistinctArg(rawArg)
 						value, err := evalExpressionWithScope(collectExpr, row, params)
 						if err != nil {
 							return nil, nil, err
@@ -5928,6 +5925,113 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 							group.aggExprCollectSeen[normalized][key] = struct{}{}
 						}
 						group.aggExprCollects[normalized] = append(group.aggExprCollects[normalized], value)
+					case "sum", "avg", "stdev", "stdevp", "min", "max", "percentiledisc", "percentilecont":
+						agg := group.aggExprAggs[normalized]
+						if agg == nil {
+							agg = &projectionAggregate{funcName: fn, intOnly: true}
+							group.aggExprAggs[normalized] = agg
+						}
+						switch fn {
+						case "sum", "avg":
+							value, err := evalExpressionWithScope(rawArg, row, params)
+							if err != nil {
+								return nil, nil, err
+							}
+							if value == nil {
+								continue
+							}
+							n, ok := numericValue(value)
+							if !ok {
+								continue
+							}
+							agg.sum += n
+							if agg.intOnly {
+								integer, ok := exactIntegerAggregateValue(value)
+								if ok && !isFloatLikeNumeric(value) {
+									agg.intSum += integer
+								} else {
+									agg.intOnly = false
+								}
+							}
+							agg.count++
+							agg.hasValue = true
+						case "stdev", "stdevp":
+							value, err := evalExpressionWithScope(rawArg, row, params)
+							if err != nil {
+								return nil, nil, err
+							}
+							if value == nil {
+								continue
+							}
+							n, ok := numericValue(value)
+							if !ok {
+								continue
+							}
+							agg.sum += n
+							agg.sumSq += n * n
+							agg.count++
+							agg.hasValue = true
+						case "min":
+							value, err := evalExpressionWithScope(rawArg, row, params)
+							if err != nil {
+								return nil, nil, err
+							}
+							if value == nil {
+								continue
+							}
+							if !agg.hasValue {
+								agg.min = value
+								agg.hasValue = true
+								continue
+							}
+							if cmp, ok := compareCypherValues(value, agg.min); ok && cmp < 0 {
+								agg.min = value
+							}
+						case "max":
+							value, err := evalExpressionWithScope(rawArg, row, params)
+							if err != nil {
+								return nil, nil, err
+							}
+							if value == nil {
+								continue
+							}
+							if !agg.hasValue {
+								agg.max = value
+								agg.hasValue = true
+								continue
+							}
+							if cmp, ok := compareCypherValues(value, agg.max); ok && cmp > 0 {
+								agg.max = value
+							}
+						case "percentiledisc", "percentilecont":
+							valueExpr, percentileExpr, ok := parsePercentileAggregateArgs(rawArg)
+							if !ok {
+								return nil, nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+							}
+							percentileRaw, err := evalExpressionWithScope(percentileExpr, row, params)
+							if err != nil {
+								return nil, nil, err
+							}
+							p, ok := numericValue(percentileRaw)
+							if !ok || p < 0 || p > 1 {
+								return nil, nil, graph.NewError(graph.ErrKindInvalidInput, "NumberOutOfRange", nil)
+							}
+							agg.pValue = &p
+
+							valueRaw, err := evalExpressionWithScope(valueExpr, row, params)
+							if err != nil {
+								return nil, nil, err
+							}
+							if valueRaw == nil {
+								continue
+							}
+							n, ok := numericValue(valueRaw)
+							if !ok {
+								continue
+							}
+							agg.values = append(agg.values, n)
+							agg.hasValue = true
+						}
 					}
 				}
 			}
@@ -6276,6 +6380,88 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 								evalRow[alias] = append([]any(nil), values...)
 							} else {
 								evalRow[alias] = []any{}
+							}
+						case "sum":
+							agg := group.aggExprAggs[normalized]
+							if agg == nil || !agg.hasValue {
+								evalRow[alias] = nil
+							} else if agg.intOnly {
+								evalRow[alias] = agg.intSum
+							} else {
+								evalRow[alias] = agg.sum
+							}
+						case "avg":
+							agg := group.aggExprAggs[normalized]
+							if agg == nil || !agg.hasValue || agg.count == 0 {
+								evalRow[alias] = nil
+							} else {
+								evalRow[alias] = json.Number(formatFloatResult(agg.sum / float64(agg.count)))
+							}
+						case "stdev":
+							agg := group.aggExprAggs[normalized]
+							if agg == nil || !agg.hasValue {
+								evalRow[alias] = nil
+							} else {
+								evalRow[alias] = standardDeviationResult(agg.sum, agg.sumSq, agg.count, true)
+							}
+						case "stdevp":
+							agg := group.aggExprAggs[normalized]
+							if agg == nil || !agg.hasValue {
+								evalRow[alias] = nil
+							} else {
+								evalRow[alias] = standardDeviationResult(agg.sum, agg.sumSq, agg.count, false)
+							}
+						case "min":
+							agg := group.aggExprAggs[normalized]
+							if agg == nil || !agg.hasValue {
+								evalRow[alias] = nil
+							} else {
+								evalRow[alias] = agg.min
+							}
+						case "max":
+							agg := group.aggExprAggs[normalized]
+							if agg == nil || !agg.hasValue {
+								evalRow[alias] = nil
+							} else {
+								evalRow[alias] = agg.max
+							}
+						case "percentiledisc":
+							agg := group.aggExprAggs[normalized]
+							if agg == nil || !agg.hasValue || agg.pValue == nil || len(agg.values) == 0 {
+								evalRow[alias] = nil
+							} else {
+								values := append([]float64(nil), agg.values...)
+								sort.Float64s(values)
+								idx := int(math.Ceil(*agg.pValue*float64(len(values)))) - 1
+								if idx < 0 {
+									idx = 0
+								}
+								if idx >= len(values) {
+									idx = len(values) - 1
+								}
+								evalRow[alias] = json.Number(formatFloatResult(values[idx]))
+							}
+						case "percentilecont":
+							agg := group.aggExprAggs[normalized]
+							if agg == nil || !agg.hasValue || agg.pValue == nil || len(agg.values) == 0 {
+								evalRow[alias] = nil
+							} else {
+								values := append([]float64(nil), agg.values...)
+								sort.Float64s(values)
+								if len(values) == 1 {
+									evalRow[alias] = json.Number(formatFloatResult(values[0]))
+								} else {
+									pos := *agg.pValue * float64(len(values)-1)
+									low := int(math.Floor(pos))
+									high := int(math.Ceil(pos))
+									if low == high {
+										evalRow[alias] = json.Number(formatFloatResult(values[low]))
+									} else {
+										frac := pos - float64(low)
+										interpolated := values[low] + (values[high]-values[low])*frac
+										evalRow[alias] = json.Number(formatFloatResult(interpolated))
+									}
+								}
 							}
 						default:
 							evalRow[alias] = nil
@@ -7454,6 +7640,22 @@ func parseFunctionCall(raw string, name string) (string, bool) {
 	}
 	arg := strings.TrimSpace(raw[len(prefix) : len(raw)-1])
 	return arg, true
+}
+
+func parseAggregateCallArg(call string) (string, bool) {
+	call = strings.TrimSpace(call)
+	if call == "" {
+		return "", false
+	}
+	openIdx := strings.Index(call, "(")
+	if openIdx <= 0 {
+		return "", false
+	}
+	closeIdx := findClosingParen(call, openIdx)
+	if closeIdx < 0 || closeIdx != len(call)-1 {
+		return "", false
+	}
+	return strings.TrimSpace(call[openIdx+1 : closeIdx]), true
 }
 
 func normalizeProjectionIdentifier(raw string) string {
@@ -13097,6 +13299,12 @@ func splitTopLevelKeyword(raw, keyword string) (string, string, bool) {
 			afterIdx := i + len(keyword)
 			afterIsWord := afterIdx < len(raw) && isAlphaOrUnderscore(raw[afterIdx])
 			if beforeIsWord || afterIsWord {
+				// Only allow compact boolean tokens (for example `aORb`) when the
+				// token is explicitly uppercase in the raw expression. This avoids
+				// splitting identifier substrings like `threat_score` on `or`.
+				if raw[i:i+len(keyword)] != keyword {
+					continue
+				}
 				if !shouldSplitCompressedKeyword(raw, i, len(keyword)) {
 					continue
 				}

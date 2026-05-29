@@ -1181,6 +1181,128 @@ func TestExecuteSetNodeLabelIgnoresNullBinding(t *testing.T) {
 	}
 }
 
+// TestSetCaseSimple verifies that a CASE expression may appear on the RHS of a
+// SET property assignment (simple CASE — switch on a comparison value).
+func TestSetCaseSimple(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	// Create two nodes: a "person" with role and a "dept" with two phone fields.
+	setup, err := parser.ParseStatement(
+		"CREATE (p:Person {id:'p1', role:'business'}), (d:Dept {id:'d1', departmentPhone:'555-DEPT', businessPhone:'555-BIZ'})")
+	if err != nil {
+		t.Fatalf("setup parse failed: %v", err)
+	}
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, setup, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("setup execute failed: %v", err)
+	}
+
+	// Run a MATCH + SET that assigns x.phone via a CASE on p.role.
+	stmt, err := parser.ParseStatement(
+		"MATCH (p:Person {id:'p1'}), (d:Dept {id:'d1'}), (x:Person {id:'p1'}) " +
+			"SET x.phone = CASE p.role " +
+			"  WHEN 'management' THEN d.departmentPhone " +
+			"  WHEN 'business'   THEN d.businessPhone " +
+			"  ELSE d.departmentPhone END " +
+			"RETURN x.phone AS phone")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	got, _ := res.Rows[0]["phone"].(string)
+	if got != "555-BIZ" {
+		t.Fatalf("expected '555-BIZ' (business phone from CASE), got %q", got)
+	}
+}
+
+// TestSetCaseGeneric verifies a generic CASE WHEN expression (boolean
+// conditions) on the RHS of a SET property assignment.
+func TestSetCaseGeneric(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	setup, err := parser.ParseStatement(
+		"CREATE (n:Node {id:'n1', score:42})")
+	if err != nil {
+		t.Fatalf("setup parse failed: %v", err)
+	}
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, setup, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("setup execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement(
+		"MATCH (n:Node {id:'n1'}) " +
+			"SET n.grade = CASE " +
+			"  WHEN n.score >= 90 THEN 'A' " +
+			"  WHEN n.score >= 70 THEN 'B' " +
+			"  ELSE 'C' END " +
+			"RETURN n.grade AS grade")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	got, _ := res.Rows[0]["grade"].(string)
+	if got != "C" {
+		t.Fatalf("expected grade 'C' (score 42), got %q", got)
+	}
+}
+
+// TestSetCaseMultiProperty verifies that multiple SET items can be combined
+// where one or more use CASE expressions.
+func TestSetCaseMultiProperty(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	setup, err := parser.ParseStatement(
+		"CREATE (n:Node {id:'n2', flag:true})")
+	if err != nil {
+		t.Fatalf("setup parse failed: %v", err)
+	}
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, setup, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("setup execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement(
+		"MATCH (n:Node {id:'n2'}) " +
+			"SET n.label = CASE n.flag WHEN true THEN 'active' ELSE 'inactive' END, " +
+			"    n.note = 'set' " +
+			"RETURN n.label AS label, n.note AS note")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got, _ := res.Rows[0]["label"].(string); got != "active" {
+		t.Fatalf("expected label 'active', got %q", got)
+	}
+	if got, _ := res.Rows[0]["note"].(string); got != "set" {
+		t.Fatalf("expected note 'set', got %q", got)
+	}
+}
+
 func TestExecuteUnionDistinct(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

@@ -614,6 +614,15 @@ type cypherPathValue struct {
 	Direction string
 }
 
+func (p cypherPathValue) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"__path__":   true,
+		"nodes":      []any{vertexToMap(p.Left), vertexToMap(p.Right)},
+		"edges":      []any{edgeToMap(p.Edge)},
+		"directions": []any{p.Direction},
+	})
+}
+
 func (p cypherPathValue) String() string {
 	left := renderPathNode(p.Left)
 	if p.Edge == nil && p.Right == nil {
@@ -3463,6 +3472,27 @@ type multiHopCypherPath struct {
 	Nodes      []*graph.Vertex
 	Edges      []*graph.Edge
 	Directions []string
+}
+
+func (p multiHopCypherPath) MarshalJSON() ([]byte, error) {
+	nodes := make([]any, len(p.Nodes))
+	for i, v := range p.Nodes {
+		nodes[i] = vertexToMap(v)
+	}
+	edges := make([]any, len(p.Edges))
+	for i, e := range p.Edges {
+		edges[i] = edgeToMap(e)
+	}
+	directions := make([]any, len(p.Directions))
+	for i, d := range p.Directions {
+		directions[i] = d
+	}
+	return json.Marshal(map[string]any{
+		"__path__":   true,
+		"nodes":      nodes,
+		"edges":      edges,
+		"directions": directions,
+	})
 }
 
 type multiHopPartialPath struct {

@@ -446,7 +446,7 @@ func validateSetAssignmentsAndExpressions(raw string, bound map[string]patternVa
 
 	expressions := extractSetValueExpressions(raw)
 	for _, expr := range expressions {
-		if hasUndefinedWhereIdentifier(expr, bound) {
+		if hasUndefinedIdentifierCaseAware(expr, bound) {
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
 		}
 		if containsForbiddenPatternExpression(expr) {
@@ -2013,6 +2013,149 @@ func extractProjectionExpressions(raw string, kind ast.ClauseKind) []string {
 	}
 
 	return expressions
+}
+
+// hasUndefinedIdentifierCaseAware wraps hasUndefinedWhereIdentifier with
+// awareness for CASE...END expressions. Because clause.Raw comes from ANTLR's
+// GetText() with all whitespace stripped, a CASE expression token-collapses
+// its keywords into the adjacent identifiers (e.g. "CASEp.role" instead of
+// "CASE p.role"), causing the plain identifier extractor to flag false
+// undefined-variable errors. This function detects top-level CASE expressions,
+// expands them into their individual sub-expressions (comparison operand, WHEN
+// operands, THEN results, ELSE result), and validates each part independently.
+func hasUndefinedIdentifierCaseAware(expr string, bound map[string]patternVarRole) bool {
+	if subExprs := extractCaseSubExpressions(expr); subExprs != nil {
+		for _, sub := range subExprs {
+			if hasUndefinedIdentifierCaseAware(sub, bound) {
+				return true
+			}
+		}
+		return false
+	}
+	return hasUndefinedWhereIdentifier(expr, bound)
+}
+
+// extractCaseSubExpressions parses a CASE...END expression (in the
+// whitespace-stripped ANTLR form) and returns all constituent sub-expressions:
+// the optional comparison operand for simple CASE, each WHEN operand, each
+// THEN result expression, and the optional ELSE expression. Returns nil if
+// expr is not a top-level CASE expression.
+func extractCaseSubExpressions(expr string) []string {
+	expr = strings.TrimSpace(expr)
+	upper := strings.ToUpper(expr)
+	if !strings.HasPrefix(upper, "CASE") || !strings.HasSuffix(upper, "END") {
+		return nil
+	}
+	// "END" must be the trailing keyword, not merely a suffix of the last
+	// identifier (e.g. "n.trendEnd" would collapse to "...trendEND" which
+	// ends with "END" too). Require that the byte right before the trailing
+	// "END" is either a quote, a closing bracket/paren/brace, or another
+	// uppercase identifier character that completes a valid identifier — we
+	// accept any such form and let the sub-expression validator catch
+	// genuinely malformed input.
+	body := strings.TrimSpace(expr[len("CASE") : len(expr)-len("END")])
+	if body == "" {
+		return nil
+	}
+
+	var parts []string
+	remaining := body
+
+	// Detect simple CASE (comparison operand before first WHEN) vs generic.
+	if !strings.HasPrefix(strings.ToUpper(remaining), "WHEN") {
+		whenIdx := findCaseKeywordIdx(remaining, "WHEN")
+		if whenIdx <= 0 {
+			return nil
+		}
+		compExpr := strings.TrimSpace(remaining[:whenIdx])
+		if compExpr != "" {
+			parts = append(parts, compExpr)
+		}
+		remaining = strings.TrimSpace(remaining[whenIdx:])
+	}
+
+	for {
+		if !strings.HasPrefix(strings.ToUpper(remaining), "WHEN") {
+			break
+		}
+		remaining = strings.TrimSpace(remaining[len("WHEN"):])
+		thenIdx := findCaseKeywordIdx(remaining, "THEN")
+		if thenIdx < 0 {
+			break
+		}
+		whenExpr := strings.TrimSpace(remaining[:thenIdx])
+		if whenExpr != "" {
+			parts = append(parts, whenExpr)
+		}
+		afterThen := strings.TrimSpace(remaining[thenIdx+len("THEN"):])
+
+		nextWhenIdx := findCaseKeywordIdx(afterThen, "WHEN")
+		elseIdx := findCaseKeywordIdx(afterThen, "ELSE")
+		resultExpr := afterThen
+		remaining = ""
+		if nextWhenIdx >= 0 && (elseIdx < 0 || nextWhenIdx < elseIdx) {
+			resultExpr = strings.TrimSpace(afterThen[:nextWhenIdx])
+			remaining = strings.TrimSpace(afterThen[nextWhenIdx:])
+		} else if elseIdx >= 0 {
+			resultExpr = strings.TrimSpace(afterThen[:elseIdx])
+			remaining = strings.TrimSpace(afterThen[elseIdx:])
+		}
+		if resultExpr != "" {
+			parts = append(parts, resultExpr)
+		}
+	}
+
+	if strings.HasPrefix(strings.ToUpper(remaining), "ELSE") {
+		elseExpr := strings.TrimSpace(remaining[len("ELSE"):])
+		if elseExpr != "" {
+			parts = append(parts, elseExpr)
+		}
+	}
+
+	return parts
+}
+
+// findCaseKeywordIdx returns the index of the first top-level (depth-0,
+// outside strings) occurrence of keyword in raw. Used by CASE expression
+// parsing to locate WHEN / THEN / ELSE keywords in the whitespace-free
+// ANTLR token text.
+func findCaseKeywordIdx(raw, keyword string) int {
+	upper := strings.ToUpper(raw)
+	keyword = strings.ToUpper(strings.TrimSpace(keyword))
+	if keyword == "" || len(upper) < len(keyword) {
+		return -1
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i <= len(upper)-len(keyword); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch upper[i] {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth == 0 && strings.HasPrefix(upper[i:], keyword) {
+			return i
+		}
+	}
+	return -1
 }
 
 func extractSetValueExpressions(raw string) []string {

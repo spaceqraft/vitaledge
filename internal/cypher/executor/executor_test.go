@@ -256,6 +256,32 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
 	}
+	statsSnapshot, ok := influencers["statsSnapshot"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected statsSnapshot map, got %T", influencers["statsSnapshot"])
+	}
+	coverage, ok := statsSnapshot["coverage"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected statsSnapshot.coverage map, got %T", statsSnapshot["coverage"])
+	}
+	if totals, _ := coverage["totals"].(string); totals != "snapshot" {
+		t.Fatalf("expected statsSnapshot coverage totals=snapshot, got %#v", coverage["totals"])
+	}
+	if nodeCountsCoverage, _ := coverage["nodeCounts"].(string); nodeCountsCoverage != "snapshot" {
+		t.Fatalf("expected statsSnapshot coverage nodeCounts=snapshot, got %#v", coverage["nodeCounts"])
+	}
+	if edgeCountsCoverage, _ := coverage["edgeCounts"].(string); edgeCountsCoverage != "snapshot" {
+		t.Fatalf("expected statsSnapshot coverage edgeCounts=snapshot, got %#v", coverage["edgeCounts"])
+	}
+	if completeness, _ := statsSnapshot["completeness"].(string); completeness != "complete" {
+		t.Fatalf("expected statsSnapshot completeness=complete, got %#v", statsSnapshot["completeness"])
+	}
+	if backfillStatus, _ := statsSnapshot["backfillStatus"].(string); backfillStatus != "complete" {
+		t.Fatalf("expected statsSnapshot backfillStatus=complete, got %#v", statsSnapshot["backfillStatus"])
+	}
+	if backfillRequired, _ := statsSnapshot["backfillRequired"].(bool); backfillRequired {
+		t.Fatalf("expected statsSnapshot backfillRequired=false, got %#v", statsSnapshot["backfillRequired"])
+	}
 	nodeCounts, ok := influencers["nodeCounts"].([]map[string]any)
 	if !ok {
 		t.Fatalf("expected nodeCounts []map[string]any, got %T", influencers["nodeCounts"])
@@ -670,6 +696,57 @@ func TestExecuteExplainFastNodeCountPlan(t *testing.T) {
 		}
 		if !found {
 			t.Fatalf("expected AGGREGATE fast_node_count for %q, got nodes %#v", query, nodes)
+		}
+
+		cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+		if !ok || len(cardinality) < 2 {
+			t.Fatalf("expected cardinality entries for %q, got %#v", query, explainPayload["cardinality"])
+		}
+		if rowsOut, _ := cardinality[0]["rowsOut"].(int); rowsOut != 3 {
+			t.Fatalf("expected ALL_NODES_SCAN rowsOut=3 for %q, got %#v", query, cardinality[0]["rowsOut"])
+		}
+		if quality, _ := cardinality[0]["quality"].(string); quality != "exact" {
+			t.Fatalf("expected ALL_NODES_SCAN quality exact for %q, got %#v", query, cardinality[0]["quality"])
+		}
+		if rowsOut, _ := cardinality[1]["rowsOut"].(int); rowsOut != 1 {
+			t.Fatalf("expected AGGREGATE rowsOut=1 for %q, got %#v", query, cardinality[1]["rowsOut"])
+		}
+
+		costEstimate, ok := explainPayload["costEstimate"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected costEstimate map for %q, got %T", query, explainPayload["costEstimate"])
+		}
+		components, ok := costEstimate["components"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected costEstimate components map for %q, got %T", query, costEstimate["components"])
+		}
+		if scanRows, _ := components["scanRows"].(int); scanRows != 3 {
+			t.Fatalf("expected scanRows=3 for %q, got %#v", query, components["scanRows"])
+		}
+
+		runtimeStats, ok := explainPayload["runtimeStats"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected runtimeStats map for %q, got %T", query, explainPayload["runtimeStats"])
+		}
+		storeStats, ok := runtimeStats["store"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected runtimeStats.store map for %q, got %T", query, runtimeStats["store"])
+		}
+		if verticesScanned, _ := storeStats["verticesScanned"].(int); verticesScanned != 3 {
+			t.Fatalf("expected verticesScanned=3 for %q, got %#v", query, storeStats["verticesScanned"])
+		}
+		if edgesScanned, _ := storeStats["edgesScanned"].(int); edgesScanned != 0 {
+			t.Fatalf("expected edgesScanned=0 for %q, got %#v", query, storeStats["edgesScanned"])
+		}
+
+		warnings, ok := explainPayload["warnings"].([]map[string]any)
+		if !ok {
+			t.Fatalf("expected warnings []map for %q, got %T", query, explainPayload["warnings"])
+		}
+		for _, warning := range warnings {
+			if code, _ := warning["code"].(string); code == "FULL_SCAN_FALLBACK" {
+				t.Fatalf("did not expect FULL_SCAN_FALLBACK for %q, got warnings %#v", query, warnings)
+			}
 		}
 	}
 }

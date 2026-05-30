@@ -8,6 +8,7 @@ const (
 	outPrefix    = "a/out"
 	inPrefix     = "a/in"
 	indexPrefix  = "i"
+	statsPrefix  = "s"
 )
 
 func VertexKey(tenant, vertexID string) []byte {
@@ -58,4 +59,28 @@ func PropertyIndexPrefix(tenant, schema, property string) []byte {
 
 func PropertyIndexValuePrefix(tenant, schema, property string, encodedValue []byte) []byte {
 	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexPrefix, tenant, schema, property, encodedValue))
+}
+
+func StatsVertexTotalKey(tenant string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/vertex_total", statsPrefix, tenant))
+}
+
+func StatsEdgeTotalKey(tenant string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/edge_total", statsPrefix, tenant))
+}
+
+func StatsVertexLabelCountKey(tenant, label string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/label/%s", statsPrefix, tenant, label))
+}
+
+func StatsVertexLabelPrefix(tenant string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/label/", statsPrefix, tenant))
+}
+
+func StatsEdgeTypeCountKey(tenant, edgeType string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/edge_type/%s", statsPrefix, tenant, edgeType))
+}
+
+func StatsEdgeTypePrefix(tenant string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/edge_type/", statsPrefix, tenant))
 }

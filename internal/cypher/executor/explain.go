@@ -25,14 +25,16 @@ type explainAnalysis struct {
 	warnings         []map[string]any
 	source           string
 	capturedAt       string
+	statsSnapshot    map[string]any
 }
 
 type explainStoreStats struct {
-	vertices    map[string]*graph.Vertex
-	labelCounts map[string]int
-	edgeCounts  map[string]int
-	vertexTotal int
-	edgeTotal   int
+	vertices      map[string]*graph.Vertex
+	labelCounts   map[string]int
+	edgeCounts    map[string]int
+	vertexTotal   int
+	edgeTotal     int
+	snapshotFound bool
 }
 
 func (e *Executor) executeExplainStatement(ctx context.Context, stmt *ast.ExplainStatement, params Params) (*Result, error) {
@@ -71,13 +73,15 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	}); err != nil {
 		return nil, err
 	}
+	analysis.source = explainStatsSnapshotSource(stats)
+	analysis.statsSnapshot = buildExplainStatsSnapshotDetails(stats)
 
 	analysis.nodeCounts = buildExplainNodeCounts(stats)
 	analysis.edgeCounts = buildExplainEdgeCounts(stats)
 	analysis.predicateSignals = buildExplainPredicateSignals(stmt, params, tenant, stats)
 	planNodes := buildExplainPlanNodes(stmt, e.indexCatalog, tenant, params)
 	analysis.indexDecisions = buildExplainIndexDecisions(stmt, params, e.indexCatalog, tenant, stats, planNodes)
-	analysis.cardinality = buildExplainCardinalityFromPlanNodes(planNodes, params)
+	analysis.cardinality = buildExplainCardinalityFromPlanNodes(planNodes, params, stats)
 	analysis.costEstimate = buildExplainCostEstimate(planNodes, analysis.cardinality, analysis.indexDecisions)
 	analysis.warnings = buildExplainWarnings(stmt, analysis, planNodes, tenant)
 	analysis.runtimeStats = buildExplainRuntimeStats(planNodes, analysis.cardinality, analysis.indexDecisions, analysis.warnings, stats)
@@ -122,8 +126,12 @@ func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params
 			"edgeCounts":       analysis.edgeCounts,
 			"predicateSignals": analysis.predicateSignals,
 			"statsSnapshot": map[string]any{
-				"source":     analysis.source,
-				"capturedAt": analysis.capturedAt,
+				"source":           analysis.source,
+				"capturedAt":       analysis.capturedAt,
+				"coverage":         analysis.statsSnapshot["coverage"],
+				"completeness":     analysis.statsSnapshot["completeness"],
+				"backfillStatus":   analysis.statsSnapshot["backfillStatus"],
+				"backfillRequired": analysis.statsSnapshot["backfillRequired"],
 			},
 		},
 		"cardinality":    analysis.cardinality,
@@ -148,6 +156,27 @@ func collectExplainStoreStats(ctx context.Context, tx graph.Tx, tenant string) (
 	if strings.TrimSpace(tenant) == "" {
 		return stats, nil
 	}
+	hasSnapshotTotals := false
+	if snapshot, err := tx.GetStatsSnapshot(ctx, tenant); err == nil && snapshot != nil {
+		stats.snapshotFound = true
+		stats.vertexTotal = snapshot.VertexTotal
+		stats.edgeTotal = snapshot.EdgeTotal
+		for label, count := range snapshot.LabelCounts {
+			label = strings.TrimSpace(label)
+			if label == "" || count <= 0 {
+				continue
+			}
+			stats.labelCounts[label] = count
+		}
+		for edgeType, count := range snapshot.EdgeCounts {
+			edgeType = strings.TrimSpace(edgeType)
+			if edgeType == "" || count <= 0 {
+				continue
+			}
+			stats.edgeCounts[edgeType] = count
+		}
+		hasSnapshotTotals = true
+	}
 
 	if err := tx.ScanVertices(ctx, tenant, 0, func(v *graph.Vertex) error {
 		if v == nil {
@@ -155,29 +184,21 @@ func collectExplainStoreStats(ctx context.Context, tx graph.Tx, tenant string) (
 		}
 		clone := *v
 		stats.vertices[v.ID] = &clone
-		stats.vertexTotal++
-		if len(clone.Labels) == 0 {
-			stats.labelCounts["UNLABELED"]++
+		if !hasSnapshotTotals {
+			stats.vertexTotal++
 		}
-		for _, label := range clone.Labels {
-			label = strings.TrimSpace(label)
-			if label == "" {
-				continue
-			}
-			stats.labelCounts[label]++
-		}
-		return tx.ScanOutEdges(ctx, tenant, v.ID, "", 0, func(edge *graph.Edge) error {
-			if edge == nil {
+		if !hasSnapshotTotals {
+			if err := tx.ScanOutEdges(ctx, tenant, v.ID, "", 0, func(edge *graph.Edge) error {
+				if edge == nil {
+					return nil
+				}
+				stats.edgeTotal++
 				return nil
+			}); err != nil {
+				return err
 			}
-			stats.edgeTotal++
-			edgeType := strings.TrimSpace(edge.Type)
-			if edgeType == "" {
-				edgeType = "UNTYPED"
-			}
-			stats.edgeCounts[edgeType]++
-			return nil
-		})
+		}
+		return nil
 	}); err != nil {
 		return explainStoreStats{}, err
 	}
@@ -201,6 +222,57 @@ func buildExplainNodeCounts(stats explainStoreStats) []map[string]any {
 		})
 	}
 	return out
+}
+
+func explainStatsSnapshotSource(stats explainStoreStats) string {
+	if stats.snapshotFound {
+		return "stats-snapshot+store-scan"
+	}
+	return "store-scan"
+}
+
+func buildExplainStatsSnapshotDetails(stats explainStoreStats) map[string]any {
+	totalsCoverage := "scan_fallback"
+	if stats.snapshotFound {
+		totalsCoverage = "snapshot"
+	}
+	nodeCountsCoverage := "missing"
+	if stats.snapshotFound {
+		nodeCountsCoverage = "snapshot"
+		if stats.vertexTotal > 0 && len(stats.labelCounts) == 0 {
+			nodeCountsCoverage = "incomplete"
+		}
+	}
+	edgeCountsCoverage := "missing"
+	if stats.snapshotFound {
+		edgeCountsCoverage = "snapshot"
+		if stats.edgeTotal > 0 && len(stats.edgeCounts) == 0 {
+			edgeCountsCoverage = "incomplete"
+		}
+	}
+
+	completeness := "partial"
+	if totalsCoverage == "snapshot" && nodeCountsCoverage == "snapshot" && edgeCountsCoverage == "snapshot" {
+		completeness = "complete"
+	}
+	if totalsCoverage == "scan_fallback" && nodeCountsCoverage == "missing" && edgeCountsCoverage == "missing" {
+		completeness = "missing"
+	}
+	backfillStatus := "required"
+	if completeness == "complete" {
+		backfillStatus = "complete"
+	}
+
+	return map[string]any{
+		"coverage": map[string]any{
+			"totals":     totalsCoverage,
+			"nodeCounts": nodeCountsCoverage,
+			"edgeCounts": edgeCountsCoverage,
+		},
+		"completeness":     completeness,
+		"backfillStatus":   backfillStatus,
+		"backfillRequired": backfillStatus != "complete",
+	}
 }
 
 func buildExplainEdgeCounts(stats explainStoreStats) []map[string]any {
@@ -513,7 +585,7 @@ func explainIndexTuningImpact(selectivity float64) string {
 	return "low"
 }
 
-func buildExplainCardinalityFromPlanNodes(nodes []map[string]any, params Params) []map[string]any {
+func buildExplainCardinalityFromPlanNodes(nodes []map[string]any, params Params, stats explainStoreStats) []map[string]any {
 	entries := make([]map[string]any, 0, len(nodes))
 	rows := 1
 	for _, node := range nodes {
@@ -523,12 +595,23 @@ func buildExplainCardinalityFromPlanNodes(nodes []map[string]any, params Params)
 		rowsOut := rows
 		quality := "estimate"
 		switch op {
-		case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_NODES_SCAN", "OPTIONAL_ALL_NODES_SCAN":
+		case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN":
 			quality = "exact"
 			if predicate, _ := node["predicate"].(string); strings.TrimSpace(predicate) != "" {
 				rowsOut = 1
 			} else {
 				rowsOut = rowsIn
+			}
+		case "ALL_NODES_SCAN", "OPTIONAL_ALL_NODES_SCAN":
+			quality = "exact"
+			rowsOut = stats.vertexTotal
+			if op == "OPTIONAL_ALL_NODES_SCAN" && rowsOut == 0 {
+				rowsOut = 1
+			}
+		case "AGGREGATE":
+			if impl, _ := node["implementation"].(string); impl == "fast_node_count" {
+				rowsOut = 1
+				quality = "exact"
 			}
 		case "SKIP":
 			if page, ok := node["pagination"].(map[string]any); ok {
@@ -565,6 +648,7 @@ func buildExplainCardinalityFromPlanNodes(nodes []map[string]any, params Params)
 
 func buildExplainCostEstimate(planNodes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any) map[string]any {
 	rowsOutByNode := map[string]int{}
+	exactCardinality := len(cardinality) > 0
 	for _, entry := range cardinality {
 		nodeID, _ := entry["nodeId"].(string)
 		if strings.TrimSpace(nodeID) == "" {
@@ -572,6 +656,9 @@ func buildExplainCostEstimate(planNodes []map[string]any, cardinality []map[stri
 		}
 		rowsOut, _ := entry["rowsOut"].(int)
 		rowsOutByNode[nodeID] = rowsOut
+		if quality, _ := entry["quality"].(string); quality != "exact" {
+			exactCardinality = false
+		}
 	}
 
 	scanRows := 0
@@ -609,12 +696,16 @@ func buildExplainCostEstimate(planNodes []map[string]any, cardinality []map[stri
 	if total < 1 {
 		total = 1
 	}
+	quality := "estimate"
+	if exactCardinality {
+		quality = "exact"
+	}
 
 	return map[string]any{
 		"model":   "heuristic-v1",
 		"value":   total,
 		"unit":    "work_units",
-		"quality": "estimate",
+		"quality": quality,
 		"components": map[string]any{
 			"scanRows":            scanRows,
 			"outputRows":          outputRows,
@@ -661,17 +752,48 @@ func buildExplainRuntimeStats(planNodes []map[string]any, cardinality []map[stri
 
 	rowsRead := 0
 	rowsOutput := 0
+	rowsOutByNode := map[string]int{}
+	allExactCardinality := len(cardinality) > 0
 	for _, entry := range cardinality {
+		nodeID, _ := entry["nodeId"].(string)
 		rowsIn, _ := entry["rowsIn"].(int)
 		rowsOut, _ := entry["rowsOut"].(int)
 		rowsRead += rowsIn
 		rowsOutput = rowsOut
+		if strings.TrimSpace(nodeID) != "" {
+			rowsOutByNode[nodeID] = rowsOut
+		}
+		if quality, _ := entry["quality"].(string); quality != "exact" {
+			allExactCardinality = false
+		}
+	}
+	cardinalityQuality := "estimate"
+	if allExactCardinality {
+		cardinalityQuality = "exact"
+	}
+
+	verticesScanned := 0
+	edgesScanned := 0
+	for _, node := range planNodes {
+		nodeID, _ := node["id"].(string)
+		op, _ := node["op"].(string)
+		rowsOut := rowsOutByNode[nodeID]
+		switch op {
+		case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_NODES_SCAN", "OPTIONAL_ALL_NODES_SCAN":
+			verticesScanned += rowsOut
+		case "EDGE_SCAN", "OPTIONAL_EDGE_SCAN":
+			edgesScanned += rowsOut
+		}
+	}
+	if verticesScanned == 0 && edgesScanned == 0 {
+		verticesScanned = stats.vertexTotal
+		edgesScanned = stats.edgeTotal
 	}
 
 	return map[string]any{
 		"store": map[string]any{
-			"verticesScanned": stats.vertexTotal,
-			"edgesScanned":    stats.edgeTotal,
+			"verticesScanned": verticesScanned,
+			"edgesScanned":    edgesScanned,
 		},
 		"plan": map[string]any{
 			"totalNodes":      len(planNodes),
@@ -691,7 +813,7 @@ func buildExplainRuntimeStats(planNodes []map[string]any, cardinality []map[stri
 		"cardinality": map[string]any{
 			"rowsRead":   rowsRead,
 			"rowsOutput": rowsOutput,
-			"quality":    "estimate",
+			"quality":    cardinalityQuality,
 		},
 	}
 }
@@ -732,6 +854,9 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNod
 		op, _ := node["op"].(string)
 		nodeID, _ := node["id"].(string)
 		if op == "ALL_NODES_SCAN" || op == "OPTIONAL_ALL_NODES_SCAN" {
+			if explainAllNodesScanBackedByFastNodeCount(planNodes, nodeID) {
+				continue
+			}
 			addWarning(map[string]any{
 				"code":    "FULL_SCAN_FALLBACK",
 				"message": "Planner selected an all-nodes scan access path",
@@ -773,6 +898,29 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNod
 		})
 	}
 	return warnings
+}
+
+func explainAllNodesScanBackedByFastNodeCount(planNodes []map[string]any, nodeID string) bool {
+	if strings.TrimSpace(nodeID) == "" {
+		return false
+	}
+	for _, node := range planNodes {
+		op, _ := node["op"].(string)
+		if op != "AGGREGATE" {
+			continue
+		}
+		impl, _ := node["implementation"].(string)
+		if impl != "fast_node_count" {
+			continue
+		}
+		children, _ := node["children"].([]string)
+		for _, child := range children {
+			if child == nodeID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func buildExplainQueryOptions(stmt ast.Statement) map[string]any {

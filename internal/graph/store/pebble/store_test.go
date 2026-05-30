@@ -146,6 +146,171 @@ func TestScanVertices(t *testing.T) {
 	}
 }
 
+func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v1"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v2"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "REL", SrcID: "v1", DstID: "v2"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "REL", SrcID: "v2", DstID: "v1"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		snapshot, err := tx.GetStatsSnapshot(ctx, "acme")
+		if err != nil {
+			return err
+		}
+		if snapshot.VertexTotal != 2 {
+			return fmt.Errorf("expected VertexTotal=2, got %d", snapshot.VertexTotal)
+		}
+		if snapshot.EdgeTotal != 2 {
+			return fmt.Errorf("expected EdgeTotal=2, got %d", snapshot.EdgeTotal)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot verification failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.DeleteEdge(ctx, "acme", "e2"); err != nil {
+			return err
+		}
+		return tx.DeleteVertex(ctx, "acme", "v2")
+	})
+	if err != nil {
+		t.Fatalf("delete mutation failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		snapshot, err := tx.GetStatsSnapshot(ctx, "acme")
+		if err != nil {
+			return err
+		}
+		if snapshot.VertexTotal != 1 {
+			return fmt.Errorf("expected VertexTotal=1 after delete, got %d", snapshot.VertexTotal)
+		}
+		if snapshot.EdgeTotal != 1 {
+			return fmt.Errorf("expected EdgeTotal=1 after delete, got %d", snapshot.EdgeTotal)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-delete snapshot verification failed: %v", err)
+	}
+}
+
+func TestStatsSnapshotMissingForTenant(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.View(ctx, func(tx graph.Tx) error {
+		_, err := tx.GetStatsSnapshot(ctx, "unknown")
+		if !graph.IsKind(err, graph.ErrKindNotFound) {
+			return fmt.Errorf("expected not found for missing stats snapshot, got %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("missing snapshot check failed: %v", err)
+	}
+}
+
+func TestStatsSnapshotLabelAndEdgeTypeCounters(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v1", Labels: []string{"Movie", "Featured"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v2", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v3"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "v1", DstID: "v2"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "RATED", SrcID: "v2", DstID: "v3"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "GENRED", SrcID: "v1", DstID: "v3"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v2", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "LIKED", SrcID: "v2", DstID: "v3"}); err != nil {
+			return err
+		}
+		if err := tx.DeleteVertex(ctx, "acme", "v3"); err != nil {
+			return err
+		}
+		return tx.DeleteEdge(ctx, "acme", "e3")
+	})
+	if err != nil {
+		t.Fatalf("mutation failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		snapshot, err := tx.GetStatsSnapshot(ctx, "acme")
+		if err != nil {
+			return err
+		}
+		if got := snapshot.LabelCounts["Movie"]; got != 1 {
+			return fmt.Errorf("expected Movie label count=1, got %d", got)
+		}
+		if got := snapshot.LabelCounts["Featured"]; got != 1 {
+			return fmt.Errorf("expected Featured label count=1, got %d", got)
+		}
+		if got := snapshot.LabelCounts["User"]; got != 1 {
+			return fmt.Errorf("expected User label count=1, got %d", got)
+		}
+		if got := snapshot.LabelCounts["UNLABELED"]; got != 0 {
+			return fmt.Errorf("expected UNLABELED label count=0, got %d", got)
+		}
+		if got := snapshot.EdgeCounts["RATED"]; got != 1 {
+			return fmt.Errorf("expected RATED edge count=1, got %d", got)
+		}
+		if got := snapshot.EdgeCounts["LIKED"]; got != 1 {
+			return fmt.Errorf("expected LIKED edge count=1, got %d", got)
+		}
+		if got := snapshot.EdgeCounts["GENRED"]; got != 0 {
+			return fmt.Errorf("expected GENRED edge count=0, got %d", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot validation failed: %v", err)
+	}
+}
+
 func TestDurabilityAcrossRestart(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()

@@ -21,6 +21,7 @@ type Tx interface {
 	ScanVertices(ctx context.Context, tenant string, limit int, fn func(*Vertex) error) error
 	PutVertex(ctx context.Context, vertex *Vertex) error
 	DeleteVertex(ctx context.Context, tenant, vertexID string) error
+	GetStatsSnapshot(ctx context.Context, tenant string) (*StatsSnapshot, error)
 
 	GetEdge(ctx context.Context, tenant, edgeID string) (*Edge, error)
 	PutEdge(ctx context.Context, edge *Edge) error

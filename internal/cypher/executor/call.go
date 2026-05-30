@@ -238,6 +238,23 @@ func (e *Executor) builtinEdgeCountProcedure(ctx context.Context, args []any, pa
 	if err != nil {
 		return nil, err
 	}
+	if label == "" {
+		var edgeTotal int
+		err = e.store.View(ctx, func(tx graph.Tx) error {
+			snapshot, snapshotErr := tx.GetStatsSnapshot(ctx, tenant)
+			if snapshotErr != nil {
+				return snapshotErr
+			}
+			edgeTotal = snapshot.EdgeTotal
+			return nil
+		})
+		if err == nil {
+			return []Row{{"edgeCount": edgeTotal}}, nil
+		}
+		if !graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil, err
+		}
+	}
 
 	edgeIDs := map[string]struct{}{}
 	err = e.store.View(ctx, func(tx graph.Tx) error {
@@ -329,6 +346,39 @@ func (e *Executor) builtinNodeCountProcedure(ctx context.Context, args []any, pa
 	label, err := parseOptionalLabelArg(args)
 	if err != nil {
 		return nil, err
+	}
+	if label == "" {
+		var vertexTotal int
+		err = e.store.View(ctx, func(tx graph.Tx) error {
+			snapshot, snapshotErr := tx.GetStatsSnapshot(ctx, tenant)
+			if snapshotErr != nil {
+				return snapshotErr
+			}
+			vertexTotal = snapshot.VertexTotal
+			return nil
+		})
+		if err == nil {
+			return []Row{{"nodeCount": vertexTotal}}, nil
+		}
+		if !graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil, err
+		}
+	} else {
+		var labelTotal int
+		err = e.store.View(ctx, func(tx graph.Tx) error {
+			snapshot, snapshotErr := tx.GetStatsSnapshot(ctx, tenant)
+			if snapshotErr != nil {
+				return snapshotErr
+			}
+			labelTotal = snapshot.LabelCounts[label]
+			return nil
+		})
+		if err == nil {
+			return []Row{{"nodeCount": labelTotal}}, nil
+		}
+		if !graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil, err
+		}
 	}
 
 	count := 0

@@ -26,3 +26,24 @@ func TestPropertyIndexKey(t *testing.T) {
 		t.Fatalf("unexpected property index key: %s", key)
 	}
 }
+
+func TestStatsKeys(t *testing.T) {
+	if got := string(StatsVertexTotalKey("t1")); got != "s/t1/vertex_total" {
+		t.Fatalf("unexpected vertex total stats key: %s", got)
+	}
+	if got := string(StatsEdgeTotalKey("t1")); got != "s/t1/edge_total" {
+		t.Fatalf("unexpected edge total stats key: %s", got)
+	}
+	if got := string(StatsVertexLabelCountKey("t1", "Movie")); got != "s/t1/label/Movie" {
+		t.Fatalf("unexpected label stats key: %s", got)
+	}
+	if got := string(StatsEdgeTypeCountKey("t1", "RATED")); got != "s/t1/edge_type/RATED" {
+		t.Fatalf("unexpected edge type stats key: %s", got)
+	}
+	if got := string(StatsVertexLabelPrefix("t1")); got != "s/t1/label/" {
+		t.Fatalf("unexpected label stats prefix: %s", got)
+	}
+	if got := string(StatsEdgeTypePrefix("t1")); got != "s/t1/edge_type/" {
+		t.Fatalf("unexpected edge type stats prefix: %s", got)
+	}
+}

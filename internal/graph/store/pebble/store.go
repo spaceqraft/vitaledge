@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +45,9 @@ type tx struct {
 	snapshot           *cpebble.Snapshot
 	batch              *cpebble.Batch
 	locks              map[string]func()
+	counterBase        map[string]int
+	counterBasePresent map[string]bool
+	counterDeltas      map[string]int
 	closed             bool
 	maxWriteBatchBytes int
 }
@@ -229,6 +234,36 @@ func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 	if vertex == nil || vertex.Tenant == "" || vertex.ID == "" {
 		return graph.NewError(graph.ErrKindInvalidInput, "vertex tenant and id are required", nil)
 	}
+	previous, err := t.GetVertex(ctx, vertex.Tenant, vertex.ID)
+	if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+		return err
+	}
+	if previous == nil {
+		if err := t.addToCounter(keyspace.StatsVertexTotalKey(vertex.Tenant), 1); err != nil {
+			return err
+		}
+	}
+	prevLabels := normalizedLabelSet(nil)
+	if previous != nil {
+		prevLabels = normalizedLabelSet(previous.Labels)
+	}
+	nextLabels := normalizedLabelSet(vertex.Labels)
+	for label := range prevLabels {
+		if _, ok := nextLabels[label]; ok {
+			continue
+		}
+		if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(vertex.Tenant, label), -1); err != nil {
+			return err
+		}
+	}
+	for label := range nextLabels {
+		if _, ok := prevLabels[label]; ok {
+			continue
+		}
+		if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(vertex.Tenant, label), 1); err != nil {
+			return err
+		}
+	}
 	buf, err := json.Marshal(vertex)
 	if err != nil {
 		return graph.NewError(graph.ErrKindStorage, "encode vertex", err)
@@ -249,10 +284,67 @@ func (t *tx) DeleteVertex(ctx context.Context, tenant, vertexID string) (err err
 	if tenant == "" || vertexID == "" {
 		return graph.NewError(graph.ErrKindInvalidInput, "tenant and vertex id are required", nil)
 	}
+	vertex, err := t.GetVertex(ctx, tenant, vertexID)
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil
+		}
+		return err
+	}
+	if vertex != nil {
+		if err := t.addToCounter(keyspace.StatsVertexTotalKey(tenant), -1); err != nil {
+			return err
+		}
+		for label := range normalizedLabelSet(vertex.Labels) {
+			if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(tenant, label), -1); err != nil {
+				return err
+			}
+		}
+	}
 	if err := t.delete(keyspace.VertexKey(tenant, vertexID), "delete vertex"); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (t *tx) GetStatsSnapshot(ctx context.Context, tenant string) (snapshot *graph.StatsSnapshot, err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("get_stats_snapshot", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return nil, err
+	}
+	if tenant == "" {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "tenant is required", nil)
+	}
+
+	vertexTotal, hasVertex, err := t.readCounterMaybeMissing(keyspace.StatsVertexTotalKey(tenant))
+	if err != nil {
+		return nil, err
+	}
+	edgeTotal, hasEdge, err := t.readCounterMaybeMissing(keyspace.StatsEdgeTotalKey(tenant))
+	if err != nil {
+		return nil, err
+	}
+	if !hasVertex && !hasEdge {
+		return nil, graph.NewError(graph.ErrKindNotFound, "stats snapshot not found", nil)
+	}
+	labelCounts, err := t.scanCounterMap(keyspace.StatsVertexLabelPrefix(tenant))
+	if err != nil {
+		return nil, err
+	}
+	edgeCounts, err := t.scanCounterMap(keyspace.StatsEdgeTypePrefix(tenant))
+	if err != nil {
+		return nil, err
+	}
+
+	return &graph.StatsSnapshot{
+		Tenant:      tenant,
+		VertexTotal: vertexTotal,
+		EdgeTotal:   edgeTotal,
+		LabelCounts: labelCounts,
+		EdgeCounts:  edgeCounts,
+	}, nil
 }
 
 func (t *tx) GetEdge(ctx context.Context, tenant, edgeID string) (edge *graph.Edge, err error) {
@@ -293,6 +385,26 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 	if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 		return err
 	}
+	if previous == nil {
+		if err := t.addToCounter(keyspace.StatsEdgeTotalKey(edge.Tenant), 1); err != nil {
+			return err
+		}
+		if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(edge.Tenant, normalizedEdgeType(edge.Type)), 1); err != nil {
+			return err
+		}
+	}
+	if previous != nil {
+		oldType := normalizedEdgeType(previous.Type)
+		newType := normalizedEdgeType(edge.Type)
+		if oldType != newType {
+			if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(edge.Tenant, oldType), -1); err != nil {
+				return err
+			}
+			if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(edge.Tenant, newType), 1); err != nil {
+				return err
+			}
+		}
+	}
 	if previous != nil {
 		if err := t.delete(keyspace.OutAdjacencyKey(previous.Tenant, previous.SrcID, previous.Type, previous.ID), "delete stale out adjacency"); err != nil {
 			return err
@@ -332,6 +444,12 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 
 	edge, err := t.GetEdge(ctx, tenant, edgeID)
 	if err != nil {
+		return err
+	}
+	if err := t.addToCounter(keyspace.StatsEdgeTotalKey(tenant), -1); err != nil {
+		return err
+	}
+	if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(tenant, normalizedEdgeType(edge.Type)), -1); err != nil {
 		return err
 	}
 	if err := t.delete(keyspace.EdgeKey(tenant, edgeID), "delete edge"); err != nil {
@@ -455,7 +573,7 @@ func (t *tx) Commit() error {
 	if t.mode == graph.TxReadOnly {
 		return nil
 	}
-	if err := t.ensureBatchCapacity(0); err != nil {
+	if err := t.flushCounterDeltas(); err != nil {
 		return err
 	}
 	if err := t.batch.Commit(cpebble.Sync); err != nil {
@@ -468,6 +586,10 @@ func (t *tx) set(key, value []byte, action string) (err error) {
 	if err := t.ensureBatchCapacity(len(key) + len(value) + 64); err != nil {
 		return err
 	}
+	return t.setUnchecked(key, value, action)
+}
+
+func (t *tx) setUnchecked(key, value []byte, action string) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = t.handleRecoveredWrite(action, recovered)
@@ -633,6 +755,212 @@ func (t *tx) get(key []byte) ([]byte, error) {
 	out := make([]byte, len(value))
 	copy(out, value)
 	return out, nil
+}
+
+func (t *tx) readCounterMaybeMissing(key []byte) (value int, found bool, err error) {
+	if value, found, ok, err := t.counterValueFromPending(key); ok || err != nil {
+		return value, found, err
+	}
+	buf, err := t.get(key)
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	parsed, parseErr := strconv.ParseInt(strings.TrimSpace(string(buf)), 10, 64)
+	if parseErr != nil {
+		return 0, false, graph.NewError(graph.ErrKindStorage, "decode counter", parseErr)
+	}
+	if parsed < 0 {
+		parsed = 0
+	}
+	value = int(parsed)
+	if t != nil && t.mode == graph.TxReadWrite {
+		if t.counterBase == nil {
+			t.counterBase = map[string]int{}
+		}
+		if t.counterBasePresent == nil {
+			t.counterBasePresent = map[string]bool{}
+		}
+		t.counterBase[string(key)] = value
+		t.counterBasePresent[string(key)] = true
+	}
+	return value, true, nil
+}
+
+func (t *tx) addToCounter(key []byte, delta int) error {
+	if t == nil || t.mode != graph.TxReadWrite {
+		return graph.NewError(graph.ErrKindUnsupported, "transaction is read only", nil)
+	}
+	if _, _, err := t.readCounterMaybeMissing(key); err != nil {
+		return err
+	}
+	if t.counterDeltas == nil {
+		t.counterDeltas = map[string]int{}
+	}
+	t.counterDeltas[string(key)] += delta
+	return nil
+}
+
+func (t *tx) counterValueFromPending(key []byte) (value int, found bool, ok bool, err error) {
+	if t == nil || t.mode != graph.TxReadWrite {
+		return 0, false, false, nil
+	}
+	if t.counterBase == nil {
+		t.counterBase = map[string]int{}
+	}
+	if t.counterBasePresent == nil {
+		t.counterBasePresent = map[string]bool{}
+	}
+	keyStr := string(key)
+	base, hasBase := t.counterBase[keyStr]
+	basePresent := t.counterBasePresent[keyStr]
+	if !hasBase && !basePresent {
+		return 0, false, false, nil
+	}
+	delta := 0
+	if t.counterDeltas != nil {
+		delta = t.counterDeltas[keyStr]
+	}
+	next := base + delta
+	if next < 0 {
+		next = 0
+	}
+	found = basePresent || delta != 0
+	return next, found, true, nil
+}
+
+func (t *tx) flushCounterDeltas() error {
+	if t == nil || t.mode != graph.TxReadWrite || len(t.counterDeltas) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(t.counterDeltas))
+	for key, delta := range t.counterDeltas {
+		if delta != 0 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		delta := t.counterDeltas[key]
+		if delta == 0 {
+			continue
+		}
+		base, hasBase, err := t.loadCounterBaseMaybeMissing([]byte(key))
+		if err != nil {
+			return err
+		}
+		if !hasBase {
+			base = 0
+		}
+		next := base + delta
+		if next < 0 {
+			next = 0
+		}
+		if err := t.setUnchecked([]byte(key), []byte(strconv.FormatInt(int64(next), 10)), "write counter"); err != nil {
+			return err
+		}
+		t.counterBase[key] = next
+		t.counterBasePresent[key] = true
+		t.counterDeltas[key] = 0
+	}
+	return nil
+}
+
+func (t *tx) scanCounterMap(prefix []byte) (map[string]int, error) {
+	out := map[string]int{}
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "create counter iterator", err)
+	}
+	defer iter.Close()
+
+	for ok := iter.First(); ok; ok = iter.Next() {
+		key := iter.Key()
+		if !bytes.HasPrefix(key, prefix) {
+			continue
+		}
+		suffix := strings.TrimSpace(string(key[len(prefix):]))
+		if suffix == "" {
+			continue
+		}
+		value, parseErr := strconv.ParseInt(strings.TrimSpace(string(iter.Value())), 10, 64)
+		if parseErr != nil {
+			return nil, graph.NewError(graph.ErrKindStorage, "decode counter", parseErr)
+		}
+		if value > 0 {
+			out[suffix] = int(value)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "scan counters", err)
+	}
+	return out, nil
+}
+
+func normalizedLabelSet(labels []string) map[string]struct{} {
+	set := map[string]struct{}{}
+	if len(labels) == 0 {
+		set["UNLABELED"] = struct{}{}
+		return set
+	}
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		set[label] = struct{}{}
+	}
+	if len(set) == 0 {
+		set["UNLABELED"] = struct{}{}
+	}
+	return set
+}
+
+func normalizedEdgeType(edgeType string) string {
+	edgeType = strings.TrimSpace(edgeType)
+	if edgeType == "" {
+		return "UNTYPED"
+	}
+	return edgeType
+}
+
+func (t *tx) loadCounterBaseMaybeMissing(key []byte) (value int, found bool, err error) {
+	if t == nil {
+		return 0, false, graph.NewError(graph.ErrKindStorage, "transaction is closed", nil)
+	}
+	if t.counterBase == nil {
+		t.counterBase = map[string]int{}
+	}
+	if t.counterBasePresent == nil {
+		t.counterBasePresent = map[string]bool{}
+	}
+	keyStr := string(key)
+	if basePresent, known := t.counterBasePresent[keyStr]; known {
+		return t.counterBase[keyStr], basePresent, nil
+	}
+
+	buf, err := t.get(key)
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			t.counterBase[keyStr] = 0
+			t.counterBasePresent[keyStr] = false
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	parsed, parseErr := strconv.ParseInt(strings.TrimSpace(string(buf)), 10, 64)
+	if parseErr != nil {
+		return 0, false, graph.NewError(graph.ErrKindStorage, "decode counter", parseErr)
+	}
+	if parsed < 0 {
+		parsed = 0
+	}
+	value = int(parsed)
+	t.counterBase[keyStr] = value
+	t.counterBasePresent[keyStr] = true
+	return value, true, nil
 }
 
 func (t *tx) ensureActive(ctx context.Context) error {

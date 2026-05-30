@@ -123,6 +123,29 @@ What to look at:
 - `indexDecisions`: reports candidate indexes, whether one was selected, chosen access path, estimated scan savings/selectivity, and recommendation (`keep-index`, `create-index`, or `consider-index`).
 - `cardinality`: shows per-plan-node row estimates and their quality (`exact`, `estimate`, or `sample`).
 - `warnings`: emits fallback diagnostics (for example missing index, full-scan fallback, and estimate-only tuning signals) to highlight when planning signals are partial.
+- `influencers.statsSnapshot`: reports statistics source and coverage completeness, including backfill readiness fields:
+	- `coverage.totals`, `coverage.nodeCounts`, `coverage.edgeCounts`
+	- `completeness` (`complete`, `partial`, `missing`)
+	- `backfillStatus` (`complete`, `required`)
+	- `backfillRequired` (`true`, `false`)
+
+Backfill guidance:
+
+- If `backfillRequired=true`, treat planner influencer counts as not fully trusted for manual tuning decisions.
+- `coverage.totals=snapshot` with `coverage.nodeCounts=incomplete` or `coverage.edgeCounts=incomplete` indicates partial historical stats population.
+- A healthy steady-state signal is:
+	- `coverage.totals=snapshot`
+	- `coverage.nodeCounts=snapshot`
+	- `coverage.edgeCounts=snapshot`
+	- `completeness=complete`
+	- `backfillRequired=false`
+- New writes maintain stats incrementally. Older data can require a one-time administrative backfill before EXPLAIN influencer statistics are fully complete.
+
+Migration behavior:
+
+- Upgrading from legacy stores (created before persisted stats existed) triggers an automatic startup migration that backfills statistics data.
+- The migration is one-time and schema-versioned; no manual admin command is required.
+- After migration completes, EXPLAIN should report `backfillRequired=false` and `completeness=complete` for populated tenants.
 
 Warning codes currently emitted:
 

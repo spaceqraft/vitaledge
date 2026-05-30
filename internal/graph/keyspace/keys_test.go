@@ -46,4 +46,7 @@ func TestStatsKeys(t *testing.T) {
 	if got := string(StatsEdgeTypePrefix("t1")); got != "s/t1/edge_type/" {
 		t.Fatalf("unexpected edge type stats prefix: %s", got)
 	}
+	if got := string(SchemaVersionKey()); got != "m/schema_version" {
+		t.Fatalf("unexpected schema version key: %s", got)
+	}
 }

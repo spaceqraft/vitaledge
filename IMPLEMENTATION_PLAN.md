@@ -92,6 +92,9 @@ Current implementation status:
 - Implemented: projection and aggregation enhancements for `count(...)`, `collect(...)`, `labels(...)`, and `type(...)`, including WITH alias propagation and ORDER BY/LIMIT handling in projection flow.
 - Implemented: broad built-in function coverage across string, math, list, predicate/scalar, temporal, spatial, and vector families.
 - Implemented: EXISTS subquery support in WHERE for supported MATCH subquery bodies.
+- Implemented: persisted statistics-as-data side effects for tenant totals, per-label node counts, and per-edge-type counts.
+- Implemented: stats snapshot read API consumed by EXPLAIN and statistics procedures, including EXPLAIN diagnostics for snapshot coverage completeness and backfill-required status.
+- Implemented: startup schema migration (`no-stats` -> `stats`) that backfills persisted statistics for legacy stores and records schema version metadata.
 
 Phase 1 deliverable status:
 
@@ -260,6 +263,10 @@ Required output:
    - predicate cardinality signals.
 3. Cardinality entries with quality classification: `exact`, `estimate`, `sample`.
 4. Warnings and fallback diagnostics.
+5. Statistics snapshot diagnostics exposing data readiness:
+   - `coverage` by stats family,
+   - `completeness` classification,
+   - `backfillStatus` and `backfillRequired` flags.
 
 Schema and transport policy:
 
@@ -280,6 +287,7 @@ Implementation status for current EXPLAIN slice set:
 3. Index-tuning signals: completed (index decisions include recommendation, impact, selectivity, and access-path context).
 4. Warning/fallback diagnostics: completed (specific warning codes emitted for full scans, missing indexes, estimate-only signals, missing tenant context, and write dry-run behavior).
 5. Documentation: completed (README and DESIGN include concrete EXPLAIN interpretation guidance and warning semantics).
+6. Statistics transparency: completed for current persisted envelope (tenant totals + per-label + per-edge-type), including explicit backfill-required signaling in EXPLAIN `statsSnapshot`.
 
 #### Query Pipeline slice-by-slice execution plan (next)
 

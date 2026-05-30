@@ -121,6 +121,27 @@ Current concrete diagnostics and tuning signals:
 4. Query-level cost estimate (`costEstimate`) for deterministic before/after tuning comparisons.
 5. Runtime planning counters (`runtimeStats`) for store/plan/index/cardinality summaries.
 6. Warning diagnostics keyed by explicit fallback conditions (`MISSING_PROPERTY_INDEX`, `FULL_SCAN_FALLBACK`, `ESTIMATE_ONLY_INDEX_SIGNAL`, `WRITE_QUERY_DRY_RUN`, `MISSING_TENANT_CONTEXT`).
+7. Statistics snapshot diagnostics that expose backfill and completeness state (`coverage`, `completeness`, `backfillStatus`, `backfillRequired`).
+
+### Statistics-as-data and backfill policy
+
+Decision:
+
+1. Planner influencer statistics are maintained as persisted data, updated as side effects of graph mutations.
+2. EXPLAIN must surface statistics coverage completeness so operators can determine whether tuning signals are fully reliable.
+
+Current persisted statistics envelope:
+
+1. Tenant totals: vertex and edge counts.
+2. Per-label vertex counts.
+3. Per-edge-type counts.
+
+Backfill expectations:
+
+1. New writes maintain stats incrementally.
+2. Existing datasets from earlier versions are migrated by a startup database migration (`no-stats` -> `stats`) that backfills missing statistics keys.
+3. EXPLAIN `statsSnapshot.backfillRequired=true` is the explicit signal that backfill completeness is not yet achieved.
+4. Manual index-tuning decisions should prefer snapshots where `statsSnapshot.completeness=complete`.
 
 ### Cardinality quality policy
 

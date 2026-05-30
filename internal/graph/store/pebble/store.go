@@ -27,6 +27,8 @@ type Store struct {
 	maxWriteBatchBytes int
 }
 
+const currentSchemaVersion = 1
+
 type kvReader interface {
 	Get(key []byte) ([]byte, io.Closer, error)
 	NewIter(o *cpebble.IterOptions) (*cpebble.Iterator, error)
@@ -76,7 +78,68 @@ func OpenWithOptions(path string, opts StoreOptions) (*Store, error) {
 	if maxWriteBatchBytes <= 0 {
 		maxWriteBatchBytes = DefaultMaxWriteBatchBytes
 	}
-	return &Store{db: db, metrics: metrics, maxWriteBatchBytes: maxWriteBatchBytes}, nil
+	store := &Store{db: db, metrics: metrics, maxWriteBatchBytes: maxWriteBatchBytes}
+	if err := store.runMigrations(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *Store) runMigrations(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return graph.NewError(graph.ErrKindStorage, "graph store is closed", nil)
+	}
+	version, err := s.schemaVersion()
+	if err != nil {
+		return err
+	}
+	if version >= currentSchemaVersion {
+		return nil
+	}
+
+	return s.Update(ctx, func(txn graph.Tx) error {
+		t, ok := txn.(*tx)
+		if !ok {
+			return graph.NewError(graph.ErrKindStorage, "unexpected tx implementation for migration", nil)
+		}
+		tenants, err := t.collectStatsBackfillTenants()
+		if err != nil {
+			return err
+		}
+		for _, tenant := range tenants {
+			if err := t.backfillTenantStats(ctx, tenant); err != nil {
+				return err
+			}
+		}
+		if err := t.setUnchecked(keyspace.SchemaVersionKey(), []byte(strconv.Itoa(currentSchemaVersion)), "write schema version"); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func (s *Store) schemaVersion() (int, error) {
+	if s == nil || s.db == nil {
+		return 0, graph.NewError(graph.ErrKindStorage, "graph store is closed", nil)
+	}
+	value, closer, err := s.db.Get(keyspace.SchemaVersionKey())
+	if err != nil {
+		if errors.Is(err, cpebble.ErrNotFound) {
+			return 0, nil
+		}
+		return 0, graph.NewError(graph.ErrKindStorage, "read schema version", err)
+	}
+	defer closer.Close()
+
+	parsed, parseErr := strconv.Atoi(strings.TrimSpace(string(value)))
+	if parseErr != nil {
+		return 0, graph.NewError(graph.ErrKindStorage, "decode schema version", parseErr)
+	}
+	if parsed < 0 {
+		return 0, nil
+	}
+	return parsed, nil
 }
 
 func (s *Store) BeginTx(ctx context.Context, opts graph.TxOptions) (graph.Tx, error) {
@@ -897,6 +960,145 @@ func (t *tx) scanCounterMap(prefix []byte) (map[string]int, error) {
 		return nil, graph.NewError(graph.ErrKindStorage, "scan counters", err)
 	}
 	return out, nil
+}
+
+func (t *tx) collectStatsBackfillTenants() ([]string, error) {
+	tenants := map[string]struct{}{}
+	collect := func(prefix []byte) error {
+		iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+		if err != nil {
+			return graph.NewError(graph.ErrKindStorage, "create tenant iterator", err)
+		}
+		defer iter.Close()
+		for ok := iter.First(); ok; ok = iter.Next() {
+			parts := strings.SplitN(string(iter.Key()), "/", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			tenant := strings.TrimSpace(parts[1])
+			if tenant == "" {
+				continue
+			}
+			tenants[tenant] = struct{}{}
+		}
+		if err := iter.Error(); err != nil {
+			return graph.NewError(graph.ErrKindStorage, "scan tenants", err)
+		}
+		return nil
+	}
+	if err := collect([]byte("v/")); err != nil {
+		return nil, err
+	}
+	if err := collect([]byte("e/")); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(tenants))
+	for tenant := range tenants {
+		out = append(out, tenant)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (t *tx) backfillTenantStats(ctx context.Context, tenant string) error {
+	if strings.TrimSpace(tenant) == "" {
+		return nil
+	}
+	vertexTotal := 0
+	edgeTotal := 0
+	labelCounts := map[string]int{}
+	edgeCounts := map[string]int{}
+
+	if err := t.ScanVertices(ctx, tenant, 0, func(v *graph.Vertex) error {
+		if v == nil {
+			return nil
+		}
+		vertexTotal++
+		for label := range normalizedLabelSet(v.Labels) {
+			labelCounts[label]++
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	edgePrefix := keyspace.EdgePrefix(tenant)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: edgePrefix, UpperBound: prefixUpperBound(edgePrefix)})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create edge iterator", err)
+	}
+	defer iter.Close()
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		var edge graph.Edge
+		if err := json.Unmarshal(iter.Value(), &edge); err != nil {
+			return graph.NewError(graph.ErrKindStorage, "decode edge", err)
+		}
+		edgeTotal++
+		edgeCounts[normalizedEdgeType(edge.Type)]++
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan edges", err)
+	}
+
+	if err := t.clearCounterPrefix(keyspace.StatsVertexLabelPrefix(tenant)); err != nil {
+		return err
+	}
+	if err := t.clearCounterPrefix(keyspace.StatsEdgeTypePrefix(tenant)); err != nil {
+		return err
+	}
+
+	if err := t.setUnchecked(keyspace.StatsVertexTotalKey(tenant), []byte(strconv.Itoa(vertexTotal)), "write vertex total"); err != nil {
+		return err
+	}
+	if err := t.setUnchecked(keyspace.StatsEdgeTotalKey(tenant), []byte(strconv.Itoa(edgeTotal)), "write edge total"); err != nil {
+		return err
+	}
+	labelKeys := make([]string, 0, len(labelCounts))
+	for label := range labelCounts {
+		labelKeys = append(labelKeys, label)
+	}
+	sort.Strings(labelKeys)
+	for _, label := range labelKeys {
+		if err := t.setUnchecked(keyspace.StatsVertexLabelCountKey(tenant, label), []byte(strconv.Itoa(labelCounts[label])), "write label count"); err != nil {
+			return err
+		}
+	}
+	typeKeys := make([]string, 0, len(edgeCounts))
+	for edgeType := range edgeCounts {
+		typeKeys = append(typeKeys, edgeType)
+	}
+	sort.Strings(typeKeys)
+	for _, edgeType := range typeKeys {
+		if err := t.setUnchecked(keyspace.StatsEdgeTypeCountKey(tenant, edgeType), []byte(strconv.Itoa(edgeCounts[edgeType])), "write edge type count"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *tx) clearCounterPrefix(prefix []byte) error {
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create counter clear iterator", err)
+	}
+	defer iter.Close()
+	keys := make([][]byte, 0)
+	for ok := iter.First(); ok; ok = iter.Next() {
+		key := append([]byte(nil), iter.Key()...)
+		keys = append(keys, key)
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan counters for clear", err)
+	}
+	for _, key := range keys {
+		if err := t.delete(key, "clear counter key"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func normalizedLabelSet(labels []string) map[string]struct{} {

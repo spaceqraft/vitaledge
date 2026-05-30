@@ -352,6 +352,78 @@ func TestDurabilityAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestOpenRunsStatsMigrationForLegacyData(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "graph.db")
+
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "TAGGED", SrcID: "m1", DstID: "x1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	wipePrefixKeys(t, store, []byte("s/"))
+	if err := store.db.Delete(keyspace.SchemaVersionKey(), nil); err != nil && !errors.Is(err, cpebble.ErrNotFound) {
+		t.Fatalf("delete schema version key failed: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+
+	store, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen store failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		snapshot, err := tx.GetStatsSnapshot(ctx, "acme")
+		if err != nil {
+			return err
+		}
+		if snapshot.VertexTotal != 3 {
+			return fmt.Errorf("expected VertexTotal=3, got %d", snapshot.VertexTotal)
+		}
+		if snapshot.EdgeTotal != 2 {
+			return fmt.Errorf("expected EdgeTotal=2, got %d", snapshot.EdgeTotal)
+		}
+		if snapshot.LabelCounts["Movie"] != 1 || snapshot.LabelCounts["User"] != 1 || snapshot.LabelCounts["UNLABELED"] != 1 {
+			return fmt.Errorf("unexpected label counts: %#v", snapshot.LabelCounts)
+		}
+		if snapshot.EdgeCounts["RATED"] != 1 || snapshot.EdgeCounts["TAGGED"] != 1 {
+			return fmt.Errorf("unexpected edge counts: %#v", snapshot.EdgeCounts)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("stats snapshot verification failed: %v", err)
+	}
+
+	if !dbHasKey(t, store, keyspace.SchemaVersionKey()) {
+		t.Fatalf("expected schema version key to exist after migration")
+	}
+}
+
 func TestPropertyIndexRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)
@@ -1127,6 +1199,28 @@ func countByPrefix(t *testing.T, store *Store, prefix []byte) int {
 		t.Fatalf("iter error: %v", err)
 	}
 	return count
+}
+
+func wipePrefixKeys(t *testing.T, store *Store, prefix []byte) {
+	t.Helper()
+	iter, err := store.db.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		t.Fatalf("new iter failed: %v", err)
+	}
+	defer iter.Close()
+
+	keys := make([][]byte, 0)
+	for ok := iter.First(); ok; ok = iter.Next() {
+		keys = append(keys, append([]byte(nil), iter.Key()...))
+	}
+	if err := iter.Error(); err != nil {
+		t.Fatalf("iter error: %v", err)
+	}
+	for _, key := range keys {
+		if err := store.db.Delete(key, nil); err != nil {
+			t.Fatalf("delete key %q failed: %v", key, err)
+		}
+	}
 }
 
 func assertAdjacencyConsistency(t *testing.T, store *Store, tenant string) {

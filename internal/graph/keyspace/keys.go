@@ -9,6 +9,7 @@ const (
 	inPrefix     = "a/in"
 	indexPrefix  = "i"
 	statsPrefix  = "s"
+	metaPrefix   = "m"
 )
 
 func VertexKey(tenant, vertexID string) []byte {
@@ -83,4 +84,8 @@ func StatsEdgeTypeCountKey(tenant, edgeType string) []byte {
 
 func StatsEdgeTypePrefix(tenant string) []byte {
 	return []byte(fmt.Sprintf("%s/%s/edge_type/", statsPrefix, tenant))
+}
+
+func SchemaVersionKey() []byte {
+	return []byte(fmt.Sprintf("%s/schema_version", metaPrefix))
 }

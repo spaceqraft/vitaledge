@@ -16,10 +16,13 @@ type Metrics interface {
 	IncTxConflict()
 }
 
+const DefaultMaxWriteBatchBytes = 64 * 1024 * 1024
+
 // StoreOptions configures OpenWithOptions behavior.
 type StoreOptions struct {
-	PebbleOptions *cpebble.Options
-	Metrics       Metrics
+	PebbleOptions      *cpebble.Options
+	Metrics            Metrics
+	MaxWriteBatchBytes int
 }
 
 type noopMetrics struct{}

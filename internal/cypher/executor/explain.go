@@ -485,7 +485,7 @@ func explainScanPlanNodes(nodes []map[string]any) []explainScanPlanNode {
 
 func isScanOperator(op string) bool {
 	switch op {
-	case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_NODES_SCAN", "OPTIONAL_ALL_NODES_SCAN":
+	case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_NODES_SCAN", "OPTIONAL_ALL_NODES_SCAN", "EDGE_SCAN", "OPTIONAL_EDGE_SCAN":
 		return true
 	default:
 		return false
@@ -969,7 +969,9 @@ func (b *explainPlanBuilder) addClause(clause ast.Clause) {
 		b.add("UNWIND", map[string]any{"predicate": strings.TrimSpace(clause.Raw)})
 	case ast.ClauseKindInQueryCall, ast.ClauseKindStandaloneCall:
 		b.add("CALL", map[string]any{"predicate": strings.TrimSpace(clause.Raw)})
-	case ast.ClauseKindCreate, ast.ClauseKindMerge, ast.ClauseKindSet, ast.ClauseKindRemove, ast.ClauseKindDelete:
+	case ast.ClauseKindDelete:
+		b.addDeleteClause(clause)
+	case ast.ClauseKindCreate, ast.ClauseKindMerge, ast.ClauseKindSet, ast.ClauseKindRemove:
 		attrs := map[string]any{"writeAction": string(clause.Kind)}
 		if raw := strings.TrimSpace(clause.Raw); raw != "" {
 			attrs["predicate"] = raw
@@ -1001,6 +1003,10 @@ func (b *explainPlanBuilder) addMatchClause(optional bool, raw string, where *as
 		b.addAnchoredScan(optional, anchored, where)
 		return
 	}
+	if edgePattern, ok := explainFastUndirectedEdgePatternFromRaw(patternBody); ok {
+		b.addFastUndirectedEdgeScan(optional, edgePattern, where)
+		return
+	}
 
 	op := "MATCH"
 	if optional {
@@ -1009,6 +1015,56 @@ func (b *explainPlanBuilder) addMatchClause(optional bool, raw string, where *as
 	attrs := map[string]any{}
 	if patternBody != "" {
 		attrs["predicate"] = patternBody
+	}
+	b.add(op, attrs)
+	if where != nil && strings.TrimSpace(where.Raw) != "" {
+		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(where.Raw)})
+	}
+}
+
+type explainFastUndirectedEdgePattern struct {
+	EdgeVar    string
+	LeftLabel  string
+	RightLabel string
+}
+
+func explainFastUndirectedEdgePatternFromRaw(raw string) (explainFastUndirectedEdgePattern, bool) {
+	pattern, err := parseUndirectedRelationshipPattern(strings.TrimSpace(raw))
+	if err != nil {
+		return explainFastUndirectedEdgePattern{}, false
+	}
+	if strings.TrimSpace(pattern.EdgeVar) == "" || strings.TrimSpace(pattern.EdgeProps) != "" || pattern.EdgeType != "" || len(pattern.EdgeAnyOf) != 0 {
+		return explainFastUndirectedEdgePattern{}, false
+	}
+	if strings.TrimSpace(pattern.Left.Var) != "" || strings.TrimSpace(pattern.Right.Var) != "" {
+		return explainFastUndirectedEdgePattern{}, false
+	}
+	leftLabel, leftAny, ok := fastEdgeCountNodeLabelFilter(pattern.Left)
+	if !ok {
+		return explainFastUndirectedEdgePattern{}, false
+	}
+	rightLabel, rightAny, ok := fastEdgeCountNodeLabelFilter(pattern.Right)
+	if !ok {
+		return explainFastUndirectedEdgePattern{}, false
+	}
+	if !leftAny && !rightAny {
+		return explainFastUndirectedEdgePattern{}, false
+	}
+	return explainFastUndirectedEdgePattern{EdgeVar: strings.TrimSpace(pattern.EdgeVar), LeftLabel: leftLabel, RightLabel: rightLabel}, true
+}
+
+func (b *explainPlanBuilder) addFastUndirectedEdgeScan(optional bool, pattern explainFastUndirectedEdgePattern, where *ast.Expression) {
+	op := "EDGE_SCAN"
+	if optional {
+		op = "OPTIONAL_EDGE_SCAN"
+	}
+	attrs := map[string]any{
+		"accessPath":       "edge_adjacency",
+		"edgeVar":          pattern.EdgeVar,
+		"implementation":   "fast_candidate",
+		"matchDirection":   "undirected",
+		"leftLabelFilter":  pattern.LeftLabel,
+		"rightLabelFilter": pattern.RightLabel,
 	}
 	b.add(op, attrs)
 	if where != nil && strings.TrimSpace(where.Raw) != "" {
@@ -1062,6 +1118,9 @@ func (b *explainPlanBuilder) addNodeScan(optional bool, pattern nodePattern, whe
 		op = "OPTIONAL_" + op
 	}
 	attrs := map[string]any{"accessPath": indexPath}
+	if nodeVar := strings.TrimSpace(pattern.Var); nodeVar != "" {
+		attrs["nodeVar"] = nodeVar
+	}
 	if indexed && strings.TrimSpace(pattern.PropertiesRaw) != "" {
 		attrs["predicate"] = strings.TrimSpace(pattern.PropertiesRaw)
 		if err != nil {
@@ -1112,6 +1171,38 @@ func (b *explainPlanBuilder) addProjectionClause(clause ast.Clause) {
 	if projection == nil {
 		return
 	}
+	if nodeVar, ok := b.canUseFastNodeCount(); ok {
+		if output, ok := explainFastNodeCountProjection(projection, nodeVar); ok {
+			attrs := map[string]any{
+				"aggregates":     []string{fmt.Sprintf("count(%s)", nodeVar)},
+				"projection":     []string{output},
+				"implementation": "fast_node_count",
+			}
+			b.add("AGGREGATE", attrs)
+			return
+		}
+	}
+	if edgeVar, ok := b.canUseFastEdgeCount(); ok {
+		if output, ok := explainFastEdgeCountProjection(projection, edgeVar); ok {
+			attrs := map[string]any{
+				"aggregates":     []string{fmt.Sprintf("count(%s)", edgeVar)},
+				"projection":     []string{output},
+				"implementation": "fast_edge_count",
+			}
+			b.add("AGGREGATE", attrs)
+			return
+		}
+	}
+	if spec, ok := explainFastLabelHistogramProjection(projection); ok && b.canUseFastLabelHistogram() {
+		attrs := map[string]any{
+			"groupBy":        []string{spec.labelsOutput},
+			"aggregates":     []string{fmt.Sprintf("count(%s)", spec.countInputExpr)},
+			"projection":     []string{spec.labelsOutput, spec.countOutput},
+			"implementation": "fast_label_histogram",
+		}
+		b.add("AGGREGATE", attrs)
+		return
+	}
 	items := make([]string, 0, len(projection.Items))
 	for _, item := range projection.Items {
 		expr := strings.TrimSpace(item.Expression.Raw)
@@ -1157,6 +1248,223 @@ func (b *explainPlanBuilder) addProjectionClause(clause ast.Clause) {
 	if projection.Limit != nil && strings.TrimSpace(projection.Limit.Raw) != "" {
 		b.add("LIMIT", map[string]any{"pagination": map[string]any{"limit": strings.TrimSpace(projection.Limit.Raw)}})
 	}
+}
+
+func (b *explainPlanBuilder) addDeleteClause(clause ast.Clause) {
+	if edgeVar, ok := b.canUseFastEdgeDelete(); ok {
+		if target, ok := explainDeleteSingleTarget(clause.Raw); ok && target == edgeVar {
+			attrs := map[string]any{"writeAction": string(clause.Kind), "implementation": "fast_edge_delete"}
+			if raw := strings.TrimSpace(clause.Raw); raw != "" {
+				attrs["predicate"] = raw
+			}
+			b.add("DELETE", attrs)
+			return
+		}
+	}
+	attrs := map[string]any{"writeAction": string(clause.Kind)}
+	if raw := strings.TrimSpace(clause.Raw); raw != "" {
+		attrs["predicate"] = raw
+	}
+	b.add("WRITE", attrs)
+}
+
+func explainDeleteSingleTarget(raw string) (string, bool) {
+	normalized := normalizeClauseBody(raw)
+	upper := strings.ToUpper(normalized)
+	if strings.HasPrefix(upper, "DETACHDELETE") {
+		return "", false
+	}
+	if !strings.HasPrefix(upper, "DELETE") {
+		return "", false
+	}
+	body := strings.TrimSpace(normalized[len("DELETE"):])
+	if body == "" || strings.Contains(body, ",") || !isIdentifierLike(body) {
+		return "", false
+	}
+	return body, true
+}
+
+func explainFastEdgeCountProjection(projection *ast.ReturnClause, edgeVar string) (string, bool) {
+	if projection == nil || projection.Distinct || projection.IncludeAll || projection.Skip != nil || projection.Limit != nil || len(projection.OrderBy) != 0 || len(projection.Items) != 1 {
+		return "", false
+	}
+	item := projection.Items[0]
+	expr := strings.TrimSpace(item.Expression.Raw)
+	countArg, ok := parseFunctionCall(expr, "count")
+	if !ok {
+		return "", false
+	}
+	countArg = strings.TrimSpace(countArg)
+	if strings.HasPrefix(strings.ToUpper(countArg), "DISTINCT") {
+		return "", false
+	}
+	if countArg != edgeVar {
+		return "", false
+	}
+	if alias := strings.TrimSpace(item.Alias); alias != "" {
+		return alias, true
+	}
+	return expr, true
+}
+
+func explainFastNodeCountProjection(projection *ast.ReturnClause, nodeVar string) (string, bool) {
+	if projection == nil || projection.Distinct || projection.IncludeAll || projection.Skip != nil || projection.Limit != nil || len(projection.OrderBy) != 0 || len(projection.Items) != 1 {
+		return "", false
+	}
+	item := projection.Items[0]
+	expr := strings.TrimSpace(item.Expression.Raw)
+	countArg, ok := parseFunctionCall(expr, "count")
+	if !ok {
+		return "", false
+	}
+	countArg = strings.TrimSpace(countArg)
+	if strings.HasPrefix(strings.ToUpper(countArg), "DISTINCT") {
+		return "", false
+	}
+	if countArg != nodeVar {
+		return "", false
+	}
+	if alias := strings.TrimSpace(item.Alias); alias != "" {
+		return alias, true
+	}
+	return expr, true
+}
+
+type explainFastLabelHistogramSpec struct {
+	labelsOutput   string
+	countOutput    string
+	countInputExpr string
+}
+
+func explainFastLabelHistogramProjection(projection *ast.ReturnClause) (explainFastLabelHistogramSpec, bool) {
+	if projection == nil || projection.Distinct || projection.IncludeAll || projection.Skip != nil || projection.Limit != nil || len(projection.OrderBy) != 0 || len(projection.Items) != 2 {
+		return explainFastLabelHistogramSpec{}, false
+	}
+
+	labelsIdx := -1
+	countIdx := -1
+	labelsVar := ""
+	for idx, item := range projection.Items {
+		expr := strings.TrimSpace(item.Expression.Raw)
+		if arg, ok := parseFunctionCall(expr, "labels"); ok {
+			arg = strings.TrimSpace(arg)
+			if arg == "" {
+				return explainFastLabelHistogramSpec{}, false
+			}
+			labelsIdx = idx
+			labelsVar = arg
+			continue
+		}
+		countArg, ok := parseFunctionCall(expr, "count")
+		if !ok {
+			continue
+		}
+		countArg = strings.TrimSpace(countArg)
+		if strings.HasPrefix(strings.ToUpper(countArg), "DISTINCT") {
+			return explainFastLabelHistogramSpec{}, false
+		}
+		inner, ok := parseFunctionCall(countArg, "labels")
+		if !ok {
+			continue
+		}
+		inner = strings.TrimSpace(inner)
+		if inner == "" {
+			return explainFastLabelHistogramSpec{}, false
+		}
+		countIdx = idx
+		if labelsVar == "" {
+			labelsVar = inner
+		} else if labelsVar != inner {
+			return explainFastLabelHistogramSpec{}, false
+		}
+	}
+	if labelsIdx < 0 || countIdx < 0 || labelsIdx == countIdx || labelsVar == "" {
+		return explainFastLabelHistogramSpec{}, false
+	}
+
+	labelsOutput := strings.TrimSpace(projection.Items[labelsIdx].Alias)
+	if labelsOutput == "" {
+		labelsOutput = strings.TrimSpace(projection.Items[labelsIdx].Expression.Raw)
+	}
+	countOutput := strings.TrimSpace(projection.Items[countIdx].Alias)
+	if countOutput == "" {
+		countOutput = strings.TrimSpace(projection.Items[countIdx].Expression.Raw)
+	}
+	if labelsOutput == "" || countOutput == "" {
+		return explainFastLabelHistogramSpec{}, false
+	}
+
+	return explainFastLabelHistogramSpec{
+		labelsOutput:   labelsOutput,
+		countOutput:    countOutput,
+		countInputExpr: strings.TrimSpace(projection.Items[labelsIdx].Expression.Raw),
+	}, true
+}
+
+func (b *explainPlanBuilder) canUseFastLabelHistogram() bool {
+	if len(b.nodes) == 0 {
+		return false
+	}
+	for _, node := range b.nodes {
+		op, _ := node["op"].(string)
+		if op == "LABEL_SCAN" || op == "OPTIONAL_LABEL_SCAN" || op == "INDEX_SCAN" || op == "OPTIONAL_INDEX_SCAN" || op == "FILTER" {
+			return false
+		}
+	}
+	last := b.nodes[len(b.nodes)-1]
+	op, _ := last["op"].(string)
+	return op == "ALL_NODES_SCAN"
+}
+
+func (b *explainPlanBuilder) canUseFastEdgeCount() (string, bool) {
+	if len(b.nodes) == 0 {
+		return "", false
+	}
+	last := b.nodes[len(b.nodes)-1]
+	op, _ := last["op"].(string)
+	if op != "EDGE_SCAN" {
+		return "", false
+	}
+	edgeVar, _ := last["edgeVar"].(string)
+	edgeVar = strings.TrimSpace(edgeVar)
+	if edgeVar == "" {
+		return "", false
+	}
+	return edgeVar, true
+}
+
+func (b *explainPlanBuilder) canUseFastNodeCount() (string, bool) {
+	if len(b.nodes) == 0 {
+		return "", false
+	}
+	last := b.nodes[len(b.nodes)-1]
+	op, _ := last["op"].(string)
+	if op != "ALL_NODES_SCAN" {
+		return "", false
+	}
+	nodeVar, _ := last["nodeVar"].(string)
+	nodeVar = strings.TrimSpace(nodeVar)
+	if nodeVar == "" {
+		return "", false
+	}
+	return nodeVar, true
+}
+
+func (b *explainPlanBuilder) canUseFastEdgeDelete() (string, bool) {
+	if len(b.nodes) == 0 {
+		return "", false
+	}
+	last := b.nodes[len(b.nodes)-1]
+	op, _ := last["op"].(string)
+	if op != "EDGE_SCAN" {
+		return "", false
+	}
+	edgeVar, _ := last["edgeVar"].(string)
+	edgeVar = strings.TrimSpace(edgeVar)
+	if edgeVar == "" {
+		return "", false
+	}
+	return edgeVar, true
 }
 
 func (b *explainPlanBuilder) add(op string, attrs map[string]any) string {

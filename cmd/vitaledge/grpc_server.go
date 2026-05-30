@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
 	"github.com/paegun/vitaledge/internal/cypher"
 	"github.com/paegun/vitaledge/internal/cypher/executor"
 	"github.com/paegun/vitaledge/internal/graph"
+	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -22,8 +24,9 @@ const (
 )
 
 type grpcQueryHandler struct {
-	executor      *executor.Executor
-	defaultTenant string
+	executor           *executor.Executor
+	defaultTenant      string
+	maxWriteBatchBytes int64
 }
 
 func startGRPCServer(listenAddress string, handler v1.QueryServiceServer) (*grpc.Server, net.Listener, error) {
@@ -75,7 +78,7 @@ func (h *grpcQueryHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*
 		Rows:    rows,
 		Stats: &v1.QueryStats{
 			RowsReturned: int64(result.Stats.RowsReturned),
-			DurationMs:   result.Stats.Duration.Milliseconds(),
+			DurationMs:   grpcDurationMs(result.Stats.Duration),
 		},
 	}, nil
 }
@@ -118,12 +121,27 @@ func (h *grpcQueryHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*
 		ExplainJson: explainJSON,
 		Stats: &v1.QueryStats{
 			RowsReturned: int64(result.Stats.RowsReturned),
-			DurationMs:   result.Stats.Duration.Milliseconds(),
+			DurationMs:   grpcDurationMs(result.Stats.Duration),
 		},
 	}, nil
 }
 
+func grpcDurationMs(duration time.Duration) int64 {
+	if duration <= 0 {
+		return 0
+	}
+	ms := duration.Milliseconds()
+	if ms == 0 {
+		return 1
+	}
+	return ms
+}
+
 func (h *grpcQueryHandler) GetCapabilities(_ context.Context, _ *v1.CapabilitiesRequest) (*v1.CapabilitiesResponse, error) {
+	maxWriteBatchBytes := h.maxWriteBatchBytes
+	if maxWriteBatchBytes <= 0 {
+		maxWriteBatchBytes = int64(pebblestore.DefaultMaxWriteBatchBytes)
+	}
 	return &v1.CapabilitiesResponse{
 		ProtocolVersion:        "v1",
 		ParserVersions:         []string{grpcSupportedParserVersion},
@@ -131,6 +149,7 @@ func (h *grpcQueryHandler) GetCapabilities(_ context.Context, _ *v1.Capabilities
 		PreparedQuerySupported: true,
 		ParameterBinding:       "server_side",
 		IndexDdlSupported:      true,
+		MaxWriteBatchBytes:     maxWriteBatchBytes,
 	}, nil
 }
 

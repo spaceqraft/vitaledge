@@ -13,6 +13,28 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+func TestGRPCDurationMs(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    time.Duration
+		expected int64
+	}{
+		{name: "zero", input: 0, expected: 0},
+		{name: "negative", input: -1 * time.Millisecond, expected: 0},
+		{name: "sub-millisecond rounds up", input: 500 * time.Microsecond, expected: 1},
+		{name: "exact millisecond", input: 1 * time.Millisecond, expected: 1},
+		{name: "multi-millisecond", input: 123 * time.Millisecond, expected: 123},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := grpcDurationMs(tc.input); got != tc.expected {
+				t.Fatalf("grpcDurationMs(%s)=%d, want %d", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
 func TestGRPCAnyToProtoValueJSONNumberInteger(t *testing.T) {
 	converted, err := grpcAnyToProtoValue(json.Number("42"))
 	if err != nil {

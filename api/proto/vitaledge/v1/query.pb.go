@@ -659,6 +659,7 @@ type CapabilitiesResponse struct {
 	PreparedQuerySupported bool                   `protobuf:"varint,4,opt,name=prepared_query_supported,json=preparedQuerySupported,proto3" json:"prepared_query_supported,omitempty"`
 	ParameterBinding       string                 `protobuf:"bytes,5,opt,name=parameter_binding,json=parameterBinding,proto3" json:"parameter_binding,omitempty"`
 	IndexDdlSupported      bool                   `protobuf:"varint,6,opt,name=index_ddl_supported,json=indexDdlSupported,proto3" json:"index_ddl_supported,omitempty"`
+	MaxWriteBatchBytes     int64                  `protobuf:"varint,7,opt,name=max_write_batch_bytes,json=maxWriteBatchBytes,proto3" json:"max_write_batch_bytes,omitempty"`
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -733,6 +734,13 @@ func (x *CapabilitiesResponse) GetIndexDdlSupported() bool {
 		return x.IndexDdlSupported
 	}
 	return false
+}
+
+func (x *CapabilitiesResponse) GetMaxWriteBatchBytes() int64 {
+	if x != nil {
+		return x.MaxWriteBatchBytes
+	}
+	return 0
 }
 
 type CreatePropertyIndexRequest struct {
@@ -1257,7 +1265,7 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"Diagnostic\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"\x15\n" +
-	"\x13CapabilitiesRequest\"\xa2\x02\n" +
+	"\x13CapabilitiesRequest\"\xd5\x02\n" +
 	"\x14CapabilitiesResponse\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\tR\x0fprotocolVersion\x12'\n" +
 	"\x0fparser_versions\x18\x02 \x03(\tR\x0eparserVersions\x12\x1f\n" +
@@ -1265,7 +1273,8 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"irVersions\x128\n" +
 	"\x18prepared_query_supported\x18\x04 \x01(\bR\x16preparedQuerySupported\x12+\n" +
 	"\x11parameter_binding\x18\x05 \x01(\tR\x10parameterBinding\x12.\n" +
-	"\x13index_ddl_supported\x18\x06 \x01(\bR\x11indexDdlSupported\"\x8c\x01\n" +
+	"\x13index_ddl_supported\x18\x06 \x01(\bR\x11indexDdlSupported\x121\n" +
+	"\x15max_write_batch_bytes\x18\a \x01(\x03R\x12maxWriteBatchBytes\"\x8c\x01\n" +
 	"\x1aCreatePropertyIndexRequest\x12\x16\n" +
 	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x12\x16\n" +
 	"\x06schema\x18\x02 \x01(\tR\x06schema\x12\x1a\n" +

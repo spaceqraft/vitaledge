@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -23,7 +24,14 @@ type yieldItem struct {
 	Alias string
 }
 
-func (e *Executor) executeStandaloneCallStatement(stmt *ast.StandaloneCallStatement, params Params) (*Result, error) {
+type builtinProcedureHandler func(ctx context.Context, args []any, params Params) ([]Row, error)
+
+type resolvedProcedure struct {
+	decl    ProcedureDecl
+	handler builtinProcedureHandler
+}
+
+func (e *Executor) executeStandaloneCallStatement(ctx context.Context, stmt *ast.StandaloneCallStatement, params Params) (*Result, error) {
 	if stmt == nil {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "standalone call statement is required", nil)
 	}
@@ -31,7 +39,7 @@ func (e *Executor) executeStandaloneCallStatement(stmt *ast.StandaloneCallStatem
 	if err != nil {
 		return nil, err
 	}
-	rows, columns, err := e.executeProcedureCall([]Row{{}}, spec, params, false)
+	rows, columns, err := e.executeProcedureCall(ctx, []Row{{}}, spec, params, false)
 	if err != nil {
 		return nil, err
 	}
@@ -39,24 +47,27 @@ func (e *Executor) executeStandaloneCallStatement(stmt *ast.StandaloneCallStatem
 	return &Result{Columns: columns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}, nil
 }
 
-func (e *Executor) applyInQueryCallClause(rows []Row, clause ast.Clause, params Params) ([]Row, error) {
+func (e *Executor) applyInQueryCallClause(ctx context.Context, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
 	spec, err := parseCallClauseRaw(clause.Raw)
 	if err != nil {
 		return nil, err
 	}
-	resultRows, _, err := e.executeProcedureCall(rows, spec, params, true)
+	resultRows, _, err := e.executeProcedureCall(ctx, rows, spec, params, true)
 	if err != nil {
 		return nil, err
 	}
 	return resultRows, nil
 }
 
-func (e *Executor) executeProcedureCall(inputRows []Row, spec callSpec, params Params, inQuery bool) ([]Row, []string, error) {
-	decls := procedureDeclsFromParams(params)
-	decl, ok := decls[spec.Name]
+func (e *Executor) executeProcedureCall(ctx context.Context, inputRows []Row, spec callSpec, params Params, inQuery bool) ([]Row, []string, error) {
+	resolved, ok := e.resolveProcedure(spec.Name, params)
 	if !ok {
 		return nil, nil, graph.NewError(graph.ErrKindSemantic, fmt.Sprintf("procedure %q not found", spec.Name), nil)
 	}
+	if resolved.handler != nil {
+		return e.executeBuiltinProcedureCall(ctx, inputRows, spec, resolved, params, inQuery)
+	}
+	decl := resolved.decl
 
 	if err := validateCallSpec(spec, decl, inQuery); err != nil {
 		return nil, nil, err
@@ -84,7 +95,7 @@ func (e *Executor) executeProcedureCall(inputRows []Row, spec callSpec, params P
 		if argErr != nil {
 			return nil, nil, argErr
 		}
-		procRows, callErr := executeProcedureRows(decl, args)
+		procRows, callErr := e.executeProcedureRows(ctx, resolved, args, params)
 		if callErr != nil {
 			return nil, nil, callErr
 		}
@@ -109,6 +120,249 @@ func (e *Executor) executeProcedureCall(inputRows []Row, spec callSpec, params P
 	}
 
 	return resultRows, outColumns, nil
+}
+
+func (e *Executor) executeBuiltinProcedureCall(ctx context.Context, inputRows []Row, spec callSpec, proc resolvedProcedure, params Params, inQuery bool) ([]Row, []string, error) {
+	if inQuery && spec.ImplicitArgs {
+		return nil, nil, graph.NewError(graph.ErrKindSemantic, "invalid argument passing mode", nil)
+	}
+	for _, arg := range spec.ArgExprs {
+		if strings.Contains(strings.ToLower(arg), "count(") {
+			return nil, nil, graph.NewError(graph.ErrKindSemantic, "invalid aggregation in procedure argument", nil)
+		}
+	}
+
+	if !inQuery && len(inputRows) == 0 {
+		inputRows = []Row{{}}
+	}
+	if len(inputRows) == 0 {
+		return []Row{}, selectedColumns(proc.decl, spec), nil
+	}
+
+	selectedOutputs, outColumns, err := resolveYieldSelection(proc.decl, spec, inQuery, inputRows)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	resultRows := make([]Row, 0)
+	for _, row := range inputRows {
+		args := make([]any, 0, len(spec.ArgExprs))
+		for _, argExpr := range spec.ArgExprs {
+			value, evalErr := evalExpressionWithScope(argExpr, row, params)
+			if evalErr != nil {
+				return nil, nil, evalErr
+			}
+			args = append(args, value)
+		}
+
+		procRows, callErr := e.executeProcedureRows(ctx, proc, args, params)
+		if callErr != nil {
+			return nil, nil, callErr
+		}
+		for _, procRow := range procRows {
+			if inQuery {
+				merged := cloneRow(row)
+				for outName, alias := range selectedOutputs {
+					merged[alias] = procRow[outName]
+				}
+				resultRows = append(resultRows, merged)
+				continue
+			}
+			if len(selectedOutputs) == 0 {
+				continue
+			}
+			out := Row{}
+			for outName, alias := range selectedOutputs {
+				out[alias] = procRow[outName]
+			}
+			resultRows = append(resultRows, out)
+		}
+	}
+
+	return resultRows, outColumns, nil
+}
+
+func (e *Executor) executeProcedureRows(ctx context.Context, proc resolvedProcedure, args []any, params Params) ([]Row, error) {
+	if proc.handler != nil {
+		return proc.handler(ctx, args, params)
+	}
+	return executeProcedureRows(proc.decl, args)
+}
+
+func (e *Executor) resolveProcedure(name string, params Params) (resolvedProcedure, bool) {
+	if builtin, ok := e.resolveBuiltinProcedure(name); ok {
+		return builtin, true
+	}
+	decls := procedureDeclsFromParams(params)
+	decl, ok := decls[name]
+	if !ok {
+		return resolvedProcedure{}, false
+	}
+	return resolvedProcedure{decl: decl}, true
+}
+
+func (e *Executor) resolveBuiltinProcedure(name string) (resolvedProcedure, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "db.stats.edgecount":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name:    "db.stats.edgeCount",
+				Outputs: []ProcedureArg{{Name: "edgeCount", Type: "INTEGER", Nullable: false}},
+			},
+			handler: e.builtinEdgeCountProcedure,
+		}, true
+	case "db.stats.nodecount":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name:    "db.stats.nodeCount",
+				Outputs: []ProcedureArg{{Name: "nodeCount", Type: "INTEGER", Nullable: false}},
+			},
+			handler: e.builtinNodeCountProcedure,
+		}, true
+	default:
+		return resolvedProcedure{}, false
+	}
+}
+
+func (e *Executor) builtinEdgeCountProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+	if e == nil || e.store == nil {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "executor requires a graph store", nil)
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	label, err := parseOptionalLabelArg(args)
+	if err != nil {
+		return nil, err
+	}
+
+	edgeIDs := map[string]struct{}{}
+	err = e.store.View(ctx, func(tx graph.Tx) error {
+		type edgeIDScannerTx interface {
+			ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
+			ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
+		}
+
+		if label == "" {
+			if scanner, ok := tx.(edgeIDScannerTx); ok {
+				return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+					if vertex == nil {
+						return nil
+					}
+					return scanner.ScanOutEdgeIDs(ctx, tenant, vertex.ID, "", 0, func(edgeID string) error {
+						edgeIDs[edgeID] = struct{}{}
+						return nil
+					})
+				})
+			}
+			return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+				if vertex == nil {
+					return nil
+				}
+				return tx.ScanOutEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+					if edge != nil {
+						edgeIDs[edge.ID] = struct{}{}
+					}
+					return nil
+				})
+			})
+		}
+
+		if scanner, ok := tx.(edgeIDScannerTx); ok {
+			return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+				if !vertexHasLabel(vertex, label) {
+					return nil
+				}
+				if err := scanner.ScanOutEdgeIDs(ctx, tenant, vertex.ID, "", 0, func(edgeID string) error {
+					edgeIDs[edgeID] = struct{}{}
+					return nil
+				}); err != nil {
+					return err
+				}
+				return scanner.ScanInEdgeIDs(ctx, tenant, vertex.ID, "", 0, func(edgeID string) error {
+					edgeIDs[edgeID] = struct{}{}
+					return nil
+				})
+			})
+		}
+
+		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+			if !vertexHasLabel(vertex, label) {
+				return nil
+			}
+			if err := tx.ScanOutEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+				if edge != nil {
+					edgeIDs[edge.ID] = struct{}{}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			return tx.ScanInEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+				if edge != nil {
+					edgeIDs[edge.ID] = struct{}{}
+				}
+				return nil
+			})
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return []Row{{"edgeCount": len(edgeIDs)}}, nil
+}
+
+func (e *Executor) builtinNodeCountProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+	if e == nil || e.store == nil {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "executor requires a graph store", nil)
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+
+	label, err := parseOptionalLabelArg(args)
+	if err != nil {
+		return nil, err
+	}
+
+	count := 0
+	err = e.store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+			if vertex == nil {
+				return nil
+			}
+			if label != "" && !vertexHasLabel(vertex, label) {
+				return nil
+			}
+			count++
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return []Row{{"nodeCount": count}}, nil
+}
+
+func parseOptionalLabelArg(args []any) (string, error) {
+	if len(args) > 1 {
+		return "", graph.NewError(graph.ErrKindSemantic, "invalid number of arguments", nil)
+	}
+	if len(args) == 0 || args[0] == nil {
+		return "", nil
+	}
+	s, ok := args[0].(string)
+	if !ok {
+		return "", graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"label\"", nil)
+	}
+	return strings.TrimSpace(s), nil
 }
 
 func parseCallClauseRaw(raw string) (callSpec, error) {

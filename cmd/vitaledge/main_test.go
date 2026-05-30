@@ -131,6 +131,9 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	if !capResp.GetIndexDdlSupported() {
 		t.Fatalf("expected index DDL support to be true")
 	}
+	if capResp.GetMaxWriteBatchBytes() != int64(pebblestore.DefaultMaxWriteBatchBytes) {
+		t.Fatalf("unexpected max_write_batch_bytes capability: %#v", capResp.GetMaxWriteBatchBytes())
+	}
 
 	execResp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",
@@ -205,6 +208,64 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	fallbackRowValue := fallbackResp.GetRows()[0].GetValues()["id"]
 	if fallbackRowValue == nil || fallbackRowValue.GetStringValue() != "seed" {
 		t.Fatalf("unexpected fallback row value: %#v", fallbackRowValue)
+	}
+}
+
+func TestGRPCQueryServiceCapabilitiesReflectConfiguredMaxWriteBatch(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
+	const configuredMaxWriteBatchBytes = 123456
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{
+		executor:           exec,
+		defaultTenant:      "acme",
+		maxWriteBatchBytes: configuredMaxWriteBatchBytes,
+	})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+	capResp, err := client.GetCapabilities(ctx, &v1.CapabilitiesRequest{})
+	if err != nil {
+		t.Fatalf("GetCapabilities failed: %v", err)
+	}
+	if capResp.GetMaxWriteBatchBytes() != configuredMaxWriteBatchBytes {
+		t.Fatalf("unexpected max_write_batch_bytes capability: %#v", capResp.GetMaxWriteBatchBytes())
+	}
+}
+
+func TestOpenGraphStoreRejectsNonPositiveBatchLimit(t *testing.T) {
+	_, err := openGraphStore(t.TempDir(), 0)
+	if err == nil {
+		t.Fatalf("expected error when max write batch bytes is non-positive")
+	}
+}
+
+func TestOpenGraphStoreAcceptsConfiguredBatchLimit(t *testing.T) {
+	store, err := openGraphStore(t.TempDir(), 1024)
+	if err != nil {
+		t.Fatalf("openGraphStore failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	err = store.Update(context.Background(), func(tx graph.Tx) error {
+		return tx.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "ok"})
+	})
+	if err != nil {
+		t.Fatalf("expected write under limit to succeed, got: %v", err)
 	}
 }
 

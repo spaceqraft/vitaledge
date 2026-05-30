@@ -134,6 +134,30 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 		}
 	}
 
+	if !writeQuery {
+		if fastResult, ok, fastErr := e.tryFastEdgeCountQuery(ctx, stmt, params); fastErr != nil {
+			return nil, fastErr
+		} else if ok {
+			return fastResult, nil
+		}
+		if fastResult, ok, fastErr := e.tryFastNodeCountQuery(ctx, stmt, params); fastErr != nil {
+			return nil, fastErr
+		} else if ok {
+			return fastResult, nil
+		}
+		if fastResult, ok, fastErr := e.tryFastLabelHistogramQuery(ctx, stmt, params); fastErr != nil {
+			return nil, fastErr
+		} else if ok {
+			return fastResult, nil
+		}
+	} else {
+		if fastResult, ok, fastErr := e.tryFastEdgeDeleteQuery(ctx, stmt, params); fastErr != nil {
+			return nil, fastErr
+		} else if ok {
+			return fastResult, nil
+		}
+	}
+
 	resultRows := []Row{}
 	resultColumns := []string{}
 	hasAnyReturn := false
@@ -229,7 +253,7 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 			}
 			return rows, resultColumns, true, nil
 		case ast.ClauseKindInQueryCall:
-			rows, stepErr = e.applyInQueryCallClause(rows, clause, params)
+			rows, stepErr = e.applyInQueryCallClause(ctx, rows, clause, params)
 		default:
 			return nil, nil, false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("clause %s is not yet supported", clause.Kind), nil)
 		}
@@ -274,6 +298,556 @@ func hasWriteClause(part ast.QueryPart) bool {
 		}
 	}
 	return false
+}
+
+func (e *Executor) tryFastEdgeCountQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
+	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
+		return nil, false, nil
+	}
+	part := stmt.Parts[0]
+	if len(part.Clauses) != 2 {
+		return nil, false, nil
+	}
+	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindReturn {
+		return nil, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
+	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
+		return nil, false, nil
+	}
+
+	relPattern, err := parseUndirectedRelationshipPattern(matchSpec.Pattern)
+	if err != nil {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(relPattern.EdgeVar) == "" || relPattern.EdgeType != "" || len(relPattern.EdgeAnyOf) != 0 || strings.TrimSpace(relPattern.EdgeProps) != "" {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(relPattern.Left.Var) != "" || strings.TrimSpace(relPattern.Right.Var) != "" {
+		return nil, false, nil
+	}
+
+	leftLabel, leftAny, ok := fastEdgeCountNodeLabelFilter(relPattern.Left)
+	if !ok {
+		return nil, false, nil
+	}
+	rightLabel, rightAny, ok := fastEdgeCountNodeLabelFilter(relPattern.Right)
+	if !ok {
+		return nil, false, nil
+	}
+
+	projection, err := projectionClauseSpecFromClause(part.Clauses[1])
+	if err != nil {
+		return nil, false, nil
+	}
+	if projection.Distinct || strings.TrimSpace(projection.WhereRaw) != "" || len(projection.OrderBy) != 0 || strings.TrimSpace(projection.SkipRaw) != "" || strings.TrimSpace(projection.LimitRaw) != "" {
+		return nil, false, nil
+	}
+	items, err := parseProjectionItems(projection.ProjectionRaw)
+	if err != nil || len(items) != 1 {
+		return nil, false, nil
+	}
+	item := items[0]
+	if item.CollectArg != "" || item.AggFunc != "" {
+		return nil, false, nil
+	}
+	countExpr, countDistinct := parseCountDistinctArg(item.CountArg)
+	if countDistinct || strings.TrimSpace(countExpr) != relPattern.EdgeVar {
+		return nil, false, nil
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, true, err
+	}
+
+	total := 0
+	err = e.store.View(ctx, func(tx graph.Tx) error {
+		switch {
+		case leftAny && rightAny:
+			count, err := countUndirectedEdgeMatchesFast(ctx, tx, tenant, "")
+			if err != nil {
+				return err
+			}
+			total = count
+			return nil
+		case !leftAny && rightAny:
+			count, err := countUndirectedEdgeMatchesFast(ctx, tx, tenant, leftLabel)
+			if err != nil {
+				return err
+			}
+			total = count
+			return nil
+		case leftAny && !rightAny:
+			count, err := countUndirectedEdgeMatchesFast(ctx, tx, tenant, rightLabel)
+			if err != nil {
+				return err
+			}
+			total = count
+			return nil
+		default:
+			return graph.NewError(graph.ErrKindUnsupported, "fast edge count unavailable for this label combination", nil)
+		}
+	})
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindUnsupported) {
+			return nil, false, nil
+		}
+		return nil, true, err
+	}
+
+	column := item.Expression
+	if item.Alias != "" {
+		column = item.Alias
+	}
+	return &Result{
+		Columns: []string{column},
+		Rows:    []Row{{column: total}},
+		Stats:   Stats{RowsReturned: 1},
+	}, true, nil
+}
+
+func fastEdgeCountNodeLabelFilter(pattern nodePattern) (label string, any bool, ok bool) {
+	if strings.TrimSpace(pattern.PropertiesRaw) != "" {
+		return "", false, false
+	}
+	if len(pattern.AnyOfLabels) != 0 || len(pattern.ExcludedLabels) != 0 {
+		return "", false, false
+	}
+	switch len(pattern.AllOfLabels) {
+	case 0:
+		return "", true, true
+	case 1:
+		return strings.TrimSpace(pattern.AllOfLabels[0]), false, true
+	default:
+		return "", false, false
+	}
+}
+
+func countUndirectedEdgeMatchesFast(ctx context.Context, tx graph.Tx, tenant, leftLabel string) (int, error) {
+	total := 0
+	err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+		if vertex == nil {
+			return nil
+		}
+		if strings.TrimSpace(leftLabel) != "" && !vertexHasLabel(vertex, leftLabel) {
+			return nil
+		}
+
+		emitted := map[string]struct{}{}
+		if err := tx.ScanOutEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+			if edge == nil {
+				return nil
+			}
+			key := edge.ID + "|" + edge.DstID
+			if _, seen := emitted[key]; seen {
+				return nil
+			}
+			emitted[key] = struct{}{}
+			total++
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.ScanInEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
+			if edge == nil {
+				return nil
+			}
+			key := edge.ID + "|" + edge.SrcID
+			if _, seen := emitted[key]; seen {
+				return nil
+			}
+			emitted[key] = struct{}{}
+			total++
+			return nil
+		})
+	})
+	return total, err
+}
+
+func (e *Executor) tryFastNodeCountQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
+	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
+		return nil, false, nil
+	}
+	part := stmt.Parts[0]
+	if len(part.Clauses) != 2 {
+		return nil, false, nil
+	}
+	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindReturn {
+		return nil, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
+	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
+		return nil, false, nil
+	}
+	nodePattern, err := parseNodePattern(matchSpec.Pattern)
+	if err != nil {
+		return nil, false, nil
+	}
+	nodeVar := strings.TrimSpace(nodePattern.Var)
+	if nodeVar == "" || strings.TrimSpace(nodePattern.PropertiesRaw) != "" || len(nodePattern.AllOfLabels) != 0 || len(nodePattern.AnyOfLabels) != 0 || len(nodePattern.ExcludedLabels) != 0 {
+		return nil, false, nil
+	}
+
+	projection, err := projectionClauseSpecFromClause(part.Clauses[1])
+	if err != nil {
+		return nil, false, nil
+	}
+	if projection.Distinct || strings.TrimSpace(projection.WhereRaw) != "" || len(projection.OrderBy) != 0 || strings.TrimSpace(projection.SkipRaw) != "" || strings.TrimSpace(projection.LimitRaw) != "" {
+		return nil, false, nil
+	}
+	items, err := parseProjectionItems(projection.ProjectionRaw)
+	if err != nil || len(items) != 1 {
+		return nil, false, nil
+	}
+	item := items[0]
+	if item.CountArg == "" || item.CollectArg != "" || item.AggFunc != "" {
+		return nil, false, nil
+	}
+	countExpr, countDistinct := parseCountDistinctArg(item.CountArg)
+	if countDistinct || strings.TrimSpace(countExpr) != nodeVar {
+		return nil, false, nil
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, true, err
+	}
+
+	total := 0
+	err = e.store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+			if vertex != nil {
+				total++
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, true, err
+	}
+
+	column := item.Expression
+	if item.Alias != "" {
+		column = item.Alias
+	}
+	return &Result{Columns: []string{column}, Rows: []Row{{column: total}}, Stats: Stats{RowsReturned: 1}}, true, nil
+}
+
+func (e *Executor) tryFastLabelHistogramQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
+	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
+		return nil, false, nil
+	}
+	part := stmt.Parts[0]
+	if len(part.Clauses) != 2 {
+		return nil, false, nil
+	}
+	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindReturn {
+		return nil, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
+	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
+		return nil, false, nil
+	}
+	nodePattern, err := parseNodePattern(matchSpec.Pattern)
+	if err != nil {
+		return nil, false, nil
+	}
+	nodeVar := strings.TrimSpace(nodePattern.Var)
+	if nodeVar == "" || strings.TrimSpace(nodePattern.PropertiesRaw) != "" || len(nodePattern.AnyOfLabels) != 0 || len(nodePattern.ExcludedLabels) != 0 || len(nodePattern.AllOfLabels) != 0 {
+		return nil, false, nil
+	}
+
+	projection, err := projectionClauseSpecFromClause(part.Clauses[1])
+	if err != nil {
+		return nil, false, nil
+	}
+	if projection.Distinct || strings.TrimSpace(projection.WhereRaw) != "" || len(projection.OrderBy) != 0 || strings.TrimSpace(projection.SkipRaw) != "" || strings.TrimSpace(projection.LimitRaw) != "" {
+		return nil, false, nil
+	}
+	items, err := parseProjectionItems(projection.ProjectionRaw)
+	if err != nil || len(items) != 2 {
+		return nil, false, nil
+	}
+
+	labelsIdx := -1
+	countIdx := -1
+	for idx, item := range items {
+		if arg, ok := parseFunctionCall(item.Expression, "labels"); ok {
+			if strings.TrimSpace(arg) == nodeVar && item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" {
+				labelsIdx = idx
+				continue
+			}
+		}
+		if item.CountArg == "" || item.CollectArg != "" || item.AggFunc != "" {
+			continue
+		}
+		countExpr, countDistinct := parseCountDistinctArg(item.CountArg)
+		if countDistinct {
+			continue
+		}
+		if arg, ok := parseFunctionCall(countExpr, "labels"); ok && strings.TrimSpace(arg) == nodeVar {
+			countIdx = idx
+		}
+	}
+	if labelsIdx < 0 || countIdx < 0 || labelsIdx == countIdx {
+		return nil, false, nil
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, true, err
+	}
+
+	type labelGroup struct {
+		labels []string
+		count  int
+	}
+	groups := map[string]*labelGroup{}
+	groupOrder := make([]string, 0)
+	err = e.store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+			if vertex == nil {
+				return nil
+			}
+			labels := append([]string(nil), vertex.Labels...)
+			keyBytes, marshalErr := json.Marshal(normalizeResultValue(labels))
+			if marshalErr != nil {
+				return graph.NewError(graph.ErrKindUnsupported, "labels histogram key is not serializable", marshalErr)
+			}
+			key := string(keyBytes)
+			group, ok := groups[key]
+			if !ok {
+				group = &labelGroup{labels: labels}
+				groups[key] = group
+				groupOrder = append(groupOrder, key)
+			}
+			group.count++
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, true, err
+	}
+
+	columns := make([]string, len(items))
+	for idx, item := range items {
+		if item.Alias != "" {
+			columns[idx] = item.Alias
+		} else {
+			columns[idx] = item.Expression
+		}
+	}
+
+	rows := make([]Row, 0, len(groupOrder))
+	for _, key := range groupOrder {
+		group := groups[key]
+		if group == nil {
+			continue
+		}
+		row := Row{}
+		row[columns[labelsIdx]] = append([]string(nil), group.labels...)
+		row[columns[countIdx]] = group.count
+		rows = append(rows, row)
+	}
+
+	return &Result{Columns: columns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}, true, nil
+}
+
+func (e *Executor) tryFastEdgeDeleteQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
+	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
+		return nil, false, nil
+	}
+	part := stmt.Parts[0]
+	if len(part.Clauses) != 2 {
+		return nil, false, nil
+	}
+	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindDelete {
+		return nil, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
+	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
+		return nil, false, nil
+	}
+
+	relPattern, err := parseUndirectedRelationshipPattern(matchSpec.Pattern)
+	if err != nil {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(relPattern.EdgeVar) == "" || relPattern.EdgeType != "" || len(relPattern.EdgeAnyOf) != 0 || strings.TrimSpace(relPattern.EdgeProps) != "" {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(relPattern.Left.Var) != "" || strings.TrimSpace(relPattern.Right.Var) != "" {
+		return nil, false, nil
+	}
+
+	leftLabel, leftAny, ok := fastEdgeCountNodeLabelFilter(relPattern.Left)
+	if !ok {
+		return nil, false, nil
+	}
+	rightLabel, rightAny, ok := fastEdgeCountNodeLabelFilter(relPattern.Right)
+	if !ok {
+		return nil, false, nil
+	}
+	if !leftAny && !rightAny {
+		return nil, false, nil
+	}
+
+	deleteTarget, ok := fastDeleteEdgeTarget(part.Clauses[1].Raw)
+	if !ok || deleteTarget != relPattern.EdgeVar {
+		return nil, false, nil
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, true, err
+	}
+
+	err = e.store.Update(ctx, func(tx graph.Tx) error {
+		edgeIDs, err := collectFastEdgeIDsForLabels(ctx, tx, tenant, leftLabel, rightLabel, leftAny, rightAny)
+		if err != nil {
+			return err
+		}
+		for edgeID := range edgeIDs {
+			if err := tx.DeleteEdge(ctx, tenant, edgeID); err != nil {
+				if graph.IsKind(err, graph.ErrKindNotFound) {
+					continue
+				}
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, true, err
+	}
+
+	return &Result{Columns: nil, Rows: nil, Stats: Stats{RowsReturned: 0}}, true, nil
+}
+
+func fastDeleteEdgeTarget(raw string) (string, bool) {
+	normalized := normalizeClauseBody(raw)
+	upper := strings.ToUpper(normalized)
+	if strings.HasPrefix(upper, "DETACHDELETE") {
+		return "", false
+	}
+	if !strings.HasPrefix(upper, "DELETE") {
+		return "", false
+	}
+	body := strings.TrimSpace(normalized[len("DELETE"):])
+	if body == "" || strings.Contains(body, ",") || !isIdentifierLike(body) {
+		return "", false
+	}
+	return body, true
+}
+
+func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, leftLabel, rightLabel string, leftAny, rightAny bool) (map[string]struct{}, error) {
+	edgeIDs := map[string]struct{}{}
+	type edgeIDScannerTx interface {
+		ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
+		ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
+	}
+
+	collectAllOut := func(scanOut func(vertexID string, fn func(string) error) error) error {
+		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+			if vertex == nil {
+				return nil
+			}
+			return scanOut(vertex.ID, func(edgeID string) error {
+				edgeIDs[edgeID] = struct{}{}
+				return nil
+			})
+		})
+	}
+
+	collectIncidentForLabel := func(label string, scanOutIn func(vertexID string, fn func(string) error) error) error {
+		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+			if !vertexHasLabel(vertex, label) {
+				return nil
+			}
+			return scanOutIn(vertex.ID, func(edgeID string) error {
+				edgeIDs[edgeID] = struct{}{}
+				return nil
+			})
+		})
+	}
+
+	if scanner, ok := tx.(edgeIDScannerTx); ok {
+		scanOut := func(vertexID string, fn func(string) error) error {
+			return scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, "", 0, fn)
+		}
+		scanOutIn := func(vertexID string, fn func(string) error) error {
+			if err := scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, "", 0, fn); err != nil {
+				return err
+			}
+			return scanner.ScanInEdgeIDs(ctx, tenant, vertexID, "", 0, fn)
+		}
+		switch {
+		case leftAny && rightAny:
+			if err := collectAllOut(scanOut); err != nil {
+				return nil, err
+			}
+		case !leftAny && rightAny:
+			if err := collectIncidentForLabel(leftLabel, scanOutIn); err != nil {
+				return nil, err
+			}
+		case leftAny && !rightAny:
+			if err := collectIncidentForLabel(rightLabel, scanOutIn); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, graph.NewError(graph.ErrKindUnsupported, "fast edge id collection unavailable for this label combination", nil)
+		}
+		return edgeIDs, nil
+	}
+
+	scanOut := func(vertexID string, fn func(string) error) error {
+		return tx.ScanOutEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
+			if edge == nil {
+				return nil
+			}
+			return fn(edge.ID)
+		})
+	}
+	scanOutIn := func(vertexID string, fn func(string) error) error {
+		if err := tx.ScanOutEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
+			if edge == nil {
+				return nil
+			}
+			return fn(edge.ID)
+		}); err != nil {
+			return err
+		}
+		return tx.ScanInEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
+			if edge == nil {
+				return nil
+			}
+			return fn(edge.ID)
+		})
+	}
+
+	switch {
+	case leftAny && rightAny:
+		if err := collectAllOut(scanOut); err != nil {
+			return nil, err
+		}
+	case !leftAny && rightAny:
+		if err := collectIncidentForLabel(leftLabel, scanOutIn); err != nil {
+			return nil, err
+		}
+	case leftAny && !rightAny:
+		if err := collectIncidentForLabel(rightLabel, scanOutIn); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, graph.NewError(graph.ErrKindUnsupported, "fast edge id collection unavailable for this label combination", nil)
+	}
+
+	return edgeIDs, nil
 }
 
 func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
@@ -5676,6 +6250,7 @@ func (e *Executor) applyDeleteClause(ctx context.Context, tx graph.Tx, rows []Ro
 	}
 
 	out := make([]Row, 0, len(rows))
+	e.metrics.ObserveDeleteCounter("rows_seen", int64(len(rows)))
 	for _, row := range rows {
 		working := row
 		for _, target := range targets {
@@ -5722,8 +6297,9 @@ func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, deta
 	case nil:
 		return nil, nil
 	case *graph.Vertex:
+		e.metrics.ObserveDeleteCounter("vertex_targets", 1)
 		if detach {
-			if err := deleteVertexWithEdges(ctx, tx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+			if err := deleteVertexWithEdges(ctx, tx, typed.Tenant, typed.ID, e.metrics); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 				return nil, err
 			}
 		} else {
@@ -5737,12 +6313,15 @@ func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, deta
 			if err := tx.DeleteVertex(ctx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 				return nil, err
 			}
+			e.metrics.ObserveDeleteCounter("vertices_deleted", 1)
 		}
 		return deletedVertexBinding{Tenant: typed.Tenant, ID: typed.ID, Labels: append([]string(nil), typed.Labels...)}, nil
 	case *graph.Edge:
+		e.metrics.ObserveDeleteCounter("edge_targets", 1)
 		if err := tx.DeleteEdge(ctx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 			return nil, err
 		}
+		e.metrics.ObserveDeleteCounter("edges_deleted", 1)
 		return deletedEdgeBinding{Tenant: typed.Tenant, ID: typed.ID, Type: typed.Type}, nil
 	case deletedVertexBinding, deletedEdgeBinding:
 		return typed, nil
@@ -5787,7 +6366,7 @@ func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any) 
 			return nil
 		}
 		// Deleting a path should remove entities reachable by that path.
-		if err := deleteVertexWithEdges(ctx, tx, vertex.Tenant, vertex.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+		if err := deleteVertexWithEdges(ctx, tx, vertex.Tenant, vertex.ID, e.metrics); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 			return err
 		}
 		return nil
@@ -14614,26 +15193,69 @@ func flattenListValue(value any) ([]any, error) {
 	return []any{value}, nil
 }
 
-func deleteVertexWithEdges(ctx context.Context, tx graph.Tx, tenant, vertexID string) error {
-	edgeIDs := map[string]struct{}{}
-	if err := tx.ScanOutEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
-		edgeIDs[edge.ID] = struct{}{}
-		return nil
-	}); err != nil {
-		return err
+func deleteVertexWithEdges(ctx context.Context, tx graph.Tx, tenant, vertexID string, metrics Metrics) error {
+	if metrics != nil {
+		metrics.ObserveDeleteCounter("vertex_detach_targets", 1)
 	}
-	if err := tx.ScanInEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
-		edgeIDs[edge.ID] = struct{}{}
-		return nil
-	}); err != nil {
-		return err
+	type edgeIDScannerTx interface {
+		ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
+		ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
+	}
+	edgeIDs := map[string]struct{}{}
+	if scanner, ok := tx.(edgeIDScannerTx); ok {
+		if err := scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, "", 0, func(edgeID string) error {
+			edgeIDs[edgeID] = struct{}{}
+			if metrics != nil {
+				metrics.ObserveDeleteCounter("out_edges_scanned", 1)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := scanner.ScanInEdgeIDs(ctx, tenant, vertexID, "", 0, func(edgeID string) error {
+			edgeIDs[edgeID] = struct{}{}
+			if metrics != nil {
+				metrics.ObserveDeleteCounter("in_edges_scanned", 1)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	} else {
+		if err := tx.ScanOutEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
+			edgeIDs[edge.ID] = struct{}{}
+			if metrics != nil {
+				metrics.ObserveDeleteCounter("out_edges_scanned", 1)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if err := tx.ScanInEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
+			edgeIDs[edge.ID] = struct{}{}
+			if metrics != nil {
+				metrics.ObserveDeleteCounter("in_edges_scanned", 1)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 	for edgeID := range edgeIDs {
 		if err := tx.DeleteEdge(ctx, tenant, edgeID); err != nil {
 			return err
 		}
+		if metrics != nil {
+			metrics.ObserveDeleteCounter("edges_deleted", 1)
+		}
 	}
-	return tx.DeleteVertex(ctx, tenant, vertexID)
+	if err := tx.DeleteVertex(ctx, tenant, vertexID); err != nil {
+		return err
+	}
+	if metrics != nil {
+		metrics.ObserveDeleteCounter("vertices_deleted", 1)
+	}
+	return nil
 }
 
 func resolvePatternSourceID(row Row, params Params, varName, paramName string) (string, error) {

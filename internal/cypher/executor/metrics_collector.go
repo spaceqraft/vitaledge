@@ -47,6 +47,7 @@ type Snapshot struct {
 	RowsReturned    int64
 	IndexCandidates map[IndexCandidateKey]int64
 	IndexLookups    map[IndexLookupKey]IndexLookupValue
+	DeleteCounters  map[string]int64
 }
 
 type Collector struct {
@@ -55,6 +56,7 @@ type Collector struct {
 	rowsReturned    int64
 	indexCandidates map[IndexCandidateKey]int64
 	indexLookups    map[IndexLookupKey]IndexLookupValue
+	deleteCounters  map[string]int64
 }
 
 var _ Metrics = (*Collector)(nil)
@@ -64,6 +66,7 @@ func NewCollector() *Collector {
 		statements:      map[StatementMetricKey]StatementMetricValue{},
 		indexCandidates: map[IndexCandidateKey]int64{},
 		indexLookups:    map[IndexLookupKey]IndexLookupValue{},
+		deleteCounters:  map[string]int64{},
 	}
 }
 
@@ -112,6 +115,15 @@ func (c *Collector) ObserveIndexLookup(strategy, outcome string, matches int) {
 	c.indexLookups[key] = value
 }
 
+func (c *Collector) ObserveDeleteCounter(event string, delta int64) {
+	if c == nil || delta == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deleteCounters[event] += delta
+}
+
 func (c *Collector) Snapshot() Snapshot {
 	if c == nil {
 		return Snapshot{}
@@ -134,11 +146,17 @@ func (c *Collector) Snapshot() Snapshot {
 		indexLookups[key] = value
 	}
 
+	deleteCounters := make(map[string]int64, len(c.deleteCounters))
+	for key, value := range c.deleteCounters {
+		deleteCounters[key] = value
+	}
+
 	return Snapshot{
 		Statements:      statements,
 		RowsReturned:    c.rowsReturned,
 		IndexCandidates: indexCandidates,
 		IndexLookups:    indexLookups,
+		DeleteCounters:  deleteCounters,
 	}
 }
 

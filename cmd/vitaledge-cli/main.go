@@ -44,6 +44,8 @@ type cliConfig struct {
 	loadReadMinHop int
 	loadReadMaxHop int
 	loadReportEach int
+	purge          string
+	purgeBatchSize int
 }
 
 type cliState struct {
@@ -77,6 +79,8 @@ func loadCLIConfig() cliConfig {
 	flag.IntVar(&cfg.loadReadMinHop, "load-read-min-hop", 1, "minimum hop count for read load queries")
 	flag.IntVar(&cfg.loadReadMaxHop, "load-read-max-hop", 3, "maximum hop count for read load queries")
 	flag.IntVar(&cfg.loadReportEach, "load-report-each", 100, "emit progress every N load operations")
+	flag.StringVar(&cfg.purge, "purge", "", "optional one-shot purge: label expression (e.g. Movie|Genre|User or * for all)")
+	flag.IntVar(&cfg.purgeBatchSize, "purge-batch-size", 1000, "nodes deleted per batch during purge")
 	flag.Parse()
 	if cfg.maxColumnWidth < 3 {
 		cfg.maxColumnWidth = 3
@@ -116,6 +120,14 @@ func run(cfg cliConfig, in io.Reader, out io.Writer, stderr io.Writer) error {
 		return runLoadLoop(client, cfg, out, stderr)
 	}
 
+	if strings.TrimSpace(cfg.purge) != "" {
+		labelExpr, _, err := parsePurgeArgs(":purge " + strings.TrimSpace(cfg.purge))
+		if err != nil {
+			return fmt.Errorf("--purge: %w", err)
+		}
+		return runPurge(context.Background(), client, cfg, labelExpr, cfg.purgeBatchSize, out, stderr)
+	}
+
 	if strings.TrimSpace(cfg.execute) != "" {
 		return runStatement(context.Background(), client, cfg, state, strings.TrimSpace(cfg.execute), out, stderr)
 	}
@@ -148,7 +160,23 @@ func runInteractiveLoop(client v1.QueryServiceClient, cfg cliConfig, state *cliS
 		}
 		line := scanner.Text()
 		if statementBuilder.Len() == 0 {
-			handled, err := handleCLICommand(strings.TrimSpace(line), state, out)
+			normalized := strings.TrimSpace(line)
+			if strings.HasPrefix(strings.ToLower(normalized), ":purge") {
+				labelExpr, batchOverride, err := parsePurgeArgs(normalized)
+				if err != nil {
+					fmt.Fprintf(stderr, "purge error: %v\n", err)
+				} else {
+					batchSize := cfg.purgeBatchSize
+					if batchOverride > 0 {
+						batchSize = batchOverride
+					}
+					if err := runPurge(context.Background(), client, cfg, labelExpr, batchSize, out, stderr); err != nil {
+						fmt.Fprintf(stderr, "purge error: %v\n", err)
+					}
+				}
+				continue
+			}
+			handled, err := handleCLICommand(normalized, state, out)
 			if err != nil {
 				if errors.Is(err, io.EOF) {
 					fmt.Fprintln(out, "bye")
@@ -1299,4 +1327,158 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// parsePurgeArgs parses a ":purge <labelExpr> [<batchSize>]" command line.
+// labelExpr may be a pipe-separated list of Cypher labels (e.g. "Movie|Genre|User")
+// or "*" to match all nodes.  An optional trailing integer overrides the batch size.
+// Returns (labelExpr, batchSizeOverride, error).  batchSizeOverride is 0 when absent.
+func parsePurgeArgs(line string) (string, int, error) {
+	rest := strings.TrimSpace(line)
+	// Strip the ":purge" prefix (case-insensitive).
+	if len(rest) < 6 {
+		return "", 0, errors.New("usage: :purge <labels> [<batchSize>]  (e.g. :purge Movie|Genre|User)")
+	}
+	rest = strings.TrimSpace(rest[6:]) // drop ":purge"
+	if rest == "" {
+		return "", 0, errors.New("usage: :purge <labels> [<batchSize>]  (e.g. :purge Movie|Genre|User)")
+	}
+
+	// Last token may be an optional integer batch size override.
+	batchOverride := 0
+	tokens := strings.Fields(rest)
+	if len(tokens) >= 2 {
+		if n, err := strconv.Atoi(tokens[len(tokens)-1]); err == nil && n > 0 {
+			batchOverride = n
+			rest = strings.TrimSpace(strings.Join(tokens[:len(tokens)-1], " "))
+		}
+	}
+
+	labelExpr := strings.TrimSpace(rest)
+	if labelExpr == "" {
+		return "", 0, errors.New("purge label expression must not be empty")
+	}
+	if err := validatePurgeLabelExpr(labelExpr); err != nil {
+		return "", 0, err
+	}
+	return labelExpr, batchOverride, nil
+}
+
+// validatePurgeLabelExpr ensures the label expression is either "*" (all nodes)
+// or a pipe-separated list of valid Cypher identifiers.
+func validatePurgeLabelExpr(expr string) error {
+	if expr == "*" {
+		return nil
+	}
+	parts := strings.Split(expr, "|")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return fmt.Errorf("empty label in expression %q", expr)
+		}
+		if !isValidCypherIdentifier(part) {
+			return fmt.Errorf("invalid label %q: must be a valid Cypher identifier", part)
+		}
+	}
+	return nil
+}
+
+// isValidCypherIdentifier reports whether s is a valid unquoted Cypher identifier.
+func isValidCypherIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 {
+			if !unicode.IsLetter(r) && r != '_' {
+				return false
+			}
+		} else {
+			if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// runPurge deletes all nodes matching labelExpr in batches, reporting progress
+// after each batch.  It uses countQuery round-trips to determine when all nodes
+// have been removed, so it always terminates correctly regardless of whether
+// concurrent writers are active.
+func runPurge(parent context.Context, client v1.QueryServiceClient, cfg cliConfig, labelExpr string, batchSize int, out io.Writer, stderr io.Writer) error {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+
+	var matchClause string
+	if labelExpr == "*" {
+		matchClause = "MATCH (n)"
+	} else {
+		matchClause = "MATCH (n:" + labelExpr + ")"
+	}
+	countQuery := matchClause + " RETURN count(n) AS remaining"
+	deleteQuery := matchClause + fmt.Sprintf(" WITH n LIMIT %d DETACH DELETE n", batchSize)
+
+	countNodes := func() (int64, error) {
+		ctx, cancel := context.WithTimeout(parent, cfg.timeout)
+		defer cancel()
+		resp, err := executeCypher(ctx, client, cfg.tenant, countQuery)
+		if err != nil {
+			return 0, fmt.Errorf("count query failed: %w", err)
+		}
+		if len(resp.GetRows()) == 0 {
+			return 0, nil
+		}
+		row := resp.GetRows()[0]
+		if val, ok := row.GetValues()["remaining"]; ok {
+			if iv, ok2 := val.Kind.(*v1.Value_IntValue); ok2 {
+				return iv.IntValue, nil
+			}
+		}
+		return 0, nil
+	}
+
+	initial, err := countNodes()
+	if err != nil {
+		return err
+	}
+	if initial == 0 {
+		fmt.Fprintf(out, "purge-done labels=%s total_deleted=0 batches=0\n", labelExpr)
+		return nil
+	}
+
+	fmt.Fprintf(out, "purge-start labels=%s total=%d batch_size=%d\n", labelExpr, initial, batchSize)
+
+	started := time.Now()
+	totalDeleted := int64(0)
+	batch := 0
+
+	for {
+		ctx, cancel := context.WithTimeout(parent, cfg.timeout)
+		_, err := executeCypher(ctx, client, cfg.tenant, deleteQuery)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("purge batch %d failed: %w", batch+1, err)
+		}
+		batch++
+
+		remaining, err := countNodes()
+		if err != nil {
+			return fmt.Errorf("purge count after batch %d failed: %w", batch, err)
+		}
+		totalDeleted = initial - remaining
+		elapsed := time.Since(started)
+		fmt.Fprintf(out, "purge-progress batch=%d deleted=%d remaining=%d elapsed=%s\n",
+			batch, totalDeleted, remaining, elapsed.Truncate(time.Millisecond))
+
+		if remaining == 0 {
+			break
+		}
+	}
+
+	elapsed := time.Since(started)
+	fmt.Fprintf(out, "purge-done labels=%s total_deleted=%d batches=%d elapsed=%s\n",
+		labelExpr, totalDeleted, batch, elapsed.Truncate(time.Millisecond))
+	return nil
 }

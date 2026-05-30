@@ -73,6 +73,15 @@ Graph store and tenant defaults are configurable at startup:
 - flag: `--tenant default`
 - env: `VITALEDGE_DEFAULT_TENANT=default`
 
+Maximum write transaction batch size is configurable at startup:
+
+- flag: `--max-write-batch-bytes 67108864`
+- env: `VITALEDGE_MAX_WRITE_BATCH_BYTES=67108864`
+
+The value must be greater than `0`. Oversized write transactions are rejected with an invalid-input error instead of triggering a Pebble panic.
+
+The configured value is also exposed through gRPC capabilities as `max_write_batch_bytes`, so SDK clients can chunk write-heavy workloads (for example, bulk `UNWIND ... MERGE` ingest) before execution.
+
 Index recommendation metrics logging is enabled by default and configurable:
 
 - flag: `--metrics-report-interval 30s`

@@ -375,6 +375,305 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	}
 }
 
+func TestExecuteExplainFastLabelHistogramPlan(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n) RETURN labels(n) AS l, count(labels(n)) AS lc")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %d", len(res.Rows))
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	nodes, ok := logicalPlan["nodes"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan.nodes []map[string]any, got %T", logicalPlan["nodes"])
+	}
+	if len(nodes) < 2 {
+		t.Fatalf("expected at least 2 plan nodes, got %d", len(nodes))
+	}
+	firstOp, _ := nodes[0]["op"].(string)
+	if firstOp != "ALL_NODES_SCAN" {
+		t.Fatalf("expected first plan node ALL_NODES_SCAN, got %#v", nodes[0]["op"])
+	}
+
+	foundFastAggregate := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		if op != "AGGREGATE" {
+			continue
+		}
+		impl, _ := node["implementation"].(string)
+		if impl != "fast_label_histogram" {
+			continue
+		}
+		projection, _ := node["projection"].([]string)
+		if !reflect.DeepEqual(projection, []string{"l", "lc"}) {
+			t.Fatalf("expected fast aggregate projection [l lc], got %#v", node["projection"])
+		}
+		foundFastAggregate = true
+		break
+	}
+	if !foundFastAggregate {
+		t.Fatalf("expected AGGREGATE node with implementation=fast_label_histogram, got nodes %#v", nodes)
+	}
+}
+
+func TestExecuteExplainFastEdgeCountPlan(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "R", SrcID: "m1", DstID: "p1"},
+			{Tenant: "acme", ID: "e2", Type: "R", SrcID: "p1", DstID: "m2"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	tests := []string{
+		"EXPLAIN MATCH ()-[e]-() RETURN count(e)",
+		"EXPLAIN MATCH (:Movie)-[e]-() RETURN count(e)",
+		"EXPLAIN MATCH ()-[e]-(:Movie) RETURN count(e)",
+	}
+
+	exec := New(store, Options{})
+	for _, query := range tests {
+		stmt, err := parser.ParseStatement(query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", query, err)
+		}
+		explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected explain payload map for %q, got %T", query, res.Rows[0]["explain"])
+		}
+		logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected logicalPlan map for %q, got %T", query, explainPayload["logicalPlan"])
+		}
+		nodes, ok := logicalPlan["nodes"].([]map[string]any)
+		if !ok {
+			t.Fatalf("expected logicalPlan.nodes []map for %q, got %T", query, logicalPlan["nodes"])
+		}
+		found := false
+		for _, node := range nodes {
+			op, _ := node["op"].(string)
+			if op != "AGGREGATE" {
+				continue
+			}
+			impl, _ := node["implementation"].(string)
+			if impl == "fast_edge_count" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected AGGREGATE fast_edge_count for %q, got nodes %#v", query, nodes)
+		}
+	}
+}
+
+func TestExecuteExplainFastEdgeDeletePlan(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "R", SrcID: "m1", DstID: "p1"},
+			{Tenant: "acme", ID: "e2", Type: "R", SrcID: "p1", DstID: "m2"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	tests := []string{
+		"EXPLAIN MATCH ()-[e]-() DELETE e",
+		"EXPLAIN MATCH (:Movie)-[e]-() DELETE e",
+		"EXPLAIN MATCH ()-[e]-(:Movie) DELETE e",
+	}
+
+	exec := New(store, Options{})
+	for _, query := range tests {
+		stmt, err := parser.ParseStatement(query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", query, err)
+		}
+		explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected explain payload map for %q, got %T", query, res.Rows[0]["explain"])
+		}
+		logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected logicalPlan map for %q, got %T", query, explainPayload["logicalPlan"])
+		}
+		nodes, ok := logicalPlan["nodes"].([]map[string]any)
+		if !ok {
+			t.Fatalf("expected logicalPlan.nodes []map for %q, got %T", query, logicalPlan["nodes"])
+		}
+		found := false
+		for _, node := range nodes {
+			op, _ := node["op"].(string)
+			if op != "DELETE" {
+				continue
+			}
+			impl, _ := node["implementation"].(string)
+			if impl == "fast_edge_delete" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected DELETE fast_edge_delete for %q, got nodes %#v", query, nodes)
+		}
+	}
+}
+
+func TestExecuteExplainFastNodeCountPlan(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "v1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "v2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "v3", Labels: []string{"Genre"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	queries := []string{
+		"EXPLAIN MATCH (n) RETURN count(n)",
+		"EXPLAIN MATCH (n) RETURN count(n) AS total",
+	}
+
+	exec := New(store, Options{})
+	for _, query := range queries {
+		stmt, err := parser.ParseStatement(query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", query, err)
+		}
+		explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected explain payload map for %q, got %T", query, res.Rows[0]["explain"])
+		}
+		logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected logicalPlan map for %q, got %T", query, explainPayload["logicalPlan"])
+		}
+		nodes, ok := logicalPlan["nodes"].([]map[string]any)
+		if !ok {
+			t.Fatalf("expected logicalPlan.nodes []map for %q, got %T", query, logicalPlan["nodes"])
+		}
+		found := false
+		for _, node := range nodes {
+			op, _ := node["op"].(string)
+			if op != "AGGREGATE" {
+				continue
+			}
+			impl, _ := node["implementation"].(string)
+			if impl == "fast_node_count" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected AGGREGATE fast_node_count for %q, got nodes %#v", query, nodes)
+		}
+	}
+}
+
 func TestExecuteExplainIndexTuningSignalsForMissingIndex(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -3277,6 +3576,290 @@ func TestExecuteCountTwoHopUndirectedRelationshipChain(t *testing.T) {
 	}
 }
 
+func TestExecuteFastEdgeCountQueries(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p2", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1", Labels: []string{"Other"}}); err != nil {
+			return err
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "R", SrcID: "m1", DstID: "p1"},
+			{Tenant: "acme", ID: "e2", Type: "R", SrcID: "p2", DstID: "m1"},
+			{Tenant: "acme", ID: "e3", Type: "R", SrcID: "m1", DstID: "m2"},
+			{Tenant: "acme", ID: "e4", Type: "R", SrcID: "p1", DstID: "x1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	tests := []struct {
+		query string
+		want  string
+	}{
+		{query: "MATCH ()-[e]-() RETURN count(e) AS c", want: "8"},
+		{query: "MATCH (:Movie)-[e]-() RETURN count(e) AS c", want: "4"},
+		{query: "MATCH ()-[e]-(:Movie) RETURN count(e) AS c", want: "4"},
+	}
+
+	for _, tc := range tests {
+		stmt, err := parser.ParseStatement(tc.query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", tc.query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", tc.query, err)
+		}
+		if len(res.Rows) != 1 {
+			t.Fatalf("expected one row for %q, got %d", tc.query, len(res.Rows))
+		}
+		if got := fmt.Sprint(res.Rows[0]["c"]); got != tc.want {
+			t.Fatalf("unexpected count for %q: got %s want %s", tc.query, got, tc.want)
+		}
+	}
+}
+
+func TestExecuteBuiltinProcedureUniquePhysicalEdgeCount(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1", Labels: []string{"Other"}}); err != nil {
+			return err
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "R", SrcID: "m1", DstID: "p1"},
+			{Tenant: "acme", ID: "e2", Type: "R", SrcID: "p1", DstID: "m1"},
+			{Tenant: "acme", ID: "e3", Type: "R", SrcID: "m1", DstID: "m2"},
+			{Tenant: "acme", ID: "e4", Type: "R", SrcID: "p1", DstID: "x1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	tests := []struct {
+		query string
+		want  string
+	}{
+		{query: "CALL db.stats.edgeCount()", want: "4"},
+		{query: "CALL db.stats.edgeCount('Movie')", want: "3"},
+		{query: "CALL db.stats.edgeCount('Movie') YIELD edgeCount AS c", want: "3"},
+	}
+
+	for _, tc := range tests {
+		stmt, err := parser.ParseStatement(tc.query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", tc.query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", tc.query, err)
+		}
+		if len(res.Rows) != 1 {
+			t.Fatalf("expected one row for %q, got %d", tc.query, len(res.Rows))
+		}
+
+		column := "edgeCount"
+		if strings.Contains(tc.query, " AS c") {
+			column = "c"
+		}
+		if got := fmt.Sprint(res.Rows[0][column]); got != tc.want {
+			t.Fatalf("unexpected count for %q: got %s want %s", tc.query, got, tc.want)
+		}
+	}
+}
+
+func TestExecuteBuiltinProcedureNodeCount(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "x1", Labels: []string{"Other"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	tests := []struct {
+		query string
+		want  string
+	}{
+		{query: "CALL db.stats.nodeCount()", want: "4"},
+		{query: "CALL db.stats.nodeCount('Movie')", want: "2"},
+		{query: "CALL db.stats.nodeCount('Movie') YIELD nodeCount AS c", want: "2"},
+	}
+
+	for _, tc := range tests {
+		stmt, err := parser.ParseStatement(tc.query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", tc.query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", tc.query, err)
+		}
+		if len(res.Rows) != 1 {
+			t.Fatalf("expected one row for %q, got %d", tc.query, len(res.Rows))
+		}
+
+		column := "nodeCount"
+		if strings.Contains(tc.query, " AS c") {
+			column = "c"
+		}
+		if got := fmt.Sprint(res.Rows[0][column]); got != tc.want {
+			t.Fatalf("unexpected count for %q: got %s want %s", tc.query, got, tc.want)
+		}
+	}
+}
+
+func TestExecuteFastLabelHistogramQuery(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "mf1", Labels: []string{"Movie", "Featured"}},
+			{Tenant: "acme", ID: "u1"},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	tests := []struct {
+		query        string
+		wantColumns  []string
+		labelsColumn string
+		countColumn  string
+	}{
+		{
+			query:        "MATCH (n) RETURN count(labels(n)), labels(n)",
+			wantColumns:  []string{"count(labels(n))", "labels(n)"},
+			labelsColumn: "labels(n)",
+			countColumn:  "count(labels(n))",
+		},
+		{
+			query:        "MATCH (n) RETURN labels(n), count(labels(n))",
+			wantColumns:  []string{"labels(n)", "count(labels(n))"},
+			labelsColumn: "labels(n)",
+			countColumn:  "count(labels(n))",
+		},
+		{
+			query:        "MATCH (n) RETURN count(labels(n)) AS ct, labels(n) AS lbs",
+			wantColumns:  []string{"ct", "lbs"},
+			labelsColumn: "lbs",
+			countColumn:  "ct",
+		},
+		{
+			query:        "MATCH (n) RETURN labels(n) AS lbs, count(labels(n)) AS ct",
+			wantColumns:  []string{"lbs", "ct"},
+			labelsColumn: "lbs",
+			countColumn:  "ct",
+		},
+	}
+
+	wantHistogram := map[string]string{
+		`["Movie"]`:            "2",
+		`["Person"]`:           "1",
+		`["Movie","Featured"]`: "1",
+		`null`:                 "1",
+	}
+
+	for _, tc := range tests {
+		stmt, err := parser.ParseStatement(tc.query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", tc.query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", tc.query, err)
+		}
+		if !reflect.DeepEqual(res.Columns, tc.wantColumns) {
+			t.Fatalf("unexpected columns for %q: got %#v want %#v", tc.query, res.Columns, tc.wantColumns)
+		}
+
+		gotHistogram := map[string]string{}
+		for _, row := range res.Rows {
+			labelsRaw := row[tc.labelsColumn]
+			labelsKeyBytes, marshalErr := json.Marshal(labelsRaw)
+			if marshalErr != nil {
+				t.Fatalf("json.Marshal(labels) failed for %q: %v", tc.query, marshalErr)
+			}
+			gotHistogram[string(labelsKeyBytes)] = fmt.Sprint(row[tc.countColumn])
+		}
+		if !reflect.DeepEqual(gotHistogram, wantHistogram) {
+			t.Fatalf("unexpected histogram for %q: got %#v want %#v", tc.query, gotHistogram, wantHistogram)
+		}
+	}
+}
+
 func TestParseMixedRelationshipChainPatternBounds(t *testing.T) {
 	pattern, err := parseMixedRelationshipChainPattern("(a)-[:LIKES*2]->()-[:LIKES]->(c)")
 	if err != nil {
@@ -6027,3 +6610,5 @@ func (r *executorMetricsRecorder) ObserveIndexCandidate(tenant, schema, property
 func (r *executorMetricsRecorder) ObserveIndexLookup(strategy, outcome string, matches int) {
 	r.indexLookups = append(r.indexLookups, indexLookupMetric{strategy: strategy, outcome: outcome, matches: matches})
 }
+
+func (r *executorMetricsRecorder) ObserveDeleteCounter(_ string, _ int64) {}

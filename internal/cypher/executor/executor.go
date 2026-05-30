@@ -57,6 +57,7 @@ type Metrics interface {
 	ObserveRowsReturned(rows int)
 	ObserveIndexCandidate(tenant, schema, property string, indexed bool)
 	ObserveIndexLookup(strategy, outcome string, matches int)
+	ObserveDeleteCounter(event string, delta int64)
 }
 
 type IndexCatalog interface {
@@ -86,6 +87,8 @@ func (noopMetrics) ObserveIndexCandidate(_, _, _ string, _ bool) {}
 
 func (noopMetrics) ObserveIndexLookup(_, _ string, _ int) {}
 
+func (noopMetrics) ObserveDeleteCounter(_ string, _ int64) {}
+
 func New(store graph.GraphStore, opts Options) *Executor {
 	metrics := opts.Metrics
 	if metrics == nil {
@@ -94,7 +97,7 @@ func New(store graph.GraphStore, opts Options) *Executor {
 	return &Executor{store: store, metrics: metrics, indexCatalog: opts.IndexCatalog}
 }
 
-func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, params Params) (_ *Result, err error) {
+func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, params Params) (res *Result, err error) {
 	if e == nil || e.store == nil {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "executor requires a graph store", nil)
 	}
@@ -107,7 +110,11 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 
 	started := time.Now()
 	defer func() {
-		e.metrics.ObserveStatement(stmt.Kind(), outcomeFromError(err), time.Since(started))
+		elapsed := time.Since(started)
+		if err == nil && res != nil && res.Stats.Duration <= 0 {
+			res.Stats.Duration = elapsed
+		}
+		e.metrics.ObserveStatement(stmt.Kind(), outcomeFromError(err), elapsed)
 	}()
 
 	switch s := stmt.(type) {
@@ -133,7 +140,7 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 		e.metrics.ObserveRowsReturned(len(res.Rows))
 		return res, nil
 	case *ast.StandaloneCallStatement:
-		res, execErr := e.executeStandaloneCallStatement(s, params)
+		res, execErr := e.executeStandaloneCallStatement(ctx, s, params)
 		if execErr != nil {
 			return nil, execErr
 		}

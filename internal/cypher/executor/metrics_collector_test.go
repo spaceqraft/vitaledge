@@ -17,6 +17,8 @@ func TestCollectorSnapshot(t *testing.T) {
 	collector.ObserveIndexCandidate("acme", "User", "email", false)
 	collector.ObserveIndexLookup("property_index", "miss", 0)
 	collector.ObserveIndexLookup("property_index", "hit", 2)
+	collector.ObserveDeleteCounter("rows_seen", 10)
+	collector.ObserveDeleteCounter("edges_deleted", 7)
 
 	snapshot := collector.Snapshot()
 
@@ -37,6 +39,12 @@ func TestCollectorSnapshot(t *testing.T) {
 	lookup := snapshot.IndexLookups[IndexLookupKey{Strategy: "property_index", Outcome: "hit"}]
 	if lookup.Count != 1 || lookup.TotalMatches != 2 {
 		t.Fatalf("unexpected lookup aggregate: %#v", lookup)
+	}
+	if snapshot.DeleteCounters["rows_seen"] != 10 {
+		t.Fatalf("expected rows_seen 10, got %d", snapshot.DeleteCounters["rows_seen"])
+	}
+	if snapshot.DeleteCounters["edges_deleted"] != 7 {
+		t.Fatalf("expected edges_deleted 7, got %d", snapshot.DeleteCounters["edges_deleted"])
 	}
 }
 

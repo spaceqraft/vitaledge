@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,9 +19,10 @@ import (
 )
 
 type Store struct {
-	db        *cpebble.DB
-	edgeLocks sync.Map
-	metrics   Metrics
+	db                 *cpebble.DB
+	edgeLocks          sync.Map
+	metrics            Metrics
+	maxWriteBatchBytes int
 }
 
 type kvReader interface {
@@ -34,14 +36,15 @@ type kvWriter interface {
 }
 
 type tx struct {
-	store    *Store
-	mode     graph.TxMode
-	reader   kvReader
-	writer   kvWriter
-	snapshot *cpebble.Snapshot
-	batch    *cpebble.Batch
-	locks    map[string]func()
-	closed   bool
+	store              *Store
+	mode               graph.TxMode
+	reader             kvReader
+	writer             kvWriter
+	snapshot           *cpebble.Snapshot
+	batch              *cpebble.Batch
+	locks              map[string]func()
+	closed             bool
+	maxWriteBatchBytes int
 }
 
 var _ graph.GraphStore = (*Store)(nil)
@@ -64,7 +67,11 @@ func OpenWithOptions(path string, opts StoreOptions) (*Store, error) {
 	if metrics == nil {
 		metrics = defaultMetrics
 	}
-	return &Store{db: db, metrics: metrics}, nil
+	maxWriteBatchBytes := opts.MaxWriteBatchBytes
+	if maxWriteBatchBytes <= 0 {
+		maxWriteBatchBytes = DefaultMaxWriteBatchBytes
+	}
+	return &Store{db: db, metrics: metrics, maxWriteBatchBytes: maxWriteBatchBytes}, nil
 }
 
 func (s *Store) BeginTx(ctx context.Context, opts graph.TxOptions) (graph.Tx, error) {
@@ -81,7 +88,7 @@ func (s *Store) BeginTx(ctx context.Context, opts graph.TxOptions) (graph.Tx, er
 		return &tx{store: s, mode: opts.Mode, reader: snap, snapshot: snap}, nil
 	case graph.TxReadWrite:
 		batch := s.db.NewIndexedBatch()
-		return &tx{store: s, mode: opts.Mode, reader: batch, writer: batch, batch: batch}, nil
+		return &tx{store: s, mode: opts.Mode, reader: batch, writer: batch, batch: batch, maxWriteBatchBytes: s.maxWriteBatchBytes}, nil
 	default:
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "unsupported transaction mode", nil)
 	}
@@ -226,8 +233,8 @@ func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 	if err != nil {
 		return graph.NewError(graph.ErrKindStorage, "encode vertex", err)
 	}
-	if err := t.writer.Set(keyspace.VertexKey(vertex.Tenant, vertex.ID), buf, nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "write vertex", err)
+	if err := t.set(keyspace.VertexKey(vertex.Tenant, vertex.ID), buf, "write vertex"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -242,8 +249,8 @@ func (t *tx) DeleteVertex(ctx context.Context, tenant, vertexID string) (err err
 	if tenant == "" || vertexID == "" {
 		return graph.NewError(graph.ErrKindInvalidInput, "tenant and vertex id are required", nil)
 	}
-	if err := t.writer.Delete(keyspace.VertexKey(tenant, vertexID), nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "delete vertex", err)
+	if err := t.delete(keyspace.VertexKey(tenant, vertexID), "delete vertex"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -287,11 +294,11 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 		return err
 	}
 	if previous != nil {
-		if err := t.writer.Delete(keyspace.OutAdjacencyKey(previous.Tenant, previous.SrcID, previous.Type, previous.ID), nil); err != nil {
-			return graph.NewError(graph.ErrKindStorage, "delete stale out adjacency", err)
+		if err := t.delete(keyspace.OutAdjacencyKey(previous.Tenant, previous.SrcID, previous.Type, previous.ID), "delete stale out adjacency"); err != nil {
+			return err
 		}
-		if err := t.writer.Delete(keyspace.InAdjacencyKey(previous.Tenant, previous.DstID, previous.Type, previous.ID), nil); err != nil {
-			return graph.NewError(graph.ErrKindStorage, "delete stale in adjacency", err)
+		if err := t.delete(keyspace.InAdjacencyKey(previous.Tenant, previous.DstID, previous.Type, previous.ID), "delete stale in adjacency"); err != nil {
+			return err
 		}
 	}
 
@@ -299,14 +306,14 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 	if err != nil {
 		return graph.NewError(graph.ErrKindStorage, "encode edge", err)
 	}
-	if err := t.writer.Set(keyspace.EdgeKey(edge.Tenant, edge.ID), buf, nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "write edge", err)
+	if err := t.set(keyspace.EdgeKey(edge.Tenant, edge.ID), buf, "write edge"); err != nil {
+		return err
 	}
-	if err := t.writer.Set(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), []byte(edge.ID), nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "write out adjacency", err)
+	if err := t.set(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), []byte(edge.ID), "write out adjacency"); err != nil {
+		return err
 	}
-	if err := t.writer.Set(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), []byte(edge.ID), nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "write in adjacency", err)
+	if err := t.set(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), []byte(edge.ID), "write in adjacency"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -327,14 +334,14 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 	if err != nil {
 		return err
 	}
-	if err := t.writer.Delete(keyspace.EdgeKey(tenant, edgeID), nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "delete edge", err)
+	if err := t.delete(keyspace.EdgeKey(tenant, edgeID), "delete edge"); err != nil {
+		return err
 	}
-	if err := t.writer.Delete(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "delete out adjacency", err)
+	if err := t.delete(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), "delete out adjacency"); err != nil {
+		return err
 	}
-	if err := t.writer.Delete(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "delete in adjacency", err)
+	if err := t.delete(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), "delete in adjacency"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -352,6 +359,20 @@ func (t *tx) ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, l
 	return t.scanAdjacency(ctx, keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType), limit, tenant, fn)
 }
 
+// ScanOutEdgeIDs scans outgoing adjacency keys and yields edge IDs without loading edge records.
+func (t *tx) ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_out_edge_ids", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || srcID == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, and callback are required", nil)
+	}
+	return t.scanAdjacencyEdgeIDs(ctx, keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType), limit, fn)
+}
+
 func (t *tx) ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(*graph.Edge) error) (err error) {
 	started := time.Now()
 	defer func() { t.observeOperation("scan_in_edges", err, started) }()
@@ -363,6 +384,20 @@ func (t *tx) ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, li
 		return graph.NewError(graph.ErrKindInvalidInput, "tenant, dst id, and callback are required", nil)
 	}
 	return t.scanAdjacency(ctx, keyspace.InAdjacencyPrefix(tenant, dstID, edgeType), limit, tenant, fn)
+}
+
+// ScanInEdgeIDs scans incoming adjacency keys and yields edge IDs without loading edge records.
+func (t *tx) ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_in_edge_ids", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || dstID == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, dst id, and callback are required", nil)
+	}
+	return t.scanAdjacencyEdgeIDs(ctx, keyspace.InAdjacencyPrefix(tenant, dstID, edgeType), limit, fn)
 }
 
 func (t *tx) ScanPropertyIndex(ctx context.Context, tenant, schema, property string, encodedValue []byte, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
@@ -389,8 +424,8 @@ func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEnt
 		return err
 	}
 	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID)
-	if err := t.writer.Set(key, []byte(entry.EntityClass), nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "write property index", err)
+	if err := t.set(key, []byte(entry.EntityClass), "write property index"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -406,8 +441,8 @@ func (t *tx) DeletePropertyIndex(ctx context.Context, entry *graph.PropertyIndex
 		return err
 	}
 	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID)
-	if err := t.writer.Delete(key, nil); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "delete property index", err)
+	if err := t.delete(key, "delete property index"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -420,10 +455,58 @@ func (t *tx) Commit() error {
 	if t.mode == graph.TxReadOnly {
 		return nil
 	}
+	if err := t.ensureBatchCapacity(0); err != nil {
+		return err
+	}
 	if err := t.batch.Commit(cpebble.Sync); err != nil {
 		return graph.NewError(graph.ErrKindStorage, "commit transaction", err)
 	}
 	return nil
+}
+
+func (t *tx) set(key, value []byte, action string) (err error) {
+	if err := t.ensureBatchCapacity(len(key) + len(value) + 64); err != nil {
+		return err
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = t.handleRecoveredWrite(action, recovered)
+		}
+	}()
+	if err := t.writer.Set(key, value, nil); err != nil {
+		return graph.NewError(graph.ErrKindStorage, action, err)
+	}
+	return nil
+}
+
+func (t *tx) delete(key []byte, action string) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = t.handleRecoveredWrite(action, recovered)
+		}
+	}()
+	if err := t.writer.Delete(key, nil); err != nil {
+		return graph.NewError(graph.ErrKindStorage, action, err)
+	}
+	return nil
+}
+
+func (t *tx) ensureBatchCapacity(estimatedDelta int) error {
+	if t.mode != graph.TxReadWrite || t.batch == nil || t.maxWriteBatchBytes <= 0 {
+		return nil
+	}
+	if t.batch.Len()+estimatedDelta > t.maxWriteBatchBytes {
+		return graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("transaction batch exceeds max_write_batch_bytes capability (%d bytes)", t.maxWriteBatchBytes), nil)
+	}
+	return nil
+}
+
+func (t *tx) handleRecoveredWrite(action string, recovered any) error {
+	panicText := fmt.Sprint(recovered)
+	if strings.Contains(panicText, "pebble: batch too large") {
+		return graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("transaction batch exceeds max_write_batch_bytes capability (%d bytes)", t.maxWriteBatchBytes), nil)
+	}
+	return graph.NewError(graph.ErrKindStorage, action, fmt.Errorf("panic: %v", recovered))
 }
 
 func (t *tx) Rollback() error {
@@ -458,6 +541,39 @@ func (t *tx) scanAdjacency(ctx context.Context, prefix []byte, limit int, tenant
 			return err
 		}
 		if err := fn(edge); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan adjacency", err)
+	}
+	return nil
+}
+
+func (t *tx) scanAdjacencyEdgeIDs(ctx context.Context, prefix []byte, limit int, fn func(string) error) error {
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create adjacency iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		edgeID := edgeIDFromAdjKey(iter.Key())
+		if edgeID == "" {
+			return graph.NewError(graph.ErrKindStorage, "malformed adjacency key", nil)
+		}
+		if err := fn(edgeID); err != nil {
 			return err
 		}
 		seen++

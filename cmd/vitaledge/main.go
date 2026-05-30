@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ const defaultGRPCListenAddress = ":7443"
 const defaultGraphPath = "data/graph.db"
 const defaultTenant = "default"
 const defaultMetricsReportInterval = 30 * time.Second
+const defaultMaxWriteBatchBytes = pebblestore.DefaultMaxWriteBatchBytes
 
 const indexSchemaConfigEnv = "VITALEDGE_INDEX_SCHEMA_CONFIG"
 const metricsReportIntervalEnv = "VITALEDGE_METRICS_REPORT_INTERVAL"
@@ -29,6 +31,7 @@ const metricsListenEnv = "VITALEDGE_METRICS_LISTEN"
 const grpcListenEnv = "VITALEDGE_GRPC_LISTEN"
 const graphPathEnv = "VITALEDGE_GRAPH_PATH"
 const defaultTenantEnv = "VITALEDGE_DEFAULT_TENANT"
+const maxWriteBatchBytesEnv = "VITALEDGE_MAX_WRITE_BATCH_BYTES"
 
 type Config struct {
 	GraphPath             string
@@ -39,6 +42,7 @@ type Config struct {
 	MetricsReportInterval time.Duration
 	MetricsListenAddress  string
 	GRPCListenAddress     string
+	MaxWriteBatchBytes    int
 	Store                 graph.GraphStore
 	Executor              *executor.Executor
 }
@@ -78,7 +82,7 @@ func (s *Server) Start() error {
 		s.metricsSV = metricsServer
 		log.Printf("Metrics endpoint is listening on %s/metrics", s.MetricsListenAddress)
 	}
-	grpcServer, grpcListener, err := startGRPCServer(s.GRPCListenAddress, &grpcQueryHandler{executor: s.executor, defaultTenant: s.DefaultTenant})
+	grpcServer, grpcListener, err := startGRPCServer(s.GRPCListenAddress, &grpcQueryHandler{executor: s.executor, defaultTenant: s.DefaultTenant, maxWriteBatchBytes: int64(s.MaxWriteBatchBytes)})
 	if err != nil {
 		if s.metricsSV != nil {
 			_ = s.metricsSV.Close()
@@ -122,7 +126,7 @@ func main() {
 		log.Fatalf("startup config error: %v", err)
 	}
 
-	store, err := openGraphStore(config.GraphPath)
+	store, err := openGraphStore(config.GraphPath, config.MaxWriteBatchBytes)
 	if err != nil {
 		log.Fatalf("startup graph store error: %v", err)
 	}
@@ -145,6 +149,7 @@ func loadConfigFromStartup() (Config, error) {
 	var metricsReportInterval time.Duration
 	var metricsListenAddress string
 	var grpcListenAddress string
+	var maxWriteBatchBytes int
 
 	flag.StringVar(&graphPath, "graph-path", defaultGraphPath, "Path to graph store directory")
 	flag.StringVar(&tenant, "tenant", defaultTenant, "Default tenant used for query execution")
@@ -152,6 +157,7 @@ func loadConfigFromStartup() (Config, error) {
 	flag.DurationVar(&metricsReportInterval, "metrics-report-interval", defaultMetricsReportInterval, "Interval for logging index recommendation metrics")
 	flag.StringVar(&metricsListenAddress, "metrics-listen", "", "Optional HTTP listen address for Prometheus metrics endpoint (for example :9100)")
 	flag.StringVar(&grpcListenAddress, "grpc-listen", defaultGRPCListenAddress, "gRPC listen address for QueryService")
+	flag.IntVar(&maxWriteBatchBytes, "max-write-batch-bytes", defaultMaxWriteBatchBytes, "Maximum bytes allowed in a single write transaction batch")
 	flag.Parse()
 
 	if strings.TrimSpace(indexConfigPath) == "" {
@@ -176,6 +182,16 @@ func loadConfigFromStartup() (Config, error) {
 	if env := strings.TrimSpace(os.Getenv(grpcListenEnv)); env != "" {
 		grpcListenAddress = env
 	}
+	if env := strings.TrimSpace(os.Getenv(maxWriteBatchBytesEnv)); env != "" {
+		parsed, err := strconv.Atoi(env)
+		if err != nil {
+			return Config{}, err
+		}
+		maxWriteBatchBytes = parsed
+	}
+	if maxWriteBatchBytes <= 0 {
+		return Config{}, fmt.Errorf("max write batch bytes must be > 0")
+	}
 
 	cfg := Config{
 		GraphPath:             graphPath,
@@ -185,6 +201,7 @@ func loadConfigFromStartup() (Config, error) {
 		MetricsReportInterval: metricsReportInterval,
 		MetricsListenAddress:  metricsListenAddress,
 		GRPCListenAddress:     grpcListenAddress,
+		MaxWriteBatchBytes:    maxWriteBatchBytes,
 		ExecutorMetrics:       executor.NewCollector(),
 	}
 	if strings.TrimSpace(indexConfigPath) == "" {
@@ -199,7 +216,7 @@ func loadConfigFromStartup() (Config, error) {
 	return cfg, nil
 }
 
-func openGraphStore(path string) (graph.GraphStore, error) {
+func openGraphStore(path string, maxWriteBatchBytes int) (graph.GraphStore, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, fmt.Errorf("graph path is required")
@@ -207,5 +224,8 @@ func openGraphStore(path string) (graph.GraphStore, error) {
 	if err := os.MkdirAll(filepath.Clean(path), 0o755); err != nil {
 		return nil, err
 	}
-	return pebblestore.Open(path)
+	if maxWriteBatchBytes <= 0 {
+		return nil, fmt.Errorf("max write batch bytes must be > 0")
+	}
+	return pebblestore.OpenWithOptions(path, pebblestore.StoreOptions{MaxWriteBatchBytes: maxWriteBatchBytes})
 }

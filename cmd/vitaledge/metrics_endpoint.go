@@ -116,6 +116,16 @@ func writePrometheusMetrics(w http.ResponseWriter, collector *executor.Collector
 		fmt.Fprintf(w, "vitaledge_executor_index_lookups_total{strategy=%q,outcome=%q} %d\n", key.Strategy, key.Outcome, value.Count)
 		fmt.Fprintf(w, "vitaledge_executor_index_lookup_matches_total{strategy=%q,outcome=%q} %d\n", key.Strategy, key.Outcome, value.TotalMatches)
 	}
+
+	writeHelpType(w, "vitaledge_executor_delete_events_total", "Count of delete-related executor events by event type.", "counter")
+	deleteKeys := make([]string, 0, len(snapshot.DeleteCounters))
+	for key := range snapshot.DeleteCounters {
+		deleteKeys = append(deleteKeys, key)
+	}
+	sort.Strings(deleteKeys)
+	for _, key := range deleteKeys {
+		fmt.Fprintf(w, "vitaledge_executor_delete_events_total{event=%q} %d\n", key, snapshot.DeleteCounters[key])
+	}
 }
 
 func writeGoRuntimeMetrics(w http.ResponseWriter) {

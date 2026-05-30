@@ -79,6 +79,7 @@ message CapabilitiesResponse {
   bool prepared_query_supported = 4;
   string parameter_binding = 5;
   bool index_ddl_supported = 6;
+  int64 max_write_batch_bytes = 7;
 }
 
 message CreatePropertyIndexRequest {

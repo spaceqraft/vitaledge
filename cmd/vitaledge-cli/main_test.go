@@ -2,13 +2,41 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
 	"github.com/paegun/vitaledge/internal/cypher"
+	"google.golang.org/grpc"
 )
+
+// stubQueryServiceClient is a minimal QueryServiceClient for use in unit tests.
+// Each Execute call invokes executeFunc; all other methods are no-ops.
+type stubQueryServiceClient struct {
+	executeFunc func(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.QueryResponse, error)
+}
+
+func (s *stubQueryServiceClient) Execute(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.QueryResponse, error) {
+	if s.executeFunc != nil {
+		return s.executeFunc(ctx, in, opts...)
+	}
+	return &v1.QueryResponse{}, nil
+}
+
+func (s *stubQueryServiceClient) Explain(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.ExplainResponse, error) {
+	return &v1.ExplainResponse{}, nil
+}
+
+func (s *stubQueryServiceClient) GetCapabilities(ctx context.Context, in *v1.CapabilitiesRequest, opts ...grpc.CallOption) (*v1.CapabilitiesResponse, error) {
+	return &v1.CapabilitiesResponse{}, nil
+}
+
+func (s *stubQueryServiceClient) CreatePropertyIndex(ctx context.Context, in *v1.CreatePropertyIndexRequest, opts ...grpc.CallOption) (*v1.CreatePropertyIndexResponse, error) {
+	return &v1.CreatePropertyIndexResponse{}, nil
+}
 
 func TestHandleCLICommandSetListUnset(t *testing.T) {
 	state := &cliState{variables: map[string]any{}}
@@ -402,5 +430,189 @@ func TestNextLoadQueryReadModeRespectsHopBoundsAndLimit(t *testing.T) {
 		if !strings.Contains(query, "-[*2]-") && !strings.Contains(query, "-[*3]-") && !strings.Contains(query, "-[*4]-") {
 			t.Fatalf("expected hop within [2,4], got %s", query)
 		}
+	}
+}
+
+func TestParsePurgeArgsValid(t *testing.T) {
+	cases := []struct {
+		line          string
+		wantLabel     string
+		wantBatchSize int
+	}{
+		{":purge Movie", "Movie", 0},
+		{":purge Movie|Genre|User", "Movie|Genre|User", 0},
+		{":purge *", "*", 0},
+		{":purge Movie|Genre 500", "Movie|Genre", 500},
+		{":PURGE movie_node", "movie_node", 0},
+		{":purge _Private|Public 250", "_Private|Public", 250},
+	}
+	for _, tc := range cases {
+		label, batch, err := parsePurgeArgs(tc.line)
+		if err != nil {
+			t.Errorf("parsePurgeArgs(%q) unexpected error: %v", tc.line, err)
+			continue
+		}
+		if label != tc.wantLabel {
+			t.Errorf("parsePurgeArgs(%q) label = %q, want %q", tc.line, label, tc.wantLabel)
+		}
+		if batch != tc.wantBatchSize {
+			t.Errorf("parsePurgeArgs(%q) batch = %d, want %d", tc.line, batch, tc.wantBatchSize)
+		}
+	}
+}
+
+func TestParsePurgeArgsInvalid(t *testing.T) {
+	cases := []string{
+		":purge",
+		":purge 123badlabel",
+		":purge Movie|",
+		":purge |Genre",
+	}
+	for _, tc := range cases {
+		_, _, err := parsePurgeArgs(tc)
+		if err == nil {
+			t.Errorf("parsePurgeArgs(%q) expected error, got nil", tc)
+		}
+	}
+}
+
+func TestValidatePurgeLabelExpr(t *testing.T) {
+	valid := []string{"Movie", "Movie|Genre", "*", "_Under", "Label123"}
+	for _, v := range valid {
+		if err := validatePurgeLabelExpr(v); err != nil {
+			t.Errorf("validatePurgeLabelExpr(%q) unexpected error: %v", v, err)
+		}
+	}
+
+	invalid := []string{"", "Movie|", "|Genre", "123Bad", "has space", "bad-dash"}
+	for _, v := range invalid {
+		if err := validatePurgeLabelExpr(v); err == nil {
+			t.Errorf("validatePurgeLabelExpr(%q) expected error, got nil", v)
+		}
+	}
+}
+
+// intValue wraps an int64 as a v1.Value with IntValue kind.
+func intValue(n int64) *v1.Value {
+	return &v1.Value{Kind: &v1.Value_IntValue{IntValue: n}}
+}
+
+// countResponse builds a QueryResponse containing a single "remaining" int column.
+func countResponse(n int64) *v1.QueryResponse {
+	return &v1.QueryResponse{
+		Columns: []string{"remaining"},
+		Rows: []*v1.Row{{
+			Values: map[string]*v1.Value{"remaining": intValue(n)},
+		}},
+		Stats: &v1.QueryStats{RowsReturned: 1, DurationMs: 1},
+	}
+}
+
+func TestRunPurgeNoNodes(t *testing.T) {
+	stub := &stubQueryServiceClient{
+		executeFunc: func(_ context.Context, in *v1.QueryRequest, _ ...grpc.CallOption) (*v1.QueryResponse, error) {
+			// Only count query should be called; returns 0.
+			return countResponse(0), nil
+		},
+	}
+	cfg := cliConfig{tenant: "default", timeout: 2 * time.Second, purgeBatchSize: 10}
+	var out bytes.Buffer
+	if err := runPurge(context.Background(), stub, cfg, "Movie", 10, &out, &out); err != nil {
+		t.Fatalf("runPurge returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "total_deleted=0") {
+		t.Fatalf("expected zero-deleted message, got: %s", out.String())
+	}
+}
+
+func TestRunPurgeSingleBatch(t *testing.T) {
+	// Simulate: initial count=5, after delete count=0 → done in 1 batch.
+	callNum := 0
+	stub := &stubQueryServiceClient{
+		executeFunc: func(_ context.Context, in *v1.QueryRequest, _ ...grpc.CallOption) (*v1.QueryResponse, error) {
+			callNum++
+			q := strings.ToUpper(in.GetInput().GetCypher())
+			if strings.Contains(q, "RETURN COUNT") || strings.Contains(q, "RETURN count") || strings.Contains(in.GetInput().GetCypher(), "RETURN count") {
+				if callNum == 1 {
+					return countResponse(5), nil // initial count
+				}
+				return countResponse(0), nil // after-batch count
+			}
+			// delete batch → empty response
+			return &v1.QueryResponse{}, nil
+		},
+	}
+
+	cfg := cliConfig{tenant: "default", timeout: 2 * time.Second, purgeBatchSize: 100}
+	var out bytes.Buffer
+	if err := runPurge(context.Background(), stub, cfg, "Movie", 100, &out, &out); err != nil {
+		t.Fatalf("runPurge returned error: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "purge-start") {
+		t.Errorf("expected purge-start line, got: %s", got)
+	}
+	if !strings.Contains(got, "purge-done") {
+		t.Errorf("expected purge-done line, got: %s", got)
+	}
+	if !strings.Contains(got, "batch=1") {
+		t.Errorf("expected batch=1 in progress, got: %s", got)
+	}
+}
+
+func TestRunPurgeMultiBatch(t *testing.T) {
+	// Simulate: 2500 nodes, batch size 1000 → 3 batches needed.
+	remaining := int64(2500)
+	batchSize := int64(1000)
+
+	stub := &stubQueryServiceClient{
+		executeFunc: func(_ context.Context, in *v1.QueryRequest, _ ...grpc.CallOption) (*v1.QueryResponse, error) {
+			cypher := in.GetInput().GetCypher()
+			if strings.Contains(cypher, "RETURN count") {
+				return countResponse(remaining), nil
+			}
+			// delete batch
+			if remaining >= batchSize {
+				remaining -= batchSize
+			} else {
+				remaining = 0
+			}
+			return &v1.QueryResponse{}, nil
+		},
+	}
+
+	cfg := cliConfig{tenant: "default", timeout: 5 * time.Second, purgeBatchSize: int(batchSize)}
+	var out bytes.Buffer
+	if err := runPurge(context.Background(), stub, cfg, "Movie|Genre", int(batchSize), &out, &out); err != nil {
+		t.Fatalf("runPurge returned error: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "batch=3") {
+		t.Errorf("expected batch=3 in progress output, got: %s", got)
+	}
+	if !strings.Contains(got, "batches=3") {
+		t.Errorf("expected batches=3 in done line, got: %s", got)
+	}
+}
+
+func TestRunPurgeAllNodes(t *testing.T) {
+	// Verify "*" generates MATCH (n) without label filter.
+	var capturedQuery string
+	stub := &stubQueryServiceClient{
+		executeFunc: func(_ context.Context, in *v1.QueryRequest, _ ...grpc.CallOption) (*v1.QueryResponse, error) {
+			capturedQuery = in.GetInput().GetCypher()
+			return countResponse(0), nil // 0 nodes → exits immediately
+		},
+	}
+	cfg := cliConfig{tenant: "default", timeout: 2 * time.Second, purgeBatchSize: 100}
+	var out bytes.Buffer
+	if err := runPurge(context.Background(), stub, cfg, "*", 100, &out, &out); err != nil {
+		t.Fatalf("runPurge returned error: %v", err)
+	}
+	if !strings.Contains(capturedQuery, "MATCH (n)") {
+		t.Errorf("expected MATCH (n) without label filter, got: %s", capturedQuery)
+	}
+	if strings.Contains(capturedQuery, "MATCH (n:") {
+		t.Errorf("expected no label filter for *, got: %s", capturedQuery)
 	}
 }

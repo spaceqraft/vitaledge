@@ -270,6 +270,89 @@ func TestUpdateRollsBackOnCallbackError(t *testing.T) {
 	}
 }
 
+func TestUpdateRejectsBatchLargerThanConfiguredLimit(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "graph.db")
+	if err := os.MkdirAll(dbPath, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+
+	store, err := OpenWithOptions(dbPath, StoreOptions{MaxWriteBatchBytes: 1024})
+	if err != nil {
+		t.Fatalf("open store failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	largeValue := strings.Repeat("a", 2048)
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "too-large",
+			Properties: graph.PropertyMap{"payload": []byte(largeValue)},
+		})
+	})
+	if err == nil {
+		t.Fatalf("expected oversized batch error")
+	}
+	if !graph.IsKind(err, graph.ErrKindInvalidInput) {
+		t.Fatalf("expected invalid input error kind, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "max_write_batch_bytes") {
+		t.Fatalf("expected max_write_batch_bytes in error, got %v", err)
+	}
+}
+
+func TestDeleteBatchCanExceedConfiguredLimit(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "graph.db")
+	if err := os.MkdirAll(dbPath, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+
+	store, err := OpenWithOptions(dbPath, StoreOptions{MaxWriteBatchBytes: 256})
+	if err != nil {
+		t.Fatalf("open store failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	const vertexCount = 16
+	for i := 0; i < vertexCount; i++ {
+		err = store.Update(ctx, func(tx graph.Tx) error {
+			return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("v-%d", i)})
+		})
+		if err != nil {
+			t.Fatalf("seed vertex %d failed: %v", i, err)
+		}
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < vertexCount; i++ {
+			if err := tx.DeleteVertex(ctx, "acme", fmt.Sprintf("v-%d", i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("delete batch failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		for i := 0; i < vertexCount; i++ {
+			_, err := tx.GetVertex(ctx, "acme", fmt.Sprintf("v-%d", i))
+			if !graph.IsKind(err, graph.ErrKindNotFound) {
+				return fmt.Errorf("expected vertex v-%d to be absent, got %w", i, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("delete verification failed: %v", err)
+	}
+}
+
 func TestEdgeUpdateRewritesAdjacencyIndexes(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)

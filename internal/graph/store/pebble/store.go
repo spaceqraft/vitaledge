@@ -25,6 +25,7 @@ type Store struct {
 	edgeLocks          sync.Map
 	metrics            Metrics
 	maxWriteBatchBytes int
+	ownedCache         *cpebble.Cache
 }
 
 const currentSchemaVersion = 1
@@ -62,12 +63,26 @@ func Open(path string) (*Store, error) {
 }
 
 func OpenWithOptions(path string, opts StoreOptions) (*Store, error) {
-	pebbleOpts := &cpebble.Options{}
-	if opts.PebbleOptions != nil {
-		pebbleOpts = opts.PebbleOptions
+	pebbleOpts := opts.PebbleOptions
+	if pebbleOpts == nil {
+		pebbleOpts = &cpebble.Options{}
+	}
+	var ownedCache *cpebble.Cache
+	if opts.PebbleBlockCacheBytes > 0 && pebbleOpts.Cache == nil {
+		ownedCache = cpebble.NewCache(opts.PebbleBlockCacheBytes)
+		pebbleOpts.Cache = ownedCache
+	}
+	if opts.PebbleMemTableSizeBytes > 0 {
+		pebbleOpts.MemTableSize = uint64(opts.PebbleMemTableSizeBytes)
+	}
+	if opts.PebbleMemTableStopWritesThreshold > 0 {
+		pebbleOpts.MemTableStopWritesThreshold = opts.PebbleMemTableStopWritesThreshold
 	}
 	db, err := cpebble.Open(path, pebbleOpts)
 	if err != nil {
+		if ownedCache != nil {
+			ownedCache.Unref()
+		}
 		return nil, graph.NewError(graph.ErrKindStorage, "open pebble db", err)
 	}
 	metrics := opts.Metrics
@@ -78,9 +93,12 @@ func OpenWithOptions(path string, opts StoreOptions) (*Store, error) {
 	if maxWriteBatchBytes <= 0 {
 		maxWriteBatchBytes = DefaultMaxWriteBatchBytes
 	}
-	store := &Store{db: db, metrics: metrics, maxWriteBatchBytes: maxWriteBatchBytes}
+	store := &Store{db: db, metrics: metrics, maxWriteBatchBytes: maxWriteBatchBytes, ownedCache: ownedCache}
 	if err := store.runMigrations(context.Background()); err != nil {
 		_ = db.Close()
+		if ownedCache != nil {
+			ownedCache.Unref()
+		}
 		return nil, err
 	}
 	return store, nil
@@ -211,14 +229,21 @@ func (s *Store) Update(ctx context.Context, fn func(graph.Tx) error) error {
 }
 
 func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
 		return nil
 	}
-	if err := s.db.Close(); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "close pebble db", err)
+	var closeErr error
+	if s.db != nil {
+		if err := s.db.Close(); err != nil {
+			closeErr = graph.NewError(graph.ErrKindStorage, "close pebble db", err)
+		}
+		s.db = nil
 	}
-	s.db = nil
-	return nil
+	if s.ownedCache != nil {
+		s.ownedCache.Unref()
+		s.ownedCache = nil
+	}
+	return closeErr
 }
 
 func (t *tx) GetVertex(ctx context.Context, tenant, vertexID string) (vertex *graph.Vertex, err error) {

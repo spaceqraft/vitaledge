@@ -78,6 +78,24 @@ Maximum write transaction batch size is configurable at startup:
 - flag: `--max-write-batch-bytes 67108864`
 - env: `VITALEDGE_MAX_WRITE_BATCH_BYTES=67108864`
 
+Go runtime memory ceiling is configurable at startup:
+
+- flag: `--go-memory-limit-bytes 0`
+- env: `VITALEDGE_GO_MEMORY_LIMIT_BYTES=0`
+
+Set to a positive value to apply a Go soft memory limit (in bytes). `0` disables this override.
+
+Pebble memory controls are configurable at startup:
+
+- flag: `--pebble-block-cache-bytes 0`
+- env: `VITALEDGE_PEBBLE_BLOCK_CACHE_BYTES=0`
+- flag: `--pebble-memtable-size-bytes 0`
+- env: `VITALEDGE_PEBBLE_MEMTABLE_SIZE_BYTES=0`
+- flag: `--pebble-memtable-stop-writes-threshold 0`
+- env: `VITALEDGE_PEBBLE_MEMTABLE_STOP_WRITES_THRESHOLD=0`
+
+Each value uses Pebble defaults when set to `0`.
+
 The value must be greater than `0`. Oversized write transactions are rejected with an invalid-input error instead of triggering a Pebble panic.
 
 The configured value is also exposed through gRPC capabilities as `max_write_batch_bytes`, so SDK clients can chunk write-heavy workloads (for example, bulk `UNWIND ... MERGE` ingest) before execution.

@@ -253,14 +253,14 @@ func TestGRPCQueryServiceCapabilitiesReflectConfiguredMaxWriteBatch(t *testing.T
 }
 
 func TestOpenGraphStoreRejectsNonPositiveBatchLimit(t *testing.T) {
-	_, err := openGraphStore(t.TempDir(), 0)
+	_, err := openGraphStore(t.TempDir(), 0, 0, 0, 0)
 	if err == nil {
 		t.Fatalf("expected error when max write batch bytes is non-positive")
 	}
 }
 
 func TestOpenGraphStoreAcceptsConfiguredBatchLimit(t *testing.T) {
-	store, err := openGraphStore(t.TempDir(), 1024)
+	store, err := openGraphStore(t.TempDir(), 1024, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("openGraphStore failed: %v", err)
 	}

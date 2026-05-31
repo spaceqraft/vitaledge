@@ -590,6 +590,73 @@ func TestDeleteBatchCanExceedConfiguredLimit(t *testing.T) {
 	}
 }
 
+func TestOpenWithOptionsAppliesPebbleMemoryOverrides(t *testing.T) {
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "graph.db")
+	if err := os.MkdirAll(dbPath, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+
+	pebbleOpts := &cpebble.Options{}
+	store, err := OpenWithOptions(dbPath, StoreOptions{
+		PebbleOptions:                     pebbleOpts,
+		PebbleBlockCacheBytes:             1 << 20,
+		PebbleMemTableSizeBytes:           1 << 19,
+		PebbleMemTableStopWritesThreshold: 4,
+	})
+	if err != nil {
+		t.Fatalf("open store failed: %v", err)
+	}
+
+	if store.ownedCache == nil {
+		t.Fatalf("expected store to own configured Pebble cache")
+	}
+	if pebbleOpts.Cache == nil {
+		t.Fatalf("expected Pebble options cache to be configured")
+	}
+	if got, want := pebbleOpts.MemTableSize, uint64(1<<19); got != want {
+		t.Fatalf("expected MemTableSize=%d, got %d", want, got)
+	}
+	if got, want := pebbleOpts.MemTableStopWritesThreshold, 4; got != want {
+		t.Fatalf("expected MemTableStopWritesThreshold=%d, got %d", want, got)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store failed: %v", err)
+	}
+	if store.ownedCache != nil {
+		t.Fatalf("expected owned cache to be released on close")
+	}
+}
+
+func TestOpenWithOptionsDoesNotOverrideProvidedPebbleCache(t *testing.T) {
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "graph.db")
+	if err := os.MkdirAll(dbPath, 0o755); err != nil {
+		t.Fatalf("mkdir failed: %v", err)
+	}
+
+	providedCache := cpebble.NewCache(2 << 20)
+	defer providedCache.Unref()
+	pebbleOpts := &cpebble.Options{Cache: providedCache}
+
+	store, err := OpenWithOptions(dbPath, StoreOptions{
+		PebbleOptions:         pebbleOpts,
+		PebbleBlockCacheBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("open store failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	if store.ownedCache != nil {
+		t.Fatalf("expected store not to own cache when PebbleOptions.Cache is preconfigured")
+	}
+	if pebbleOpts.Cache != providedCache {
+		t.Fatalf("expected provided cache pointer to be preserved")
+	}
+}
+
 func TestEdgeUpdateRewritesAdjacencyIndexes(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)

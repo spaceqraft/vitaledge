@@ -20,9 +20,12 @@ const DefaultMaxWriteBatchBytes = 64 * 1024 * 1024
 
 // StoreOptions configures OpenWithOptions behavior.
 type StoreOptions struct {
-	PebbleOptions      *cpebble.Options
-	Metrics            Metrics
-	MaxWriteBatchBytes int
+	PebbleOptions                     *cpebble.Options
+	Metrics                           Metrics
+	MaxWriteBatchBytes                int
+	PebbleBlockCacheBytes             int64
+	PebbleMemTableSizeBytes           int
+	PebbleMemTableStopWritesThreshold int
 }
 
 type noopMetrics struct{}

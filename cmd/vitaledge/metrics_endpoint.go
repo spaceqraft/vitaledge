@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/paegun/vitaledge/internal/cypher/executor"
 )
@@ -65,6 +66,29 @@ func writePrometheusMetrics(w http.ResponseWriter, collector *executor.Collector
 	for _, key := range stmtKeys {
 		value := snapshot.Statements[key]
 		fmt.Fprintf(w, "vitaledge_executor_statement_duration_seconds_total{kind=%q,outcome=%q} %s\n", string(key.Kind), key.Outcome, strconv.FormatFloat(value.TotalDuration.Seconds(), 'f', 9, 64))
+	}
+
+	bucketBounds := executor.StatementDurationHistogramBuckets()
+	writeHelpType(w, "vitaledge_executor_statement_duration_seconds", "Statement execution latency histogram in seconds by kind and outcome.", "histogram")
+	for _, key := range stmtKeys {
+		value := snapshot.Statements[key]
+		cumulative := int64(0)
+		for idx, upperBound := range bucketBounds {
+			if idx < len(value.DurationBuckets) {
+				cumulative += value.DurationBuckets[idx]
+			}
+			fmt.Fprintf(
+				w,
+				"vitaledge_executor_statement_duration_seconds_bucket{kind=%q,outcome=%q,le=%q} %d\n",
+				string(key.Kind),
+				key.Outcome,
+				formatPrometheusDurationBucket(upperBound),
+				cumulative,
+			)
+		}
+		fmt.Fprintf(w, "vitaledge_executor_statement_duration_seconds_bucket{kind=%q,outcome=%q,le=%q} %d\n", string(key.Kind), key.Outcome, "+Inf", value.Count)
+		fmt.Fprintf(w, "vitaledge_executor_statement_duration_seconds_sum{kind=%q,outcome=%q} %s\n", string(key.Kind), key.Outcome, strconv.FormatFloat(value.TotalDuration.Seconds(), 'f', 9, 64))
+		fmt.Fprintf(w, "vitaledge_executor_statement_duration_seconds_count{kind=%q,outcome=%q} %d\n", string(key.Kind), key.Outcome, value.Count)
 	}
 
 	writeHelpType(w, "vitaledge_executor_rows_returned_total", "Total rows returned by executed statements.", "counter")
@@ -268,4 +292,9 @@ func writeHostNetworkMetrics(w http.ResponseWriter) {
 func writeHelpType(w http.ResponseWriter, name, help, metricType string) {
 	fmt.Fprintf(w, "# HELP %s %s\n", name, help)
 	fmt.Fprintf(w, "# TYPE %s %s\n", name, metricType)
+}
+
+func formatPrometheusDurationBucket(duration time.Duration) string {
+	seconds := duration.Seconds()
+	return strconv.FormatFloat(seconds, 'f', -1, 64)
 }

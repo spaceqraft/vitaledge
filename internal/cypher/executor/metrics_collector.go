@@ -14,8 +14,9 @@ type StatementMetricKey struct {
 }
 
 type StatementMetricValue struct {
-	Count         int64
-	TotalDuration time.Duration
+	Count           int64
+	TotalDuration   time.Duration
+	DurationBuckets []int64
 }
 
 type IndexCandidateKey struct {
@@ -61,6 +62,21 @@ type Collector struct {
 
 var _ Metrics = (*Collector)(nil)
 
+var statementDurationHistogramBuckets = []time.Duration{
+	1 * time.Millisecond,
+	5 * time.Millisecond,
+	10 * time.Millisecond,
+	25 * time.Millisecond,
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	250 * time.Millisecond,
+	500 * time.Millisecond,
+	1 * time.Second,
+	2 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+}
+
 func NewCollector() *Collector {
 	return &Collector{
 		statements:      map[StatementMetricKey]StatementMetricValue{},
@@ -80,6 +96,15 @@ func (c *Collector) ObserveStatement(kind ast.StatementKind, outcome string, dur
 	value := c.statements[key]
 	value.Count++
 	value.TotalDuration += duration
+	if len(value.DurationBuckets) != len(statementDurationHistogramBuckets) {
+		value.DurationBuckets = make([]int64, len(statementDurationHistogramBuckets))
+	}
+	for i, upperBound := range statementDurationHistogramBuckets {
+		if duration <= upperBound {
+			value.DurationBuckets[i]++
+			break
+		}
+	}
 	c.statements[key] = value
 }
 
@@ -133,6 +158,11 @@ func (c *Collector) Snapshot() Snapshot {
 
 	statements := make(map[StatementMetricKey]StatementMetricValue, len(c.statements))
 	for key, value := range c.statements {
+		if len(value.DurationBuckets) > 0 {
+			bucketsCopy := make([]int64, len(value.DurationBuckets))
+			copy(bucketsCopy, value.DurationBuckets)
+			value.DurationBuckets = bucketsCopy
+		}
 		statements[key] = value
 	}
 
@@ -158,6 +188,12 @@ func (c *Collector) Snapshot() Snapshot {
 		IndexLookups:    indexLookups,
 		DeleteCounters:  deleteCounters,
 	}
+}
+
+func StatementDurationHistogramBuckets() []time.Duration {
+	out := make([]time.Duration, len(statementDurationHistogramBuckets))
+	copy(out, statementDurationHistogramBuckets)
+	return out
 }
 
 func (c *Collector) TopUnindexedCandidates(limit int) []UnindexedCandidate {

@@ -82,11 +82,6 @@ The value must be greater than `0`. Oversized write transactions are rejected wi
 
 The configured value is also exposed through gRPC capabilities as `max_write_batch_bytes`, so SDK clients can chunk write-heavy workloads (for example, bulk `UNWIND ... MERGE` ingest) before execution.
 
-Index recommendation metrics logging is enabled by default and configurable:
-
-- flag: `--metrics-report-interval 30s`
-- env: `VITALEDGE_METRICS_REPORT_INTERVAL=30s`
-
 Prometheus metrics endpoint is optional and configurable:
 
 - flag: `--metrics-listen :9100`
@@ -101,8 +96,6 @@ When enabled, the process serves:
 
 - `GET /metrics` (Prometheus text exposition)
 - `GET /healthz` (simple liveness check)
-
-If set to `0`, periodic recommendation logging is disabled.
 
 ## EXPLAIN For Index Tuning
 

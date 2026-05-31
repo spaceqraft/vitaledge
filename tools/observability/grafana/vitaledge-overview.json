@@ -35,13 +35,21 @@
     },
     {
       "id": 2,
-      "title": "Statement Duration (avg ms, 5m)",
+      "title": "Statement Duration Percentiles (ms, 5m)",
       "type": "timeseries",
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
-          "expr": "1000 * sum(rate(vitaledge_executor_statement_duration_seconds_total[5m])) by (kind) / clamp_min(sum(rate(vitaledge_executor_statements_total[5m])) by (kind), 1)",
-          "legendFormat": "{{kind}}"
+          "expr": "1000 * histogram_quantile(0.50, sum(rate(vitaledge_executor_statement_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "1000 * histogram_quantile(0.95, sum(rate(vitaledge_executor_statement_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "1000 * histogram_quantile(0.99, sum(rate(vitaledge_executor_statement_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
         }
       ],
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
@@ -171,6 +179,27 @@
         }
       ],
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 41}
+    },
+    {
+      "id": 12,
+      "title": "Statement Duration Percentiles by Kind (ms, 5m)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "1000 * histogram_quantile(0.50, sum(rate(vitaledge_executor_statement_duration_seconds_bucket[5m])) by (le, kind))",
+          "legendFormat": "p50 {{kind}}"
+        },
+        {
+          "expr": "1000 * histogram_quantile(0.95, sum(rate(vitaledge_executor_statement_duration_seconds_bucket[5m])) by (le, kind))",
+          "legendFormat": "p95 {{kind}}"
+        },
+        {
+          "expr": "1000 * histogram_quantile(0.99, sum(rate(vitaledge_executor_statement_duration_seconds_bucket[5m])) by (le, kind))",
+          "legendFormat": "p99 {{kind}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 49}
     }
   ]
 }

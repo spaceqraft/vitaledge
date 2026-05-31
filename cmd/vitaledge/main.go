@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/paegun/vitaledge/internal/cypher/executor"
 	"github.com/paegun/vitaledge/internal/cypher/indexschema"
@@ -22,11 +21,9 @@ import (
 const defaultGRPCListenAddress = ":7443"
 const defaultGraphPath = "data/graph.db"
 const defaultTenant = "default"
-const defaultMetricsReportInterval = 30 * time.Second
 const defaultMaxWriteBatchBytes = pebblestore.DefaultMaxWriteBatchBytes
 
 const indexSchemaConfigEnv = "VITALEDGE_INDEX_SCHEMA_CONFIG"
-const metricsReportIntervalEnv = "VITALEDGE_METRICS_REPORT_INTERVAL"
 const metricsListenEnv = "VITALEDGE_METRICS_LISTEN"
 const grpcListenEnv = "VITALEDGE_GRPC_LISTEN"
 const graphPathEnv = "VITALEDGE_GRAPH_PATH"
@@ -34,22 +31,20 @@ const defaultTenantEnv = "VITALEDGE_DEFAULT_TENANT"
 const maxWriteBatchBytesEnv = "VITALEDGE_MAX_WRITE_BATCH_BYTES"
 
 type Config struct {
-	GraphPath             string
-	DefaultTenant         string
-	IndexConfigPath       string
-	IndexCatalog          *indexschema.Catalog
-	ExecutorMetrics       *executor.Collector
-	MetricsReportInterval time.Duration
-	MetricsListenAddress  string
-	GRPCListenAddress     string
-	MaxWriteBatchBytes    int
-	Store                 graph.GraphStore
-	Executor              *executor.Executor
+	GraphPath            string
+	DefaultTenant        string
+	IndexConfigPath      string
+	IndexCatalog         *indexschema.Catalog
+	ExecutorMetrics      *executor.Collector
+	MetricsListenAddress string
+	GRPCListenAddress    string
+	MaxWriteBatchBytes   int
+	Store                graph.GraphStore
+	Executor             *executor.Executor
 }
 
 type Server struct {
 	Config
-	quitCh    chan struct{}
 	metrics   *executor.Collector
 	executor  *executor.Executor
 	metricsSV *http.Server
@@ -66,7 +61,6 @@ func NewServer(config Config) *Server {
 	}
 	return &Server{
 		Config:   config,
-		quitCh:   make(chan struct{}),
 		metrics:  config.ExecutorMetrics,
 		executor: config.Executor,
 	}
@@ -92,32 +86,11 @@ func (s *Server) Start() error {
 	s.grpcSV = grpcServer
 	s.grpcLN = grpcListener
 	log.Printf("gRPC endpoint is listening on %s", grpcListener.Addr().String())
-	if s.metrics != nil && s.MetricsReportInterval > 0 {
-		go s.reportMetricsLoop(s.MetricsReportInterval)
-	}
 	err = s.grpcSV.Serve(s.grpcLN)
-	close(s.quitCh)
 	if s.metricsSV != nil {
 		_ = s.metricsSV.Close()
 	}
 	return err
-}
-
-func (s *Server) reportMetricsLoop(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			top := s.metrics.TopUnindexedCandidates(5)
-			for _, candidate := range top {
-				log.Printf("index-recommendation tenant=%s schema=%s property=%s observed=%d", candidate.Tenant, candidate.Schema, candidate.Property, candidate.Count)
-			}
-		case <-s.quitCh:
-			return
-		}
-	}
 }
 
 func main() {
@@ -146,7 +119,6 @@ func loadConfigFromStartup() (Config, error) {
 	var graphPath string
 	var tenant string
 	var indexConfigPath string
-	var metricsReportInterval time.Duration
 	var metricsListenAddress string
 	var grpcListenAddress string
 	var maxWriteBatchBytes int
@@ -154,7 +126,6 @@ func loadConfigFromStartup() (Config, error) {
 	flag.StringVar(&graphPath, "graph-path", defaultGraphPath, "Path to graph store directory")
 	flag.StringVar(&tenant, "tenant", defaultTenant, "Default tenant used for query execution")
 	flag.StringVar(&indexConfigPath, "index-schema-config", "", "Path to index schema configuration JSON file")
-	flag.DurationVar(&metricsReportInterval, "metrics-report-interval", defaultMetricsReportInterval, "Interval for logging index recommendation metrics")
 	flag.StringVar(&metricsListenAddress, "metrics-listen", "", "Optional HTTP listen address for Prometheus metrics endpoint (for example :9100)")
 	flag.StringVar(&grpcListenAddress, "grpc-listen", defaultGRPCListenAddress, "gRPC listen address for QueryService")
 	flag.IntVar(&maxWriteBatchBytes, "max-write-batch-bytes", defaultMaxWriteBatchBytes, "Maximum bytes allowed in a single write transaction batch")
@@ -168,13 +139,6 @@ func loadConfigFromStartup() (Config, error) {
 	}
 	if env := strings.TrimSpace(os.Getenv(defaultTenantEnv)); env != "" {
 		tenant = env
-	}
-	if env := strings.TrimSpace(os.Getenv(metricsReportIntervalEnv)); env != "" {
-		parsed, err := time.ParseDuration(env)
-		if err != nil {
-			return Config{}, err
-		}
-		metricsReportInterval = parsed
 	}
 	if env := strings.TrimSpace(os.Getenv(metricsListenEnv)); env != "" {
 		metricsListenAddress = env
@@ -194,15 +158,14 @@ func loadConfigFromStartup() (Config, error) {
 	}
 
 	cfg := Config{
-		GraphPath:             graphPath,
-		DefaultTenant:         tenant,
-		IndexConfigPath:       indexConfigPath,
-		IndexCatalog:          indexschema.NewCatalog(),
-		MetricsReportInterval: metricsReportInterval,
-		MetricsListenAddress:  metricsListenAddress,
-		GRPCListenAddress:     grpcListenAddress,
-		MaxWriteBatchBytes:    maxWriteBatchBytes,
-		ExecutorMetrics:       executor.NewCollector(),
+		GraphPath:            graphPath,
+		DefaultTenant:        tenant,
+		IndexConfigPath:      indexConfigPath,
+		IndexCatalog:         indexschema.NewCatalog(),
+		MetricsListenAddress: metricsListenAddress,
+		GRPCListenAddress:    grpcListenAddress,
+		MaxWriteBatchBytes:   maxWriteBatchBytes,
+		ExecutorMetrics:      executor.NewCollector(),
 	}
 	if strings.TrimSpace(indexConfigPath) == "" {
 		return cfg, nil

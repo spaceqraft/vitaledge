@@ -24,9 +24,11 @@ const (
 )
 
 type grpcQueryHandler struct {
-	executor           *executor.Executor
-	defaultTenant      string
-	maxWriteBatchBytes int64
+	executor                     *executor.Executor
+	defaultTenant                string
+	configuredMaxWriteBatchBytes int64
+	maxWriteBatchBytes           int64
+	maxWriteBatchBytesTuned      bool
 }
 
 func startGRPCServer(listenAddress string, handler v1.QueryServiceServer) (*grpc.Server, net.Listener, error) {
@@ -77,8 +79,11 @@ func (h *grpcQueryHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*
 		Columns: result.Columns,
 		Rows:    rows,
 		Stats: &v1.QueryStats{
-			RowsReturned: int64(result.Stats.RowsReturned),
-			DurationMs:   grpcDurationMs(result.Stats.Duration),
+			RowsReturned:                 int64(result.Stats.RowsReturned),
+			DurationMs:                   grpcDurationMs(result.Stats.Duration),
+			ConfiguredMaxWriteBatchBytes: grpcConfiguredWriteBatchBytes(h.configuredMaxWriteBatchBytes, h.maxWriteBatchBytes),
+			EffectiveMaxWriteBatchBytes:  grpcEffectiveWriteBatchBytes(h.maxWriteBatchBytes),
+			MaxWriteBatchBytesTuned:      h.maxWriteBatchBytesTuned,
 		},
 	}, nil
 }
@@ -120,8 +125,11 @@ func (h *grpcQueryHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*
 	return &v1.ExplainResponse{
 		ExplainJson: explainJSON,
 		Stats: &v1.QueryStats{
-			RowsReturned: int64(result.Stats.RowsReturned),
-			DurationMs:   grpcDurationMs(result.Stats.Duration),
+			RowsReturned:                 int64(result.Stats.RowsReturned),
+			DurationMs:                   grpcDurationMs(result.Stats.Duration),
+			ConfiguredMaxWriteBatchBytes: grpcConfiguredWriteBatchBytes(h.configuredMaxWriteBatchBytes, h.maxWriteBatchBytes),
+			EffectiveMaxWriteBatchBytes:  grpcEffectiveWriteBatchBytes(h.maxWriteBatchBytes),
+			MaxWriteBatchBytesTuned:      h.maxWriteBatchBytesTuned,
 		},
 	}, nil
 }
@@ -137,19 +145,35 @@ func grpcDurationMs(duration time.Duration) int64 {
 	return ms
 }
 
+func grpcConfiguredWriteBatchBytes(configuredMaxWriteBatchBytes, effectiveMaxWriteBatchBytes int64) int64 {
+	if configuredMaxWriteBatchBytes > 0 {
+		return configuredMaxWriteBatchBytes
+	}
+	return grpcEffectiveWriteBatchBytes(effectiveMaxWriteBatchBytes)
+}
+
+func grpcEffectiveWriteBatchBytes(maxWriteBatchBytes int64) int64 {
+	if maxWriteBatchBytes > 0 {
+		return maxWriteBatchBytes
+	}
+	return int64(pebblestore.DefaultMaxWriteBatchBytes)
+}
+
 func (h *grpcQueryHandler) GetCapabilities(_ context.Context, _ *v1.CapabilitiesRequest) (*v1.CapabilitiesResponse, error) {
 	maxWriteBatchBytes := h.maxWriteBatchBytes
-	if maxWriteBatchBytes <= 0 {
-		maxWriteBatchBytes = int64(pebblestore.DefaultMaxWriteBatchBytes)
-	}
+	configuredMaxWriteBatchBytes := grpcConfiguredWriteBatchBytes(h.configuredMaxWriteBatchBytes, maxWriteBatchBytes)
+	maxWriteBatchBytes = grpcEffectiveWriteBatchBytes(maxWriteBatchBytes)
 	return &v1.CapabilitiesResponse{
-		ProtocolVersion:        "v1",
-		ParserVersions:         []string{grpcSupportedParserVersion},
-		IrVersions:             []string{grpcSupportedIRVersion},
-		PreparedQuerySupported: true,
-		ParameterBinding:       "server_side",
-		IndexDdlSupported:      true,
-		MaxWriteBatchBytes:     maxWriteBatchBytes,
+		ProtocolVersion:              "v1",
+		ParserVersions:               []string{grpcSupportedParserVersion},
+		IrVersions:                   []string{grpcSupportedIRVersion},
+		PreparedQuerySupported:       true,
+		ParameterBinding:             "server_side",
+		IndexDdlSupported:            true,
+		MaxWriteBatchBytes:           maxWriteBatchBytes,
+		ConfiguredMaxWriteBatchBytes: configuredMaxWriteBatchBytes,
+		EffectiveMaxWriteBatchBytes:  maxWriteBatchBytes,
+		MaxWriteBatchBytesTuned:      h.maxWriteBatchBytesTuned,
 	}, nil
 }
 

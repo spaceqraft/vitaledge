@@ -75,8 +75,10 @@ Graph store and tenant defaults are configurable at startup:
 
 Maximum write transaction batch size is configurable at startup:
 
-- flag: `--max-write-batch-bytes 67108864`
-- env: `VITALEDGE_MAX_WRITE_BATCH_BYTES=67108864`
+- flag: `--max-write-batch-bytes 0`
+- env: `VITALEDGE_MAX_WRITE_BATCH_BYTES=0`
+
+Set to `0` to auto-tune from host memory. When auto-tuning is active, the server logs a warning if it adjusts the batch size up or down from the default baseline.
 
 Go runtime memory ceiling is configurable at startup:
 
@@ -96,9 +98,11 @@ Pebble memory controls are configurable at startup:
 
 Each value uses Pebble defaults when set to `0`.
 
-The value must be greater than `0`. Oversized write transactions are rejected with an invalid-input error instead of triggering a Pebble panic.
+The write batch setting must resolve to a positive value before the graph store opens. Oversized write transactions are rejected with an invalid-input error instead of triggering a Pebble panic.
 
-The configured value is also exposed through gRPC capabilities as `max_write_batch_bytes`, so SDK clients can chunk write-heavy workloads (for example, bulk `UNWIND ... MERGE` ingest) before execution.
+The resolved value is exposed through gRPC capabilities as `max_write_batch_bytes`. Capabilities also include `configured_max_write_batch_bytes`, `effective_max_write_batch_bytes`, and `max_write_batch_bytes_tuned` so SDK clients can detect when the server auto-tuned the batch size and mirror that value client-side before bulk ingest.
+
+The same batch-size fields are returned in each `Execute` and `Explain` response inside `stats`, so single-threaded clients can adapt immediately without polling capabilities.
 
 Prometheus metrics endpoint is optional and configurable:
 

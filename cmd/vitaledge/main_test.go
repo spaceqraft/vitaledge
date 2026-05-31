@@ -141,6 +141,15 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	if capResp.GetMaxWriteBatchBytes() != int64(pebblestore.DefaultMaxWriteBatchBytes) {
 		t.Fatalf("unexpected max_write_batch_bytes capability: %#v", capResp.GetMaxWriteBatchBytes())
 	}
+	if capResp.GetConfiguredMaxWriteBatchBytes() != int64(pebblestore.DefaultMaxWriteBatchBytes) {
+		t.Fatalf("unexpected configured_max_write_batch_bytes capability: %#v", capResp.GetConfiguredMaxWriteBatchBytes())
+	}
+	if capResp.GetEffectiveMaxWriteBatchBytes() != int64(pebblestore.DefaultMaxWriteBatchBytes) {
+		t.Fatalf("unexpected effective_max_write_batch_bytes capability: %#v", capResp.GetEffectiveMaxWriteBatchBytes())
+	}
+	if capResp.GetMaxWriteBatchBytesTuned() {
+		t.Fatalf("expected max_write_batch_bytes_tuned to be false")
+	}
 
 	execResp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",
@@ -162,6 +171,18 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	}
 	if rowValue.GetStringValue() != "seed" {
 		t.Fatalf("unexpected row value: %#v", rowValue)
+	}
+	if execResp.GetStats() == nil {
+		t.Fatalf("expected query stats on Execute response")
+	}
+	if execResp.GetStats().GetConfiguredMaxWriteBatchBytes() != int64(pebblestore.DefaultMaxWriteBatchBytes) {
+		t.Fatalf("unexpected Execute configured_max_write_batch_bytes: %#v", execResp.GetStats().GetConfiguredMaxWriteBatchBytes())
+	}
+	if execResp.GetStats().GetEffectiveMaxWriteBatchBytes() != int64(pebblestore.DefaultMaxWriteBatchBytes) {
+		t.Fatalf("unexpected Execute effective_max_write_batch_bytes: %#v", execResp.GetStats().GetEffectiveMaxWriteBatchBytes())
+	}
+	if execResp.GetStats().GetMaxWriteBatchBytesTuned() {
+		t.Fatalf("expected Execute stats max_write_batch_bytes_tuned to be false")
 	}
 
 	preparedResp, err := client.Execute(ctx, &v1.QueryRequest{
@@ -218,16 +239,19 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	}
 }
 
-func TestGRPCQueryServiceCapabilitiesReflectConfiguredMaxWriteBatch(t *testing.T) {
+func TestGRPCQueryServiceCapabilitiesReflectTunedMaxWriteBatch(t *testing.T) {
 	store := openTestStore(t)
 	defer func() { _ = store.Close() }()
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
-	const configuredMaxWriteBatchBytes = 123456
+	const configuredMaxWriteBatchBytes = int64(pebblestore.DefaultMaxWriteBatchBytes)
+	const effectiveMaxWriteBatchBytes = 32 * 1024 * 1024
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{
-		executor:           exec,
-		defaultTenant:      "acme",
-		maxWriteBatchBytes: configuredMaxWriteBatchBytes,
+		executor:                     exec,
+		defaultTenant:                "acme",
+		configuredMaxWriteBatchBytes: configuredMaxWriteBatchBytes,
+		maxWriteBatchBytes:           effectiveMaxWriteBatchBytes,
+		maxWriteBatchBytesTuned:      true,
 	})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
@@ -249,8 +273,85 @@ func TestGRPCQueryServiceCapabilitiesReflectConfiguredMaxWriteBatch(t *testing.T
 	if err != nil {
 		t.Fatalf("GetCapabilities failed: %v", err)
 	}
-	if capResp.GetMaxWriteBatchBytes() != configuredMaxWriteBatchBytes {
+	if capResp.GetMaxWriteBatchBytes() != effectiveMaxWriteBatchBytes {
 		t.Fatalf("unexpected max_write_batch_bytes capability: %#v", capResp.GetMaxWriteBatchBytes())
+	}
+	if capResp.GetConfiguredMaxWriteBatchBytes() != configuredMaxWriteBatchBytes {
+		t.Fatalf("unexpected configured_max_write_batch_bytes capability: %#v", capResp.GetConfiguredMaxWriteBatchBytes())
+	}
+	if capResp.GetEffectiveMaxWriteBatchBytes() != effectiveMaxWriteBatchBytes {
+		t.Fatalf("unexpected effective_max_write_batch_bytes capability: %#v", capResp.GetEffectiveMaxWriteBatchBytes())
+	}
+	if !capResp.GetMaxWriteBatchBytesTuned() {
+		t.Fatalf("expected max_write_batch_bytes_tuned to be true")
+	}
+	execResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if execResp.GetStats() == nil {
+		t.Fatalf("expected query stats on Execute response")
+	}
+	if execResp.GetStats().GetConfiguredMaxWriteBatchBytes() != configuredMaxWriteBatchBytes {
+		t.Fatalf("unexpected Execute configured_max_write_batch_bytes: %#v", execResp.GetStats().GetConfiguredMaxWriteBatchBytes())
+	}
+	if execResp.GetStats().GetEffectiveMaxWriteBatchBytes() != effectiveMaxWriteBatchBytes {
+		t.Fatalf("unexpected Execute effective_max_write_batch_bytes: %#v", execResp.GetStats().GetEffectiveMaxWriteBatchBytes())
+	}
+	if !execResp.GetStats().GetMaxWriteBatchBytesTuned() {
+		t.Fatalf("expected Execute stats max_write_batch_bytes_tuned to be true")
+	}
+}
+
+func TestGRPCQueryServiceExplainReportsWriteBatchSettings(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{
+		executor:                     exec,
+		defaultTenant:                "acme",
+		configuredMaxWriteBatchBytes: 123456,
+		maxWriteBatchBytes:           32 * 1024 * 1024,
+		maxWriteBatchBytesTuned:      true,
+	})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+	explainResp, err := client.Explain(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
+	})
+	if err != nil {
+		t.Fatalf("Explain failed: %v", err)
+	}
+	if explainResp.GetStats() == nil {
+		t.Fatalf("expected query stats on Explain response")
+	}
+	if explainResp.GetStats().GetConfiguredMaxWriteBatchBytes() != 123456 {
+		t.Fatalf("unexpected Explain configured_max_write_batch_bytes: %#v", explainResp.GetStats().GetConfiguredMaxWriteBatchBytes())
+	}
+	if explainResp.GetStats().GetEffectiveMaxWriteBatchBytes() != 32*1024*1024 {
+		t.Fatalf("unexpected Explain effective_max_write_batch_bytes: %#v", explainResp.GetStats().GetEffectiveMaxWriteBatchBytes())
+	}
+	if !explainResp.GetStats().GetMaxWriteBatchBytesTuned() {
+		t.Fatalf("expected Explain stats max_write_batch_bytes_tuned to be true")
 	}
 }
 
@@ -274,6 +375,42 @@ func TestOpenGraphStoreAcceptsConfiguredBatchLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected write under limit to succeed, got: %v", err)
 	}
+}
+
+func TestLoadConfigFromStartupAutoTunesMaxWriteBatchBytes(t *testing.T) {
+	withHostMemoryTotalBytes(t, 4*1024*1024*1024, func() {
+		cfg, err := loadConfigFromStartupForTest(t, []string{"vitaledge-test"})
+		if err != nil {
+			t.Fatalf("load config failed: %v", err)
+		}
+		if got, want := cfg.ConfiguredMaxWriteBatchBytes, defaultMaxWriteBatchBytes; got != want {
+			t.Fatalf("expected configured batch bytes=%d, got %d", want, got)
+		}
+		if got, want := cfg.MaxWriteBatchBytes, 32*1024*1024; got != want {
+			t.Fatalf("expected tuned max write batch bytes=%d, got %d", want, got)
+		}
+		if !cfg.MaxWriteBatchBytesAutoTuned {
+			t.Fatalf("expected max write batch bytes to be auto-tuned")
+		}
+	})
+}
+
+func TestLoadConfigFromStartupUsesExplicitMaxWriteBatchBytes(t *testing.T) {
+	withHostMemoryTotalBytes(t, 4*1024*1024*1024, func() {
+		cfg, err := loadConfigFromStartupForTest(t, []string{"vitaledge-test", "-max-write-batch-bytes", "123456"})
+		if err != nil {
+			t.Fatalf("load config failed: %v", err)
+		}
+		if got, want := cfg.ConfiguredMaxWriteBatchBytes, 123456; got != want {
+			t.Fatalf("expected configured batch bytes=%d, got %d", want, got)
+		}
+		if got, want := cfg.MaxWriteBatchBytes, 123456; got != want {
+			t.Fatalf("expected effective batch bytes=%d, got %d", want, got)
+		}
+		if cfg.MaxWriteBatchBytesAutoTuned {
+			t.Fatalf("did not expect max write batch bytes to be auto-tuned")
+		}
+	})
 }
 
 func TestLoadConfigFromStartupParsesGoMemoryLimitFlag(t *testing.T) {
@@ -331,6 +468,20 @@ func loadConfigFromStartupForTest(t *testing.T, args []string) (Config, error) {
 	})
 
 	return loadConfigFromStartup()
+}
+
+func withHostMemoryTotalBytes(t *testing.T, totalBytes uint64, fn func()) {
+	t.Helper()
+
+	previous := readHostMemoryTotalBytes
+	readHostMemoryTotalBytes = func() (uint64, error) {
+		return totalBytes, nil
+	}
+	t.Cleanup(func() {
+		readHostMemoryTotalBytes = previous
+	})
+
+	fn()
 }
 
 func TestGRPCQueryServiceCreatePropertyIndex(t *testing.T) {

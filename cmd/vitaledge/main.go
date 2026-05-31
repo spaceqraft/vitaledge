@@ -36,20 +36,23 @@ const pebbleMemTableSizeBytesEnv = "VITALEDGE_PEBBLE_MEMTABLE_SIZE_BYTES"
 const pebbleMemTableStopWritesThresholdEnv = "VITALEDGE_PEBBLE_MEMTABLE_STOP_WRITES_THRESHOLD"
 
 type Config struct {
-	GraphPath            string
-	DefaultTenant        string
-	IndexConfigPath      string
-	IndexCatalog         *indexschema.Catalog
-	ExecutorMetrics      *executor.Collector
-	MetricsListenAddress string
-	GRPCListenAddress    string
-	MaxWriteBatchBytes   int
-	GoMemoryLimitBytes   int64
-	PebbleBlockCacheBytes int64
-	PebbleMemTableSizeBytes int
+	GraphPath                      string
+	DefaultTenant                  string
+	IndexConfigPath                string
+	IndexCatalog                   *indexschema.Catalog
+	ExecutorMetrics                *executor.Collector
+	MetricsListenAddress           string
+	GRPCListenAddress              string
+	ConfiguredMaxWriteBatchBytes   int
+	MaxWriteBatchBytes             int
+	MaxWriteBatchBytesAutoTuned    bool
+	HostMemoryBytes                uint64
+	GoMemoryLimitBytes             int64
+	PebbleBlockCacheBytes          int64
+	PebbleMemTableSizeBytes        int
 	PebbleMemTableStopWritesThreshold int
-	Store                graph.GraphStore
-	Executor             *executor.Executor
+	Store                          graph.GraphStore
+	Executor                       *executor.Executor
 }
 
 type Server struct {
@@ -85,7 +88,13 @@ func (s *Server) Start() error {
 		s.metricsSV = metricsServer
 		log.Printf("Metrics endpoint is listening on %s/metrics", s.MetricsListenAddress)
 	}
-	grpcServer, grpcListener, err := startGRPCServer(s.GRPCListenAddress, &grpcQueryHandler{executor: s.executor, defaultTenant: s.DefaultTenant, maxWriteBatchBytes: int64(s.MaxWriteBatchBytes)})
+	grpcServer, grpcListener, err := startGRPCServer(s.GRPCListenAddress, &grpcQueryHandler{
+		executor:                    s.executor,
+		defaultTenant:               s.DefaultTenant,
+		configuredMaxWriteBatchBytes: int64(s.ConfiguredMaxWriteBatchBytes),
+		maxWriteBatchBytes:          int64(s.MaxWriteBatchBytes),
+		maxWriteBatchBytesTuned:      s.MaxWriteBatchBytesAutoTuned,
+	})
 	if err != nil {
 		if s.metricsSV != nil {
 			_ = s.metricsSV.Close()
@@ -106,6 +115,13 @@ func main() {
 	config, err := loadConfigFromStartup()
 	if err != nil {
 		log.Fatalf("startup config error: %v", err)
+	}
+	if config.MaxWriteBatchBytesAutoTuned {
+		direction := "up"
+		if config.MaxWriteBatchBytes < config.ConfiguredMaxWriteBatchBytes {
+			direction = "down"
+		}
+		log.Printf("WARNING: auto-tuned max write batch bytes %s from %d to %d based on host memory %d bytes", direction, config.ConfiguredMaxWriteBatchBytes, config.MaxWriteBatchBytes, config.HostMemoryBytes)
 	}
 	if config.GoMemoryLimitBytes > 0 {
 		previous := debug.SetMemoryLimit(config.GoMemoryLimitBytes)
@@ -151,7 +167,7 @@ func loadConfigFromStartup() (Config, error) {
 	flag.StringVar(&indexConfigPath, "index-schema-config", "", "Path to index schema configuration JSON file")
 	flag.StringVar(&metricsListenAddress, "metrics-listen", "", "Optional HTTP listen address for Prometheus metrics endpoint (for example :9100)")
 	flag.StringVar(&grpcListenAddress, "grpc-listen", defaultGRPCListenAddress, "gRPC listen address for QueryService")
-	flag.IntVar(&maxWriteBatchBytes, "max-write-batch-bytes", defaultMaxWriteBatchBytes, "Maximum bytes allowed in a single write transaction batch")
+	flag.IntVar(&maxWriteBatchBytes, "max-write-batch-bytes", 0, "Maximum bytes allowed in a single write transaction batch (0 auto-tunes from host memory)")
 	flag.Int64Var(&goMemoryLimitBytes, "go-memory-limit-bytes", 0, "Optional Go runtime soft memory limit in bytes (0 disables)")
 	flag.Int64Var(&pebbleBlockCacheBytes, "pebble-block-cache-bytes", 0, "Optional Pebble block cache size in bytes (0 uses Pebble defaults)")
 	flag.IntVar(&pebbleMemTableSizeBytes, "pebble-memtable-size-bytes", 0, "Optional Pebble memtable size in bytes (0 uses Pebble defaults)")
@@ -208,8 +224,9 @@ func loadConfigFromStartup() (Config, error) {
 		}
 		pebbleMemTableStopWritesThreshold = parsed
 	}
-	if maxWriteBatchBytes <= 0 {
-		return Config{}, fmt.Errorf("max write batch bytes must be > 0")
+	configuredMaxWriteBatchBytes, effectiveMaxWriteBatchBytes, autoTuned, hostMemoryBytes, err := resolveMaxWriteBatchBytes(maxWriteBatchBytes)
+	if err != nil {
+		return Config{}, err
 	}
 	if goMemoryLimitBytes < 0 {
 		return Config{}, fmt.Errorf("go memory limit bytes must be >= 0")
@@ -225,18 +242,21 @@ func loadConfigFromStartup() (Config, error) {
 	}
 
 	cfg := Config{
-		GraphPath:            graphPath,
-		DefaultTenant:        tenant,
-		IndexConfigPath:      indexConfigPath,
-		IndexCatalog:         indexschema.NewCatalog(),
-		MetricsListenAddress: metricsListenAddress,
-		GRPCListenAddress:    grpcListenAddress,
-		MaxWriteBatchBytes:   maxWriteBatchBytes,
-		GoMemoryLimitBytes:   goMemoryLimitBytes,
-		PebbleBlockCacheBytes: pebbleBlockCacheBytes,
-		PebbleMemTableSizeBytes: pebbleMemTableSizeBytes,
+		GraphPath:                        graphPath,
+		DefaultTenant:                    tenant,
+		IndexConfigPath:                  indexConfigPath,
+		IndexCatalog:                     indexschema.NewCatalog(),
+		MetricsListenAddress:             metricsListenAddress,
+		GRPCListenAddress:                grpcListenAddress,
+		ConfiguredMaxWriteBatchBytes:     configuredMaxWriteBatchBytes,
+		MaxWriteBatchBytes:               effectiveMaxWriteBatchBytes,
+		MaxWriteBatchBytesAutoTuned:      autoTuned,
+		HostMemoryBytes:                  hostMemoryBytes,
+		GoMemoryLimitBytes:               goMemoryLimitBytes,
+		PebbleBlockCacheBytes:            pebbleBlockCacheBytes,
+		PebbleMemTableSizeBytes:          pebbleMemTableSizeBytes,
 		PebbleMemTableStopWritesThreshold: pebbleMemTableStopWritesThreshold,
-		ExecutorMetrics:      executor.NewCollector(),
+		ExecutorMetrics:                  executor.NewCollector(),
 	}
 	if strings.TrimSpace(indexConfigPath) == "" {
 		return cfg, nil
@@ -271,9 +291,9 @@ func openGraphStore(path string, maxWriteBatchBytes int, pebbleBlockCacheBytes i
 		return nil, fmt.Errorf("pebble memtable stop writes threshold must be >= 0")
 	}
 	return pebblestore.OpenWithOptions(path, pebblestore.StoreOptions{
-		MaxWriteBatchBytes:             maxWriteBatchBytes,
-		PebbleBlockCacheBytes:          pebbleBlockCacheBytes,
-		PebbleMemTableSizeBytes:        pebbleMemTableSizeBytes,
+		MaxWriteBatchBytes:               maxWriteBatchBytes,
+		PebbleBlockCacheBytes:            pebbleBlockCacheBytes,
+		PebbleMemTableSizeBytes:          pebbleMemTableSizeBytes,
 		PebbleMemTableStopWritesThreshold: pebbleMemTableStopWritesThreshold,
 	})
 }

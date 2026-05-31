@@ -512,11 +512,14 @@ func (x *ExplainResponse) GetWarnings() []*Diagnostic {
 }
 
 type QueryStats struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RowsReturned  int64                  `protobuf:"varint,1,opt,name=rows_returned,json=rowsReturned,proto3" json:"rows_returned,omitempty"`
-	DurationMs    int64                  `protobuf:"varint,2,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                        protoimpl.MessageState `protogen:"open.v1"`
+	RowsReturned                 int64                  `protobuf:"varint,1,opt,name=rows_returned,json=rowsReturned,proto3" json:"rows_returned,omitempty"`
+	DurationMs                   int64                  `protobuf:"varint,2,opt,name=duration_ms,json=durationMs,proto3" json:"duration_ms,omitempty"`
+	ConfiguredMaxWriteBatchBytes int64                  `protobuf:"varint,3,opt,name=configured_max_write_batch_bytes,json=configuredMaxWriteBatchBytes,proto3" json:"configured_max_write_batch_bytes,omitempty"`
+	EffectiveMaxWriteBatchBytes  int64                  `protobuf:"varint,4,opt,name=effective_max_write_batch_bytes,json=effectiveMaxWriteBatchBytes,proto3" json:"effective_max_write_batch_bytes,omitempty"`
+	MaxWriteBatchBytesTuned      bool                   `protobuf:"varint,5,opt,name=max_write_batch_bytes_tuned,json=maxWriteBatchBytesTuned,proto3" json:"max_write_batch_bytes_tuned,omitempty"`
+	unknownFields                protoimpl.UnknownFields
+	sizeCache                    protoimpl.SizeCache
 }
 
 func (x *QueryStats) Reset() {
@@ -561,6 +564,27 @@ func (x *QueryStats) GetDurationMs() int64 {
 		return x.DurationMs
 	}
 	return 0
+}
+
+func (x *QueryStats) GetConfiguredMaxWriteBatchBytes() int64 {
+	if x != nil {
+		return x.ConfiguredMaxWriteBatchBytes
+	}
+	return 0
+}
+
+func (x *QueryStats) GetEffectiveMaxWriteBatchBytes() int64 {
+	if x != nil {
+		return x.EffectiveMaxWriteBatchBytes
+	}
+	return 0
+}
+
+func (x *QueryStats) GetMaxWriteBatchBytesTuned() bool {
+	if x != nil {
+		return x.MaxWriteBatchBytesTuned
+	}
+	return false
 }
 
 type Diagnostic struct {
@@ -652,16 +676,19 @@ func (*CapabilitiesRequest) Descriptor() ([]byte, []int) {
 }
 
 type CapabilitiesResponse struct {
-	state                  protoimpl.MessageState `protogen:"open.v1"`
-	ProtocolVersion        string                 `protobuf:"bytes,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
-	ParserVersions         []string               `protobuf:"bytes,2,rep,name=parser_versions,json=parserVersions,proto3" json:"parser_versions,omitempty"`
-	IrVersions             []string               `protobuf:"bytes,3,rep,name=ir_versions,json=irVersions,proto3" json:"ir_versions,omitempty"`
-	PreparedQuerySupported bool                   `protobuf:"varint,4,opt,name=prepared_query_supported,json=preparedQuerySupported,proto3" json:"prepared_query_supported,omitempty"`
-	ParameterBinding       string                 `protobuf:"bytes,5,opt,name=parameter_binding,json=parameterBinding,proto3" json:"parameter_binding,omitempty"`
-	IndexDdlSupported      bool                   `protobuf:"varint,6,opt,name=index_ddl_supported,json=indexDdlSupported,proto3" json:"index_ddl_supported,omitempty"`
-	MaxWriteBatchBytes     int64                  `protobuf:"varint,7,opt,name=max_write_batch_bytes,json=maxWriteBatchBytes,proto3" json:"max_write_batch_bytes,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	state                        protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolVersion              string                 `protobuf:"bytes,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	ParserVersions               []string               `protobuf:"bytes,2,rep,name=parser_versions,json=parserVersions,proto3" json:"parser_versions,omitempty"`
+	IrVersions                   []string               `protobuf:"bytes,3,rep,name=ir_versions,json=irVersions,proto3" json:"ir_versions,omitempty"`
+	PreparedQuerySupported       bool                   `protobuf:"varint,4,opt,name=prepared_query_supported,json=preparedQuerySupported,proto3" json:"prepared_query_supported,omitempty"`
+	ParameterBinding             string                 `protobuf:"bytes,5,opt,name=parameter_binding,json=parameterBinding,proto3" json:"parameter_binding,omitempty"`
+	IndexDdlSupported            bool                   `protobuf:"varint,6,opt,name=index_ddl_supported,json=indexDdlSupported,proto3" json:"index_ddl_supported,omitempty"`
+	MaxWriteBatchBytes           int64                  `protobuf:"varint,7,opt,name=max_write_batch_bytes,json=maxWriteBatchBytes,proto3" json:"max_write_batch_bytes,omitempty"`
+	ConfiguredMaxWriteBatchBytes int64                  `protobuf:"varint,8,opt,name=configured_max_write_batch_bytes,json=configuredMaxWriteBatchBytes,proto3" json:"configured_max_write_batch_bytes,omitempty"`
+	EffectiveMaxWriteBatchBytes  int64                  `protobuf:"varint,9,opt,name=effective_max_write_batch_bytes,json=effectiveMaxWriteBatchBytes,proto3" json:"effective_max_write_batch_bytes,omitempty"`
+	MaxWriteBatchBytesTuned      bool                   `protobuf:"varint,10,opt,name=max_write_batch_bytes_tuned,json=maxWriteBatchBytesTuned,proto3" json:"max_write_batch_bytes_tuned,omitempty"`
+	unknownFields                protoimpl.UnknownFields
+	sizeCache                    protoimpl.SizeCache
 }
 
 func (x *CapabilitiesResponse) Reset() {
@@ -741,6 +768,27 @@ func (x *CapabilitiesResponse) GetMaxWriteBatchBytes() int64 {
 		return x.MaxWriteBatchBytes
 	}
 	return 0
+}
+
+func (x *CapabilitiesResponse) GetConfiguredMaxWriteBatchBytes() int64 {
+	if x != nil {
+		return x.ConfiguredMaxWriteBatchBytes
+	}
+	return 0
+}
+
+func (x *CapabilitiesResponse) GetEffectiveMaxWriteBatchBytes() int64 {
+	if x != nil {
+		return x.EffectiveMaxWriteBatchBytes
+	}
+	return 0
+}
+
+func (x *CapabilitiesResponse) GetMaxWriteBatchBytesTuned() bool {
+	if x != nil {
+		return x.MaxWriteBatchBytesTuned
+	}
+	return false
 }
 
 type CreatePropertyIndexRequest struct {
@@ -1255,17 +1303,20 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"\x0fExplainResponse\x12!\n" +
 	"\fexplain_json\x18\x01 \x01(\fR\vexplainJson\x12.\n" +
 	"\x05stats\x18\x02 \x01(\v2\x18.vitaledge.v1.QueryStatsR\x05stats\x124\n" +
-	"\bwarnings\x18\x03 \x03(\v2\x18.vitaledge.v1.DiagnosticR\bwarnings\"R\n" +
+	"\bwarnings\x18\x03 \x03(\v2\x18.vitaledge.v1.DiagnosticR\bwarnings\"\x9e\x02\n" +
 	"\n" +
 	"QueryStats\x12#\n" +
 	"\rrows_returned\x18\x01 \x01(\x03R\frowsReturned\x12\x1f\n" +
 	"\vduration_ms\x18\x02 \x01(\x03R\n" +
-	"durationMs\":\n" +
+	"durationMs\x12F\n" +
+	" configured_max_write_batch_bytes\x18\x03 \x01(\x03R\x1cconfiguredMaxWriteBatchBytes\x12D\n" +
+	"\x1feffective_max_write_batch_bytes\x18\x04 \x01(\x03R\x1beffectiveMaxWriteBatchBytes\x12<\n" +
+	"\x1bmax_write_batch_bytes_tuned\x18\x05 \x01(\bR\x17maxWriteBatchBytesTuned\":\n" +
 	"\n" +
 	"Diagnostic\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"\x15\n" +
-	"\x13CapabilitiesRequest\"\xd5\x02\n" +
+	"\x13CapabilitiesRequest\"\xa1\x04\n" +
 	"\x14CapabilitiesResponse\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\tR\x0fprotocolVersion\x12'\n" +
 	"\x0fparser_versions\x18\x02 \x03(\tR\x0eparserVersions\x12\x1f\n" +
@@ -1274,7 +1325,11 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"\x18prepared_query_supported\x18\x04 \x01(\bR\x16preparedQuerySupported\x12+\n" +
 	"\x11parameter_binding\x18\x05 \x01(\tR\x10parameterBinding\x12.\n" +
 	"\x13index_ddl_supported\x18\x06 \x01(\bR\x11indexDdlSupported\x121\n" +
-	"\x15max_write_batch_bytes\x18\a \x01(\x03R\x12maxWriteBatchBytes\"\x8c\x01\n" +
+	"\x15max_write_batch_bytes\x18\a \x01(\x03R\x12maxWriteBatchBytes\x12F\n" +
+	" configured_max_write_batch_bytes\x18\b \x01(\x03R\x1cconfiguredMaxWriteBatchBytes\x12D\n" +
+	"\x1feffective_max_write_batch_bytes\x18\t \x01(\x03R\x1beffectiveMaxWriteBatchBytes\x12<\n" +
+	"\x1bmax_write_batch_bytes_tuned\x18\n" +
+	" \x01(\bR\x17maxWriteBatchBytesTuned\"\x8c\x01\n" +
 	"\x1aCreatePropertyIndexRequest\x12\x16\n" +
 	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x12\x16\n" +
 	"\x06schema\x18\x02 \x01(\tR\x06schema\x12\x1a\n" +

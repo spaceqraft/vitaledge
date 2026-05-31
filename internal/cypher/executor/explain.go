@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/graph"
@@ -23,9 +22,8 @@ type explainAnalysis struct {
 	costEstimate     map[string]any
 	runtimeStats     map[string]any
 	warnings         []map[string]any
-	source           string
-	capturedAt       string
-	statsSnapshot    map[string]any
+	vertexTotal      int
+	edgeTotal        int
 }
 
 type explainStoreStats struct {
@@ -70,10 +68,7 @@ func (e *Executor) executeExplainStatement(ctx context.Context, stmt *ast.Explai
 }
 
 func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement, params Params) (*explainAnalysis, error) {
-	analysis := &explainAnalysis{
-		source:     "store-scan",
-		capturedAt: time.Now().UTC().Format(time.RFC3339Nano),
-	}
+	analysis := &explainAnalysis{}
 
 	tenant := tenantFromParams(params)
 	var stats explainStoreStats
@@ -87,12 +82,11 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	}); err != nil {
 		return nil, err
 	}
-	analysis.source = explainStatsSnapshotSource(stats)
-	analysis.statsSnapshot = buildExplainStatsSnapshotDetails(stats)
-
 	refs := collectExplainPatternRefs(stmt)
 	analysis.vertexCounts = buildExplainVertexCounts(stats, refs)
 	analysis.edgeCounts = buildExplainEdgeCounts(stats, refs)
+	analysis.vertexTotal = stats.vertexTotal
+	analysis.edgeTotal = stats.edgeTotal
 	analysis.predicateSignals = buildExplainPredicateSignals(stmt, params, tenant, stats)
 	planNodes := buildExplainPlanNodes(stmt, e.indexCatalog, tenant, params)
 	analysis.indexDecisions = buildExplainIndexDecisions(stmt, params, e.indexCatalog, tenant, stats, planNodes)
@@ -137,18 +131,13 @@ func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params
 			"vertexes":     planVertexes,
 		},
 		"influencers": map[string]any{
-			"vertexCounts":     analysis.vertexCounts,
-			"edgeCounts":       analysis.edgeCounts,
-			"totals":           analysis.statsSnapshot["totals"],
-			"predicateSignals": analysis.predicateSignals,
-			"statsSnapshot": map[string]any{
-				"source":           analysis.source,
-				"capturedAt":       analysis.capturedAt,
-				"coverage":         analysis.statsSnapshot["coverage"],
-				"completeness":     analysis.statsSnapshot["completeness"],
-				"backfillStatus":   analysis.statsSnapshot["backfillStatus"],
-				"backfillRequired": analysis.statsSnapshot["backfillRequired"],
+			"vertexCounts": analysis.vertexCounts,
+			"edgeCounts":   analysis.edgeCounts,
+			"totals": map[string]any{
+				"vertexes": analysis.vertexTotal,
+				"edges":    analysis.edgeTotal,
 			},
+			"predicateSignals": analysis.predicateSignals,
 		},
 		"cardinality":    analysis.cardinality,
 		"costEstimate":   analysis.costEstimate,
@@ -432,61 +421,6 @@ func collectExplainPatternRefs(stmt ast.Statement) explainPatternRefs {
 	}
 
 	return refs
-}
-
-func explainStatsSnapshotSource(stats explainStoreStats) string {
-	if stats.snapshotFound {
-		return "stats-snapshot+store-scan"
-	}
-	return "store-scan"
-}
-
-func buildExplainStatsSnapshotDetails(stats explainStoreStats) map[string]any {
-	totalsCoverage := "scan_fallback"
-	if stats.snapshotFound {
-		totalsCoverage = "snapshot"
-	}
-	vertexCountsCoverage := "missing"
-	if stats.snapshotFound {
-		vertexCountsCoverage = "snapshot"
-		if stats.vertexTotal > 0 && len(stats.labelCounts) == 0 {
-			vertexCountsCoverage = "incomplete"
-		}
-	}
-	edgeCountsCoverage := "missing"
-	if stats.snapshotFound {
-		edgeCountsCoverage = "snapshot"
-		if stats.edgeTotal > 0 && len(stats.edgeCounts) == 0 {
-			edgeCountsCoverage = "incomplete"
-		}
-	}
-
-	completeness := "partial"
-	if totalsCoverage == "snapshot" && vertexCountsCoverage == "snapshot" && edgeCountsCoverage == "snapshot" {
-		completeness = "complete"
-	}
-	if totalsCoverage == "scan_fallback" && vertexCountsCoverage == "missing" && edgeCountsCoverage == "missing" {
-		completeness = "missing"
-	}
-	backfillStatus := "required"
-	if completeness == "complete" {
-		backfillStatus = "complete"
-	}
-
-	return map[string]any{
-		"coverage": map[string]any{
-			"totals":       totalsCoverage,
-			"vertexCounts": vertexCountsCoverage,
-			"edgeCounts":   edgeCountsCoverage,
-		},
-		"totals": map[string]any{
-			"vertexes": stats.vertexTotal,
-			"edges":    stats.edgeTotal,
-		},
-		"completeness":     completeness,
-		"backfillStatus":   backfillStatus,
-		"backfillRequired": backfillStatus != "complete",
-	}
 }
 
 func buildExplainEdgeCounts(stats explainStoreStats, refs explainPatternRefs) []map[string]any {

@@ -294,8 +294,8 @@
       "required": [
         "vertexCounts",
         "edgeCounts",
-        "predicateSignals",
-        "statsSnapshot"
+        "totals",
+        "predicateSignals"
       ],
       "properties": {
         "vertexCounts": {
@@ -310,28 +310,28 @@
             "$ref": "#/$defs/edgeCount"
           }
         },
+        "totals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "vertexes",
+            "edges"
+          ],
+          "properties": {
+            "vertexes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "edges": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
         "predicateSignals": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/predicateSignal"
-          }
-        },
-        "statsSnapshot": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "source",
-            "capturedAt"
-          ],
-          "properties": {
-            "source": {
-              "type": "string",
-              "description": "Source of statistics used by planning, for example runtime catalog, sampled probes, or static defaults."
-            },
-            "capturedAt": {
-              "type": "string",
-              "format": "date-time"
-            }
           }
         }
       }

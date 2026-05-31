@@ -256,31 +256,8 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
 	}
-	statsSnapshot, ok := influencers["statsSnapshot"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected statsSnapshot map, got %T", influencers["statsSnapshot"])
-	}
-	coverage, ok := statsSnapshot["coverage"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected statsSnapshot.coverage map, got %T", statsSnapshot["coverage"])
-	}
-	if totals, _ := coverage["totals"].(string); totals != "snapshot" {
-		t.Fatalf("expected statsSnapshot coverage totals=snapshot, got %#v", coverage["totals"])
-	}
-	if vertexCountsCoverage, _ := coverage["vertexCounts"].(string); vertexCountsCoverage != "snapshot" {
-		t.Fatalf("expected statsSnapshot coverage vertexCounts=snapshot, got %#v", coverage["vertexCounts"])
-	}
-	if edgeCountsCoverage, _ := coverage["edgeCounts"].(string); edgeCountsCoverage != "snapshot" {
-		t.Fatalf("expected statsSnapshot coverage edgeCounts=snapshot, got %#v", coverage["edgeCounts"])
-	}
-	if completeness, _ := statsSnapshot["completeness"].(string); completeness != "complete" {
-		t.Fatalf("expected statsSnapshot completeness=complete, got %#v", statsSnapshot["completeness"])
-	}
-	if backfillStatus, _ := statsSnapshot["backfillStatus"].(string); backfillStatus != "complete" {
-		t.Fatalf("expected statsSnapshot backfillStatus=complete, got %#v", statsSnapshot["backfillStatus"])
-	}
-	if backfillRequired, _ := statsSnapshot["backfillRequired"].(bool); backfillRequired {
-		t.Fatalf("expected statsSnapshot backfillRequired=false, got %#v", statsSnapshot["backfillRequired"])
+	if _, exists := influencers["statsSnapshot"]; exists {
+		t.Fatalf("expected statsSnapshot to be omitted from influencers, got %#v", influencers["statsSnapshot"])
 	}
 	vertexCounts, ok := influencers["vertexCounts"].([]map[string]any)
 	if !ok {

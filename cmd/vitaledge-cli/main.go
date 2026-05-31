@@ -35,8 +35,6 @@ type cliConfig struct {
 	tenant         string
 	timeout        time.Duration
 	execute        string
-	explainVerbose bool
-	explainTerse   bool
 	maxColumnWidth int
 	loadMode       string
 	loadOps        int
@@ -72,8 +70,6 @@ func loadCLIConfig() cliConfig {
 	flag.StringVar(&cfg.tenant, "tenant", defaultTenant, "tenant for query execution")
 	flag.DurationVar(&cfg.timeout, "timeout", 5*time.Second, "request timeout")
 	flag.StringVar(&cfg.execute, "execute", "", "optional one-shot statement (non-interactive)")
-	flag.BoolVar(&cfg.explainVerbose, "explain-verbose", true, "include supporting decision data in EXPLAIN output")
-	flag.BoolVar(&cfg.explainTerse, "explain-terse", false, "render EXPLAIN in terse mode (execution path focused)")
 	flag.IntVar(&cfg.maxColumnWidth, "max-column-width", defaultMaxColumnWidth, "maximum width for rendered table columns")
 	flag.StringVar(&cfg.loadMode, "load-mode", "", "optional load generator mode: write|noop-write|read")
 	flag.IntVar(&cfg.loadOps, "load-ops", 1000, "number of load operations to execute")
@@ -88,9 +84,6 @@ func loadCLIConfig() cliConfig {
 	flag.Parse()
 	if cfg.maxColumnWidth < 3 {
 		cfg.maxColumnWidth = 3
-	}
-	if cfg.explainTerse {
-		cfg.explainVerbose = false
 	}
 	if cfg.loadOps < 1 {
 		cfg.loadOps = 1
@@ -239,7 +232,7 @@ func runStatement(parent context.Context, client v1.QueryServiceClient, cfg cliC
 	defer cancel()
 
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(boundQuery)), "EXPLAIN ") {
-		return runExplain(ctx, client, cfg.tenant, boundQuery, cfg.explainVerbose, out)
+		return runExplain(ctx, client, cfg.tenant, boundQuery, out)
 	}
 	return runExecute(ctx, client, cfg.tenant, boundQuery, cfg.maxColumnWidth, out, stderr)
 }
@@ -363,7 +356,7 @@ func executeCypher(ctx context.Context, client v1.QueryServiceClient, tenant str
 	return resp, nil
 }
 
-func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, verbose bool, out io.Writer) error {
+func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, out io.Writer) error {
 	resp, err := client.Explain(ctx, &v1.QueryRequest{
 		Tenant: tenant,
 		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: query}},
@@ -380,7 +373,7 @@ func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string
 	if len(resp.GetExplainJson()) > 0 {
 		var decoded map[string]any
 		if err := json.Unmarshal(resp.GetExplainJson(), &decoded); err == nil {
-			renderExplainNarrative(out, decoded, verbose)
+			renderExplainNarrative(out, decoded)
 		} else {
 			fmt.Fprintln(out, string(resp.GetExplainJson()))
 		}
@@ -391,7 +384,7 @@ func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string
 	return nil
 }
 
-func renderExplainNarrative(out io.Writer, explain map[string]any, verbose bool) {
+func renderExplainNarrative(out io.Writer, explain map[string]any) {
 	if explain == nil {
 		return
 	}
@@ -426,37 +419,17 @@ func renderExplainNarrative(out io.Writer, explain map[string]any, verbose bool)
 		}
 	}
 
-	if verbose {
-		if influencers, ok := explain["influencers"].(map[string]any); ok {
-			if statsSnapshot, ok := influencers["statsSnapshot"].(map[string]any); ok {
-				fmt.Fprintln(out, "Statistics snapshot:")
-				if source := asString(statsSnapshot["source"]); source != "" {
-					fmt.Fprintf(out, "- source: %s\n", source)
-				}
-				if completeness := asString(statsSnapshot["completeness"]); completeness != "" {
-					fmt.Fprintf(out, "- completeness: %s\n", completeness)
-				}
-				if backfillStatus := asString(statsSnapshot["backfillStatus"]); backfillStatus != "" {
-					fmt.Fprintf(out, "- backfillStatus: %s\n", backfillStatus)
-				}
-				if required, ok := statsSnapshot["backfillRequired"].(bool); ok {
-					fmt.Fprintf(out, "- backfillRequired: %t\n", required)
-				}
+	warnings := asMapSlice(explain["warnings"])
+	if len(warnings) > 0 {
+		fmt.Fprintln(out, "Warnings:")
+		for _, warning := range warnings {
+			code := asString(warning["code"])
+			message := asString(warning["message"])
+			if code == "" {
+				fmt.Fprintf(out, "- %s\n", message)
+				continue
 			}
-		}
-
-		warnings := asMapSlice(explain["warnings"])
-		if len(warnings) > 0 {
-			fmt.Fprintln(out, "Warnings:")
-			for _, warning := range warnings {
-				code := asString(warning["code"])
-				message := asString(warning["message"])
-				if code == "" {
-					fmt.Fprintf(out, "- %s\n", message)
-					continue
-				}
-				fmt.Fprintf(out, "- [%s] %s\n", code, message)
-			}
+			fmt.Fprintf(out, "- [%s] %s\n", code, message)
 		}
 	}
 }

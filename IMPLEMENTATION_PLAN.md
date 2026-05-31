@@ -287,7 +287,7 @@ Implementation status for current EXPLAIN slice set:
 3. Index-tuning signals: completed (index decisions include recommendation, impact, selectivity, and access-path context).
 4. Warning/fallback diagnostics: completed (specific warning codes emitted for full scans, missing indexes, estimate-only signals, missing tenant context, and write dry-run behavior).
 5. Documentation: completed (README and DESIGN include concrete EXPLAIN interpretation guidance and warning semantics).
-6. Statistics transparency: completed for current persisted envelope (tenant totals + per-label + per-edge-type), including explicit backfill-required signaling in EXPLAIN `statsSnapshot`.
+6. Statistics transparency: completed for current persisted envelope (tenant totals + per-label + per-edge-type) and exposed through EXPLAIN influencer totals/counts.
 
 #### Query Pipeline slice-by-slice execution plan (next)
 

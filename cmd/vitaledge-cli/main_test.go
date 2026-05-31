@@ -45,14 +45,6 @@ func TestRunExplainRendersHumanReadableNarrative(t *testing.T) {
 				{"id": "N2", "op": "AGGREGATE", "implementation": "fast_vertex_count", "children": []string{"N1"}},
 			},
 		},
-		"influencers": map[string]any{
-			"statsSnapshot": map[string]any{
-				"source":           "stats-snapshot+store-scan",
-				"completeness":     "complete",
-				"backfillStatus":   "complete",
-				"backfillRequired": false,
-			},
-		},
 		"warnings": []map[string]any{{"code": "FULL_SCAN_FALLBACK", "message": "example"}},
 	}
 	encoded, err := json.Marshal(payload)
@@ -67,7 +59,7 @@ func TestRunExplainRendersHumanReadableNarrative(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runExplain(context.Background(), client, "acme", "EXPLAIN MATCH (n) RETURN count(n)", true, &out); err != nil {
+	if err := runExplain(context.Background(), client, "acme", "EXPLAIN MATCH (n) RETURN count(n)", &out); err != nil {
 		t.Fatalf("runExplain returned error: %v", err)
 	}
 	rendered := out.String()
@@ -80,9 +72,6 @@ func TestRunExplainRendersHumanReadableNarrative(t *testing.T) {
 	if !strings.Contains(rendered, "1. ALL_VERTEXES_SCAN") || !strings.Contains(rendered, "2. AGGREGATE") {
 		t.Fatalf("expected ordered plan steps, got: %s", rendered)
 	}
-	if !strings.Contains(rendered, "backfillRequired: false") {
-		t.Fatalf("expected stats snapshot details, got: %s", rendered)
-	}
 	if !strings.Contains(rendered, "[FULL_SCAN_FALLBACK] example") {
 		t.Fatalf("expected warnings section, got: %s", rendered)
 	}
@@ -91,7 +80,7 @@ func TestRunExplainRendersHumanReadableNarrative(t *testing.T) {
 	}
 }
 
-func TestRunExplainTerseOmitsSupportingDataSections(t *testing.T) {
+func TestRunExplainIncludesWarningsWhenPresent(t *testing.T) {
 	payload := map[string]any{
 		"query": map[string]any{"text": "MATCH (n) RETURN count(n)"},
 		"logicalPlan": map[string]any{
@@ -99,14 +88,6 @@ func TestRunExplainTerseOmitsSupportingDataSections(t *testing.T) {
 			"vertexes": []map[string]any{
 				{"id": "N1", "op": "ALL_VERTEXES_SCAN", "children": []string{}},
 				{"id": "N2", "op": "AGGREGATE", "implementation": "fast_vertex_count", "children": []string{"N1"}},
-			},
-		},
-		"influencers": map[string]any{
-			"statsSnapshot": map[string]any{
-				"source":           "stats-snapshot",
-				"completeness":     "complete",
-				"backfillStatus":   "complete",
-				"backfillRequired": false,
 			},
 		},
 		"warnings": []map[string]any{{"code": "FULL_SCAN_FALLBACK", "message": "example"}},
@@ -123,18 +104,15 @@ func TestRunExplainTerseOmitsSupportingDataSections(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runExplain(context.Background(), client, "acme", "EXPLAIN MATCH (n) RETURN count(n)", false, &out); err != nil {
+	if err := runExplain(context.Background(), client, "acme", "EXPLAIN MATCH (n) RETURN count(n)", &out); err != nil {
 		t.Fatalf("runExplain returned error: %v", err)
 	}
 	rendered := out.String()
 	if !strings.Contains(rendered, "Execution path:") {
 		t.Fatalf("expected execution path section, got: %s", rendered)
 	}
-	if strings.Contains(rendered, "Statistics snapshot:") {
-		t.Fatalf("did not expect statistics snapshot in terse mode, got: %s", rendered)
-	}
-	if strings.Contains(rendered, "Warnings:") {
-		t.Fatalf("did not expect warnings section in terse mode, got: %s", rendered)
+	if !strings.Contains(rendered, "Warnings:") {
+		t.Fatalf("expected warnings section, got: %s", rendered)
 	}
 	if !strings.Contains(rendered, "stats: rows=1 durationMs=7") {
 		t.Fatalf("expected stats footer, got: %s", rendered)

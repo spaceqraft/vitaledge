@@ -9397,6 +9397,9 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "vertexes"); ok {
 		return evalVertexesFunction(arg, row, params)
 	}
+	if arg, ok := parseFunctionCall(raw, "nodes"); ok {
+		return evalVertexesFunction(arg, row, params)
+	}
 	if arg, ok := parseFunctionCall(raw, "relationships"); ok {
 		return evalRelationshipsFunction(arg, row, params)
 	}
@@ -9415,7 +9418,13 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "startVertex"); ok {
 		return evalStartVertexFunction(arg, row, params)
 	}
+	if arg, ok := parseFunctionCall(raw, "startNode"); ok {
+		return evalStartVertexFunction(arg, row, params)
+	}
 	if arg, ok := parseFunctionCall(raw, "endVertex"); ok {
+		return evalEndVertexFunction(arg, row, params)
+	}
+	if arg, ok := parseFunctionCall(raw, "endNode"); ok {
 		return evalEndVertexFunction(arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "date.truncate"); ok {

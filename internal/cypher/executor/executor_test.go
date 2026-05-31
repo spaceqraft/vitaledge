@@ -293,8 +293,18 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
 	}
-	if len(edgeCounts) == 0 {
-		t.Fatalf("expected non-empty edgeCounts")
+	if len(edgeCounts) != 0 {
+		t.Fatalf("expected scoped edgeCounts to be empty for node-only query, got %#v", edgeCounts)
+	}
+	totals, ok := influencers["totals"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers totals map, got %T", influencers["totals"])
+	}
+	if _, ok := totals["vertexes"].(int); !ok {
+		t.Fatalf("expected totals.vertexes int, got %#v", totals["vertexes"])
+	}
+	if _, ok := totals["edges"].(int); !ok {
+		t.Fatalf("expected totals.edges int, got %#v", totals["edges"])
 	}
 	predicateSignals, ok := influencers["predicateSignals"].([]map[string]any)
 	if !ok {
@@ -476,6 +486,701 @@ func TestExecuteExplainFastLabelHistogramPlan(t *testing.T) {
 	}
 	if !foundFastAggregate {
 		t.Fatalf("expected AGGREGATE vertex with implementation=fast_label_histogram, got vertexes %#v", vertexes)
+	}
+}
+
+func TestExecuteExplainDirectedRelationshipScopesInfluencersAndBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p3", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p1", DstID: "p2"},
+			{Tenant: "acme", ID: "e-rated-1", Type: "RATED", SrcID: "p1", DstID: "m1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)-[k:KNOWS]->(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
+	if !ok || len(vertexes) == 0 {
+		t.Fatalf("expected non-empty logicalPlan.vertexes, got %T len=%d", logicalPlan["vertexes"], len(vertexes))
+	}
+	if op, _ := vertexes[0]["op"].(string); op != "EDGE_SCAN" {
+		t.Fatalf("expected first op EDGE_SCAN, got %#v", vertexes[0]["op"])
+	}
+	if edgeType, _ := vertexes[0]["edgeType"].(string); edgeType != "KNOWS" {
+		t.Fatalf("expected edgeType KNOWS, got %#v", vertexes[0]["edgeType"])
+	}
+	if edgeVar, _ := vertexes[0]["edgeVar"].(string); edgeVar != "k" {
+		t.Fatalf("expected edgeVar k, got %#v", vertexes[0]["edgeVar"])
+	}
+
+	influencers, ok := explainPayload["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
+	}
+	vertexCounts, ok := influencers["vertexCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected vertexCounts []map[string]any, got %T", influencers["vertexCounts"])
+	}
+	if len(vertexCounts) != 1 || vertexCounts[0]["label"] != "Person" {
+		t.Fatalf("expected only Person vertex count, got %#v", vertexCounts)
+	}
+	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
+	}
+	if len(edgeCounts) != 1 || edgeCounts[0]["type"] != "KNOWS" {
+		t.Fatalf("expected only KNOWS edge count, got %#v", edgeCounts)
+	}
+	totals, ok := influencers["totals"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers totals map, got %T", influencers["totals"])
+	}
+	if verticesTotal, _ := totals["vertexes"].(int); verticesTotal != 4 {
+		t.Fatalf("expected totals.vertexes=4, got %#v", totals["vertexes"])
+	}
+	if edgesTotal, _ := totals["edges"].(int); edgesTotal != 2 {
+		t.Fatalf("expected totals.edges=2, got %#v", totals["edges"])
+	}
+
+	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+	if !ok || len(cardinality) == 0 {
+		t.Fatalf("expected cardinality entries, got %T", explainPayload["cardinality"])
+	}
+	if op, _ := cardinality[0]["op"].(string); op != "EDGE_SCAN" {
+		t.Fatalf("expected first cardinality op EDGE_SCAN, got %#v", cardinality[0]["op"])
+	}
+	bindings, ok := cardinality[0]["queryBindings"].([]string)
+	if !ok {
+		t.Fatalf("expected queryBindings []string, got %#v (%T)", cardinality[0]["queryBindings"], cardinality[0]["queryBindings"])
+	}
+	if !reflect.DeepEqual(bindings, []string{"p1", "k", "p2"}) {
+		t.Fatalf("unexpected queryBindings: %#v", bindings)
+	}
+
+	warnings, _ := explainPayload["warnings"].([]map[string]any)
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
+			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL warning: %#v", warnings)
+		}
+	}
+}
+
+func TestExecuteExplainReverseDirectedRelationshipScopesInfluencersAndBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p2", DstID: "p1"},
+			{Tenant: "acme", ID: "e-rated-1", Type: "RATED", SrcID: "u1", DstID: "p1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)<-[k:KNOWS]-(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
+	if !ok || len(vertexes) == 0 {
+		t.Fatalf("expected non-empty logicalPlan.vertexes, got %T len=%d", logicalPlan["vertexes"], len(vertexes))
+	}
+	if op, _ := vertexes[0]["op"].(string); op != "EDGE_SCAN" {
+		t.Fatalf("expected first op EDGE_SCAN, got %#v", vertexes[0]["op"])
+	}
+	if direction, _ := vertexes[0]["matchDirection"].(string); direction != "in" {
+		t.Fatalf("expected matchDirection in, got %#v", vertexes[0]["matchDirection"])
+	}
+	if edgeType, _ := vertexes[0]["edgeType"].(string); edgeType != "KNOWS" {
+		t.Fatalf("expected edgeType KNOWS, got %#v", vertexes[0]["edgeType"])
+	}
+
+	influencers, ok := explainPayload["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
+	}
+	vertexCounts, ok := influencers["vertexCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected vertexCounts []map[string]any, got %T", influencers["vertexCounts"])
+	}
+	if len(vertexCounts) != 1 || vertexCounts[0]["label"] != "Person" {
+		t.Fatalf("expected only Person vertex count, got %#v", vertexCounts)
+	}
+	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
+	}
+	if len(edgeCounts) != 1 || edgeCounts[0]["type"] != "KNOWS" {
+		t.Fatalf("expected only KNOWS edge count, got %#v", edgeCounts)
+	}
+
+	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+	if !ok || len(cardinality) == 0 {
+		t.Fatalf("expected cardinality entries, got %T", explainPayload["cardinality"])
+	}
+	binding, ok := cardinality[0]["queryBindings"].([]string)
+	if !ok {
+		t.Fatalf("expected queryBindings []string, got %#v (%T)", cardinality[0]["queryBindings"], cardinality[0]["queryBindings"])
+	}
+	if !reflect.DeepEqual(binding, []string{"p1", "k", "p2"}) {
+		t.Fatalf("unexpected queryBindings: %#v", binding)
+	}
+
+	warnings, _ := explainPayload["warnings"].([]map[string]any)
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
+			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL warning: %#v", warnings)
+		}
+	}
+}
+
+func TestExecuteExplainUndirectedRelationshipScopesInfluencersAndBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p1", DstID: "p2"},
+			{Tenant: "acme", ID: "e-acted-1", Type: "ACTED_IN", SrcID: "p1", DstID: "m1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)-[k:KNOWS]-(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
+	if !ok || len(vertexes) == 0 {
+		t.Fatalf("expected non-empty logicalPlan.vertexes, got %T len=%d", logicalPlan["vertexes"], len(vertexes))
+	}
+	if direction, _ := vertexes[0]["matchDirection"].(string); direction != "undirected" {
+		t.Fatalf("expected matchDirection undirected, got %#v", vertexes[0]["matchDirection"])
+	}
+
+	influencers, ok := explainPayload["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
+	}
+	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
+	}
+	if len(edgeCounts) != 1 || edgeCounts[0]["type"] != "KNOWS" {
+		t.Fatalf("expected only KNOWS edge count, got %#v", edgeCounts)
+	}
+
+	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+	if !ok || len(cardinality) == 0 {
+		t.Fatalf("expected cardinality entries, got %T", explainPayload["cardinality"])
+	}
+	binding, ok := cardinality[0]["queryBindings"].([]string)
+	if !ok {
+		t.Fatalf("expected queryBindings []string, got %#v (%T)", cardinality[0]["queryBindings"], cardinality[0]["queryBindings"])
+	}
+	if !reflect.DeepEqual(binding, []string{"p1", "k", "p2"}) {
+		t.Fatalf("unexpected queryBindings: %#v", binding)
+	}
+
+	warnings, _ := explainPayload["warnings"].([]map[string]any)
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
+			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL warning: %#v", warnings)
+		}
+	}
+}
+
+func TestExecuteExplainDirectedVariableLengthRelationshipScopesAndBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p3", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p1", DstID: "p2"},
+			{Tenant: "acme", ID: "e-knows-2", Type: "KNOWS", SrcID: "p2", DstID: "p3"},
+			{Tenant: "acme", ID: "e-rated-1", Type: "RATED", SrcID: "p1", DstID: "m1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)-[k:KNOWS*1..3]->(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
+	if !ok || len(vertexes) == 0 {
+		t.Fatalf("expected non-empty logicalPlan.vertexes, got %T len=%d", logicalPlan["vertexes"], len(vertexes))
+	}
+	if variableLength, _ := vertexes[0]["variableLength"].(bool); !variableLength {
+		t.Fatalf("expected variableLength=true on first scan vertex, got %#v", vertexes[0]["variableLength"])
+	}
+	if minHops, _ := vertexes[0]["minHops"].(int); minHops != 1 {
+		t.Fatalf("expected minHops=1, got %#v", vertexes[0]["minHops"])
+	}
+	if maxHops, _ := vertexes[0]["maxHops"].(int); maxHops != 3 {
+		t.Fatalf("expected maxHops=3, got %#v", vertexes[0]["maxHops"])
+	}
+
+	influencers, ok := explainPayload["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
+	}
+	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
+	}
+	if len(edgeCounts) != 1 || edgeCounts[0]["type"] != "KNOWS" {
+		t.Fatalf("expected only KNOWS edge count, got %#v", edgeCounts)
+	}
+
+	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+	if !ok || len(cardinality) == 0 {
+		t.Fatalf("expected cardinality entries, got %T", explainPayload["cardinality"])
+	}
+	binding, ok := cardinality[0]["queryBindings"].([]string)
+	if !ok {
+		t.Fatalf("expected queryBindings []string, got %#v (%T)", cardinality[0]["queryBindings"], cardinality[0]["queryBindings"])
+	}
+	if !reflect.DeepEqual(binding, []string{"p1", "k", "p2"}) {
+		t.Fatalf("unexpected queryBindings: %#v", binding)
+	}
+	if quality, _ := cardinality[0]["quality"].(string); quality != "estimate" {
+		t.Fatalf("expected variable-length cardinality quality estimate, got %#v", cardinality[0]["quality"])
+	}
+
+	warnings, _ := explainPayload["warnings"].([]map[string]any)
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
+			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL warning: %#v", warnings)
+		}
+	}
+}
+
+func TestExecuteExplainMixedRelationshipChainScopesAndBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "a1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "b1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "c1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "a1", DstID: "b1"},
+			{Tenant: "acme", ID: "e-knows-2", Type: "KNOWS", SrcID: "b1", DstID: "c1"},
+			{Tenant: "acme", ID: "e-acted-1", Type: "ACTED_IN", SrcID: "a1", DstID: "m1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (a:Person)-[r1:KNOWS*1..2]->(b:Person)-[r2:KNOWS]->(c:Person) RETURN a, r1, b, r2, c LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
+	if !ok || len(vertexes) < 3 {
+		t.Fatalf("expected logicalPlan.vertexes length >= 3, got %T len=%d", logicalPlan["vertexes"], len(vertexes))
+	}
+	for _, vertex := range vertexes {
+		if op, _ := vertex["op"].(string); op == "MATCH" || op == "OPTIONAL_MATCH" {
+			t.Fatalf("expected no fallback MATCH operators, got vertexes %#v", vertexes)
+		}
+	}
+
+	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+	if !ok || len(cardinality) < 2 {
+		t.Fatalf("expected at least two cardinality entries, got %T len=%d", explainPayload["cardinality"], len(cardinality))
+	}
+	firstBinding, ok := cardinality[0]["queryBindings"].([]string)
+	if !ok {
+		t.Fatalf("expected first queryBindings []string, got %#v (%T)", cardinality[0]["queryBindings"], cardinality[0]["queryBindings"])
+	}
+	if !reflect.DeepEqual(firstBinding, []string{"a", "r1", "b"}) {
+		t.Fatalf("unexpected first queryBindings: %#v", firstBinding)
+	}
+
+	influencers, ok := explainPayload["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
+	}
+	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
+	}
+	if len(edgeCounts) != 1 || edgeCounts[0]["type"] != "KNOWS" {
+		t.Fatalf("expected only KNOWS edge count, got %#v", edgeCounts)
+	}
+
+	warnings, _ := explainPayload["warnings"].([]map[string]any)
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
+			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL warning: %#v", warnings)
+		}
+	}
+}
+
+func TestExecuteExplainUndirectedVariableLengthRelationshipScopesAndBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p3", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p2", DstID: "p1"},
+			{Tenant: "acme", ID: "e-knows-2", Type: "KNOWS", SrcID: "p3", DstID: "p2"},
+			{Tenant: "acme", ID: "e-rated-1", Type: "RATED", SrcID: "p2", DstID: "m1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)-[k:KNOWS*1..3]-(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
+	if !ok || len(vertexes) == 0 {
+		t.Fatalf("expected non-empty logicalPlan.vertexes, got %T len=%d", logicalPlan["vertexes"], len(vertexes))
+	}
+	if direction, _ := vertexes[0]["matchDirection"].(string); direction != "undirected" {
+		t.Fatalf("expected matchDirection=undirected, got %#v", vertexes[0]["matchDirection"])
+	}
+	if variableLength, _ := vertexes[0]["variableLength"].(bool); !variableLength {
+		t.Fatalf("expected variableLength=true on first scan vertex, got %#v", vertexes[0]["variableLength"])
+	}
+
+	influencers, ok := explainPayload["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
+	}
+	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
+	}
+	if len(edgeCounts) != 1 || edgeCounts[0]["type"] != "KNOWS" {
+		t.Fatalf("expected only KNOWS edge count, got %#v", edgeCounts)
+	}
+
+	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+	if !ok || len(cardinality) == 0 {
+		t.Fatalf("expected cardinality entries, got %T", explainPayload["cardinality"])
+	}
+	binding, ok := cardinality[0]["queryBindings"].([]string)
+	if !ok {
+		t.Fatalf("expected queryBindings []string, got %#v (%T)", cardinality[0]["queryBindings"], cardinality[0]["queryBindings"])
+	}
+	if !reflect.DeepEqual(binding, []string{"p1", "k", "p2"}) {
+		t.Fatalf("unexpected queryBindings: %#v", binding)
+	}
+	if quality, _ := cardinality[0]["quality"].(string); quality != "estimate" {
+		t.Fatalf("expected variable-length cardinality quality estimate, got %#v", cardinality[0]["quality"])
+	}
+
+	warnings, _ := explainPayload["warnings"].([]map[string]any)
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
+			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL warning: %#v", warnings)
+		}
+	}
+}
+
+func TestExecuteExplainMixedRelationshipChainReverseSegmentBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "a1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "b1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "c1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "b1", DstID: "a1"},
+			{Tenant: "acme", ID: "e-knows-2", Type: "KNOWS", SrcID: "b1", DstID: "c1"},
+			{Tenant: "acme", ID: "e-acted-1", Type: "ACTED_IN", SrcID: "a1", DstID: "m1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (a:Person)<-[r1:KNOWS*1..2]-(b:Person)-[r2:KNOWS]->(c:Person) RETURN a, r1, b, r2, c LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
+	if !ok || len(vertexes) < 3 {
+		t.Fatalf("expected logicalPlan.vertexes length >= 3, got %T len=%d", logicalPlan["vertexes"], len(vertexes))
+	}
+	if direction, _ := vertexes[0]["matchDirection"].(string); direction != "in" {
+		t.Fatalf("expected first segment direction=in, got %#v", vertexes[0]["matchDirection"])
+	}
+	if direction, _ := vertexes[1]["matchDirection"].(string); direction != "out" {
+		t.Fatalf("expected second segment direction=out, got %#v", vertexes[1]["matchDirection"])
+	}
+
+	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
+	if !ok || len(cardinality) < 2 {
+		t.Fatalf("expected at least two cardinality entries, got %T len=%d", explainPayload["cardinality"], len(cardinality))
+	}
+	firstBinding, ok := cardinality[0]["queryBindings"].([]string)
+	if !ok {
+		t.Fatalf("expected first queryBindings []string, got %#v (%T)", cardinality[0]["queryBindings"], cardinality[0]["queryBindings"])
+	}
+	if !reflect.DeepEqual(firstBinding, []string{"a", "r1", "b"}) {
+		t.Fatalf("unexpected first queryBindings: %#v", firstBinding)
+	}
+	secondBinding, ok := cardinality[1]["queryBindings"].([]string)
+	if !ok {
+		t.Fatalf("expected second queryBindings []string, got %#v (%T)", cardinality[1]["queryBindings"], cardinality[1]["queryBindings"])
+	}
+	if !reflect.DeepEqual(secondBinding, []string{"b", "r2", "c"}) {
+		t.Fatalf("unexpected second queryBindings: %#v", secondBinding)
+	}
+
+	warnings, _ := explainPayload["warnings"].([]map[string]any)
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
+			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL warning: %#v", warnings)
+		}
 	}
 }
 
@@ -6296,7 +7001,7 @@ func TestExecuteRemainingFunctionSurfacePathAndRelationship(t *testing.T) {
 		t.Fatalf("execute seed failed: %v", err)
 	}
 
-	stmt, err = parser.ParseStatement("MATCH p=(a)-[r:REL]->(b) RETURN size(vertexes(p)) AS nn, size(relationships(p)) AS nr, length(p) AS l, startVertex(r).id AS s, endVertex(r).id AS e, sign(-5) AS sn, sign(0) AS sz, sign(4) AS sp, last([1,2,3]) AS lv, last([]) AS le")
+	stmt, err = parser.ParseStatement("MATCH p=(a)-[r:REL]->(b) RETURN size(nOdEs(p)) AS nn, size(relationships(p)) AS nr, length(p) AS l, startNode(r).id AS s, endNode(r).id AS e, sign(-5) AS sn, sign(0) AS sz, sign(4) AS sp, last([1,2,3]) AS lv, last([]) AS le")
 	if err != nil {
 		t.Fatalf("parse query failed: %v", err)
 	}

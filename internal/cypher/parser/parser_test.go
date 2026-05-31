@@ -843,7 +843,7 @@ func TestParseStatementAllowsPassAFunctionSurfaceInReturnProjection(t *testing.T
 }
 
 func TestParseStatementAllowsRemainingFunctionSurfaceInReturnProjection(t *testing.T) {
-	_, err := ParseStatement("MATCH p=(a)-[r]->(b) RETURN vertexes(p), relationships(p), length(p), startVertex(r).id, endVertex(r).id, last([1,2]), sign(1)")
+	_, err := ParseStatement("MATCH p=(a)-[r]->(b) RETURN vertexes(p), nOdEs(p), relationships(p), length(p), startVertex(r).id, startNode(r).id, endVertex(r).id, endNode(r).id, last([1,2]), sign(1)")
 	if err != nil {
 		t.Fatalf("ParseStatement() unexpected error: %v", err)
 	}

@@ -325,7 +325,12 @@ func (f *cypherTCKFeature) executingQuery(doc *godog.DocString) error {
 }
 
 func (f *cypherTCKFeature) executingControlQuery(doc *godog.DocString) error {
-	return f.executingQuery(doc)
+	before := f.beforeQueryCounts
+	after := f.afterQueryCounts
+	err := f.executingQuery(doc)
+	f.beforeQueryCounts = before
+	f.afterQueryCounts = after
+	return err
 }
 
 func (f *cypherTCKFeature) resultShouldBeEmpty() error {
@@ -390,7 +395,10 @@ func (f *cypherTCKFeature) sideEffectsShouldBe(table *godog.Table) error {
 		if len(row.Cells) < 2 {
 			return fmt.Errorf("side effect row must have two values")
 		}
-		key := strings.TrimSpace(row.Cells[0].Value)
+		key, err := normalizeSideEffectKey(strings.TrimSpace(row.Cells[0].Value))
+		if err != nil {
+			return err
+		}
 		count, err := strconv.Atoi(strings.TrimSpace(row.Cells[1].Value))
 		if err != nil {
 			return fmt.Errorf("invalid side effect count %q: %w", row.Cells[1].Value, err)
@@ -412,6 +420,23 @@ func (f *cypherTCKFeature) sideEffectsShouldBe(table *godog.Table) error {
 		}
 	}
 	return nil
+}
+
+func normalizeSideEffectKey(key string) (string, error) {
+	key = strings.TrimSpace(strings.ToLower(key))
+	switch key {
+	case "+nodes", "+vertices":
+		return "+vertexes", nil
+	case "-nodes", "-vertices":
+		return "-vertexes", nil
+	case "+labels", "-labels",
+		"+properties", "-properties",
+		"+relationships", "-relationships",
+		"+vertexes", "-vertexes":
+		return key, nil
+	default:
+		return "", fmt.Errorf("unsupported side effect key %q", key)
+	}
 }
 
 func (f *cypherTCKFeature) errorShouldBeRaised(category, phase, reason string) error {
@@ -890,6 +915,34 @@ func TestRenderTCKValuePreservesNewlinesAndTabs(t *testing.T) {
 	}
 	if got := renderTCKValue("Foo\tFoo"); got != "'Foo\tFoo'" {
 		t.Fatalf("renderTCKValue(tab) = %q, want %q", got, "'Foo\tFoo'")
+	}
+}
+
+func TestNormalizeSideEffectKey(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "+nodes", want: "+vertexes"},
+		{in: "-nodes", want: "-vertexes"},
+		{in: "+vertexes", want: "+vertexes"},
+		{in: "-vertexes", want: "-vertexes"},
+		{in: "+vertices", want: "+vertexes"},
+		{in: "-vertices", want: "-vertexes"},
+	}
+
+	for _, tc := range tests {
+		got, err := normalizeSideEffectKey(tc.in)
+		if err != nil {
+			t.Fatalf("normalizeSideEffectKey(%q) returned error: %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("normalizeSideEffectKey(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	if _, err := normalizeSideEffectKey("+foo"); err == nil {
+		t.Fatalf("expected normalizeSideEffectKey to reject unknown key")
 	}
 }
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -272,6 +274,63 @@ func TestOpenGraphStoreAcceptsConfiguredBatchLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected write under limit to succeed, got: %v", err)
 	}
+}
+
+func TestLoadConfigFromStartupParsesGoMemoryLimitFlag(t *testing.T) {
+	cfg, err := loadConfigFromStartupForTest(t, []string{"vitaledge-test", "-go-memory-limit-bytes", "1048576"})
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if got, want := cfg.GoMemoryLimitBytes, int64(1048576); got != want {
+		t.Fatalf("expected GoMemoryLimitBytes=%d, got %d", want, got)
+	}
+}
+
+func TestLoadConfigFromStartupParsesGoMemoryLimitEnv(t *testing.T) {
+	t.Setenv(goMemoryLimitBytesEnv, "2097152")
+
+	cfg, err := loadConfigFromStartupForTest(t, []string{"vitaledge-test"})
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if got, want := cfg.GoMemoryLimitBytes, int64(2097152); got != want {
+		t.Fatalf("expected GoMemoryLimitBytes=%d, got %d", want, got)
+	}
+}
+
+func TestLoadConfigFromStartupRejectsNegativeGoMemoryLimit(t *testing.T) {
+	t.Setenv(goMemoryLimitBytesEnv, "-1")
+
+	_, err := loadConfigFromStartupForTest(t, []string{"vitaledge-test"})
+	if err == nil {
+		t.Fatalf("expected negative go memory limit to fail")
+	}
+	if !strings.Contains(err.Error(), "go memory limit bytes must be >= 0") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func loadConfigFromStartupForTest(t *testing.T, args []string) (Config, error) {
+	t.Helper()
+
+	oldArgs := os.Args
+	oldCommandLine := flag.CommandLine
+
+	if len(args) == 0 {
+		args = []string{"vitaledge-test"}
+	}
+	os.Args = args
+
+	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	flag.CommandLine = fs
+
+	t.Cleanup(func() {
+		os.Args = oldArgs
+		flag.CommandLine = oldCommandLine
+	})
+
+	return loadConfigFromStartup()
 }
 
 func TestGRPCQueryServiceCreatePropertyIndex(t *testing.T) {

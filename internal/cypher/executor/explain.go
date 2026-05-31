@@ -27,12 +27,12 @@ type explainAnalysis struct {
 }
 
 type explainStoreStats struct {
-	vertices      map[string]*graph.Vertex
-	labelCounts   map[string]int
-	edgeCounts    map[string]int
-	vertexTotal   int
-	edgeTotal     int
-	snapshotFound bool
+	labelCounts        map[string]int
+	edgeCounts         map[string]int
+	patternMatchCounts map[string]int
+	vertexTotal        int
+	edgeTotal          int
+	snapshotFound      bool
 }
 
 type explainPatternRefs struct {
@@ -73,7 +73,7 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	tenant := tenantFromParams(params)
 	var stats explainStoreStats
 	if err := e.store.View(ctx, func(tx graph.Tx) error {
-		collected, err := collectExplainStoreStats(ctx, tx, tenant)
+		collected, err := collectExplainStoreStats(ctx, tx, tenant, stmt, params)
 		if err != nil {
 			return err
 		}
@@ -152,14 +152,18 @@ func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params
 	return payload
 }
 
-func collectExplainStoreStats(ctx context.Context, tx graph.Tx, tenant string) (explainStoreStats, error) {
+func collectExplainStoreStats(ctx context.Context, tx graph.Tx, tenant string, stmt ast.Statement, params Params) (explainStoreStats, error) {
 	stats := explainStoreStats{
-		vertices:    map[string]*graph.Vertex{},
-		labelCounts: map[string]int{},
-		edgeCounts:  map[string]int{},
+		labelCounts:        map[string]int{},
+		edgeCounts:         map[string]int{},
+		patternMatchCounts: map[string]int{},
 	}
 	if strings.TrimSpace(tenant) == "" {
 		return stats, nil
+	}
+	matchers := collectExplainVertexMatchers(stmt)
+	for _, matcher := range matchers {
+		stats.patternMatchCounts[matcher.key] = 0
 	}
 	hasSnapshotTotals := false
 	if snapshot, err := tx.GetStatsSnapshot(ctx, tenant); err == nil && snapshot != nil {
@@ -187,8 +191,11 @@ func collectExplainStoreStats(ctx context.Context, tx graph.Tx, tenant string) (
 		if v == nil {
 			return nil
 		}
-		clone := *v
-		stats.vertices[v.ID] = &clone
+		for _, matcher := range matchers {
+			if matchesExplainNodePattern(v, matcher.pattern, params) {
+				stats.patternMatchCounts[matcher.key]++
+			}
+		}
 		if !hasSnapshotTotals {
 			stats.vertexTotal++
 		}
@@ -698,6 +705,80 @@ func explainPropertyKeys(raw string) map[string]any {
 		out[key] = true
 	}
 	return out
+}
+
+type explainVertexMatcher struct {
+	key     string
+	pattern vertexPattern
+}
+
+func collectExplainVertexMatchers(stmt ast.Statement) []explainVertexMatcher {
+	out := make([]explainVertexMatcher, 0)
+	seen := map[string]struct{}{}
+	appendMatcher := func(pattern vertexPattern) {
+		key := explainPatternFingerprint(pattern)
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, explainVertexMatcher{key: key, pattern: pattern})
+	}
+	collectFromRaw := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		if pattern, ok := tryParseExplainNodePattern(raw); ok {
+			appendMatcher(pattern)
+		}
+		if anchored, ok := tryParseExplainAnchoredPattern(raw); ok {
+			appendMatcher(anchored.asNodePattern())
+		}
+	}
+
+	switch s := stmt.(type) {
+	case *ast.ExplainStatement:
+		return collectExplainVertexMatchers(s.Statement)
+	case *ast.MatchQueryStatement:
+		for _, match := range s.MatchClauses {
+			collectFromRaw(match.Pattern)
+		}
+	case *ast.QueryStatement:
+		for _, part := range s.Parts {
+			for _, clause := range part.Clauses {
+				patternRaw := strings.TrimSpace(clause.Raw)
+				if clause.Kind == ast.ClauseKindMatch {
+					patternRaw = strings.TrimSpace(stripCypherLineComments(stripLeadingClauseKeyword(clause.Raw, "MATCH")))
+				}
+				if clause.Kind == ast.ClauseKindOptionalMatch {
+					patternRaw = strings.TrimSpace(stripCypherLineComments(stripLeadingClauseKeyword(clause.Raw, "OPTIONAL MATCH")))
+				}
+				collectFromRaw(patternRaw)
+			}
+		}
+	}
+
+	return out
+}
+
+func explainPatternFingerprint(pattern vertexPattern) string {
+	props := strings.TrimSpace(pattern.PropertiesRaw)
+	if props == "" && len(pattern.AllOfLabels) == 0 && len(pattern.AnyOfLabels) == 0 && len(pattern.ExcludedLabels) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("all=")
+	b.WriteString(strings.Join(pattern.AllOfLabels, "\x1f"))
+	b.WriteString("|any=")
+	b.WriteString(strings.Join(pattern.AnyOfLabels, "\x1f"))
+	b.WriteString("|none=")
+	b.WriteString(strings.Join(pattern.ExcludedLabels, "\x1f"))
+	b.WriteString("|props=")
+	b.WriteString(props)
+	return b.String()
 }
 
 func explainScanPlanVertexes(vertexes []map[string]any) []explainScanPlanVertex {
@@ -2212,14 +2293,12 @@ func explainPatternExpression(pattern vertexPattern, params Params) (string, boo
 	return strings.Join(pairs, ","), true
 }
 
-func countMatchingVertices(stats explainStoreStats, pattern vertexPattern, params Params) int {
-	count := 0
-	for _, vertex := range stats.vertices {
-		if matchesExplainNodePattern(vertex, pattern, params) {
-			count++
-		}
+func countMatchingVertices(stats explainStoreStats, pattern vertexPattern, _ Params) int {
+	key := explainPatternFingerprint(pattern)
+	if key == "" {
+		return 0
 	}
-	return count
+	return stats.patternMatchCounts[key]
 }
 
 func countAnchoredRows(stats explainStoreStats, pattern anchoredOutPattern, params Params) int {

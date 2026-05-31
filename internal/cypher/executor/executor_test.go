@@ -129,7 +129,6 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
-
 	seedErr := store.Update(ctx, func(tx graph.Tx) error {
 		if err := tx.PutVertex(ctx, &graph.Vertex{
 			Tenant:     "acme",
@@ -385,6 +384,78 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	}
 	if quality, _ := cardinalityStats["quality"].(string); quality != "estimate" {
 		t.Fatalf("expected runtimeStats.cardinality quality estimate, got %#v", cardinalityStats["quality"])
+	}
+}
+
+func TestExecuteExplainLargeTenantKeepsExactPredicateSignals(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	const totalUsers = 2000
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < totalUsers; i++ {
+			name := fmt.Sprintf("user-%d", i)
+			if i == totalUsers/2 {
+				name = "target"
+			}
+			if err := tx.PutVertex(ctx, &graph.Vertex{
+				Tenant:     "acme",
+				ID:         fmt.Sprintf("u-%d", i),
+				Labels:     []string{"User"},
+				Properties: graph.PropertyMap{"name": []byte(name)},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:User {name: $name}) RETURN n.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "target"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	influencers, ok := explainPayload["influencers"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected influencers map, got %T", explainPayload["influencers"])
+	}
+	predicateSignals, ok := influencers["predicateSignals"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected predicateSignals []map[string]any, got %T", influencers["predicateSignals"])
+	}
+	if len(predicateSignals) == 0 {
+		t.Fatalf("expected non-empty predicateSignals")
+	}
+
+	foundExact := false
+	for _, signal := range predicateSignals {
+		expr, _ := signal["expression"].(string)
+		if !strings.Contains(expr, "name=target") {
+			continue
+		}
+		if got := signal["matchedCount"]; got != 1 {
+			t.Fatalf("expected matchedCount=1 for target predicate, got %#v", got)
+		}
+		if quality, _ := signal["quality"].(string); quality != "exact" {
+			t.Fatalf("expected exact quality, got %#v", signal["quality"])
+		}
+		foundExact = true
+	}
+	if !foundExact {
+		t.Fatalf("expected exact predicate signal for name=target, got %#v", predicateSignals)
 	}
 }
 

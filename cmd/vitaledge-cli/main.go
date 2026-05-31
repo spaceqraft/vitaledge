@@ -35,6 +35,8 @@ type cliConfig struct {
 	tenant         string
 	timeout        time.Duration
 	execute        string
+	explainVerbose bool
+	explainTerse   bool
 	maxColumnWidth int
 	loadMode       string
 	loadOps        int
@@ -70,6 +72,8 @@ func loadCLIConfig() cliConfig {
 	flag.StringVar(&cfg.tenant, "tenant", defaultTenant, "tenant for query execution")
 	flag.DurationVar(&cfg.timeout, "timeout", 5*time.Second, "request timeout")
 	flag.StringVar(&cfg.execute, "execute", "", "optional one-shot statement (non-interactive)")
+	flag.BoolVar(&cfg.explainVerbose, "explain-verbose", true, "include supporting decision data in EXPLAIN output")
+	flag.BoolVar(&cfg.explainTerse, "explain-terse", false, "render EXPLAIN in terse mode (execution path focused)")
 	flag.IntVar(&cfg.maxColumnWidth, "max-column-width", defaultMaxColumnWidth, "maximum width for rendered table columns")
 	flag.StringVar(&cfg.loadMode, "load-mode", "", "optional load generator mode: write|noop-write|read")
 	flag.IntVar(&cfg.loadOps, "load-ops", 1000, "number of load operations to execute")
@@ -80,10 +84,13 @@ func loadCLIConfig() cliConfig {
 	flag.IntVar(&cfg.loadReadMaxHop, "load-read-max-hop", 3, "maximum hop count for read load queries")
 	flag.IntVar(&cfg.loadReportEach, "load-report-each", 100, "emit progress every N load operations")
 	flag.StringVar(&cfg.purge, "purge", "", "optional one-shot purge: label expression (e.g. Movie|Genre|User or * for all)")
-	flag.IntVar(&cfg.purgeBatchSize, "purge-batch-size", 1000, "nodes deleted per batch during purge")
+	flag.IntVar(&cfg.purgeBatchSize, "purge-batch-size", 1000, "vertices deleted per batch during purge")
 	flag.Parse()
 	if cfg.maxColumnWidth < 3 {
 		cfg.maxColumnWidth = 3
+	}
+	if cfg.explainTerse {
+		cfg.explainVerbose = false
 	}
 	if cfg.loadOps < 1 {
 		cfg.loadOps = 1
@@ -232,7 +239,7 @@ func runStatement(parent context.Context, client v1.QueryServiceClient, cfg cliC
 	defer cancel()
 
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(boundQuery)), "EXPLAIN ") {
-		return runExplain(ctx, client, cfg.tenant, boundQuery, out)
+		return runExplain(ctx, client, cfg.tenant, boundQuery, cfg.explainVerbose, out)
 	}
 	return runExecute(ctx, client, cfg.tenant, boundQuery, cfg.maxColumnWidth, out, stderr)
 }
@@ -298,17 +305,17 @@ func nextLoadQuery(cfg cliConfig, mode string, opIndex int, rng *rand.Rand, stat
 		if opIndex%2 == 0 {
 			id := fmt.Sprintf("%s-write-%d", cfg.loadPrefix, opIndex/2)
 			state.createdIDs = append(state.createdIDs, id)
-			return fmt.Sprintf("CREATE (:SoakNode {id: %s, mode: 'write'})", quoteCypherString(id)), "create"
+			return fmt.Sprintf("CREATE (:SoakVertex {id: %s, mode: 'write'})", quoteCypherString(id)), "create"
 		}
 		id := ""
 		if len(state.createdIDs) > 0 {
 			id = state.createdIDs[0]
 			state.createdIDs = state.createdIDs[1:]
 		}
-		return fmt.Sprintf("MATCH (n:SoakNode {id: %s}) DETACH DELETE n", quoteCypherString(id)), "delete"
+		return fmt.Sprintf("MATCH (n:SoakVertex {id: %s}) DETACH DELETE n", quoteCypherString(id)), "delete"
 	case "noop-write":
 		id := fmt.Sprintf("%s-noop", cfg.loadPrefix)
-		return fmt.Sprintf("CREATE (:SoakNoopNode {id: %s, mode: 'noop-write'})", quoteCypherString(id)), "create"
+		return fmt.Sprintf("CREATE (:SoakNoopVertex {id: %s, mode: 'noop-write'})", quoteCypherString(id)), "create"
 	case "read":
 		hop := cfg.loadReadMinHop
 		if cfg.loadReadMaxHop > cfg.loadReadMinHop {
@@ -356,7 +363,7 @@ func executeCypher(ctx context.Context, client v1.QueryServiceClient, tenant str
 	return resp, nil
 }
 
-func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, out io.Writer) error {
+func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, verbose bool, out io.Writer) error {
 	resp, err := client.Explain(ctx, &v1.QueryRequest{
 		Tenant: tenant,
 		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: query}},
@@ -371,10 +378,9 @@ func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string
 	}
 
 	if len(resp.GetExplainJson()) > 0 {
-		var decoded any
+		var decoded map[string]any
 		if err := json.Unmarshal(resp.GetExplainJson(), &decoded); err == nil {
-			pretty, _ := json.MarshalIndent(decoded, "", "  ")
-			fmt.Fprintln(out, string(pretty))
+			renderExplainNarrative(out, decoded, verbose)
 		} else {
 			fmt.Fprintln(out, string(resp.GetExplainJson()))
 		}
@@ -383,6 +389,169 @@ func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string
 		fmt.Fprintf(out, "stats: rows=%d durationMs=%d\n", stats.GetRowsReturned(), stats.GetDurationMs())
 	}
 	return nil
+}
+
+func renderExplainNarrative(out io.Writer, explain map[string]any, verbose bool) {
+	if explain == nil {
+		return
+	}
+	fmt.Fprintln(out, "EXPLAIN")
+
+	if query, ok := explain["query"].(map[string]any); ok {
+		if text := asString(query["text"]); text != "" {
+			fmt.Fprintf(out, "Query: %s\n", text)
+		}
+	}
+
+	logicalPlan, _ := explain["logicalPlan"].(map[string]any)
+	vertexes := asMapSlice(logicalPlan["vertexes"])
+	if len(vertexes) > 0 {
+		fmt.Fprintln(out, "Execution path:")
+		for idx, vertex := range explainPlanPath(vertexes, asString(logicalPlan["rootVertexId"])) {
+			fmt.Fprintf(out, "%d. %s", idx+1, asString(vertex["op"]))
+			details := make([]string, 0, 3)
+			if accessPath := asString(vertex["accessPath"]); accessPath != "" {
+				details = append(details, "accessPath="+accessPath)
+			}
+			if impl := asString(vertex["implementation"]); impl != "" {
+				details = append(details, "implementation="+impl)
+			}
+			if predicate := asString(vertex["predicate"]); predicate != "" {
+				details = append(details, "predicate="+predicate)
+			}
+			if len(details) > 0 {
+				fmt.Fprintf(out, " (%s)", strings.Join(details, ", "))
+			}
+			fmt.Fprintln(out)
+		}
+	}
+
+	if verbose {
+		if influencers, ok := explain["influencers"].(map[string]any); ok {
+			if statsSnapshot, ok := influencers["statsSnapshot"].(map[string]any); ok {
+				fmt.Fprintln(out, "Statistics snapshot:")
+				if source := asString(statsSnapshot["source"]); source != "" {
+					fmt.Fprintf(out, "- source: %s\n", source)
+				}
+				if completeness := asString(statsSnapshot["completeness"]); completeness != "" {
+					fmt.Fprintf(out, "- completeness: %s\n", completeness)
+				}
+				if backfillStatus := asString(statsSnapshot["backfillStatus"]); backfillStatus != "" {
+					fmt.Fprintf(out, "- backfillStatus: %s\n", backfillStatus)
+				}
+				if required, ok := statsSnapshot["backfillRequired"].(bool); ok {
+					fmt.Fprintf(out, "- backfillRequired: %t\n", required)
+				}
+			}
+		}
+
+		warnings := asMapSlice(explain["warnings"])
+		if len(warnings) > 0 {
+			fmt.Fprintln(out, "Warnings:")
+			for _, warning := range warnings {
+				code := asString(warning["code"])
+				message := asString(warning["message"])
+				if code == "" {
+					fmt.Fprintf(out, "- %s\n", message)
+					continue
+				}
+				fmt.Fprintf(out, "- [%s] %s\n", code, message)
+			}
+		}
+	}
+}
+
+func explainPlanPath(vertexes []map[string]any, rootVertexID string) []map[string]any {
+	if len(vertexes) == 0 {
+		return nil
+	}
+	byID := make(map[string]map[string]any, len(vertexes))
+	for _, vertex := range vertexes {
+		id := asString(vertex["id"])
+		if id != "" {
+			byID[id] = vertex
+		}
+	}
+	if rootVertexID == "" {
+		rootVertexID = asString(vertexes[len(vertexes)-1]["id"])
+	}
+	path := make([]map[string]any, 0, len(vertexes))
+	currentID := rootVertexID
+	visited := map[string]struct{}{}
+	for currentID != "" {
+		if _, seen := visited[currentID]; seen {
+			break
+		}
+		visited[currentID] = struct{}{}
+		vertex, ok := byID[currentID]
+		if !ok {
+			break
+		}
+		path = append(path, vertex)
+		children := asStringSlice(vertex["children"])
+		if len(children) == 0 {
+			break
+		}
+		currentID = children[0]
+	}
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
+	}
+	if len(path) > 0 {
+		return path
+	}
+	return vertexes
+}
+
+func asMapSlice(value any) []map[string]any {
+	switch v := value.(type) {
+	case []map[string]any:
+		return v
+	case []any:
+		out := make([]map[string]any, 0, len(v))
+		for _, item := range v {
+			if m, ok := item.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func asStringSlice(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		return v
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if str := asString(item); str != "" {
+				out = append(out, str)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func asString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	default:
+		return ""
+	}
 }
 
 func handleCLICommand(line string, state *cliState, out io.Writer) (bool, error) {
@@ -1003,8 +1172,8 @@ func formatProtoValue(value *v1.Value) string {
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	case *v1.Value_MapValue:
-		if node, ok := formatProtoNode(kind.MapValue.GetValues()); ok {
-			return node
+		if vertex, ok := formatProtoVertex(kind.MapValue.GetValues()); ok {
+			return vertex
 		}
 		if edge, ok := formatProtoEdge(kind.MapValue.GetValues()); ok {
 			return edge
@@ -1039,22 +1208,22 @@ func formatProtoPath(values map[string]*v1.Value) (string, bool) {
 		return "", false
 	}
 
-	nodesVal := values["nodes"]
+	vertexesVal := values["vertexes"]
 	edgesVal := values["edges"]
 	dirsVal := values["directions"]
 
-	var nodeStrs []string
-	if nodesVal != nil {
-		if lv, ok := nodesVal.GetKind().(*v1.Value_ListValue); ok {
+	var vertexStrs []string
+	if vertexesVal != nil {
+		if lv, ok := vertexesVal.GetKind().(*v1.Value_ListValue); ok {
 			for _, item := range lv.ListValue.GetValues() {
 				if mv, ok := item.GetKind().(*v1.Value_MapValue); ok {
-					if s, ok := formatProtoNode(mv.MapValue.GetValues()); ok {
-						nodeStrs = append(nodeStrs, s)
+					if s, ok := formatProtoVertex(mv.MapValue.GetValues()); ok {
+						vertexStrs = append(vertexStrs, s)
 					} else {
-						nodeStrs = append(nodeStrs, "()")
+						vertexStrs = append(vertexStrs, "()")
 					}
 				} else {
-					nodeStrs = append(nodeStrs, "()")
+					vertexStrs = append(vertexStrs, "()")
 				}
 			}
 		}
@@ -1082,20 +1251,20 @@ func formatProtoPath(values map[string]*v1.Value) (string, bool) {
 		dirs = protoValueToStringList(dirsVal)
 	}
 
-	if len(nodeStrs) == 0 {
+	if len(vertexStrs) == 0 {
 		return "", false
 	}
 
 	var b strings.Builder
-	b.WriteString(nodeStrs[0])
+	b.WriteString(vertexStrs[0])
 	for i, edgeStr := range edgeStrs {
 		dir := "forward"
 		if i < len(dirs) {
 			dir = dirs[i]
 		}
-		nextNode := "()"
-		if i+1 < len(nodeStrs) {
-			nextNode = nodeStrs[i+1]
+		nextVertex := "()"
+		if i+1 < len(vertexStrs) {
+			nextVertex = vertexStrs[i+1]
 		}
 		switch dir {
 		case "reverse":
@@ -1111,13 +1280,13 @@ func formatProtoPath(values map[string]*v1.Value) (string, bool) {
 			b.WriteString(edgeStr)
 			b.WriteString("->")
 		}
-		b.WriteString(nextNode)
+		b.WriteString(nextVertex)
 	}
 
 	return b.String(), true
 }
 
-func formatProtoNode(values map[string]*v1.Value) (string, bool) {
+func formatProtoVertex(values map[string]*v1.Value) (string, bool) {
 	if values == nil {
 		return "", false
 	}
@@ -1331,7 +1500,7 @@ func max(a, b int) int {
 
 // parsePurgeArgs parses a ":purge <labelExpr> [<batchSize>]" command line.
 // labelExpr may be a pipe-separated list of Cypher labels (e.g. "Movie|Genre|User")
-// or "*" to match all nodes.  An optional trailing integer overrides the batch size.
+// or "*" to match all vertices.  An optional trailing integer overrides the batch size.
 // Returns (labelExpr, batchSizeOverride, error).  batchSizeOverride is 0 when absent.
 func parsePurgeArgs(line string) (string, int, error) {
 	rest := strings.TrimSpace(line)
@@ -1364,7 +1533,7 @@ func parsePurgeArgs(line string) (string, int, error) {
 	return labelExpr, batchOverride, nil
 }
 
-// validatePurgeLabelExpr ensures the label expression is either "*" (all nodes)
+// validatePurgeLabelExpr ensures the label expression is either "*" (all vertices)
 // or a pipe-separated list of valid Cypher identifiers.
 func validatePurgeLabelExpr(expr string) error {
 	if expr == "*" {
@@ -1402,8 +1571,8 @@ func isValidCypherIdentifier(s string) bool {
 	return true
 }
 
-// runPurge deletes all nodes matching labelExpr in batches, reporting progress
-// after each batch.  It uses countQuery round-trips to determine when all nodes
+// runPurge deletes all vertices matching labelExpr in batches, reporting progress
+// after each batch.  It uses countQuery round-trips to determine when all vertices
 // have been removed, so it always terminates correctly regardless of whether
 // concurrent writers are active.
 func runPurge(parent context.Context, client v1.QueryServiceClient, cfg cliConfig, labelExpr string, batchSize int, out io.Writer, stderr io.Writer) error {
@@ -1420,7 +1589,7 @@ func runPurge(parent context.Context, client v1.QueryServiceClient, cfg cliConfi
 	countQuery := matchClause + " RETURN count(n) AS remaining"
 	deleteQuery := matchClause + fmt.Sprintf(" WITH n LIMIT %d DETACH DELETE n", batchSize)
 
-	countNodes := func() (int64, error) {
+	countVertexes := func() (int64, error) {
 		ctx, cancel := context.WithTimeout(parent, cfg.timeout)
 		defer cancel()
 		resp, err := executeCypher(ctx, client, cfg.tenant, countQuery)
@@ -1439,7 +1608,7 @@ func runPurge(parent context.Context, client v1.QueryServiceClient, cfg cliConfi
 		return 0, nil
 	}
 
-	initial, err := countNodes()
+	initial, err := countVertexes()
 	if err != nil {
 		return err
 	}
@@ -1463,7 +1632,7 @@ func runPurge(parent context.Context, client v1.QueryServiceClient, cfg cliConfi
 		}
 		batch++
 
-		remaining, err := countNodes()
+		remaining, err := countVertexes()
 		if err != nil {
 			return fmt.Errorf("purge count after batch %d failed: %w", batch, err)
 		}

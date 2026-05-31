@@ -13,7 +13,7 @@ func TestLimitParamWithAggregateOrderBy(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
 
-	// seed: Host nodes connected to Flow nodes
+	// seed: Host vertexes connected to Flow vertexes
 	setup := []string{
 		"CREATE (src:Host {ip: '10.0.0.1'})-[:SENT]->(f:Flow {threat_score: '1.5', detected_malicious: 'true'})",
 		"CREATE (src:Host {ip: '10.0.0.1'})-[:SENT]->(f:Flow {threat_score: '1.2', detected_malicious: 'true'})",

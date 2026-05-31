@@ -211,13 +211,13 @@ func (e *Executor) resolveBuiltinProcedure(name string) (resolvedProcedure, bool
 			},
 			handler: e.builtinEdgeCountProcedure,
 		}, true
-	case "db.stats.nodecount":
+	case "db.stats.vertexcount":
 		return resolvedProcedure{
 			decl: ProcedureDecl{
-				Name:    "db.stats.nodeCount",
-				Outputs: []ProcedureArg{{Name: "nodeCount", Type: "INTEGER", Nullable: false}},
+				Name:    "db.stats.vertexCount",
+				Outputs: []ProcedureArg{{Name: "vertexCount", Type: "INTEGER", Nullable: false}},
 			},
-			handler: e.builtinNodeCountProcedure,
+			handler: e.builtinVertexCountProcedure,
 		}, true
 	default:
 		return resolvedProcedure{}, false
@@ -333,7 +333,7 @@ func (e *Executor) builtinEdgeCountProcedure(ctx context.Context, args []any, pa
 	return []Row{{"edgeCount": len(edgeIDs)}}, nil
 }
 
-func (e *Executor) builtinNodeCountProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+func (e *Executor) builtinVertexCountProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
 	if e == nil || e.store == nil {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "executor requires a graph store", nil)
 	}
@@ -358,7 +358,7 @@ func (e *Executor) builtinNodeCountProcedure(ctx context.Context, args []any, pa
 			return nil
 		})
 		if err == nil {
-			return []Row{{"nodeCount": vertexTotal}}, nil
+			return []Row{{"vertexCount": vertexTotal}}, nil
 		}
 		if !graph.IsKind(err, graph.ErrKindNotFound) {
 			return nil, err
@@ -374,7 +374,7 @@ func (e *Executor) builtinNodeCountProcedure(ctx context.Context, args []any, pa
 			return nil
 		})
 		if err == nil {
-			return []Row{{"nodeCount": labelTotal}}, nil
+			return []Row{{"vertexCount": labelTotal}}, nil
 		}
 		if !graph.IsKind(err, graph.ErrKindNotFound) {
 			return nil, err
@@ -398,7 +398,7 @@ func (e *Executor) builtinNodeCountProcedure(ctx context.Context, args []any, pa
 		return nil, err
 	}
 
-	return []Row{{"nodeCount": count}}, nil
+	return []Row{{"vertexCount": count}}, nil
 }
 
 func parseOptionalLabelArg(args []any) (string, error) {

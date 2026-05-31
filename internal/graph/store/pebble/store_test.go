@@ -728,7 +728,7 @@ func TestConcurrentEdgeMutationStressSameIDPool(t *testing.T) {
 		workers        = 12
 		opsPerWorker   = 120
 		edgeIDPool     = 16
-		nodeIDPool     = 10
+		vertexIDPool   = 10
 		relTypeVariety = 4
 	)
 
@@ -741,8 +741,8 @@ func TestConcurrentEdgeMutationStressSameIDPool(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < opsPerWorker; i++ {
 				edgeID := fmt.Sprintf("e-%02d", (worker+i)%edgeIDPool)
-				srcID := fmt.Sprintf("u-%02d", (worker+(i*3))%nodeIDPool)
-				dstID := fmt.Sprintf("g-%02d", (worker+(i*5))%nodeIDPool)
+				srcID := fmt.Sprintf("u-%02d", (worker+(i*3))%vertexIDPool)
+				dstID := fmt.Sprintf("g-%02d", (worker+(i*5))%vertexIDPool)
 				typeName := fmt.Sprintf("REL_%d", (worker+i)%relTypeVariety)
 
 				if (worker+i)%3 == 0 {
@@ -794,7 +794,7 @@ func TestConcurrentEdgeMutationWithReadersStress(t *testing.T) {
 		readerWorkers  = 6
 		opsPerWriter   = 100
 		edgeIDPool     = 20
-		nodeIDPool     = 12
+		vertexIDPool   = 12
 		relTypeVariety = 3
 	)
 
@@ -807,8 +807,8 @@ func TestConcurrentEdgeMutationWithReadersStress(t *testing.T) {
 			defer writers.Done()
 			for i := 0; i < opsPerWriter; i++ {
 				edgeID := fmt.Sprintf("e-rw-%02d", (worker+i)%edgeIDPool)
-				srcID := fmt.Sprintf("ru-%02d", (worker+i)%nodeIDPool)
-				dstID := fmt.Sprintf("rg-%02d", (worker+(i*7))%nodeIDPool)
+				srcID := fmt.Sprintf("ru-%02d", (worker+i)%vertexIDPool)
+				dstID := fmt.Sprintf("rg-%02d", (worker+(i*7))%vertexIDPool)
 				typeName := fmt.Sprintf("RW_%d", (worker+i)%relTypeVariety)
 
 				if (worker+i)%4 == 0 {
@@ -846,9 +846,9 @@ func TestConcurrentEdgeMutationWithReadersStress(t *testing.T) {
 		go func(reader int) {
 			defer readers.Done()
 			for i := 0; i < 120; i++ {
-				node := fmt.Sprintf("ru-%02d", (reader+i)%nodeIDPool)
+				vertexID := fmt.Sprintf("ru-%02d", (reader+i)%vertexIDPool)
 				err := store.View(ctx, func(tx graph.Tx) error {
-					return tx.ScanOutEdges(ctx, "acme", node, "", 25, func(edge *graph.Edge) error {
+					return tx.ScanOutEdges(ctx, "acme", vertexID, "", 25, func(edge *graph.Edge) error {
 						if edge == nil {
 							return errors.New("nil edge observed during scan")
 						}
@@ -987,7 +987,7 @@ func BenchmarkEdgeMutationHighContentionParallel(b *testing.B) {
 
 	const (
 		edgeIDPool = 16
-		nodePool   = 64
+		vertexPool = 64
 	)
 
 	b.ReportAllocs()
@@ -1001,8 +1001,8 @@ func BenchmarkEdgeMutationHighContentionParallel(b *testing.B) {
 		for pb.Next() {
 			n := seq.Add(1) - 1
 			edgeID := fmt.Sprintf("e-hot-%02d", n%edgeIDPool)
-			srcID := fmt.Sprintf("u-hot-%02d", n%nodePool)
-			dstID := fmt.Sprintf("g-hot-%02d", (n*5)%nodePool)
+			srcID := fmt.Sprintf("u-hot-%02d", n%vertexPool)
+			dstID := fmt.Sprintf("g-hot-%02d", (n*5)%vertexPool)
 			typeName := fmt.Sprintf("HOT_%d", n%4)
 
 			if n%4 == 0 {
@@ -1055,13 +1055,13 @@ func BenchmarkEdgeMutationMixedReadWriteParallel(b *testing.B) {
 	const (
 		seedEdges  = 256
 		edgeIDPool = 64
-		nodePool   = 64
+		vertexPool = 64
 	)
 
 	for i := 0; i < seedEdges; i++ {
 		edgeID := fmt.Sprintf("e-seed-%03d", i)
-		srcID := fmt.Sprintf("u-seed-%02d", i%nodePool)
-		dstID := fmt.Sprintf("g-seed-%02d", (i*3)%nodePool)
+		srcID := fmt.Sprintf("u-seed-%02d", i%vertexPool)
+		dstID := fmt.Sprintf("g-seed-%02d", (i*3)%vertexPool)
 		err := store.Update(ctx, func(tx graph.Tx) error {
 			return tx.PutEdge(ctx, &graph.Edge{
 				Tenant: "acme",
@@ -1087,9 +1087,9 @@ func BenchmarkEdgeMutationMixedReadWriteParallel(b *testing.B) {
 		for pb.Next() {
 			n := seq.Add(1) - 1
 			if n%5 == 0 {
-				nodeID := fmt.Sprintf("u-seed-%02d", n%nodePool)
+				vertexID := fmt.Sprintf("u-seed-%02d", n%vertexPool)
 				err := store.View(ctx, func(tx graph.Tx) error {
-					return tx.ScanOutEdges(ctx, "acme", nodeID, "", 20, func(edge *graph.Edge) error {
+					return tx.ScanOutEdges(ctx, "acme", vertexID, "", 20, func(edge *graph.Edge) error {
 						if edge == nil {
 							return errors.New("nil edge observed")
 						}
@@ -1108,8 +1108,8 @@ func BenchmarkEdgeMutationMixedReadWriteParallel(b *testing.B) {
 			}
 
 			edgeID := fmt.Sprintf("e-mix-%02d", n%edgeIDPool)
-			srcID := fmt.Sprintf("u-seed-%02d", n%nodePool)
-			dstID := fmt.Sprintf("g-seed-%02d", (n*11)%nodePool)
+			srcID := fmt.Sprintf("u-seed-%02d", n%vertexPool)
+			dstID := fmt.Sprintf("g-seed-%02d", (n*11)%vertexPool)
 			typeName := fmt.Sprintf("MIX_%d", n%6)
 			err := store.Update(ctx, func(tx graph.Tx) error {
 				return tx.PutEdge(ctx, &graph.Edge{

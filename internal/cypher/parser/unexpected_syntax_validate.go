@@ -50,7 +50,7 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"degrees":                     {},
 	"e":                           {},
 	"elementid":                   {},
-	"endnode":                     {},
+	"endvertex":                   {},
 	"exp":                         {},
 	"exists":                      {},
 	"floor":                       {},
@@ -83,7 +83,7 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"max":                         {},
 	"min":                         {},
 	"none":                        {},
-	"nodes":                       {},
+	"vertexes":                    {},
 	"nullif":                      {},
 	"path_length":                 {},
 	"pi":                          {},
@@ -110,7 +110,7 @@ var supportedExpressionFunctions = map[string]struct{}{
 	"sign":                        {},
 	"single":                      {},
 	"size":                        {},
-	"startnode":                   {},
+	"startvertex":                 {},
 	"split":                       {},
 	"sqrt":                        {},
 	"substring":                   {},
@@ -2717,7 +2717,7 @@ func isInvalidLengthArgumentExpression(expr string, bound map[string]patternVarR
 	if !exists {
 		return false
 	}
-	return role == patternRoleNode || role == patternRoleRel || role == patternRoleValue
+	return role == patternRoleVertex || role == patternRoleRel || role == patternRoleValue
 }
 
 func isInvalidSizeArgumentExpression(expr string, bound map[string]patternVarRole) bool {
@@ -2729,7 +2729,7 @@ func isInvalidSizeArgumentExpression(expr string, bound map[string]patternVarRol
 	if !exists {
 		return false
 	}
-	return role == patternRoleNode || role == patternRolePath
+	return role == patternRoleVertex || role == patternRolePath
 }
 
 func isInvalidTypeArgumentExpression(expr string, bound map[string]patternVarRole) bool {
@@ -2741,7 +2741,7 @@ func isInvalidTypeArgumentExpression(expr string, bound map[string]patternVarRol
 	if !exists {
 		return false
 	}
-	return role == patternRoleNode || role == patternRolePath || role == patternRoleValue
+	return role == patternRoleVertex || role == patternRolePath || role == patternRoleValue
 }
 
 func isInvalidLabelsArgumentExpression(expr string, bound map[string]patternVarRole) bool {

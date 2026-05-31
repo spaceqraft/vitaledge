@@ -117,14 +117,14 @@ EXPLAIN MATCH (n:Person {name: $name}) RETURN DISTINCT n.name AS name ORDER BY n
 What to look at:
 
 - `query.options`: captures projection modifiers such as `distinct`, `orderBy`, `skip`, and `limit`.
-- `influencers.nodeCounts`: shows label counts observed in the current graph snapshot.
+- `influencers.vertexCounts`: shows label counts observed in the current graph snapshot.
 - `influencers.edgeCounts`: shows edge-type counts that may affect traversal choices.
 - `influencers.predicateSignals`: highlights predicate clauses and the number of matching rows or vertices.
 - `indexDecisions`: reports candidate indexes, whether one was selected, chosen access path, estimated scan savings/selectivity, and recommendation (`keep-index`, `create-index`, or `consider-index`).
-- `cardinality`: shows per-plan-node row estimates and their quality (`exact`, `estimate`, or `sample`).
+- `cardinality`: shows per-plan-vertex row estimates and their quality (`exact`, `estimate`, or `sample`).
 - `warnings`: emits fallback diagnostics (for example missing index, full-scan fallback, and estimate-only tuning signals) to highlight when planning signals are partial.
 - `influencers.statsSnapshot`: reports statistics source and coverage completeness, including backfill readiness fields:
-	- `coverage.totals`, `coverage.nodeCounts`, `coverage.edgeCounts`
+	- `coverage.totals`, `coverage.vertexCounts`, `coverage.edgeCounts`
 	- `completeness` (`complete`, `partial`, `missing`)
 	- `backfillStatus` (`complete`, `required`)
 	- `backfillRequired` (`true`, `false`)
@@ -132,10 +132,10 @@ What to look at:
 Backfill guidance:
 
 - If `backfillRequired=true`, treat planner influencer counts as not fully trusted for manual tuning decisions.
-- `coverage.totals=snapshot` with `coverage.nodeCounts=incomplete` or `coverage.edgeCounts=incomplete` indicates partial historical stats population.
+- `coverage.totals=snapshot` with `coverage.vertexCounts=incomplete` or `coverage.edgeCounts=incomplete` indicates partial historical stats population.
 - A healthy steady-state signal is:
 	- `coverage.totals=snapshot`
-	- `coverage.nodeCounts=snapshot`
+	- `coverage.vertexCounts=snapshot`
 	- `coverage.edgeCounts=snapshot`
 	- `completeness=complete`
 	- `backfillRequired=false`
@@ -151,7 +151,7 @@ Warning codes currently emitted:
 
 - `WRITE_QUERY_DRY_RUN`: write clauses were detected but EXPLAIN performed no mutations.
 - `MISSING_TENANT_CONTEXT`: tenant was not supplied, so influencer stats are from an empty snapshot.
-- `FULL_SCAN_FALLBACK`: planner selected an all-nodes scan access path.
+- `FULL_SCAN_FALLBACK`: planner selected an all-vertices scan access path.
 - `MISSING_PROPERTY_INDEX`: a property predicate has no selected property index.
 - `ESTIMATE_ONLY_INDEX_SIGNAL`: index recommendation is based on estimate-quality signals (for example unbound parameters).
 - `PLAN_ANALYSIS_PARTIAL`: catch-all fallback when no more specific diagnostics apply.
@@ -280,7 +280,7 @@ After adding property index (`Person.email`) and re-running EXPLAIN:
 
 - `indexDecisions[*].selected=true`
 - `indexDecisions[*].recommendation=keep-index`
-- scan node `accessPath=property_index`
+- scan vertex `accessPath=property_index`
 - `runtimeStats.index.selected` increases and `runtimeStats.index.missing` drops
 - `costEstimate.value` drops sharply on the same graph snapshot
 
@@ -364,9 +364,9 @@ Execution behavior:
 	- column width is computed from the column header and scanned row values,
 	- width is capped by `--max-column-width` (default `80`).
 - Returned graph values use Cypher-like rendering:
-	- nodes: `(id:Label {"k":"v"})` (auto-generated ids suppressed, first label shown),
+	- vertexes: `(id:Label {"k":"v"})` (auto-generated ids suppressed, first label shown),
 	- edges: `[id:TYPE {"k":"v"}]` (internal auto-generated composite ids suppressed),
-	- paths: node/edge chains with directionality (`->`, `<-`).
+	- paths: vertex/edge chains with directionality (`->`, `<-`).
 - Each request prints execution stats (`rows`, `durationMs`).
 
 Common CLI flags:
@@ -380,7 +380,7 @@ Common CLI flags:
 Soak/load modes (deterministic, configurable, and suitable for running multiple CLI processes):
 
 - `--load-mode write`: alternates `CREATE` and `DETACH DELETE` with locally tracked ids (equal create/delete counts).
-- `--load-mode noop-write`: repeatedly `CREATE`s the same node id.
+- `--load-mode noop-write`: repeatedly `CREATE`s the same vertex id.
 - `--load-mode read`: repeatedly runs `MATCH p=(a)-[*N]-(b) RETURN p LIMIT <k>` with deterministic hop selection.
 
 Load flags:

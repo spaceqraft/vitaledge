@@ -7,15 +7,15 @@ import (
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 )
 
-var standaloneNodePatternWhereRE = regexp.MustCompile(`^\(\s*(?:[A-Za-z_][A-Za-z0-9_]*)?\s*(?::!?[A-Za-z_][A-Za-z0-9_]*(?:\s*(?::|\|:?)\s*!?[A-Za-z_][A-Za-z0-9_]*)*)?\s*(?:\{[^{}]*\})?\s*\)$`)
+var standaloneVertexPatternWhereRE = regexp.MustCompile(`^\(\s*(?:[A-Za-z_][A-Za-z0-9_]*)?\s*(?::!?[A-Za-z_][A-Za-z0-9_]*(?:\s*(?::|\|:?)\s*!?[A-Za-z_][A-Za-z0-9_]*)*)?\s*(?:\{[^{}]*\})?\s*\)$`)
 
 type patternVarRole string
 
 const (
-	patternRoleValue patternVarRole = "value"
-	patternRoleNode  patternVarRole = "node"
-	patternRoleRel   patternVarRole = "relationship"
-	patternRolePath  patternVarRole = "path"
+	patternRoleValue  patternVarRole = "value"
+	patternRoleVertex patternVarRole = "vertex"
+	patternRoleRel    patternVarRole = "relationship"
+	patternRolePath   patternVarRole = "path"
 )
 
 type patternBinding struct {
@@ -99,15 +99,15 @@ func validatePatternBindings(pattern string, bound map[string]patternVarRole, se
 			seenRelationshipInPattern[b.name] = struct{}{}
 		}
 		if prev, ok := bound[b.name]; ok {
-			if clauseKind == ast.ClauseKindCreate && prev == patternRoleValue && (b.role == patternRoleNode || b.role == patternRoleRel) {
-				// CREATE can bind previously projected values as node/relationship entities.
+			if clauseKind == ast.ClauseKindCreate && prev == patternRoleValue && (b.role == patternRoleVertex || b.role == patternRoleRel) {
+				// CREATE can bind previously projected values as vertex/relationship entities.
 				bound[b.name] = b.role
 				if clauseIntroduced != nil {
 					clauseIntroduced[b.name] = struct{}{}
 				}
 				continue
 			}
-			if clauseKind == ast.ClauseKindOptionalMatch && prev == patternRoleValue && (b.role == patternRoleNode || b.role == patternRoleRel || b.role == patternRolePath) {
+			if clauseKind == ast.ClauseKindOptionalMatch && prev == patternRoleValue && (b.role == patternRoleVertex || b.role == patternRoleRel || b.role == patternRolePath) {
 				continue
 			}
 			if prev == patternRoleValue && b.role == patternRoleRel && isVariableLengthRelationshipBinding(pattern, b.name) {
@@ -140,7 +140,7 @@ func validatePatternBindings(pattern string, bound map[string]patternVarRole, se
 func shouldRejectSameRoleRebinding(clauseKind ast.ClauseKind, b patternBinding, seenInClause bool, patternHasRelationship bool) bool {
 	switch clauseKind {
 	case ast.ClauseKindCreate:
-		if b.role == patternRoleNode {
+		if b.role == patternRoleVertex {
 			if b.constrained {
 				return true
 			}
@@ -154,7 +154,7 @@ func shouldRejectSameRoleRebinding(clauseKind ast.ClauseKind, b patternBinding, 
 		if b.role == patternRoleRel || b.role == patternRolePath {
 			return true
 		}
-		if b.role == patternRoleNode {
+		if b.role == patternRoleVertex {
 			if b.constrained {
 				return true
 			}
@@ -595,7 +595,7 @@ func validateWherePatternBindings(whereRaw string, bound map[string]patternVarRo
 		}
 		return &ParseError{Kind: ParseErrorUnsupported, Message: "undefined variable", Statement: seg.index}
 	}
-	if isStandaloneNodePatternPredicate(whereRaw) {
+	if isStandaloneVertexPatternPredicate(whereRaw) {
 		return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
 	}
 	return nil
@@ -659,7 +659,7 @@ func extractListComprehensionVariables(raw string) map[string]struct{} {
 	return vars
 }
 
-func isStandaloneNodePatternPredicate(raw string) bool {
+func isStandaloneVertexPatternPredicate(raw string) bool {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return false
@@ -667,7 +667,7 @@ func isStandaloneNodePatternPredicate(raw string) bool {
 	if strings.Contains(raw, "->") || strings.Contains(raw, "<-") || strings.Contains(raw, "-[") || strings.Contains(raw, "--") {
 		return false
 	}
-	return standaloneNodePatternWhereRE.MatchString(raw)
+	return standaloneVertexPatternWhereRE.MatchString(raw)
 }
 
 func isVariableLengthRelationshipBinding(pattern, name string) bool {
@@ -774,8 +774,8 @@ func scanPatternBindings(pattern string) []patternBinding {
 		switch ch {
 		case '(':
 			depthParen++
-			if name, constrained, next, ok := scanNodeBinding(pattern, i+1); ok {
-				bindings = append(bindings, patternBinding{name: name, role: patternRoleNode, constrained: constrained})
+			if name, constrained, next, ok := scanVertexBinding(pattern, i+1); ok {
+				bindings = append(bindings, patternBinding{name: name, role: patternRoleVertex, constrained: constrained})
 				i = next - 1
 			}
 		case ')':
@@ -820,7 +820,7 @@ func scanTopLevelAssignment(raw string, start int) (string, int, bool) {
 	return name, idx + 1, true
 }
 
-func scanNodeBinding(raw string, start int) (string, bool, int, bool) {
+func scanVertexBinding(raw string, start int) (string, bool, int, bool) {
 	idx := skipSpaces(raw, start)
 	if idx >= len(raw) {
 		return "", false, start, false

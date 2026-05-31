@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"math/rand"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 // Each Execute call invokes executeFunc; all other methods are no-ops.
 type stubQueryServiceClient struct {
 	executeFunc func(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.QueryResponse, error)
+	explainFunc func(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.ExplainResponse, error)
 }
 
 func (s *stubQueryServiceClient) Execute(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.QueryResponse, error) {
@@ -27,7 +29,116 @@ func (s *stubQueryServiceClient) Execute(ctx context.Context, in *v1.QueryReques
 }
 
 func (s *stubQueryServiceClient) Explain(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.ExplainResponse, error) {
+	if s.explainFunc != nil {
+		return s.explainFunc(ctx, in, opts...)
+	}
 	return &v1.ExplainResponse{}, nil
+}
+
+func TestRunExplainRendersHumanReadableNarrative(t *testing.T) {
+	payload := map[string]any{
+		"query": map[string]any{"text": "MATCH (n) RETURN count(n)"},
+		"logicalPlan": map[string]any{
+			"rootVertexId": "N2",
+			"vertexes": []map[string]any{
+				{"id": "N1", "op": "ALL_VERTEXES_SCAN", "accessPath": "all_vertices", "children": []string{}},
+				{"id": "N2", "op": "AGGREGATE", "implementation": "fast_vertex_count", "children": []string{"N1"}},
+			},
+		},
+		"influencers": map[string]any{
+			"statsSnapshot": map[string]any{
+				"source":           "stats-snapshot+store-scan",
+				"completeness":     "complete",
+				"backfillStatus":   "complete",
+				"backfillRequired": false,
+			},
+		},
+		"warnings": []map[string]any{{"code": "FULL_SCAN_FALLBACK", "message": "example"}},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload failed: %v", err)
+	}
+
+	client := &stubQueryServiceClient{
+		explainFunc: func(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.ExplainResponse, error) {
+			return &v1.ExplainResponse{ExplainJson: encoded, Stats: &v1.QueryStats{RowsReturned: 1, DurationMs: 7}}, nil
+		},
+	}
+
+	var out bytes.Buffer
+	if err := runExplain(context.Background(), client, "acme", "EXPLAIN MATCH (n) RETURN count(n)", true, &out); err != nil {
+		t.Fatalf("runExplain returned error: %v", err)
+	}
+	rendered := out.String()
+	if !strings.Contains(rendered, "EXPLAIN") {
+		t.Fatalf("expected EXPLAIN header, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "Execution path:") {
+		t.Fatalf("expected execution path section, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "1. ALL_VERTEXES_SCAN") || !strings.Contains(rendered, "2. AGGREGATE") {
+		t.Fatalf("expected ordered plan steps, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "backfillRequired: false") {
+		t.Fatalf("expected stats snapshot details, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "[FULL_SCAN_FALLBACK] example") {
+		t.Fatalf("expected warnings section, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "stats: rows=1 durationMs=7") {
+		t.Fatalf("expected stats footer, got: %s", rendered)
+	}
+}
+
+func TestRunExplainTerseOmitsSupportingDataSections(t *testing.T) {
+	payload := map[string]any{
+		"query": map[string]any{"text": "MATCH (n) RETURN count(n)"},
+		"logicalPlan": map[string]any{
+			"rootVertexId": "N2",
+			"vertexes": []map[string]any{
+				{"id": "N1", "op": "ALL_VERTEXES_SCAN", "children": []string{}},
+				{"id": "N2", "op": "AGGREGATE", "implementation": "fast_vertex_count", "children": []string{"N1"}},
+			},
+		},
+		"influencers": map[string]any{
+			"statsSnapshot": map[string]any{
+				"source":           "stats-snapshot",
+				"completeness":     "complete",
+				"backfillStatus":   "complete",
+				"backfillRequired": false,
+			},
+		},
+		"warnings": []map[string]any{{"code": "FULL_SCAN_FALLBACK", "message": "example"}},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload failed: %v", err)
+	}
+
+	client := &stubQueryServiceClient{
+		explainFunc: func(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.ExplainResponse, error) {
+			return &v1.ExplainResponse{ExplainJson: encoded, Stats: &v1.QueryStats{RowsReturned: 1, DurationMs: 7}}, nil
+		},
+	}
+
+	var out bytes.Buffer
+	if err := runExplain(context.Background(), client, "acme", "EXPLAIN MATCH (n) RETURN count(n)", false, &out); err != nil {
+		t.Fatalf("runExplain returned error: %v", err)
+	}
+	rendered := out.String()
+	if !strings.Contains(rendered, "Execution path:") {
+		t.Fatalf("expected execution path section, got: %s", rendered)
+	}
+	if strings.Contains(rendered, "Statistics snapshot:") {
+		t.Fatalf("did not expect statistics snapshot in terse mode, got: %s", rendered)
+	}
+	if strings.Contains(rendered, "Warnings:") {
+		t.Fatalf("did not expect warnings section in terse mode, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "stats: rows=1 durationMs=7") {
+		t.Fatalf("expected stats footer, got: %s", rendered)
+	}
 }
 
 func (s *stubQueryServiceClient) GetCapabilities(ctx context.Context, in *v1.CapabilitiesRequest, opts ...grpc.CallOption) (*v1.CapabilitiesResponse, error) {
@@ -241,7 +352,7 @@ func TestRenderTableColumnWidthUsesHeaderAndRowsWithCap(t *testing.T) {
 	}
 }
 
-func TestFormatProtoValueNodeAutoIDSuppressed(t *testing.T) {
+func TestFormatProtoValueVertexAutoIDSuppressed(t *testing.T) {
 	value := &v1.Value{Kind: &v1.Value_MapValue{MapValue: &v1.MapValue{Values: map[string]*v1.Value{
 		"id": {Kind: &v1.Value_StringValue{StringValue: "auto-charlie-1"}},
 		"labels": {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{
@@ -254,11 +365,11 @@ func TestFormatProtoValueNodeAutoIDSuppressed(t *testing.T) {
 
 	got := formatProtoValue(value)
 	if got != "(:Person {\"name\":\"Charlie Sheen\"})" {
-		t.Fatalf("unexpected node rendering: %s", got)
+		t.Fatalf("unexpected vertex rendering: %s", got)
 	}
 }
 
-func TestFormatProtoValueNodeKeepsExplicitID(t *testing.T) {
+func TestFormatProtoValueVertexKeepsExplicitID(t *testing.T) {
 	value := &v1.Value{Kind: &v1.Value_MapValue{MapValue: &v1.MapValue{Values: map[string]*v1.Value{
 		"id": {Kind: &v1.Value_StringValue{StringValue: "charlie"}},
 		"labels": {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{
@@ -272,7 +383,7 @@ func TestFormatProtoValueNodeKeepsExplicitID(t *testing.T) {
 
 	got := formatProtoValue(value)
 	if got != "(charlie:Person {\"name\":\"Charlie Sheen\"})" {
-		t.Fatalf("unexpected node rendering: %s", got)
+		t.Fatalf("unexpected vertex rendering: %s", got)
 	}
 }
 
@@ -308,7 +419,7 @@ func TestFormatProtoValueEdgeKeepsExplicitID(t *testing.T) {
 	}
 }
 
-func makeNodeValue(id, label string, props map[string]*v1.Value) *v1.Value {
+func makeVertexValue(id, label string, props map[string]*v1.Value) *v1.Value {
 	labelList := &v1.Value{Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{
 		{Kind: &v1.Value_StringValue{StringValue: label}},
 	}}}}
@@ -330,19 +441,19 @@ func makeEdgeValue(id, edgeType string, props map[string]*v1.Value) *v1.Value {
 }
 
 func TestFormatProtoValuePathForward(t *testing.T) {
-	charlie := makeNodeValue("auto-charlie-1", "Person", map[string]*v1.Value{
+	charlie := makeVertexValue("auto-charlie-1", "Person", map[string]*v1.Value{
 		"name": {Kind: &v1.Value_StringValue{StringValue: "Charlie Sheen"}},
 	})
 	actedIn := makeEdgeValue("acme|auto-charlie-1|ACTED_IN|auto-wallStreet-6|1", "ACTED_IN", map[string]*v1.Value{
 		"role": {Kind: &v1.Value_StringValue{StringValue: "Bud Fox"}},
 	})
-	wallStreet := makeNodeValue("auto-wallStreet-6", "Movie", map[string]*v1.Value{
+	wallStreet := makeVertexValue("auto-wallStreet-6", "Movie", map[string]*v1.Value{
 		"title": {Kind: &v1.Value_StringValue{StringValue: "Wall Street"}},
 	})
 
 	pathValue := &v1.Value{Kind: &v1.Value_MapValue{MapValue: &v1.MapValue{Values: map[string]*v1.Value{
 		"__path__": {Kind: &v1.Value_BoolValue{BoolValue: true}},
-		"nodes":    {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{charlie, wallStreet}}}},
+		"vertexes": {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{charlie, wallStreet}}}},
 		"edges":    {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{actedIn}}}},
 		"directions": {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{
 			{Kind: &v1.Value_StringValue{StringValue: "forward"}},
@@ -357,21 +468,21 @@ func TestFormatProtoValuePathForward(t *testing.T) {
 }
 
 func TestFormatProtoValuePathMultiHop(t *testing.T) {
-	charlie := makeNodeValue("auto-charlie-1", "Person", map[string]*v1.Value{
+	charlie := makeVertexValue("auto-charlie-1", "Person", map[string]*v1.Value{
 		"name": {Kind: &v1.Value_StringValue{StringValue: "Charlie Sheen"}},
 	})
 	actedIn := makeEdgeValue("acme|auto-charlie-1|ACTED_IN|auto-wallStreet-6|1", "ACTED_IN", map[string]*v1.Value{})
-	wallStreet := makeNodeValue("auto-wallStreet-6", "Movie", map[string]*v1.Value{
+	wallStreet := makeVertexValue("auto-wallStreet-6", "Movie", map[string]*v1.Value{
 		"title": {Kind: &v1.Value_StringValue{StringValue: "Wall Street"}},
 	})
 	directed := makeEdgeValue("acme|auto-oliver-2|DIRECTED|auto-wallStreet-6|2", "DIRECTED", map[string]*v1.Value{})
-	oliver := makeNodeValue("auto-oliver-2", "Person", map[string]*v1.Value{
+	oliver := makeVertexValue("auto-oliver-2", "Person", map[string]*v1.Value{
 		"name": {Kind: &v1.Value_StringValue{StringValue: "Oliver Stone"}},
 	})
 
 	pathValue := &v1.Value{Kind: &v1.Value_MapValue{MapValue: &v1.MapValue{Values: map[string]*v1.Value{
 		"__path__": {Kind: &v1.Value_BoolValue{BoolValue: true}},
-		"nodes":    {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{charlie, wallStreet, oliver}}}},
+		"vertexes": {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{charlie, wallStreet, oliver}}}},
 		"edges":    {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{actedIn, directed}}}},
 		"directions": {Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{
 			{Kind: &v1.Value_StringValue{StringValue: "forward"}},
@@ -394,10 +505,10 @@ func TestNextLoadQueryWriteModeAlternatesCreateDelete(t *testing.T) {
 	q1, k1 := nextLoadQuery(cfg, "write", 0, rng, state)
 	q2, k2 := nextLoadQuery(cfg, "write", 1, rng, state)
 
-	if k1 != "create" || !strings.Contains(q1, "CREATE (:SoakNode") || !strings.Contains(q1, "soak-write-0") {
+	if k1 != "create" || !strings.Contains(q1, "CREATE (:SoakVertex") || !strings.Contains(q1, "soak-write-0") {
 		t.Fatalf("unexpected first write op: kind=%s query=%s", k1, q1)
 	}
-	if k2 != "delete" || !strings.Contains(q2, "MATCH (n:SoakNode") || !strings.Contains(q2, "soak-write-0") {
+	if k2 != "delete" || !strings.Contains(q2, "MATCH (n:SoakVertex") || !strings.Contains(q2, "soak-write-0") {
 		t.Fatalf("unexpected second write op: kind=%s query=%s", k2, q2)
 	}
 }
@@ -410,7 +521,7 @@ func TestNextLoadQueryNoopWriteMode(t *testing.T) {
 	if kind != "create" {
 		t.Fatalf("expected create kind, got %s", kind)
 	}
-	if !strings.Contains(query, "CREATE (:SoakNoopNode") || !strings.Contains(query, "soak-noop") {
+	if !strings.Contains(query, "CREATE (:SoakNoopVertex") || !strings.Contains(query, "soak-noop") {
 		t.Fatalf("unexpected noop-write query: %s", query)
 	}
 }
@@ -443,7 +554,7 @@ func TestParsePurgeArgsValid(t *testing.T) {
 		{":purge Movie|Genre|User", "Movie|Genre|User", 0},
 		{":purge *", "*", 0},
 		{":purge Movie|Genre 500", "Movie|Genre", 500},
-		{":PURGE movie_node", "movie_node", 0},
+		{":PURGE movie_vertex", "movie_vertex", 0},
 		{":purge _Private|Public 250", "_Private|Public", 250},
 	}
 	for _, tc := range cases {
@@ -508,7 +619,7 @@ func countResponse(n int64) *v1.QueryResponse {
 	}
 }
 
-func TestRunPurgeNoNodes(t *testing.T) {
+func TestRunPurgeNoVertices(t *testing.T) {
 	stub := &stubQueryServiceClient{
 		executeFunc: func(_ context.Context, in *v1.QueryRequest, _ ...grpc.CallOption) (*v1.QueryResponse, error) {
 			// Only count query should be called; returns 0.
@@ -561,7 +672,7 @@ func TestRunPurgeSingleBatch(t *testing.T) {
 }
 
 func TestRunPurgeMultiBatch(t *testing.T) {
-	// Simulate: 2500 nodes, batch size 1000 → 3 batches needed.
+	// Simulate: 2500 vertexes, batch size 1000 → 3 batches needed.
 	remaining := int64(2500)
 	batchSize := int64(1000)
 
@@ -595,13 +706,13 @@ func TestRunPurgeMultiBatch(t *testing.T) {
 	}
 }
 
-func TestRunPurgeAllNodes(t *testing.T) {
+func TestRunPurgeAllVertices(t *testing.T) {
 	// Verify "*" generates MATCH (n) without label filter.
 	var capturedQuery string
 	stub := &stubQueryServiceClient{
 		executeFunc: func(_ context.Context, in *v1.QueryRequest, _ ...grpc.CallOption) (*v1.QueryResponse, error) {
 			capturedQuery = in.GetInput().GetCypher()
-			return countResponse(0), nil // 0 nodes → exits immediately
+			return countResponse(0), nil // 0 vertexes → exits immediately
 		},
 	}
 	cfg := cliConfig{tenant: "default", timeout: 2 * time.Second, purgeBatchSize: 100}

@@ -9,7 +9,7 @@ import (
 )
 
 var anchoredOutPatternRE = regexp.MustCompile(`^\(([A-Za-z_][A-Za-z0-9_]*)(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[:([A-Za-z_][A-Za-z0-9_]*)\]->\(([A-Za-z_][A-Za-z0-9_]*)\)$`)
-var nodePatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var vertexPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var undirectedAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)--\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var directedAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var reverseDirectedAdjacentPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<--\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
@@ -26,7 +26,7 @@ var twoHopForwardChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9
 var twoHopConvergingChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var reverseRelationshipThenUndirectedVariableLengthPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]-\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var directedAdjacentThenVariableLengthChainPatternRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[([^\]]*)\]->\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-var chainNodeSegmentRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
+var chainVertexSegmentRE = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*)?)?(?::(!?[A-Za-z_][A-Za-z0-9_]*(?:(?::|\|:?)!?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 var identifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type anchoredOutPattern struct {
@@ -38,7 +38,7 @@ type anchoredOutPattern struct {
 	TargetVar           string
 }
 
-type nodePattern struct {
+type vertexPattern struct {
 	Var            string
 	AnyOfLabels    []string
 	AllOfLabels    []string
@@ -47,23 +47,23 @@ type nodePattern struct {
 }
 
 type undirectedAdjacentPattern struct {
-	Left  nodePattern
-	Right nodePattern
+	Left  vertexPattern
+	Right vertexPattern
 }
 
 type directedAdjacentPattern struct {
-	Left  nodePattern
-	Right nodePattern
+	Left  vertexPattern
+	Right vertexPattern
 }
 
 type reverseDirectedAdjacentPattern struct {
-	Left  nodePattern
-	Right nodePattern
+	Left  vertexPattern
+	Right vertexPattern
 }
 
 type directedRelationshipPattern struct {
-	Left      nodePattern
-	Right     nodePattern
+	Left      vertexPattern
+	Right     vertexPattern
 	EdgeVar   string
 	EdgeType  string
 	EdgeAnyOf []string
@@ -71,8 +71,8 @@ type directedRelationshipPattern struct {
 }
 
 type reverseDirectedRelationshipPattern struct {
-	Left      nodePattern
-	Right     nodePattern
+	Left      vertexPattern
+	Right     vertexPattern
 	EdgeVar   string
 	EdgeType  string
 	EdgeAnyOf []string
@@ -80,8 +80,8 @@ type reverseDirectedRelationshipPattern struct {
 }
 
 type undirectedRelationshipPattern struct {
-	Left      nodePattern
-	Right     nodePattern
+	Left      vertexPattern
+	Right     vertexPattern
 	EdgeVar   string
 	EdgeType  string
 	EdgeAnyOf []string
@@ -89,8 +89,8 @@ type undirectedRelationshipPattern struct {
 }
 
 type directedVariableLengthRelationshipPattern struct {
-	Left      nodePattern
-	Right     nodePattern
+	Left      vertexPattern
+	Right     vertexPattern
 	EdgeVar   string
 	EdgeType  string
 	EdgeAnyOf []string
@@ -100,9 +100,9 @@ type directedVariableLengthRelationshipPattern struct {
 }
 
 type directedVariableLengthThenDirectedVariableLengthPattern struct {
-	Left            nodePattern
-	Mid             nodePattern
-	Right           nodePattern
+	Left            vertexPattern
+	Mid             vertexPattern
+	Right           vertexPattern
 	FirstEdgeVar    string
 	FirstEdgeType   string
 	FirstEdgeAnyOf  []string
@@ -118,8 +118,8 @@ type directedVariableLengthThenDirectedVariableLengthPattern struct {
 }
 
 type undirectedVariableLengthRelationshipPattern struct {
-	Left      nodePattern
-	Right     nodePattern
+	Left      vertexPattern
+	Right     vertexPattern
 	EdgeVar   string
 	EdgeType  string
 	EdgeAnyOf []string
@@ -129,16 +129,16 @@ type undirectedVariableLengthRelationshipPattern struct {
 }
 
 type directedAdjacentThenVariableLengthPattern struct {
-	Left    nodePattern
-	Mid     nodePattern
-	Right   nodePattern
+	Left    vertexPattern
+	Mid     vertexPattern
+	Right   vertexPattern
 	EdgeVar string
 }
 
 type directedRelationshipThenAdjacentPattern struct {
-	Left           nodePattern
-	Mid            nodePattern
-	Right          nodePattern
+	Left           vertexPattern
+	Mid            vertexPattern
+	Right          vertexPattern
 	FirstEdgeVar   string
 	FirstEdgeType  string
 	FirstEdgeAnyOf []string
@@ -146,9 +146,9 @@ type directedRelationshipThenAdjacentPattern struct {
 }
 
 type twoHopDirectedChainPattern struct {
-	Left            nodePattern
-	Mid             nodePattern
-	Right           nodePattern
+	Left            vertexPattern
+	Mid             vertexPattern
+	Right           vertexPattern
 	FirstEdgeVar    string
 	FirstEdgeType   string
 	FirstEdgeAnyOf  []string
@@ -161,9 +161,9 @@ type twoHopDirectedChainPattern struct {
 }
 
 type twoHopUndirectedRelationshipChainPattern struct {
-	Left            nodePattern
-	Mid             nodePattern
-	Right           nodePattern
+	Left            vertexPattern
+	Mid             vertexPattern
+	Right           vertexPattern
 	FirstEdgeVar    string
 	FirstEdgeType   string
 	FirstEdgeAnyOf  []string
@@ -175,9 +175,9 @@ type twoHopUndirectedRelationshipChainPattern struct {
 }
 
 type directedThenUndirectedRelationshipChainPattern struct {
-	Left            nodePattern
-	Mid             nodePattern
-	Right           nodePattern
+	Left            vertexPattern
+	Mid             vertexPattern
+	Right           vertexPattern
 	FirstEdgeVar    string
 	FirstEdgeType   string
 	FirstEdgeAnyOf  []string
@@ -189,9 +189,9 @@ type directedThenUndirectedRelationshipChainPattern struct {
 }
 
 type reverseRelationshipThenUndirectedVariableLengthPattern struct {
-	Left            nodePattern
-	Mid             nodePattern
-	Right           nodePattern
+	Left            vertexPattern
+	Mid             vertexPattern
+	Right           vertexPattern
 	FirstEdgeVar    string
 	FirstEdgeType   string
 	FirstEdgeAnyOf  []string
@@ -216,7 +216,7 @@ type mixedRelationshipChainSegment struct {
 }
 
 type mixedRelationshipChainPattern struct {
-	Nodes    []nodePattern
+	Vertexes []vertexPattern
 	Segments []mixedRelationshipChainSegment
 }
 
@@ -250,18 +250,18 @@ func parseAnchoredOutPattern(raw string) (anchoredOutPattern, error) {
 	}, nil
 }
 
-func parseNodePattern(raw string) (nodePattern, error) {
+func parseVertexPattern(raw string) (vertexPattern, error) {
 	normalized := normalizeClauseBody(raw)
-	m := nodePatternRE.FindStringSubmatch(normalized)
+	m := vertexPatternRE.FindStringSubmatch(normalized)
 	if len(m) != 4 {
-		return nodePattern{}, graph.NewError(
+		return vertexPattern{}, graph.NewError(
 			graph.ErrKindUnsupported,
 			fmt.Sprintf("pattern %q is not yet supported", raw),
 			nil,
 		)
 	}
 	allOf, anyOf, excluded := parseLabelFilters(m[2])
-	pattern := nodePattern{
+	pattern := vertexPattern{
 		Var:            m[1],
 		AllOfLabels:    allOf,
 		AnyOfLabels:    anyOf,
@@ -286,14 +286,14 @@ func parseUndirectedAdjacentPattern(raw string) (undirectedAdjacentPattern, erro
 	rightAll, rightAny, rightExcluded := parseLabelFilters(m[5])
 
 	return undirectedAdjacentPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[4],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -318,14 +318,14 @@ func parseDirectedAdjacentPattern(raw string) (directedAdjacentPattern, error) {
 	rightAll, rightAny, rightExcluded := parseLabelFilters(m[5])
 
 	return directedAdjacentPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[4],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -350,14 +350,14 @@ func parseReverseDirectedAdjacentPattern(raw string) (reverseDirectedAdjacentPat
 	rightAll, rightAny, rightExcluded := parseLabelFilters(m[5])
 
 	return reverseDirectedAdjacentPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[4],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -387,14 +387,14 @@ func parseDirectedRelationshipPattern(raw string) (directedRelationshipPattern, 
 	}
 
 	return directedRelationshipPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -428,14 +428,14 @@ func parseReverseDirectedRelationshipPattern(raw string) (reverseDirectedRelatio
 	}
 
 	return reverseDirectedRelationshipPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -469,14 +469,14 @@ func parseUndirectedRelationshipPattern(raw string) (undirectedRelationshipPatte
 	}
 
 	return undirectedRelationshipPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -509,14 +509,14 @@ func parseDirectedVariableLengthRelationshipPattern(raw string) (directedVariabl
 	}
 
 	return directedVariableLengthRelationshipPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -557,21 +557,21 @@ func parseDirectedVariableLengthThenDirectedVariableLengthPattern(raw string) (d
 	}
 
 	return directedVariableLengthThenDirectedVariableLengthPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Mid: nodePattern{
+		Mid: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    midAll,
 			AnyOfLabels:    midAny,
 			ExcludedLabels: midExcluded,
 			PropertiesRaw:  m[7],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[9],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -612,14 +612,14 @@ func parseUndirectedVariableLengthRelationshipPattern(raw string) (undirectedVar
 	}
 
 	return undirectedVariableLengthRelationshipPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -659,21 +659,21 @@ func parseDirectedAdjacentThenVariableLengthPattern(raw string) (directedAdjacen
 	}
 
 	return directedAdjacentThenVariableLengthPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Mid: nodePattern{
+		Mid: vertexPattern{
 			Var:            m[4],
 			AllOfLabels:    midAll,
 			AnyOfLabels:    midAny,
 			ExcludedLabels: midExcluded,
 			PropertiesRaw:  m[6],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[8],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -705,21 +705,21 @@ func parseDirectedRelationshipThenAdjacentPattern(raw string) (directedRelations
 	}
 
 	return directedRelationshipThenAdjacentPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Mid: nodePattern{
+		Mid: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    midAll,
 			AnyOfLabels:    midAny,
 			ExcludedLabels: midExcluded,
 			PropertiesRaw:  m[7],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[8],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -855,21 +855,21 @@ func parseTwoHopDirectedChainPattern(raw string) (twoHopDirectedChainPattern, er
 	}
 
 	return twoHopDirectedChainPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Mid: nodePattern{
+		Mid: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    midAll,
 			AnyOfLabels:    midAny,
 			ExcludedLabels: midExcluded,
 			PropertiesRaw:  m[7],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[9],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -913,21 +913,21 @@ func parseTwoHopUndirectedRelationshipChainPattern(raw string) (twoHopUndirected
 	}
 
 	return twoHopUndirectedRelationshipChainPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Mid: nodePattern{
+		Mid: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    midAll,
 			AnyOfLabels:    midAny,
 			ExcludedLabels: midExcluded,
 			PropertiesRaw:  m[7],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[9],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -970,21 +970,21 @@ func parseDirectedThenUndirectedRelationshipChainPattern(raw string) (directedTh
 	}
 
 	return directedThenUndirectedRelationshipChainPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Mid: nodePattern{
+		Mid: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    midAll,
 			AnyOfLabels:    midAny,
 			ExcludedLabels: midExcluded,
 			PropertiesRaw:  m[7],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[9],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -1027,21 +1027,21 @@ func parseReverseRelationshipThenUndirectedVariableLengthPattern(raw string) (re
 	}
 
 	return reverseRelationshipThenUndirectedVariableLengthPattern{
-		Left: nodePattern{
+		Left: vertexPattern{
 			Var:            m[1],
 			AllOfLabels:    leftAll,
 			AnyOfLabels:    leftAny,
 			ExcludedLabels: leftExcluded,
 			PropertiesRaw:  m[3],
 		},
-		Mid: nodePattern{
+		Mid: vertexPattern{
 			Var:            m[5],
 			AllOfLabels:    midAll,
 			AnyOfLabels:    midAny,
 			ExcludedLabels: midExcluded,
 			PropertiesRaw:  m[7],
 		},
-		Right: nodePattern{
+		Right: vertexPattern{
 			Var:            m[9],
 			AllOfLabels:    rightAll,
 			AnyOfLabels:    rightAny,
@@ -1186,17 +1186,17 @@ func parseLabelFilters(raw string) (allOf []string, anyOf []string, excluded []s
 
 type multiHopAdjacentChainHop struct {
 	Direction string // "forward", "reverse", or "undirected"
-	Node      nodePattern
+	Vertex    vertexPattern
 }
 
 type multiHopAdjacentChainPattern struct {
-	Start nodePattern
-	Hops  []multiHopAdjacentChainHop // len >= 2
+	StartVertex vertexPattern
+	Hops        []multiHopAdjacentChainHop // len >= 2
 }
 
-// consumeNodeSegment reads the leading "(…)" node token from s, returning
-// (nodeString, remainder, ok).  Handles nested parens (for props).
-func consumeNodeSegment(s string) (string, string, bool) {
+// consumeVertexSegment reads the leading "(…)" vertex token from s, returning
+// (vertexString, remainder, ok).  Handles nested parens (for props).
+func consumeVertexSegment(s string) (string, string, bool) {
 	if len(s) == 0 || s[0] != '(' {
 		return "", "", false
 	}
@@ -1236,16 +1236,16 @@ func consumeAdjacentArrow(s string) (string, string, bool) {
 	return "", "", false
 }
 
-// parseChainNodeSegment parses a single "(…)" node token that may have an
-// anonymous variable (unlike parseNodePattern which requires a named var).
-func parseChainNodeSegment(raw string) (nodePattern, error) {
+// parseChainVertexSegment parses a single "(…)" vertex token that may have an
+// anonymous variable (unlike parseVertexPattern which requires a named var).
+func parseChainVertexSegment(raw string) (vertexPattern, error) {
 	normalized := normalizeClauseBody(raw)
-	m := chainNodeSegmentRE.FindStringSubmatch(normalized)
+	m := chainVertexSegmentRE.FindStringSubmatch(normalized)
 	if len(m) != 4 {
-		return nodePattern{}, fmt.Errorf("not a node segment: %q", raw)
+		return vertexPattern{}, fmt.Errorf("not a vertex segment: %q", raw)
 	}
 	allOf, anyOf, excluded := parseLabelFilters(m[2])
-	return nodePattern{
+	return vertexPattern{
 		Var:            m[1],
 		AllOfLabels:    allOf,
 		AnyOfLabels:    anyOf,
@@ -1260,11 +1260,11 @@ func parseChainNodeSegment(raw string) (nodePattern, error) {
 func parseMultiHopAdjacentChainPattern(raw string) (multiHopAdjacentChainPattern, error) {
 	normalized := normalizeClauseBody(raw)
 
-	nodeStr, rest, ok := consumeNodeSegment(normalized)
+	vertexStr, rest, ok := consumeVertexSegment(normalized)
 	if !ok {
-		return multiHopAdjacentChainPattern{}, fmt.Errorf("no leading node in %q", raw)
+		return multiHopAdjacentChainPattern{}, fmt.Errorf("no leading vertex in %q", raw)
 	}
-	startNode, err := parseChainNodeSegment(nodeStr)
+	startVertex, err := parseChainVertexSegment(vertexStr)
 	if err != nil {
 		return multiHopAdjacentChainPattern{}, err
 	}
@@ -1276,36 +1276,36 @@ func parseMultiHopAdjacentChainPattern(raw string) (multiHopAdjacentChainPattern
 		if !arrowOK {
 			break
 		}
-		hopStr, afterNode, nodeOK := consumeNodeSegment(afterArrow)
-		if !nodeOK {
+		hopStr, afterVertex, vertexOK := consumeVertexSegment(afterArrow)
+		if !vertexOK {
 			break
 		}
-		hopNode, err := parseChainNodeSegment(hopStr)
+		hopVertex, err := parseChainVertexSegment(hopStr)
 		if err != nil {
 			return multiHopAdjacentChainPattern{}, err
 		}
-		hops = append(hops, multiHopAdjacentChainHop{Direction: dir, Node: hopNode})
-		s = afterNode
+		hops = append(hops, multiHopAdjacentChainHop{Direction: dir, Vertex: hopVertex})
+		s = afterVertex
 	}
 
 	if len(hops) < 2 || s != "" {
 		return multiHopAdjacentChainPattern{}, fmt.Errorf("not a multi-hop adjacent chain: %q (hops=%d, trailing=%q)", raw, len(hops), s)
 	}
-	return multiHopAdjacentChainPattern{Start: startNode, Hops: hops}, nil
+	return multiHopAdjacentChainPattern{StartVertex: startVertex, Hops: hops}, nil
 }
 
 func parseMixedRelationshipChainPattern(raw string) (mixedRelationshipChainPattern, error) {
 	normalized := normalizeClauseBody(raw)
-	firstNode, next, ok := consumeNodeSegment(normalized)
+	firstVertex, next, ok := consumeVertexSegment(normalized)
 	if !ok {
 		return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
 	}
-	startNode, err := parseChainNodeSegment(firstNode)
+	startVertex, err := parseChainVertexSegment(firstVertex)
 	if err != nil {
 		return mixedRelationshipChainPattern{}, err
 	}
 
-	nodes := []nodePattern{startNode}
+	vertexes := []vertexPattern{startVertex}
 	segments := make([]mixedRelationshipChainSegment, 0)
 	s := next
 	for len(s) > 0 {
@@ -1325,24 +1325,24 @@ func parseMixedRelationshipChainPattern(raw string) (mixedRelationshipChainPatte
 			segment = mixedRelationshipChainSegment{Direction: direction}
 			afterSegment = afterArrow
 		}
-		nextNodeRaw, afterNode, nodeOK := consumeNodeSegment(afterSegment)
-		if !nodeOK {
+		nextVertexRaw, afterVertex, vertexOK := consumeVertexSegment(afterSegment)
+		if !vertexOK {
 			return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
 		}
-		nextNode, err := parseChainNodeSegment(nextNodeRaw)
+		nextVertex, err := parseChainVertexSegment(nextVertexRaw)
 		if err != nil {
 			return mixedRelationshipChainPattern{}, err
 		}
 		segments = append(segments, segment)
-		nodes = append(nodes, nextNode)
-		s = afterNode
+		vertexes = append(vertexes, nextVertex)
+		s = afterVertex
 	}
 
 	if len(segments) < 2 {
 		return mixedRelationshipChainPattern{}, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("pattern %q is not yet supported", raw), nil)
 	}
 
-	return mixedRelationshipChainPattern{Nodes: nodes, Segments: segments}, nil
+	return mixedRelationshipChainPattern{Vertexes: vertexes, Segments: segments}, nil
 }
 
 func consumeRelationshipSegment(s string) (string, string, bool) {

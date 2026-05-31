@@ -29,18 +29,18 @@ var procedureSignatureRE = regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\
 var tckDirFlag = flag.String("tck-dir", "", "path to the openCypher TCK features directory")
 
 type graphSnapshot struct {
-	Nodes           int
+	Vertexes        int
 	Relationships   int
 	Properties      int
 	Labels          int
-	NodeSet         map[string]struct{}
+	VertexSet       map[string]struct{}
 	RelationshipSet map[string]struct{}
 	PropertySet     map[string]struct{}
 }
 
 func (g graphSnapshot) Delta(before graphSnapshot) graphSnapshot {
 	return graphSnapshot{
-		Nodes:         g.Nodes - before.Nodes,
+		Vertexes:      g.Vertexes - before.Vertexes,
 		Relationships: g.Relationships - before.Relationships,
 		Properties:    g.Properties - before.Properties,
 		Labels:        g.Labels - before.Labels,
@@ -48,8 +48,8 @@ func (g graphSnapshot) Delta(before graphSnapshot) graphSnapshot {
 }
 
 type graphSideEffects struct {
-	AddedNodes           int
-	RemovedNodes         int
+	AddedVertexes        int
+	RemovedVertexes      int
 	AddedRelationships   int
 	RemovedRelationships int
 	AddedProperties      int
@@ -60,12 +60,12 @@ type graphSideEffects struct {
 
 func diffGraphSideEffects(before, after graphSnapshot) graphSideEffects {
 	delta := after.Delta(before)
-	addedNodes, removedNodes := propertySetDelta(before.NodeSet, after.NodeSet)
+	addedVertexes, removedVertexes := propertySetDelta(before.VertexSet, after.VertexSet)
 	addedRelationships, removedRelationships := propertySetDelta(before.RelationshipSet, after.RelationshipSet)
 	addedProps, removedProps := propertySetDelta(before.PropertySet, after.PropertySet)
 	return graphSideEffects{
-		AddedNodes:           addedNodes,
-		RemovedNodes:         removedNodes,
+		AddedVertexes:        addedVertexes,
+		RemovedVertexes:      removedVertexes,
 		AddedRelationships:   addedRelationships,
 		RemovedRelationships: removedRelationships,
 		AddedProperties:      addedProps,
@@ -375,8 +375,8 @@ func (f *cypherTCKFeature) sideEffectsShouldBe(table *godog.Table) error {
 
 	effects := diffGraphSideEffects(f.beforeQueryCounts, f.afterQueryCounts)
 	actual := map[string]int{
-		"+nodes":         effects.AddedNodes,
-		"-nodes":         effects.RemovedNodes,
+		"+vertexes":      effects.AddedVertexes,
+		"-vertexes":      effects.RemovedVertexes,
 		"+relationships": effects.AddedRelationships,
 		"-relationships": effects.RemovedRelationships,
 		"+properties":    effects.AddedProperties,
@@ -757,7 +757,7 @@ func (f *cypherTCKFeature) closeStore() error {
 
 func (f *cypherTCKFeature) snapshotGraph() (graphSnapshot, error) {
 	stats := graphSnapshot{
-		NodeSet:         map[string]struct{}{},
+		VertexSet:       map[string]struct{}{},
 		RelationshipSet: map[string]struct{}{},
 		PropertySet:     map[string]struct{}{},
 	}
@@ -765,8 +765,8 @@ func (f *cypherTCKFeature) snapshotGraph() (graphSnapshot, error) {
 	seenLabels := map[string]struct{}{}
 	err := f.store.View(f.ctx, func(tx graph.Tx) error {
 		return tx.ScanVertices(f.ctx, defaultTenant, 0, func(vertex *graph.Vertex) error {
-			stats.Nodes++
-			stats.NodeSet[fmt.Sprintf("%s:%s", vertex.Tenant, vertex.ID)] = struct{}{}
+			stats.Vertexes++
+			stats.VertexSet[fmt.Sprintf("%s:%s", vertex.Tenant, vertex.ID)] = struct{}{}
 			for _, label := range vertex.Labels {
 				seenLabels[label] = struct{}{}
 			}
@@ -958,8 +958,8 @@ func renderTCKValue(value any) string {
 		}
 		return "[" + strings.Join(items, ", ") + "]"
 	case map[string]any:
-		if isNodeValue(typed) {
-			return renderNodeValue(typed)
+		if isVertexValue(typed) {
+			return renderVertexValue(typed)
 		}
 		if isRelationshipValue(typed) {
 			return renderRelationshipValue(typed)
@@ -983,7 +983,7 @@ func renderTCKValue(value any) string {
 	}
 }
 
-func renderNodeValue(value map[string]any) string {
+func renderVertexValue(value map[string]any) string {
 	var b strings.Builder
 	b.WriteByte('(')
 	labels, _ := value["labels"].([]string)
@@ -1020,7 +1020,7 @@ func renderRelationshipValue(value map[string]any) string {
 	return b.String()
 }
 
-func isNodeValue(value map[string]any) bool {
+func isVertexValue(value map[string]any) bool {
 	_, hasLabels := value["labels"]
 	_, hasProps := value["properties"]
 	_, hasType := value["type"]

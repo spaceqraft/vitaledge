@@ -369,7 +369,7 @@ func TestParseStatementExplainRequiresInnerQuery(t *testing.T) {
 	}
 }
 
-func TestParseStatementVariableTypeConflictWithMatchNode(t *testing.T) {
+func TestParseStatementVariableTypeConflictWithMatchVertex(t *testing.T) {
 	_, err := ParseStatement("WITH 1 AS n MATCH (n) RETURN n")
 	if err == nil {
 		t.Fatalf("expected variable type conflict parse error")
@@ -384,7 +384,7 @@ func TestParseStatementVariableTypeConflictWithMatchNode(t *testing.T) {
 	}
 }
 
-func TestParseStatementOptionalMatchForwardedNodeAllowed(t *testing.T) {
+func TestParseStatementOptionalMatchForwardedVertexAllowed(t *testing.T) {
 	_, err := ParseStatement("OPTIONAL MATCH (a:Start) WITH a MATCH (a)-->(b) RETURN b")
 	if err != nil {
 		t.Fatalf("ParseStatement() unexpected error: %v", err)
@@ -412,7 +412,7 @@ func TestParseStatementVariableLengthRelationshipListBindingAllowed(t *testing.T
 	}
 }
 
-func TestParseStatementCreateAlreadyBoundNode(t *testing.T) {
+func TestParseStatementCreateAlreadyBoundVertex(t *testing.T) {
 	_, err := ParseStatement("MATCH (a) CREATE (a) RETURN a")
 	if err == nil {
 		t.Fatalf("expected variable already bound parse error")
@@ -427,7 +427,7 @@ func TestParseStatementCreateAlreadyBoundNode(t *testing.T) {
 	}
 }
 
-func TestParseStatementCreateAlreadyBoundNodeWithLabels(t *testing.T) {
+func TestParseStatementCreateAlreadyBoundVertexWithLabels(t *testing.T) {
 	_, err := ParseStatement("CREATE (n:Foo)-[:T1]->(), (n:Bar)-[:T2]->()")
 	if err == nil {
 		t.Fatalf("expected variable already bound parse error")
@@ -449,7 +449,7 @@ func TestParseStatementMergeAllowsBoundEndpointWithoutNewPredicates(t *testing.T
 	}
 }
 
-func TestParseStatementMergeRejectsNewPredicateOnBoundNode(t *testing.T) {
+func TestParseStatementMergeRejectsNewPredicateOnBoundVertex(t *testing.T) {
 	_, err := ParseStatement("CREATE (a:Foo) MERGE (a)-[r:KNOWS]->(a:Bar)")
 	if err == nil {
 		t.Fatalf("expected variable already bound parse error")
@@ -464,7 +464,7 @@ func TestParseStatementMergeRejectsNewPredicateOnBoundNode(t *testing.T) {
 	}
 }
 
-func TestParseStatementMergeRejectsStandaloneAlreadyBoundNode(t *testing.T) {
+func TestParseStatementMergeRejectsStandaloneAlreadyBoundVertex(t *testing.T) {
 	_, err := ParseStatement("MATCH (a) MERGE (a) RETURN a")
 	if err == nil {
 		t.Fatalf("expected variable already bound parse error")
@@ -784,7 +784,7 @@ func TestParseStatementRejectsPatternInWithProjection(t *testing.T) {
 }
 
 func TestParseStatementRejectsPatternInSetValueExpression(t *testing.T) {
-	_, err := ParseStatement("MATCH (n) SET n.prop = head(nodes(head((n)-[:REL]->()))).foo")
+	_, err := ParseStatement("MATCH (n) SET n.prop = head(vertexes(head((n)-[:REL]->()))).foo")
 	if err == nil {
 		t.Fatalf("expected unexpected syntax parse error")
 	}
@@ -798,7 +798,7 @@ func TestParseStatementRejectsPatternInSetValueExpression(t *testing.T) {
 	}
 }
 
-func TestParseStatementRejectsStandaloneNodePatternInWhere(t *testing.T) {
+func TestParseStatementRejectsStandaloneVertexPatternInWhere(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) WHERE (n) RETURN n")
 	if err == nil {
 		t.Fatalf("expected invalid argument type parse error")
@@ -843,7 +843,7 @@ func TestParseStatementAllowsPassAFunctionSurfaceInReturnProjection(t *testing.T
 }
 
 func TestParseStatementAllowsRemainingFunctionSurfaceInReturnProjection(t *testing.T) {
-	_, err := ParseStatement("MATCH p=(a)-[r]->(b) RETURN nodes(p), relationships(p), length(p), startNode(r).id, endNode(r).id, last([1,2]), sign(1)")
+	_, err := ParseStatement("MATCH p=(a)-[r]->(b) RETURN vertexes(p), relationships(p), length(p), startVertex(r).id, endVertex(r).id, last([1,2]), sign(1)")
 	if err != nil {
 		t.Fatalf("ParseStatement() unexpected error: %v", err)
 	}
@@ -985,7 +985,7 @@ func TestParseStatementRejectsFloatingPointOverflow(t *testing.T) {
 	}
 }
 
-func TestParseStatementRejectsLengthOnNodeAtCompileTime(t *testing.T) {
+func TestParseStatementRejectsLengthOnVertexAtCompileTime(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) RETURN length(n)")
 	if err == nil {
 		t.Fatalf("expected compile-time invalid argument type parse error")

@@ -105,7 +105,7 @@ Treat `EXPLAIN` as a dry-run planning command that executes parse, semantic vali
 1. Logical plan operators.
 2. Physical plan operators and access paths.
 3. Plan-influencing details:
-   - relevant node counts by label,
+   - relevant vertex counts by label,
    - relevant edge counts by type/direction,
    - predicate-related cardinality signals,
    - index candidate and index-selection reasoning.
@@ -116,7 +116,7 @@ Treat `EXPLAIN` as a dry-run planning command that executes parse, semantic vali
 Current concrete diagnostics and tuning signals:
 
 1. Operator-shaped plan nodes for scan/filter/project/distinct/sort/skip/limit/write/call forms.
-2. Access-path annotations on scan operators (`property_index`, label scan, or all-nodes scan).
+2. Access-path annotations on scan operators (`property_index`, label scan, or all-vertices scan).
 3. Index decisions including recommendation and impact fields (`recommendation`, `tuningImpact`, `estimatedRowsSaved`, and `quality`).
 4. Query-level cost estimate (`costEstimate`) for deterministic before/after tuning comparisons.
 5. Runtime planning counters (`runtimeStats`) for store/plan/index/cardinality summaries.

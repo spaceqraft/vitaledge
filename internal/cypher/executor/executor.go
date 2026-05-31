@@ -20,8 +20,8 @@ import (
 type Params map[string]any
 
 var (
-	patternNodeVarRE = regexp.MustCompile(`\((?:\s*)([A-Za-z_][A-Za-z0-9_]*)?(?:(?::|\{|\)))`)
-	patternEdgeVarRE = regexp.MustCompile(`\[(?:\s*)([A-Za-z_][A-Za-z0-9_]*)?(?:(?::|\{|\]))`)
+	patternVertexVarRE = regexp.MustCompile(`\((?:\s*)([A-Za-z_][A-Za-z0-9_]*)?(?:(?::|\{|\)))`)
+	patternEdgeVarRE   = regexp.MustCompile(`\[(?:\s*)([A-Za-z_][A-Za-z0-9_]*)?(?:(?::|\{|\]))`)
 )
 
 const ProcedureDeclsParam = "__tck_procedures"
@@ -248,7 +248,7 @@ func inferMatchScopeColumns(clauseRaw string) []string {
 		pattern = strings.TrimSpace(innerPattern)
 	}
 
-	for _, match := range patternNodeVarRE.FindAllStringSubmatch(pattern, -1) {
+	for _, match := range patternVertexVarRE.FindAllStringSubmatch(pattern, -1) {
 		if len(match) > 1 {
 			columns = appendUniqueColumns(columns, match[1])
 		}
@@ -270,7 +270,7 @@ func inferMatchScopeColumnsForClause(clause ast.Clause) []string {
 			columns = appendUniqueColumns(columns, pathVar)
 			pattern = strings.TrimSpace(innerPattern)
 		}
-		for _, match := range patternNodeVarRE.FindAllStringSubmatch(pattern, -1) {
+		for _, match := range patternVertexVarRE.FindAllStringSubmatch(pattern, -1) {
 			if len(match) > 1 {
 				columns = appendUniqueColumns(columns, match[1])
 			}

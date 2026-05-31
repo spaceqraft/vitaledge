@@ -41,7 +41,7 @@
     },
     "cardinality": {
       "type": "array",
-      "description": "Per-plan-node cardinality entries.",
+      "description": "Per-plan-vertex cardinality entries.",
       "items": {
         "$ref": "#/$defs/cardinalityEntry"
       }
@@ -214,22 +214,22 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "rootNodeId",
-        "nodes"
+        "rootVertexId",
+        "vertexes"
       ],
       "properties": {
-        "rootNodeId": {
+        "rootVertexId": {
           "type": "string"
         },
-        "nodes": {
+        "vertexes": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/planNode"
+            "$ref": "#/$defs/planVertex"
           }
         }
       }
     },
-    "planNode": {
+    "planVertex": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -292,16 +292,16 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "nodeCounts",
+        "vertexCounts",
         "edgeCounts",
         "predicateSignals",
         "statsSnapshot"
       ],
       "properties": {
-        "nodeCounts": {
+        "vertexCounts": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/nodeCount"
+            "$ref": "#/$defs/vertexCount"
           }
         },
         "edgeCounts": {
@@ -336,7 +336,7 @@
         }
       }
     },
-    "nodeCount": {
+    "vertexCount": {
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -412,13 +412,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "nodeId",
+        "vertexId",
         "rowsIn",
         "rowsOut",
         "quality"
       ],
       "properties": {
-        "nodeId": {
+        "vertexId": {
           "type": "string"
         },
         "rowsIn": {
@@ -520,41 +520,41 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "totalNodes",
-            "scanNodes",
-            "filterNodes",
-            "projectionNodes",
-            "sortNodes",
-            "paginationNodes",
-            "writeNodes",
+            "totalVertexes",
+            "scanVertexes",
+            "filterVertexes",
+            "projectionVertexes",
+            "sortVertexes",
+            "paginationVertexes",
+            "writeVertexes",
             "warningCount"
           ],
           "properties": {
-            "totalNodes": {
+            "totalVertexes": {
               "type": "integer",
               "minimum": 0
             },
-            "scanNodes": {
+            "scanVertexes": {
               "type": "integer",
               "minimum": 0
             },
-            "filterNodes": {
+            "filterVertexes": {
               "type": "integer",
               "minimum": 0
             },
-            "projectionNodes": {
+            "projectionVertexes": {
               "type": "integer",
               "minimum": 0
             },
-            "sortNodes": {
+            "sortVertexes": {
               "type": "integer",
               "minimum": 0
             },
-            "paginationNodes": {
+            "paginationVertexes": {
               "type": "integer",
               "minimum": 0
             },
-            "writeNodes": {
+            "writeVertexes": {
               "type": "integer",
               "minimum": 0
             },
@@ -615,7 +615,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "nodeId",
+        "vertexId",
         "schema",
         "property",
         "candidate",
@@ -623,7 +623,7 @@
         "reason"
       ],
       "properties": {
-        "nodeId": {
+        "vertexId": {
           "type": "string"
         },
         "schema": {
@@ -701,7 +701,7 @@
         "message": {
           "type": "string"
         },
-        "nodeId": {
+        "vertexId": {
           "type": "string"
         }
       }

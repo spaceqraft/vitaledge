@@ -15,7 +15,7 @@ import (
 )
 
 type explainAnalysis struct {
-	nodeCounts       []map[string]any
+	vertexCounts     []map[string]any
 	edgeCounts       []map[string]any
 	predicateSignals []map[string]any
 	indexDecisions   []map[string]any
@@ -76,7 +76,7 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	analysis.source = explainStatsSnapshotSource(stats)
 	analysis.statsSnapshot = buildExplainStatsSnapshotDetails(stats)
 
-	analysis.nodeCounts = buildExplainNodeCounts(stats)
+	analysis.vertexCounts = buildExplainVertexCounts(stats)
 	analysis.edgeCounts = buildExplainEdgeCounts(stats)
 	analysis.predicateSignals = buildExplainPredicateSignals(stmt, params, tenant, stats)
 	planNodes := buildExplainPlanNodes(stmt, e.indexCatalog, tenant, params)
@@ -90,10 +90,10 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 
 func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params, analysis *explainAnalysis) map[string]any {
 	tenant := tenantFromParams(params)
-	nodes := buildExplainPlanNodes(stmt.Statement, e.indexCatalog, tenant, params)
-	rootNodeID := ""
-	if len(nodes) > 0 {
-		rootNodeID = nodes[len(nodes)-1]["id"].(string)
+	planVertexes := buildExplainPlanNodes(stmt.Statement, e.indexCatalog, tenant, params)
+	rootVertexID := ""
+	if len(planVertexes) > 0 {
+		rootVertexID = planVertexes[len(planVertexes)-1]["id"].(string)
 	}
 
 	payload := map[string]any{
@@ -114,15 +114,15 @@ func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params
 			"planningPhaseStatus": "ok",
 		},
 		"logicalPlan": map[string]any{
-			"rootNodeId": rootNodeID,
-			"nodes":      nodes,
+			"rootVertexId": rootVertexID,
+			"vertexes":     planVertexes,
 		},
 		"physicalPlan": map[string]any{
-			"rootNodeId": rootNodeID,
-			"nodes":      nodes,
+			"rootVertexId": rootVertexID,
+			"vertexes":     planVertexes,
 		},
 		"influencers": map[string]any{
-			"nodeCounts":       analysis.nodeCounts,
+			"vertexCounts":     analysis.vertexCounts,
 			"edgeCounts":       analysis.edgeCounts,
 			"predicateSignals": analysis.predicateSignals,
 			"statsSnapshot": map[string]any{
@@ -206,7 +206,7 @@ func collectExplainStoreStats(ctx context.Context, tx graph.Tx, tenant string) (
 	return stats, nil
 }
 
-func buildExplainNodeCounts(stats explainStoreStats) []map[string]any {
+func buildExplainVertexCounts(stats explainStoreStats) []map[string]any {
 	labels := make([]string, 0, len(stats.labelCounts))
 	for label := range stats.labelCounts {
 		labels = append(labels, label)
@@ -236,11 +236,11 @@ func buildExplainStatsSnapshotDetails(stats explainStoreStats) map[string]any {
 	if stats.snapshotFound {
 		totalsCoverage = "snapshot"
 	}
-	nodeCountsCoverage := "missing"
+	vertexCountsCoverage := "missing"
 	if stats.snapshotFound {
-		nodeCountsCoverage = "snapshot"
+		vertexCountsCoverage = "snapshot"
 		if stats.vertexTotal > 0 && len(stats.labelCounts) == 0 {
-			nodeCountsCoverage = "incomplete"
+			vertexCountsCoverage = "incomplete"
 		}
 	}
 	edgeCountsCoverage := "missing"
@@ -252,10 +252,10 @@ func buildExplainStatsSnapshotDetails(stats explainStoreStats) map[string]any {
 	}
 
 	completeness := "partial"
-	if totalsCoverage == "snapshot" && nodeCountsCoverage == "snapshot" && edgeCountsCoverage == "snapshot" {
+	if totalsCoverage == "snapshot" && vertexCountsCoverage == "snapshot" && edgeCountsCoverage == "snapshot" {
 		completeness = "complete"
 	}
-	if totalsCoverage == "scan_fallback" && nodeCountsCoverage == "missing" && edgeCountsCoverage == "missing" {
+	if totalsCoverage == "scan_fallback" && vertexCountsCoverage == "missing" && edgeCountsCoverage == "missing" {
 		completeness = "missing"
 	}
 	backfillStatus := "required"
@@ -265,9 +265,9 @@ func buildExplainStatsSnapshotDetails(stats explainStoreStats) map[string]any {
 
 	return map[string]any{
 		"coverage": map[string]any{
-			"totals":     totalsCoverage,
-			"nodeCounts": nodeCountsCoverage,
-			"edgeCounts": edgeCountsCoverage,
+			"totals":       totalsCoverage,
+			"vertexCounts": vertexCountsCoverage,
+			"edgeCounts":   edgeCountsCoverage,
 		},
 		"completeness":     completeness,
 		"backfillStatus":   backfillStatus,
@@ -296,14 +296,13 @@ func buildExplainEdgeCounts(stats explainStoreStats) []map[string]any {
 
 func buildExplainPredicateSignals(stmt ast.Statement, params Params, tenant string, stats explainStoreStats) []map[string]any {
 	signals := make([]map[string]any, 0)
-	appendFromClause := func(nodeID string, pattern nodePattern, expression string) {
+	appendFromClause := func(pattern vertexPattern, expression string) {
 		matched := countMatchingVertices(stats, pattern, params)
 		signals = append(signals, map[string]any{
 			"expression":   expression,
 			"matchedCount": matched,
 			"quality":      "exact",
 		})
-		_ = nodeID
 	}
 
 	switch s := stmt.(type) {
@@ -313,12 +312,12 @@ func buildExplainPredicateSignals(stmt ast.Statement, params Params, tenant stri
 		for _, match := range s.MatchClauses {
 			if pattern, ok := tryParseExplainNodePattern(match.Pattern); ok {
 				if expr, ok := explainPatternExpression(pattern, params); ok {
-					appendFromClause("", pattern, expr)
+					appendFromClause(pattern, expr)
 				}
 			}
 			if anchored, ok := tryParseExplainAnchoredPattern(match.Pattern); ok {
 				if expr, ok := explainAnchoredExpression(anchored, params); ok {
-					appendFromClause("", anchored.asNodePattern(), expr)
+					appendFromClause(anchored.asNodePattern(), expr)
 				}
 			}
 		}
@@ -327,12 +326,12 @@ func buildExplainPredicateSignals(stmt ast.Statement, params Params, tenant stri
 			for _, clause := range part.Clauses {
 				if pattern, ok := tryParseExplainNodePattern(clause.Raw); ok {
 					if expr, ok := explainPatternExpression(pattern, params); ok {
-						appendFromClause("", pattern, expr)
+						appendFromClause(pattern, expr)
 					}
 				}
 				if anchored, ok := tryParseExplainAnchoredPattern(clause.Raw); ok {
 					if expr, ok := explainAnchoredExpression(anchored, params); ok {
-						appendFromClause("", anchored.asNodePattern(), expr)
+						appendFromClause(anchored.asNodePattern(), expr)
 					}
 				}
 			}
@@ -342,23 +341,23 @@ func buildExplainPredicateSignals(stmt ast.Statement, params Params, tenant stri
 	return signals
 }
 
-func buildExplainIndexDecisions(stmt ast.Statement, params Params, catalog IndexCatalog, tenant string, stats explainStoreStats, planNodes []map[string]any) []map[string]any {
+func buildExplainIndexDecisions(stmt ast.Statement, params Params, catalog IndexCatalog, tenant string, stats explainStoreStats, planVertexes []map[string]any) []map[string]any {
 	candidates := collectExplainIndexCandidates(stmt, params, stats)
 	if len(candidates) == 0 {
 		return nil
 	}
 
-	scanNodes := explainScanPlanNodes(planNodes)
+	scanVertexes := explainScanPlanVertexes(planVertexes)
 	decisions := make([]map[string]any, 0, len(candidates))
 	for i, candidate := range candidates {
-		nodeID := candidate.NodeID
+		vertexID := candidate.VertexID
 		accessPath := ""
-		if i < len(scanNodes) {
-			nodeID = scanNodes[i].ID
-			accessPath = scanNodes[i].AccessPath
+		if i < len(scanVertexes) {
+			vertexID = scanVertexes[i].ID
+			accessPath = scanVertexes[i].AccessPath
 		}
-		if strings.TrimSpace(nodeID) == "" {
-			nodeID = fmt.Sprintf("N%d", i+1)
+		if strings.TrimSpace(vertexID) == "" {
+			vertexID = fmt.Sprintf("N%d", i+1)
 		}
 
 		schema := strings.TrimSpace(candidate.Schema)
@@ -409,7 +408,7 @@ func buildExplainIndexDecisions(stmt ast.Statement, params Params, catalog Index
 		}
 
 		decision := map[string]any{
-			"nodeId":               nodeID,
+			"vertexId":             vertexID,
 			"schema":               schema,
 			"property":             property,
 			"candidate":            true,
@@ -434,14 +433,14 @@ func buildExplainIndexDecisions(stmt ast.Statement, params Params, catalog Index
 }
 
 type explainIndexCandidate struct {
-	NodeID       string
+	VertexID     string
 	Schema       string
 	Property     string
 	MatchedCount int
 	Quality      string
 }
 
-type explainScanPlanNode struct {
+type explainScanPlanVertex struct {
 	ID         string
 	AccessPath string
 }
@@ -541,23 +540,23 @@ func explainPropertyKeys(raw string) map[string]any {
 	return out
 }
 
-func explainScanPlanNodes(nodes []map[string]any) []explainScanPlanNode {
-	out := make([]explainScanPlanNode, 0)
-	for _, node := range nodes {
-		op, _ := node["op"].(string)
+func explainScanPlanVertexes(vertexes []map[string]any) []explainScanPlanVertex {
+	out := make([]explainScanPlanVertex, 0)
+	for _, vertex := range vertexes {
+		op, _ := vertex["op"].(string)
 		if !isScanOperator(op) {
 			continue
 		}
-		id, _ := node["id"].(string)
-		accessPath, _ := node["accessPath"].(string)
-		out = append(out, explainScanPlanNode{ID: id, AccessPath: accessPath})
+		id, _ := vertex["id"].(string)
+		accessPath, _ := vertex["accessPath"].(string)
+		out = append(out, explainScanPlanVertex{ID: id, AccessPath: accessPath})
 	}
 	return out
 }
 
 func isScanOperator(op string) bool {
 	switch op {
-	case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_NODES_SCAN", "OPTIONAL_ALL_NODES_SCAN", "EDGE_SCAN", "OPTIONAL_EDGE_SCAN":
+	case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_VERTEXES_SCAN", "OPTIONAL_ALL_VERTEXES_SCAN", "EDGE_SCAN", "OPTIONAL_EDGE_SCAN":
 		return true
 	default:
 		return false
@@ -585,36 +584,36 @@ func explainIndexTuningImpact(selectivity float64) string {
 	return "low"
 }
 
-func buildExplainCardinalityFromPlanNodes(nodes []map[string]any, params Params, stats explainStoreStats) []map[string]any {
-	entries := make([]map[string]any, 0, len(nodes))
+func buildExplainCardinalityFromPlanNodes(vertexes []map[string]any, params Params, stats explainStoreStats) []map[string]any {
+	entries := make([]map[string]any, 0, len(vertexes))
 	rows := 1
-	for _, node := range nodes {
-		nodeID, _ := node["id"].(string)
-		op, _ := node["op"].(string)
+	for _, vertex := range vertexes {
+		vertexID, _ := vertex["id"].(string)
+		op, _ := vertex["op"].(string)
 		rowsIn := rows
 		rowsOut := rows
 		quality := "estimate"
 		switch op {
 		case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN":
 			quality = "exact"
-			if predicate, _ := node["predicate"].(string); strings.TrimSpace(predicate) != "" {
+			if predicate, _ := vertex["predicate"].(string); strings.TrimSpace(predicate) != "" {
 				rowsOut = 1
 			} else {
 				rowsOut = rowsIn
 			}
-		case "ALL_NODES_SCAN", "OPTIONAL_ALL_NODES_SCAN":
+		case "ALL_VERTEXES_SCAN", "OPTIONAL_ALL_VERTEXES_SCAN":
 			quality = "exact"
 			rowsOut = stats.vertexTotal
-			if op == "OPTIONAL_ALL_NODES_SCAN" && rowsOut == 0 {
+			if op == "OPTIONAL_ALL_VERTEXES_SCAN" && rowsOut == 0 {
 				rowsOut = 1
 			}
 		case "AGGREGATE":
-			if impl, _ := node["implementation"].(string); impl == "fast_node_count" {
+			if impl, _ := vertex["implementation"].(string); impl == "fast_vertex_count" {
 				rowsOut = 1
 				quality = "exact"
 			}
 		case "SKIP":
-			if page, ok := node["pagination"].(map[string]any); ok {
+			if page, ok := vertex["pagination"].(map[string]any); ok {
 				if skipRaw, ok := page["skip"].(string); ok {
 					if skip, ok := explainPaginationValue(skipRaw, params); ok {
 						rowsOut = rowsIn - skip
@@ -625,7 +624,7 @@ func buildExplainCardinalityFromPlanNodes(nodes []map[string]any, params Params,
 				}
 			}
 		case "LIMIT":
-			if page, ok := node["pagination"].(map[string]any); ok {
+			if page, ok := vertex["pagination"].(map[string]any); ok {
 				if limitRaw, ok := page["limit"].(string); ok {
 					if limit, ok := explainPaginationValue(limitRaw, params); ok && rowsOut > limit {
 						rowsOut = limit
@@ -636,26 +635,26 @@ func buildExplainCardinalityFromPlanNodes(nodes []map[string]any, params Params,
 			rowsOut = rowsIn
 		}
 		entries = append(entries, map[string]any{
-			"nodeId":  nodeID,
-			"rowsIn":  rowsIn,
-			"rowsOut": rowsOut,
-			"quality": quality,
+			"vertexId": vertexID,
+			"rowsIn":   rowsIn,
+			"rowsOut":  rowsOut,
+			"quality":  quality,
 		})
 		rows = rowsOut
 	}
 	return entries
 }
 
-func buildExplainCostEstimate(planNodes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any) map[string]any {
-	rowsOutByNode := map[string]int{}
+func buildExplainCostEstimate(planVertexes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any) map[string]any {
+	rowsOutByVertex := map[string]int{}
 	exactCardinality := len(cardinality) > 0
 	for _, entry := range cardinality {
-		nodeID, _ := entry["nodeId"].(string)
-		if strings.TrimSpace(nodeID) == "" {
+		vertexID, _ := entry["vertexId"].(string)
+		if strings.TrimSpace(vertexID) == "" {
 			continue
 		}
 		rowsOut, _ := entry["rowsOut"].(int)
-		rowsOutByNode[nodeID] = rowsOut
+		rowsOutByVertex[vertexID] = rowsOut
 		if quality, _ := entry["quality"].(string); quality != "exact" {
 			exactCardinality = false
 		}
@@ -663,10 +662,10 @@ func buildExplainCostEstimate(planNodes []map[string]any, cardinality []map[stri
 
 	scanRows := 0
 	outputRows := 0
-	for _, node := range planNodes {
-		nodeID, _ := node["id"].(string)
-		op, _ := node["op"].(string)
-		rowsOut := rowsOutByNode[nodeID]
+	for _, vertex := range planVertexes {
+		vertexID, _ := vertex["id"].(string)
+		op, _ := vertex["op"].(string)
+		rowsOut := rowsOutByVertex[vertexID]
 		if isScanOperator(op) {
 			scanRows += rowsOut
 		}
@@ -714,30 +713,30 @@ func buildExplainCostEstimate(planNodes []map[string]any, cardinality []map[stri
 	}
 }
 
-func buildExplainRuntimeStats(planNodes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any, warnings []map[string]any, stats explainStoreStats) map[string]any {
-	scanNodes := 0
-	filterNodes := 0
-	projectionNodes := 0
-	sortNodes := 0
-	paginationNodes := 0
-	writeNodes := 0
+func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any, warnings []map[string]any, stats explainStoreStats) map[string]any {
+	scanVertexes := 0
+	filterVertexes := 0
+	projectionVertexes := 0
+	sortVertexes := 0
+	paginationVertexes := 0
+	writeVertexes := 0
 
-	for _, node := range planNodes {
-		op, _ := node["op"].(string)
+	for _, vertex := range planVertexes {
+		op, _ := vertex["op"].(string)
 		if isScanOperator(op) {
-			scanNodes++
+			scanVertexes++
 		}
 		switch op {
 		case "FILTER":
-			filterNodes++
+			filterVertexes++
 		case "PROJECT", "AGGREGATE":
-			projectionNodes++
+			projectionVertexes++
 		case "SORT":
-			sortNodes++
+			sortVertexes++
 		case "SKIP", "LIMIT":
-			paginationNodes++
+			paginationVertexes++
 		case "CREATE", "MERGE", "SET", "REMOVE", "DELETE", "DETACH_DELETE":
-			writeNodes++
+			writeVertexes++
 		}
 	}
 
@@ -755,13 +754,13 @@ func buildExplainRuntimeStats(planNodes []map[string]any, cardinality []map[stri
 	rowsOutByNode := map[string]int{}
 	allExactCardinality := len(cardinality) > 0
 	for _, entry := range cardinality {
-		nodeID, _ := entry["nodeId"].(string)
+		vertexID, _ := entry["vertexId"].(string)
 		rowsIn, _ := entry["rowsIn"].(int)
 		rowsOut, _ := entry["rowsOut"].(int)
 		rowsRead += rowsIn
 		rowsOutput = rowsOut
-		if strings.TrimSpace(nodeID) != "" {
-			rowsOutByNode[nodeID] = rowsOut
+		if strings.TrimSpace(vertexID) != "" {
+			rowsOutByNode[vertexID] = rowsOut
 		}
 		if quality, _ := entry["quality"].(string); quality != "exact" {
 			allExactCardinality = false
@@ -774,12 +773,12 @@ func buildExplainRuntimeStats(planNodes []map[string]any, cardinality []map[stri
 
 	verticesScanned := 0
 	edgesScanned := 0
-	for _, node := range planNodes {
-		nodeID, _ := node["id"].(string)
-		op, _ := node["op"].(string)
-		rowsOut := rowsOutByNode[nodeID]
+	for _, vertex := range planVertexes {
+		vertexID, _ := vertex["id"].(string)
+		op, _ := vertex["op"].(string)
+		rowsOut := rowsOutByNode[vertexID]
 		switch op {
-		case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_NODES_SCAN", "OPTIONAL_ALL_NODES_SCAN":
+		case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_VERTEXES_SCAN", "OPTIONAL_ALL_VERTEXES_SCAN":
 			verticesScanned += rowsOut
 		case "EDGE_SCAN", "OPTIONAL_EDGE_SCAN":
 			edgesScanned += rowsOut
@@ -796,14 +795,14 @@ func buildExplainRuntimeStats(planNodes []map[string]any, cardinality []map[stri
 			"edgesScanned":    edgesScanned,
 		},
 		"plan": map[string]any{
-			"totalNodes":      len(planNodes),
-			"scanNodes":       scanNodes,
-			"filterNodes":     filterNodes,
-			"projectionNodes": projectionNodes,
-			"sortNodes":       sortNodes,
-			"paginationNodes": paginationNodes,
-			"writeNodes":      writeNodes,
-			"warningCount":    len(warnings),
+			"totalVertexes":      len(planVertexes),
+			"scanVertexes":       scanVertexes,
+			"filterVertexes":     filterVertexes,
+			"projectionVertexes": projectionVertexes,
+			"sortVertexes":       sortVertexes,
+			"paginationVertexes": paginationVertexes,
+			"writeVertexes":      writeVertexes,
+			"warningCount":       len(warnings),
 		},
 		"index": map[string]any{
 			"candidates": indexCandidates,
@@ -818,13 +817,13 @@ func buildExplainRuntimeStats(planNodes []map[string]any, cardinality []map[stri
 	}
 }
 
-func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNodes []map[string]any, tenant string) []map[string]any {
+func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planVertexes []map[string]any, tenant string) []map[string]any {
 	warnings := make([]map[string]any, 0, len(analysis.warnings)+4)
 	seen := map[string]struct{}{}
 	addWarning := func(w map[string]any) {
 		code, _ := w["code"].(string)
-		nodeID, _ := w["nodeId"].(string)
-		key := code + "|" + nodeID
+		vertexID, _ := w["vertexId"].(string)
+		key := code + "|" + vertexID
 		if _, ok := seen[key]; ok {
 			return
 		}
@@ -850,17 +849,17 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNod
 		})
 	}
 
-	for _, node := range planNodes {
-		op, _ := node["op"].(string)
-		nodeID, _ := node["id"].(string)
-		if op == "ALL_NODES_SCAN" || op == "OPTIONAL_ALL_NODES_SCAN" {
-			if explainAllNodesScanBackedByFastNodeCount(planNodes, nodeID) {
+	for _, vertex := range planVertexes {
+		op, _ := vertex["op"].(string)
+		vertexID, _ := vertex["id"].(string)
+		if op == "ALL_VERTEXES_SCAN" || op == "OPTIONAL_ALL_VERTEXES_SCAN" {
+			if explainAllNodesScanBackedByFastVertexCount(planVertexes, vertexID) {
 				continue
 			}
 			addWarning(map[string]any{
-				"code":    "FULL_SCAN_FALLBACK",
-				"message": "Planner selected an all-nodes scan access path",
-				"nodeId":  nodeID,
+				"code":     "FULL_SCAN_FALLBACK",
+				"message":  "Planner selected an all-vertices scan access path",
+				"vertexId": vertexID,
 			})
 		}
 	}
@@ -870,7 +869,7 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNod
 		if selected {
 			continue
 		}
-		nodeID, _ := decision["nodeId"].(string)
+		vertexID, _ := decision["vertexId"].(string)
 		schema, _ := decision["schema"].(string)
 		property, _ := decision["property"].(string)
 		recommendation, _ := decision["recommendation"].(string)
@@ -878,15 +877,15 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNod
 			recommendation = "consider-index"
 		}
 		addWarning(map[string]any{
-			"code":    "MISSING_PROPERTY_INDEX",
-			"message": fmt.Sprintf("No property index selected for %s.%s; recommendation=%s", schema, property, recommendation),
-			"nodeId":  nodeID,
+			"code":     "MISSING_PROPERTY_INDEX",
+			"message":  fmt.Sprintf("No property index selected for %s.%s; recommendation=%s", schema, property, recommendation),
+			"vertexId": vertexID,
 		})
 		if quality, _ := decision["quality"].(string); quality == "estimate" {
 			addWarning(map[string]any{
-				"code":    "ESTIMATE_ONLY_INDEX_SIGNAL",
-				"message": fmt.Sprintf("Index signal for %s.%s is estimate quality; bind parameters for exact selectivity", schema, property),
-				"nodeId":  nodeID,
+				"code":     "ESTIMATE_ONLY_INDEX_SIGNAL",
+				"message":  fmt.Sprintf("Index signal for %s.%s is estimate quality; bind parameters for exact selectivity", schema, property),
+				"vertexId": vertexID,
 			})
 		}
 	}
@@ -900,22 +899,22 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planNod
 	return warnings
 }
 
-func explainAllNodesScanBackedByFastNodeCount(planNodes []map[string]any, nodeID string) bool {
-	if strings.TrimSpace(nodeID) == "" {
+func explainAllNodesScanBackedByFastVertexCount(planVertexes []map[string]any, vertexID string) bool {
+	if strings.TrimSpace(vertexID) == "" {
 		return false
 	}
-	for _, node := range planNodes {
-		op, _ := node["op"].(string)
+	for _, vertex := range planVertexes {
+		op, _ := vertex["op"].(string)
 		if op != "AGGREGATE" {
 			continue
 		}
-		impl, _ := node["implementation"].(string)
-		if impl != "fast_node_count" {
+		impl, _ := vertex["implementation"].(string)
+		if impl != "fast_vertex_count" {
 			continue
 		}
-		children, _ := node["children"].([]string)
+		children, _ := vertex["children"].([]string)
 		for _, child := range children {
-			if child == nodeID {
+			if child == vertexID {
 				return true
 			}
 		}
@@ -1143,7 +1142,7 @@ func (b *explainPlanBuilder) addMatchClause(optional bool, raw string, where *as
 		patternBody = strings.TrimSpace(raw)
 	}
 
-	if pattern, err := parseNodePattern(patternBody); err == nil {
+	if pattern, err := parseVertexPattern(patternBody); err == nil {
 		b.addNodeScan(optional, pattern, where)
 		return
 	}
@@ -1187,11 +1186,11 @@ func explainFastUndirectedEdgePatternFromRaw(raw string) (explainFastUndirectedE
 	if strings.TrimSpace(pattern.Left.Var) != "" || strings.TrimSpace(pattern.Right.Var) != "" {
 		return explainFastUndirectedEdgePattern{}, false
 	}
-	leftLabel, leftAny, ok := fastEdgeCountNodeLabelFilter(pattern.Left)
+	leftLabel, leftAny, ok := fastEdgeCountVertexLabelFilter(pattern.Left)
 	if !ok {
 		return explainFastUndirectedEdgePattern{}, false
 	}
-	rightLabel, rightAny, ok := fastEdgeCountNodeLabelFilter(pattern.Right)
+	rightLabel, rightAny, ok := fastEdgeCountVertexLabelFilter(pattern.Right)
 	if !ok {
 		return explainFastUndirectedEdgePattern{}, false
 	}
@@ -1220,7 +1219,7 @@ func (b *explainPlanBuilder) addFastUndirectedEdgeScan(optional bool, pattern ex
 	}
 }
 
-func (b *explainPlanBuilder) addNodeScan(optional bool, pattern nodePattern, where *ast.Expression) {
+func (b *explainPlanBuilder) addNodeScan(optional bool, pattern vertexPattern, where *ast.Expression) {
 	schema := explainPatternSchema(pattern)
 	props, err := explainPropertyMap(pattern.PropertiesRaw, b.params)
 	propKeyMap := explainPropertyKeys(pattern.PropertiesRaw)
@@ -1258,8 +1257,8 @@ func (b *explainPlanBuilder) addNodeScan(optional bool, pattern nodePattern, whe
 			op = "LABEL_SCAN"
 			indexPath = fmt.Sprintf("label(%s)", schema)
 		} else {
-			op = "ALL_NODES_SCAN"
-			indexPath = "all_nodes"
+			op = "ALL_VERTEXES_SCAN"
+			indexPath = "all_vertices"
 		}
 	}
 	if optional {
@@ -1289,14 +1288,14 @@ func (b *explainPlanBuilder) addAnchoredScan(optional bool, pattern anchoredOutP
 	prop, value, ok := anchoredSourcePropertyEquality(pattern, b.params, nil)
 	indexed := ok && b.catalog != nil && schema != "" && b.catalog.HasPropertyIndex(b.tenant, schema, prop)
 	op := "INDEX_SCAN"
-	accessPath := "all_nodes"
+	accessPath := "all_vertices"
 	if indexed {
 		accessPath = fmt.Sprintf("property_index(%s.%s)", schema, prop)
 	} else if schema != "" {
 		op = "LABEL_SCAN"
 		accessPath = fmt.Sprintf("label(%s)", schema)
 	} else {
-		op = "ALL_NODES_SCAN"
+		op = "ALL_VERTEXES_SCAN"
 	}
 	if optional {
 		op = "OPTIONAL_" + op
@@ -1319,12 +1318,12 @@ func (b *explainPlanBuilder) addProjectionClause(clause ast.Clause) {
 	if projection == nil {
 		return
 	}
-	if nodeVar, ok := b.canUseFastNodeCount(); ok {
-		if output, ok := explainFastNodeCountProjection(projection, nodeVar); ok {
+	if nodeVar, ok := b.canUseFastVertexCount(); ok {
+		if output, ok := explainFastVertexCountProjection(projection, nodeVar); ok {
 			attrs := map[string]any{
 				"aggregates":     []string{fmt.Sprintf("count(%s)", nodeVar)},
 				"projection":     []string{output},
-				"implementation": "fast_node_count",
+				"implementation": "fast_vertex_count",
 			}
 			b.add("AGGREGATE", attrs)
 			return
@@ -1455,7 +1454,7 @@ func explainFastEdgeCountProjection(projection *ast.ReturnClause, edgeVar string
 	return expr, true
 }
 
-func explainFastNodeCountProjection(projection *ast.ReturnClause, nodeVar string) (string, bool) {
+func explainFastVertexCountProjection(projection *ast.ReturnClause, nodeVar string) (string, bool) {
 	if projection == nil || projection.Distinct || projection.IncludeAll || projection.Skip != nil || projection.Limit != nil || len(projection.OrderBy) != 0 || len(projection.Items) != 1 {
 		return "", false
 	}
@@ -1561,7 +1560,7 @@ func (b *explainPlanBuilder) canUseFastLabelHistogram() bool {
 	}
 	last := b.nodes[len(b.nodes)-1]
 	op, _ := last["op"].(string)
-	return op == "ALL_NODES_SCAN"
+	return op == "ALL_VERTEXES_SCAN"
 }
 
 func (b *explainPlanBuilder) canUseFastEdgeCount() (string, bool) {
@@ -1581,13 +1580,13 @@ func (b *explainPlanBuilder) canUseFastEdgeCount() (string, bool) {
 	return edgeVar, true
 }
 
-func (b *explainPlanBuilder) canUseFastNodeCount() (string, bool) {
+func (b *explainPlanBuilder) canUseFastVertexCount() (string, bool) {
 	if len(b.nodes) == 0 {
 		return "", false
 	}
 	last := b.nodes[len(b.nodes)-1]
 	op, _ := last["op"].(string)
-	if op != "ALL_NODES_SCAN" {
+	if op != "ALL_VERTEXES_SCAN" {
 		return "", false
 	}
 	nodeVar, _ := last["nodeVar"].(string)
@@ -1710,10 +1709,10 @@ func tenantFromParams(params Params) string {
 	return ""
 }
 
-func tryParseExplainNodePattern(raw string) (nodePattern, bool) {
-	pattern, err := parseNodePattern(raw)
+func tryParseExplainNodePattern(raw string) (vertexPattern, bool) {
+	pattern, err := parseVertexPattern(raw)
 	if err != nil {
-		return nodePattern{}, false
+		return vertexPattern{}, false
 	}
 	return pattern, true
 }
@@ -1726,8 +1725,8 @@ func tryParseExplainAnchoredPattern(raw string) (anchoredOutPattern, bool) {
 	return pattern, true
 }
 
-func (p anchoredOutPattern) asNodePattern() nodePattern {
-	pattern := nodePattern{
+func (p anchoredOutPattern) asNodePattern() vertexPattern {
+	pattern := vertexPattern{
 		Var:           p.SourceVar,
 		AllOfLabels:   nil,
 		PropertiesRaw: p.SourcePropertiesRaw,
@@ -1738,7 +1737,7 @@ func (p anchoredOutPattern) asNodePattern() nodePattern {
 	return pattern
 }
 
-func explainPatternSchema(pattern nodePattern) string {
+func explainPatternSchema(pattern vertexPattern) string {
 	if len(pattern.AllOfLabels) > 0 {
 		return pattern.AllOfLabels[0]
 	}
@@ -1782,7 +1781,7 @@ func explainAnchoredExpression(pattern anchoredOutPattern, params Params) (strin
 	return strings.Join(pairs, ","), true
 }
 
-func explainPatternExpression(pattern nodePattern, params Params) (string, bool) {
+func explainPatternExpression(pattern vertexPattern, params Params) (string, bool) {
 	props, err := explainPatternProperties(pattern.PropertiesRaw, params)
 	if err != nil || len(props) == 0 {
 		return "", false
@@ -1801,7 +1800,7 @@ func explainPatternExpression(pattern nodePattern, params Params) (string, bool)
 	return strings.Join(pairs, ","), true
 }
 
-func countMatchingVertices(stats explainStoreStats, pattern nodePattern, params Params) int {
+func countMatchingVertices(stats explainStoreStats, pattern vertexPattern, params Params) int {
 	count := 0
 	for _, vertex := range stats.vertices {
 		if matchesExplainNodePattern(vertex, pattern, params) {
@@ -1816,7 +1815,7 @@ func countAnchoredRows(stats explainStoreStats, pattern anchoredOutPattern, para
 	return countMatchingVertices(stats, left, params)
 }
 
-func matchesExplainNodePattern(vertex *graph.Vertex, pattern nodePattern, params Params) bool {
+func matchesExplainNodePattern(vertex *graph.Vertex, pattern vertexPattern, params Params) bool {
 	if vertex == nil {
 		return false
 	}

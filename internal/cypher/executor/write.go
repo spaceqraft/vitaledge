@@ -30,7 +30,7 @@ var (
 	createEdgePatternReverseRE       = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 	createEdgePatternUndirectedRE    = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
 	createEdgePatternTwoDirectionsRE = regexp.MustCompile(`\)<-\[[^\]]*\]->\(`)
-	createChainNodeTokenRE           = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)`)
+	createChainVertexTokenRE         = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)`)
 	createChainRelForwardTokenRE     = regexp.MustCompile(`^-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]->`)
 	createChainRelReverseTokenRE     = regexp.MustCompile(`^<-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-`)
 	createChainRelUndirTokenRE       = regexp.MustCompile(`^-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-`)
@@ -54,7 +54,7 @@ const (
 	createEdgeDirectionUndirected createEdgeDirection = "undirected"
 )
 
-type createChainNodePattern struct {
+type createChainVertexPattern struct {
 	Var      string
 	Labels   []string
 	PropsRaw string
@@ -74,8 +74,8 @@ type createChainRelPattern struct {
 }
 
 type createChainPattern struct {
-	Nodes []createChainNodePattern
-	Rels  []createChainRelPattern
+	Vertexes []createChainVertexPattern
+	Rels     []createChainRelPattern
 }
 
 type deletedVertexBinding struct {
@@ -140,7 +140,7 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 		} else if ok {
 			return fastResult, nil
 		}
-		if fastResult, ok, fastErr := e.tryFastNodeCountQuery(ctx, stmt, params); fastErr != nil {
+		if fastResult, ok, fastErr := e.tryFastVertexCountQuery(ctx, stmt, params); fastErr != nil {
 			return nil, fastErr
 		} else if ok {
 			return fastResult, nil
@@ -328,11 +328,11 @@ func (e *Executor) tryFastEdgeCountQuery(ctx context.Context, stmt *ast.QuerySta
 		return nil, false, nil
 	}
 
-	leftLabel, leftAny, ok := fastEdgeCountNodeLabelFilter(relPattern.Left)
+	leftLabel, leftAny, ok := fastEdgeCountVertexLabelFilter(relPattern.Left)
 	if !ok {
 		return nil, false, nil
 	}
-	rightLabel, rightAny, ok := fastEdgeCountNodeLabelFilter(relPattern.Right)
+	rightLabel, rightAny, ok := fastEdgeCountVertexLabelFilter(relPattern.Right)
 	if !ok {
 		return nil, false, nil
 	}
@@ -408,7 +408,7 @@ func (e *Executor) tryFastEdgeCountQuery(ctx context.Context, stmt *ast.QuerySta
 	}, true, nil
 }
 
-func fastEdgeCountNodeLabelFilter(pattern nodePattern) (label string, any bool, ok bool) {
+func fastEdgeCountVertexLabelFilter(pattern vertexPattern) (label string, any bool, ok bool) {
 	if strings.TrimSpace(pattern.PropertiesRaw) != "" {
 		return "", false, false
 	}
@@ -466,7 +466,7 @@ func countUndirectedEdgeMatchesFast(ctx context.Context, tx graph.Tx, tenant, le
 	return total, err
 }
 
-func (e *Executor) tryFastNodeCountQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
+func (e *Executor) tryFastVertexCountQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
 	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
 		return nil, false, nil
 	}
@@ -482,12 +482,12 @@ func (e *Executor) tryFastNodeCountQuery(ctx context.Context, stmt *ast.QuerySta
 	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
 		return nil, false, nil
 	}
-	nodePattern, err := parseNodePattern(matchSpec.Pattern)
+	vertexPattern, err := parseVertexPattern(matchSpec.Pattern)
 	if err != nil {
 		return nil, false, nil
 	}
-	nodeVar := strings.TrimSpace(nodePattern.Var)
-	if nodeVar == "" || strings.TrimSpace(nodePattern.PropertiesRaw) != "" || len(nodePattern.AllOfLabels) != 0 || len(nodePattern.AnyOfLabels) != 0 || len(nodePattern.ExcludedLabels) != 0 {
+	vertexVar := strings.TrimSpace(vertexPattern.Var)
+	if vertexVar == "" || strings.TrimSpace(vertexPattern.PropertiesRaw) != "" || len(vertexPattern.AllOfLabels) != 0 || len(vertexPattern.AnyOfLabels) != 0 || len(vertexPattern.ExcludedLabels) != 0 {
 		return nil, false, nil
 	}
 
@@ -507,7 +507,7 @@ func (e *Executor) tryFastNodeCountQuery(ctx context.Context, stmt *ast.QuerySta
 		return nil, false, nil
 	}
 	countExpr, countDistinct := parseCountDistinctArg(item.CountArg)
-	if countDistinct || strings.TrimSpace(countExpr) != nodeVar {
+	if countDistinct || strings.TrimSpace(countExpr) != vertexVar {
 		return nil, false, nil
 	}
 
@@ -552,12 +552,12 @@ func (e *Executor) tryFastLabelHistogramQuery(ctx context.Context, stmt *ast.Que
 	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
 		return nil, false, nil
 	}
-	nodePattern, err := parseNodePattern(matchSpec.Pattern)
+	vertexPattern, err := parseVertexPattern(matchSpec.Pattern)
 	if err != nil {
 		return nil, false, nil
 	}
-	nodeVar := strings.TrimSpace(nodePattern.Var)
-	if nodeVar == "" || strings.TrimSpace(nodePattern.PropertiesRaw) != "" || len(nodePattern.AnyOfLabels) != 0 || len(nodePattern.ExcludedLabels) != 0 || len(nodePattern.AllOfLabels) != 0 {
+	vertexVar := strings.TrimSpace(vertexPattern.Var)
+	if vertexVar == "" || strings.TrimSpace(vertexPattern.PropertiesRaw) != "" || len(vertexPattern.AnyOfLabels) != 0 || len(vertexPattern.ExcludedLabels) != 0 || len(vertexPattern.AllOfLabels) != 0 {
 		return nil, false, nil
 	}
 
@@ -577,7 +577,7 @@ func (e *Executor) tryFastLabelHistogramQuery(ctx context.Context, stmt *ast.Que
 	countIdx := -1
 	for idx, item := range items {
 		if arg, ok := parseFunctionCall(item.Expression, "labels"); ok {
-			if strings.TrimSpace(arg) == nodeVar && item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" {
+			if strings.TrimSpace(arg) == vertexVar && item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" {
 				labelsIdx = idx
 				continue
 			}
@@ -589,7 +589,7 @@ func (e *Executor) tryFastLabelHistogramQuery(ctx context.Context, stmt *ast.Que
 		if countDistinct {
 			continue
 		}
-		if arg, ok := parseFunctionCall(countExpr, "labels"); ok && strings.TrimSpace(arg) == nodeVar {
+		if arg, ok := parseFunctionCall(countExpr, "labels"); ok && strings.TrimSpace(arg) == vertexVar {
 			countIdx = idx
 		}
 	}
@@ -685,11 +685,11 @@ func (e *Executor) tryFastEdgeDeleteQuery(ctx context.Context, stmt *ast.QuerySt
 		return nil, false, nil
 	}
 
-	leftLabel, leftAny, ok := fastEdgeCountNodeLabelFilter(relPattern.Left)
+	leftLabel, leftAny, ok := fastEdgeCountVertexLabelFilter(relPattern.Left)
 	if !ok {
 		return nil, false, nil
 	}
-	rightLabel, rightAny, ok := fastEdgeCountNodeLabelFilter(relPattern.Right)
+	rightLabel, rightAny, ok := fastEdgeCountVertexLabelFilter(relPattern.Right)
 	if !ok {
 		return nil, false, nil
 	}
@@ -866,11 +866,11 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	if parts := splitTopLevelCommaSeparated(patternRaw); len(parts) > 1 {
 		return e.expandCompositeMatch(ctx, tx, rows, spec, parts, params)
 	}
-	if multi, ok := parseMultiNodeMatchPattern(patternRaw); ok {
-		return e.expandMultiNodeMatch(ctx, tx, rows, spec, multi, params)
+	if multi, ok := parseMultiVertexMatchPattern(patternRaw); ok {
+		return e.expandMultiVertexMatch(ctx, tx, rows, spec, multi, params)
 	}
-	if node, err := parseNodePattern(patternRaw); err == nil {
-		return e.expandNodeMatch(ctx, tx, rows, spec, node, params, pathVar)
+	if vertex, err := parseVertexPattern(patternRaw); err == nil {
+		return e.expandVertexMatch(ctx, tx, rows, spec, vertex, params, pathVar)
 	}
 	if anchored, err := parseAnchoredOutPattern(patternRaw); err == nil {
 		if shouldUseAnchoredOutPath(rows, anchored) {
@@ -1191,18 +1191,18 @@ type cypherPathValue struct {
 func (p cypherPathValue) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"__path__":   true,
-		"nodes":      []any{vertexToMap(p.Left), vertexToMap(p.Right)},
+		"vertexes":   []any{vertexToMap(p.Left), vertexToMap(p.Right)},
 		"edges":      []any{edgeToMap(p.Edge)},
 		"directions": []any{p.Direction},
 	})
 }
 
 func (p cypherPathValue) String() string {
-	left := renderPathNode(p.Left)
+	left := renderPathVertex(p.Left)
 	if p.Edge == nil && p.Right == nil {
 		return "<" + left + ">"
 	}
-	right := renderPathNode(p.Right)
+	right := renderPathVertex(p.Right)
 	edge := renderPathEdge(p.Edge)
 	switch p.Direction {
 	case "reverse":
@@ -1214,7 +1214,7 @@ func (p cypherPathValue) String() string {
 	}
 }
 
-func renderPathNode(v *graph.Vertex) string {
+func renderPathVertex(v *graph.Vertex) string {
 	if v == nil {
 		return "()"
 	}
@@ -1333,27 +1333,27 @@ func edgeFromRowBinding(row Row, key string) *graph.Edge {
 	return nil
 }
 
-func parseMultiNodeMatchPattern(raw string) ([]nodePattern, bool) {
+func parseMultiVertexMatchPattern(raw string) ([]vertexPattern, bool) {
 	parts := splitTopLevelCommaSeparated(raw)
 	if len(parts) <= 1 {
 		return nil, false
 	}
-	out := make([]nodePattern, 0, len(parts))
+	out := make([]vertexPattern, 0, len(parts))
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			return nil, false
 		}
-		node, err := parseNodePattern(part)
+		vertex, err := parseVertexPattern(part)
 		if err != nil {
 			return nil, false
 		}
-		out = append(out, node)
+		out = append(out, vertex)
 	}
 	return out, true
 }
 
-func (e *Executor) expandMultiNodeMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, patterns []nodePattern, params Params) ([]Row, error) {
+func (e *Executor) expandMultiVertexMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, patterns []vertexPattern, params Params) ([]Row, error) {
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, err
@@ -1368,7 +1368,7 @@ func (e *Executor) expandMultiNodeMatch(ctx context.Context, tx graph.Tx, rows [
 		for _, pattern := range patterns {
 			next := make([]Row, 0)
 			for _, partial := range partials {
-				candidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, partial, pattern, params)
+				candidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, partial, pattern, params)
 				if err != nil {
 					return nil, err
 				}
@@ -1679,7 +1679,7 @@ func (e *Executor) resolveAnchoredSources(ctx context.Context, tx graph.Tx, tena
 	return []*graph.Vertex{vertex}, nil
 }
 
-func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern nodePattern, params Params, pathVar string) ([]Row, error) {
+func (e *Executor) expandVertexMatch(ctx context.Context, tx graph.Tx, rows []Row, spec anchoredMatchSpec, pattern vertexPattern, params Params, pathVar string) ([]Row, error) {
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, err
@@ -1691,7 +1691,7 @@ func (e *Executor) expandNodeMatch(ctx context.Context, tx graph.Tx, rows []Row,
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		candidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern, params)
+		candidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern, params)
 		if err != nil {
 			return nil, err
 		}
@@ -1752,7 +1752,7 @@ func (e *Executor) expandUndirectedAdjacentMatch(ctx context.Context, tx graph.T
 			row = cloneRow(row)
 			row[pathVar] = nil
 		}
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -1788,7 +1788,7 @@ func (e *Executor) expandUndirectedAdjacentMatch(ctx context.Context, tx graph.T
 				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, neighbor) {
 					return nil
 				}
-				if !nodePatternMatches(neighbor, pattern.Right, params, rowWithLeft) {
+				if !vertexPatternMatches(neighbor, pattern.Right, params, rowWithLeft) {
 					return nil
 				}
 
@@ -1863,7 +1863,7 @@ func (e *Executor) expandDirectedAdjacentMatch(ctx context.Context, tx graph.Tx,
 			row = cloneRow(row)
 			row[pathVar] = nil
 		}
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -1889,7 +1889,7 @@ func (e *Executor) expandDirectedAdjacentMatch(ctx context.Context, tx graph.Tx,
 				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, neighbor) {
 					return nil
 				}
-				if !nodePatternMatches(neighbor, pattern.Right, params, rowWithLeft) {
+				if !vertexPatternMatches(neighbor, pattern.Right, params, rowWithLeft) {
 					return nil
 				}
 
@@ -1945,7 +1945,7 @@ func (e *Executor) expandReverseDirectedAdjacentMatch(ctx context.Context, tx gr
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		rightCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Right, params)
+		rightCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Right, params)
 		if err != nil {
 			return nil, err
 		}
@@ -1971,7 +1971,7 @@ func (e *Executor) expandReverseDirectedAdjacentMatch(ctx context.Context, tx gr
 				if !vertexBindingMatches(rowWithRight, pattern.Left.Var, left) {
 					return nil
 				}
-				if !nodePatternMatches(left, pattern.Left, params, rowWithRight) {
+				if !vertexPatternMatches(left, pattern.Left, params, rowWithRight) {
 					return nil
 				}
 
@@ -2027,7 +2027,7 @@ func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2066,7 +2066,7 @@ func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph
 				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, neighbor) {
 					return nil
 				}
-				if !nodePatternMatches(neighbor, pattern.Right, params, rowWithLeft) {
+				if !vertexPatternMatches(neighbor, pattern.Right, params, rowWithLeft) {
 					return nil
 				}
 
@@ -2123,7 +2123,7 @@ func (e *Executor) expandReverseDirectedRelationshipMatch(ctx context.Context, t
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2162,7 +2162,7 @@ func (e *Executor) expandReverseDirectedRelationshipMatch(ctx context.Context, t
 				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, right) {
 					return nil
 				}
-				if !nodePatternMatches(right, pattern.Right, params, rowWithLeft) {
+				if !vertexPatternMatches(right, pattern.Right, params, rowWithLeft) {
 					return nil
 				}
 
@@ -2219,7 +2219,7 @@ func (e *Executor) expandUndirectedRelationshipMatch(ctx context.Context, tx gra
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2259,7 +2259,7 @@ func (e *Executor) expandUndirectedRelationshipMatch(ctx context.Context, tx gra
 				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, neighbor) {
 					return nil
 				}
-				if !nodePatternMatches(neighbor, pattern.Right, params, rowWithLeft) {
+				if !vertexPatternMatches(neighbor, pattern.Right, params, rowWithLeft) {
 					return nil
 				}
 
@@ -2389,7 +2389,7 @@ func (e *Executor) expandVariableLengthDirectedRelationshipMatch(ctx context.Con
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2405,7 +2405,7 @@ func (e *Executor) expandVariableLengthDirectedRelationshipMatch(ctx context.Con
 				baseRow[pattern.Left.Var] = left
 			}
 
-			emitMatch := func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string) error {
+			emitMatch := func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string) error {
 				depth := len(edges)
 				if depth < pattern.MinHops {
 					return nil
@@ -2428,9 +2428,9 @@ func (e *Executor) expandVariableLengthDirectedRelationshipMatch(ctx context.Con
 					merged[pattern.EdgeVar] = edgeSequenceToAny(edges)
 				}
 				if pathVar != "" {
-					merged[pathVar] = multiHopPathValue(nodes, edges, dirs)
+					merged[pathVar] = multiHopPathValue(vertexes, edges, dirs)
 				}
-				if !nodePatternMatches(current, pattern.Right, params, merged) {
+				if !vertexPatternMatches(current, pattern.Right, params, merged) {
 					return nil
 				}
 				if spec.Where != "" {
@@ -2452,8 +2452,8 @@ func (e *Executor) expandVariableLengthDirectedRelationshipMatch(ctx context.Con
 				return nil, err
 			}
 
-			var walk func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
-			walk = func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
+			var walk func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
+			walk = func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
 				if pattern.MaxHops >= 0 && len(edges) >= pattern.MaxHops {
 					return nil
 				}
@@ -2479,7 +2479,7 @@ func (e *Executor) expandVariableLengthDirectedRelationshipMatch(ctx context.Con
 						return err
 					}
 
-					nextNodes := append(append([]*graph.Vertex{}, nodes...), right)
+					nextVertexes := append(append([]*graph.Vertex{}, vertexes...), right)
 					nextEdges := append(append([]*graph.Edge{}, edges...), edge)
 					nextDirs := append(append([]string{}, dirs...), "forward")
 
@@ -2489,11 +2489,11 @@ func (e *Executor) expandVariableLengthDirectedRelationshipMatch(ctx context.Con
 					}
 					nextUsed[edge.ID] = true
 
-					if err := emitMatch(right, nextNodes, nextEdges, nextDirs); err != nil {
+					if err := emitMatch(right, nextVertexes, nextEdges, nextDirs); err != nil {
 						return err
 					}
 
-					return walk(right, nextNodes, nextEdges, nextDirs, nextUsed)
+					return walk(right, nextVertexes, nextEdges, nextDirs, nextUsed)
 				})
 			}
 
@@ -2529,7 +2529,7 @@ func (e *Executor) expandDirectedVariableLengthThenDirectedVariableLengthMatch(c
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2545,8 +2545,8 @@ func (e *Executor) expandDirectedVariableLengthThenDirectedVariableLengthMatch(c
 				baseRow[pattern.Left.Var] = left
 			}
 
-			var walkSecond func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool, midRow Row, firstEdgeCount int) error
-			walkSecond = func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool, midRow Row, firstEdgeCount int) error {
+			var walkSecond func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool, midRow Row, firstEdgeCount int) error
+			walkSecond = func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool, midRow Row, firstEdgeCount int) error {
 				depthSecond := len(edges) - firstEdgeCount
 				if depthSecond >= pattern.SecondMinHops && (pattern.SecondMaxHops < 0 || depthSecond <= pattern.SecondMaxHops) {
 					if vertexBindingMatches(midRow, pattern.Right.Var, current) {
@@ -2555,9 +2555,9 @@ func (e *Executor) expandDirectedVariableLengthThenDirectedVariableLengthMatch(c
 							merged[pattern.Right.Var] = current
 						}
 						if pathVar != "" {
-							merged[pathVar] = multiHopPathValue(nodes, edges, dirs)
+							merged[pathVar] = multiHopPathValue(vertexes, edges, dirs)
 						}
-						if nodePatternMatches(current, pattern.Right, params, merged) {
+						if vertexPatternMatches(current, pattern.Right, params, merged) {
 							if spec.Where != "" {
 								ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
 								if err != nil {
@@ -2598,7 +2598,7 @@ func (e *Executor) expandDirectedVariableLengthThenDirectedVariableLengthMatch(c
 						}
 						return err
 					}
-					nextNodes := append(append([]*graph.Vertex{}, nodes...), next)
+					nextVertexes := append(append([]*graph.Vertex{}, vertexes...), next)
 					nextEdges := append(append([]*graph.Edge{}, edges...), edge)
 					nextDirs := append(append([]string{}, dirs...), "forward")
 					nextUsed := make(map[string]bool, len(used)+1)
@@ -2606,12 +2606,12 @@ func (e *Executor) expandDirectedVariableLengthThenDirectedVariableLengthMatch(c
 						nextUsed[key] = true
 					}
 					nextUsed[edge.ID] = true
-					return walkSecond(next, nextNodes, nextEdges, nextDirs, nextUsed, midRow, firstEdgeCount)
+					return walkSecond(next, nextVertexes, nextEdges, nextDirs, nextUsed, midRow, firstEdgeCount)
 				})
 			}
 
-			var walkFirst func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
-			walkFirst = func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
+			var walkFirst func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
+			walkFirst = func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
 				depthFirst := len(edges)
 				if depthFirst >= pattern.FirstMinHops {
 					if pattern.Mid.Var == "" || vertexBindingMatches(baseRow, pattern.Mid.Var, current) {
@@ -2619,12 +2619,12 @@ func (e *Executor) expandDirectedVariableLengthThenDirectedVariableLengthMatch(c
 						if pattern.Mid.Var != "" {
 							midRow[pattern.Mid.Var] = current
 						}
-						if nodePatternMatches(current, pattern.Mid, params, midRow) {
+						if vertexPatternMatches(current, pattern.Mid, params, midRow) {
 							usedForSecond := make(map[string]bool, len(used))
 							for key := range used {
 								usedForSecond[key] = true
 							}
-							if err := walkSecond(current, nodes, edges, dirs, usedForSecond, midRow, depthFirst); err != nil {
+							if err := walkSecond(current, vertexes, edges, dirs, usedForSecond, midRow, depthFirst); err != nil {
 								return err
 							}
 						}
@@ -2655,7 +2655,7 @@ func (e *Executor) expandDirectedVariableLengthThenDirectedVariableLengthMatch(c
 						}
 						return err
 					}
-					nextNodes := append(append([]*graph.Vertex{}, nodes...), next)
+					nextVertexes := append(append([]*graph.Vertex{}, vertexes...), next)
 					nextEdges := append(append([]*graph.Edge{}, edges...), edge)
 					nextDirs := append(append([]string{}, dirs...), "forward")
 					nextUsed := make(map[string]bool, len(used)+1)
@@ -2663,7 +2663,7 @@ func (e *Executor) expandDirectedVariableLengthThenDirectedVariableLengthMatch(c
 						nextUsed[key] = true
 					}
 					nextUsed[edge.ID] = true
-					return walkFirst(next, nextNodes, nextEdges, nextDirs, nextUsed)
+					return walkFirst(next, nextVertexes, nextEdges, nextDirs, nextUsed)
 				})
 			}
 
@@ -2699,7 +2699,7 @@ func (e *Executor) expandVariableLengthUndirectedRelationshipMatch(ctx context.C
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2715,7 +2715,7 @@ func (e *Executor) expandVariableLengthUndirectedRelationshipMatch(ctx context.C
 				baseRow[pattern.Left.Var] = left
 			}
 
-			emitMatch := func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string) error {
+			emitMatch := func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string) error {
 				depth := len(edges)
 				if depth < pattern.MinHops {
 					return nil
@@ -2738,9 +2738,9 @@ func (e *Executor) expandVariableLengthUndirectedRelationshipMatch(ctx context.C
 					merged[pattern.EdgeVar] = edgeSequenceToAny(edges)
 				}
 				if pathVar != "" {
-					merged[pathVar] = multiHopPathValue(nodes, edges, dirs)
+					merged[pathVar] = multiHopPathValue(vertexes, edges, dirs)
 				}
-				if !nodePatternMatches(current, pattern.Right, params, merged) {
+				if !vertexPatternMatches(current, pattern.Right, params, merged) {
 					return nil
 				}
 				if spec.Where != "" {
@@ -2762,8 +2762,8 @@ func (e *Executor) expandVariableLengthUndirectedRelationshipMatch(ctx context.C
 				return nil, err
 			}
 
-			var walk func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
-			walk = func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
+			var walk func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
+			walk = func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
 				if pattern.MaxHops >= 0 && len(edges) >= pattern.MaxHops {
 					return nil
 				}
@@ -2816,7 +2816,7 @@ func (e *Executor) expandVariableLengthUndirectedRelationshipMatch(ctx context.C
 				}
 
 				for _, candidate := range neighbors {
-					nextNodes := append(append([]*graph.Vertex{}, nodes...), candidate.neighbor)
+					nextVertexes := append(append([]*graph.Vertex{}, vertexes...), candidate.neighbor)
 					nextEdges := append(append([]*graph.Edge{}, edges...), candidate.edge)
 					nextDirs := append(append([]string{}, dirs...), candidate.dir)
 
@@ -2826,11 +2826,11 @@ func (e *Executor) expandVariableLengthUndirectedRelationshipMatch(ctx context.C
 					}
 					nextUsed[candidate.edge.ID] = true
 
-					if err := emitMatch(candidate.neighbor, nextNodes, nextEdges, nextDirs); err != nil {
+					if err := emitMatch(candidate.neighbor, nextVertexes, nextEdges, nextDirs); err != nil {
 						return err
 					}
 
-					if err := walk(candidate.neighbor, nextNodes, nextEdges, nextDirs, nextUsed); err != nil {
+					if err := walk(candidate.neighbor, nextVertexes, nextEdges, nextDirs, nextUsed); err != nil {
 						return err
 					}
 				}
@@ -2869,7 +2869,7 @@ func (e *Executor) expandDirectedAdjacentThenVariableLengthMatch(ctx context.Con
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -2899,12 +2899,12 @@ func (e *Executor) expandDirectedAdjacentThenVariableLengthMatch(ctx context.Con
 				if pattern.Mid.Var != "" {
 					midRow[pattern.Mid.Var] = mid
 				}
-				if !nodePatternMatches(mid, pattern.Mid, params, midRow) {
+				if !vertexPatternMatches(mid, pattern.Mid, params, midRow) {
 					return nil
 				}
 
-				var walk func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
-				walk = func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
+				var walk func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
+				walk = func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
 					return tx.ScanOutEdges(ctx, tenant, current.ID, "", 0, func(edge *graph.Edge) error {
 						if edge == nil || used[edge.ID] {
 							return nil
@@ -2917,7 +2917,7 @@ func (e *Executor) expandDirectedAdjacentThenVariableLengthMatch(ctx context.Con
 							return err
 						}
 
-						nextNodes := append(append([]*graph.Vertex{}, nodes...), right)
+						nextVertexes := append(append([]*graph.Vertex{}, vertexes...), right)
 						nextEdges := append(append([]*graph.Edge{}, edges...), edge)
 						nextDirs := append(append([]string{}, dirs...), "forward")
 
@@ -2937,9 +2937,9 @@ func (e *Executor) expandDirectedAdjacentThenVariableLengthMatch(ctx context.Con
 									merged[pattern.EdgeVar] = edgeSequenceToAny(nextEdges[1:])
 								}
 								if pathVar != "" {
-									merged[pathVar] = multiHopPathValue(nextNodes, nextEdges, nextDirs)
+									merged[pathVar] = multiHopPathValue(nextVertexes, nextEdges, nextDirs)
 								}
-								if nodePatternMatches(right, pattern.Right, params, merged) {
+								if vertexPatternMatches(right, pattern.Right, params, merged) {
 									if spec.Where != "" {
 										ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
 										if err != nil {
@@ -2957,7 +2957,7 @@ func (e *Executor) expandDirectedAdjacentThenVariableLengthMatch(ctx context.Con
 							}
 						}
 
-						return walk(right, nextNodes, nextEdges, nextDirs, nextUsed)
+						return walk(right, nextVertexes, nextEdges, nextDirs, nextUsed)
 					})
 				}
 
@@ -2998,7 +2998,7 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -3043,7 +3043,7 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 				if pattern.Mid.Var != "" {
 					mergedMid[pattern.Mid.Var] = mid
 				}
-				if !nodePatternMatches(mid, pattern.Mid, params, mergedMid) {
+				if !vertexPatternMatches(mid, pattern.Mid, params, mergedMid) {
 					return nil
 				}
 
@@ -3087,7 +3087,7 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 						}
 						merged[pathVar] = multiHopPathValue([]*graph.Vertex{left, mid, right}, []*graph.Edge{edge1, edge2}, directions)
 					}
-					if !nodePatternMatches(right, pattern.Right, params, merged) {
+					if !vertexPatternMatches(right, pattern.Right, params, merged) {
 						return nil
 					}
 
@@ -3154,7 +3154,7 @@ func (e *Executor) expandDirectedRelationshipThenAdjacentMatch(ctx context.Conte
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -3201,7 +3201,7 @@ func (e *Executor) expandDirectedRelationshipThenAdjacentMatch(ctx context.Conte
 				if pattern.FirstEdgeVar != "" {
 					mergedMid[pattern.FirstEdgeVar] = edge1
 				}
-				if !nodePatternMatches(mid, pattern.Mid, params, mergedMid) {
+				if !vertexPatternMatches(mid, pattern.Mid, params, mergedMid) {
 					return nil
 				}
 
@@ -3228,7 +3228,7 @@ func (e *Executor) expandDirectedRelationshipThenAdjacentMatch(ctx context.Conte
 					if pathVar != "" {
 						merged[pathVar] = multiHopPathValue([]*graph.Vertex{left, mid, right}, []*graph.Edge{edge1, edge2}, []string{"forward", "forward"})
 					}
-					if !nodePatternMatches(right, pattern.Right, params, merged) {
+					if !vertexPatternMatches(right, pattern.Right, params, merged) {
 						return nil
 					}
 
@@ -3283,7 +3283,7 @@ func (e *Executor) expandTwoHopUndirectedRelationshipChainMatch(ctx context.Cont
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -3340,7 +3340,7 @@ func (e *Executor) expandTwoHopUndirectedRelationshipChainMatch(ctx context.Cont
 				if pattern.FirstEdgeVar != "" {
 					mergedMid[pattern.FirstEdgeVar] = edge1
 				}
-				if !nodePatternMatches(mid, pattern.Mid, params, mergedMid) {
+				if !vertexPatternMatches(mid, pattern.Mid, params, mergedMid) {
 					return nil
 				}
 
@@ -3391,7 +3391,7 @@ func (e *Executor) expandTwoHopUndirectedRelationshipChainMatch(ctx context.Cont
 					if pathVar != "" {
 						merged[pathVar] = multiHopPathValue([]*graph.Vertex{left, mid, right}, []*graph.Edge{edge1, edge2}, []string{"undirected", "undirected"})
 					}
-					if !nodePatternMatches(right, pattern.Right, params, merged) {
+					if !vertexPatternMatches(right, pattern.Right, params, merged) {
 						return nil
 					}
 
@@ -3465,7 +3465,7 @@ func (e *Executor) expandDirectedThenUndirectedRelationshipChainMatch(ctx contex
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -3512,7 +3512,7 @@ func (e *Executor) expandDirectedThenUndirectedRelationshipChainMatch(ctx contex
 				if pattern.FirstEdgeVar != "" {
 					mergedMid[pattern.FirstEdgeVar] = edge1
 				}
-				if !nodePatternMatches(mid, pattern.Mid, params, mergedMid) {
+				if !vertexPatternMatches(mid, pattern.Mid, params, mergedMid) {
 					return nil
 				}
 
@@ -3560,7 +3560,7 @@ func (e *Executor) expandDirectedThenUndirectedRelationshipChainMatch(ctx contex
 					if pathVar != "" {
 						merged[pathVar] = multiHopPathValue([]*graph.Vertex{left, mid, right}, []*graph.Edge{edge1, edge2}, []string{"forward", dir})
 					}
-					if !nodePatternMatches(right, pattern.Right, params, merged) {
+					if !vertexPatternMatches(right, pattern.Right, params, merged) {
 						return nil
 					}
 					if spec.Where != "" {
@@ -3624,7 +3624,7 @@ func (e *Executor) expandReverseRelationshipThenUndirectedVariableLengthMatch(ct
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
 		}
@@ -3671,11 +3671,11 @@ func (e *Executor) expandReverseRelationshipThenUndirectedVariableLengthMatch(ct
 				if pattern.FirstEdgeVar != "" {
 					midRow[pattern.FirstEdgeVar] = edge1
 				}
-				if !nodePatternMatches(mid, pattern.Mid, params, midRow) {
+				if !vertexPatternMatches(mid, pattern.Mid, params, midRow) {
 					return nil
 				}
 
-				emitMatch := func(current *graph.Vertex, varNodes []*graph.Vertex, varEdges []*graph.Edge, varDirs []string) error {
+				emitMatch := func(current *graph.Vertex, varVertexes []*graph.Vertex, varEdges []*graph.Edge, varDirs []string) error {
 					depth := len(varEdges)
 					if depth < pattern.MinHops {
 						return nil
@@ -3697,13 +3697,13 @@ func (e *Executor) expandReverseRelationshipThenUndirectedVariableLengthMatch(ct
 					if pattern.SecondEdgeVar != "" {
 						merged[pattern.SecondEdgeVar] = edgeSequenceToAny(varEdges)
 					}
-					pathNodes := append([]*graph.Vertex{left, mid}, varNodes...)
+					pathVertexes := append([]*graph.Vertex{left, mid}, varVertexes...)
 					pathEdges := append([]*graph.Edge{edge1}, varEdges...)
 					pathDirs := append([]string{"reverse"}, varDirs...)
 					if pathVar != "" {
-						merged[pathVar] = multiHopPathValue(pathNodes, pathEdges, pathDirs)
+						merged[pathVar] = multiHopPathValue(pathVertexes, pathEdges, pathDirs)
 					}
-					if !nodePatternMatches(current, pattern.Right, params, merged) {
+					if !vertexPatternMatches(current, pattern.Right, params, merged) {
 						return nil
 					}
 					if spec.Where != "" {
@@ -3725,8 +3725,8 @@ func (e *Executor) expandReverseRelationshipThenUndirectedVariableLengthMatch(ct
 					return err
 				}
 
-				var walk func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
-				walk = func(current *graph.Vertex, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
+				var walk func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
+				walk = func(current *graph.Vertex, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
 					if pattern.MaxHops >= 0 && len(edges) >= pattern.MaxHops {
 						return nil
 					}
@@ -3780,7 +3780,7 @@ func (e *Executor) expandReverseRelationshipThenUndirectedVariableLengthMatch(ct
 					}
 
 					for _, candidate := range neighbors {
-						nextNodes := append(append([]*graph.Vertex{}, nodes...), candidate.neighbor)
+						nextVertexes := append(append([]*graph.Vertex{}, vertexes...), candidate.neighbor)
 						nextEdges := append(append([]*graph.Edge{}, edges...), candidate.edge)
 						nextDirs := append(append([]string{}, dirs...), candidate.dir)
 
@@ -3790,10 +3790,10 @@ func (e *Executor) expandReverseRelationshipThenUndirectedVariableLengthMatch(ct
 						}
 						nextUsed[candidate.edge.ID] = true
 
-						if err := emitMatch(candidate.neighbor, nextNodes, nextEdges, nextDirs); err != nil {
+						if err := emitMatch(candidate.neighbor, nextVertexes, nextEdges, nextDirs); err != nil {
 							return err
 						}
-						if err := walk(candidate.neighbor, nextNodes, nextEdges, nextDirs, nextUsed); err != nil {
+						if err := walk(candidate.neighbor, nextVertexes, nextEdges, nextDirs, nextUsed); err != nil {
 							return err
 						}
 					}
@@ -3844,7 +3844,7 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		startCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, pattern.Nodes[0], params)
+		startCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Vertexes[0], params)
 		if err != nil {
 			return nil, err
 		}
@@ -3856,19 +3856,19 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 			}
 
 			baseRow := cloneRow(row)
-			if pattern.Nodes[0].Var != "" {
-				baseRow[pattern.Nodes[0].Var] = start
+			if pattern.Vertexes[0].Var != "" {
+				baseRow[pattern.Vertexes[0].Var] = start
 			}
-			if !nodePatternMatches(start, pattern.Nodes[0], params, baseRow) {
+			if !vertexPatternMatches(start, pattern.Vertexes[0], params, baseRow) {
 				continue
 			}
 
-			var walk func(index int, current *graph.Vertex, currentRow Row, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
-			walk = func(index int, current *graph.Vertex, currentRow Row, nodes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
+			var walk func(index int, current *graph.Vertex, currentRow Row, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error
+			walk = func(index int, current *graph.Vertex, currentRow Row, vertexes []*graph.Vertex, edges []*graph.Edge, dirs []string, used map[string]bool) error {
 				if index == len(pattern.Segments) {
 					merged := cloneRow(currentRow)
 					if pathVar != "" {
-						merged[pathVar] = multiHopPathValue(nodes, edges, dirs)
+						merged[pathVar] = multiHopPathValue(vertexes, edges, dirs)
 					}
 					if spec.Where != "" {
 						ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
@@ -3885,7 +3885,7 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 				}
 
 				segment := pattern.Segments[index]
-				nextPattern := pattern.Nodes[index+1]
+				nextPattern := pattern.Vertexes[index+1]
 
 				minHops := segment.MinHops
 				maxHops := segment.MaxHops
@@ -3894,8 +3894,8 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 					maxHops = 1
 				}
 				baseEdgeCount := len(edges)
-				var explore func(vertex *graph.Vertex, pathNodes []*graph.Vertex, pathEdges []*graph.Edge, pathDirs []string, pathUsed map[string]bool) error
-				explore = func(vertex *graph.Vertex, pathNodes []*graph.Vertex, pathEdges []*graph.Edge, pathDirs []string, pathUsed map[string]bool) error {
+				var explore func(vertex *graph.Vertex, pathVertexes []*graph.Vertex, pathEdges []*graph.Edge, pathDirs []string, pathUsed map[string]bool) error
+				explore = func(vertex *graph.Vertex, pathVertexes []*graph.Vertex, pathEdges []*graph.Edge, pathDirs []string, pathUsed map[string]bool) error {
 					segmentEdges := pathEdges[baseEdgeCount:]
 					depth := len(segmentEdges)
 					if depth >= minHops {
@@ -3916,8 +3916,8 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 									nextRow[segment.EdgeVar] = segmentEdges[0]
 								}
 							}
-							if segmentBindingOK && nodePatternMatches(vertex, nextPattern, params, nextRow) {
-								if err := walk(index+1, vertex, nextRow, pathNodes, pathEdges, pathDirs, pathUsed); err != nil {
+							if segmentBindingOK && vertexPatternMatches(vertex, nextPattern, params, nextRow) {
+								if err := walk(index+1, vertex, nextRow, pathVertexes, pathEdges, pathDirs, pathUsed); err != nil {
 									return err
 								}
 							}
@@ -3954,12 +3954,12 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 							}
 							return err
 						}
-						nextNodes := append(append([]*graph.Vertex{}, pathNodes...), neighbor)
+						nextVertexes := append(append([]*graph.Vertex{}, pathVertexes...), neighbor)
 						nextEdges := append(append([]*graph.Edge{}, pathEdges...), edge)
 						nextDirs := append(append([]string{}, pathDirs...), direction)
 						nextUsed := cloneUsed(pathUsed)
 						nextUsed[edge.ID] = true
-						return explore(neighbor, nextNodes, nextEdges, nextDirs, nextUsed)
+						return explore(neighbor, nextVertexes, nextEdges, nextDirs, nextUsed)
 					}
 
 					if segment.Direction == "reverse" {
@@ -3982,7 +3982,7 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 					})
 				}
 
-				return explore(current, nodes, edges, dirs, used)
+				return explore(current, vertexes, edges, dirs, used)
 			}
 
 			if err := walk(0, start, baseRow, []*graph.Vertex{start}, nil, nil, map[string]bool{}); err != nil {
@@ -3995,8 +3995,8 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 			if pathVar != "" {
 				merged[pathVar] = nil
 			}
-			for _, node := range pattern.Nodes {
-				setOptionalNoMatchBinding(merged, row, node.Var)
+			for _, vertex := range pattern.Vertexes {
+				setOptionalNoMatchBinding(merged, row, vertex.Var)
 			}
 			for _, segment := range pattern.Segments {
 				setOptionalNoMatchBinding(merged, row, segment.EdgeVar)
@@ -4030,28 +4030,28 @@ func setOptionalNoMatchBinding(dst Row, src Row, varName string) {
 	}
 }
 
-func multiHopPathValue(nodes []*graph.Vertex, edges []*graph.Edge, directions []string) any {
-	if len(nodes) == 0 {
+func multiHopPathValue(vertexes []*graph.Vertex, edges []*graph.Edge, directions []string) any {
+	if len(vertexes) == 0 {
 		return nil
 	}
-	if len(nodes) == 1 {
-		return cypherPathValue{Left: nodes[0]}
+	if len(vertexes) == 1 {
+		return cypherPathValue{Left: vertexes[0]}
 	}
 	// Build the path as a serialized string similar to cypherPathValue.
 	// For multi-hop, return a multiHopCypherPath struct.
-	return multiHopCypherPath{Nodes: nodes, Edges: edges, Directions: directions}
+	return multiHopCypherPath{Vertexes: vertexes, Edges: edges, Directions: directions}
 }
 
 type multiHopCypherPath struct {
-	Nodes      []*graph.Vertex
+	Vertexes   []*graph.Vertex
 	Edges      []*graph.Edge
 	Directions []string
 }
 
 func (p multiHopCypherPath) MarshalJSON() ([]byte, error) {
-	nodes := make([]any, len(p.Nodes))
-	for i, v := range p.Nodes {
-		nodes[i] = vertexToMap(v)
+	vertexes := make([]any, len(p.Vertexes))
+	for i, v := range p.Vertexes {
+		vertexes[i] = vertexToMap(v)
 	}
 	edges := make([]any, len(p.Edges))
 	for i, e := range p.Edges {
@@ -4063,14 +4063,14 @@ func (p multiHopCypherPath) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(map[string]any{
 		"__path__":   true,
-		"nodes":      nodes,
+		"vertexes":   vertexes,
 		"edges":      edges,
 		"directions": directions,
 	})
 }
 
 type multiHopPartialPath struct {
-	Nodes      []*graph.Vertex
+	Vertexes   []*graph.Vertex
 	Edges      []*graph.Edge
 	Directions []string
 	AccRow     Row
@@ -4078,12 +4078,12 @@ type multiHopPartialPath struct {
 }
 
 func (p multiHopCypherPath) String() string {
-	if len(p.Nodes) == 0 {
+	if len(p.Vertexes) == 0 {
 		return "<>"
 	}
 	b := strings.Builder{}
 	b.WriteString("<")
-	b.WriteString(renderPathNode(p.Nodes[0]))
+	b.WriteString(renderPathVertex(p.Vertexes[0]))
 	for i, edge := range p.Edges {
 		dir := "forward"
 		if i < len(p.Directions) {
@@ -4104,8 +4104,8 @@ func (p multiHopCypherPath) String() string {
 			b.WriteString(edgeStr)
 			b.WriteString("->")
 		}
-		if i+1 < len(p.Nodes) {
-			b.WriteString(renderPathNode(p.Nodes[i+1]))
+		if i+1 < len(p.Vertexes) {
+			b.WriteString(renderPathVertex(p.Vertexes[i+1]))
 		}
 	}
 	b.WriteString(">")
@@ -4123,7 +4123,7 @@ func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx grap
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		startCandidates, err := e.resolveNodePatternCandidates(ctx, tx, tenant, row, chain.Start, params)
+		startCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, chain.StartVertex, params)
 		if err != nil {
 			return nil, err
 		}
@@ -4135,12 +4135,12 @@ func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx grap
 			}
 
 			accRow := cloneRow(row)
-			if chain.Start.Var != "" {
-				accRow[chain.Start.Var] = start
+			if chain.StartVertex.Var != "" {
+				accRow[chain.StartVertex.Var] = start
 			}
 
 			current := []multiHopPartialPath{{
-				Nodes:     []*graph.Vertex{start},
+				Vertexes:  []*graph.Vertex{start},
 				AccRow:    accRow,
 				UsedEdges: make(map[string]bool),
 			}}
@@ -4149,7 +4149,7 @@ func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx grap
 			for _, hop := range chain.Hops {
 				var next []multiHopPartialPath
 				for _, partial := range current {
-					last := partial.Nodes[len(partial.Nodes)-1]
+					last := partial.Vertexes[len(partial.Vertexes)-1]
 
 					type edgeNeighbor struct {
 						edge      *graph.Edge
@@ -4204,13 +4204,13 @@ func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx grap
 						if partial.UsedEdges[c.edge.ID] {
 							continue
 						}
-						if !nodePatternMatches(c.neighbor, hop.Node, params, partial.AccRow) {
+						if !vertexPatternMatches(c.neighbor, hop.Vertex, params, partial.AccRow) {
 							continue
 						}
 
-						newNodes := make([]*graph.Vertex, len(partial.Nodes)+1)
-						copy(newNodes, partial.Nodes)
-						newNodes[len(partial.Nodes)] = c.neighbor
+						newVertexes := make([]*graph.Vertex, len(partial.Vertexes)+1)
+						copy(newVertexes, partial.Vertexes)
+						newVertexes[len(partial.Vertexes)] = c.neighbor
 
 						newEdges := make([]*graph.Edge, len(partial.Edges)+1)
 						copy(newEdges, partial.Edges)
@@ -4221,8 +4221,8 @@ func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx grap
 						newDirs[len(partial.Directions)] = c.direction
 
 						newAccRow := cloneRow(partial.AccRow)
-						if hop.Node.Var != "" {
-							newAccRow[hop.Node.Var] = c.neighbor
+						if hop.Vertex.Var != "" {
+							newAccRow[hop.Vertex.Var] = c.neighbor
 						}
 
 						newUsed := make(map[string]bool, len(partial.UsedEdges)+1)
@@ -4232,7 +4232,7 @@ func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx grap
 						newUsed[c.edge.ID] = true
 
 						next = append(next, multiHopPartialPath{
-							Nodes:      newNodes,
+							Vertexes:   newVertexes,
 							Edges:      newEdges,
 							Directions: newDirs,
 							AccRow:     newAccRow,
@@ -4253,7 +4253,7 @@ func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx grap
 			for _, path := range current {
 				merged := cloneRow(path.AccRow)
 				if pathVar != "" {
-					merged[pathVar] = multiHopPathValue(path.Nodes, path.Edges, path.Directions)
+					merged[pathVar] = multiHopPathValue(path.Vertexes, path.Edges, path.Directions)
 				}
 
 				if spec.Where != "" {
@@ -4273,12 +4273,12 @@ func (e *Executor) expandMultiHopAdjacentChainMatch(ctx context.Context, tx grap
 
 		if spec.Optional && !matched {
 			merged := cloneRow(row)
-			if chain.Start.Var != "" {
-				setOptionalNoMatchBinding(merged, row, chain.Start.Var)
+			if chain.StartVertex.Var != "" {
+				setOptionalNoMatchBinding(merged, row, chain.StartVertex.Var)
 			}
 			for _, hop := range chain.Hops {
-				if hop.Node.Var != "" {
-					setOptionalNoMatchBinding(merged, row, hop.Node.Var)
+				if hop.Vertex.Var != "" {
+					setOptionalNoMatchBinding(merged, row, hop.Vertex.Var)
 				}
 			}
 			out = append(out, merged)
@@ -4385,11 +4385,11 @@ func edgeTypeMatches(edge *graph.Edge, edgeType string, edgeAnyOf []string) bool
 	return false
 }
 
-func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx, tenant string, row Row, pattern nodePattern, params Params) ([]*graph.Vertex, error) {
+func (e *Executor) resolveVertexPatternCandidates(ctx context.Context, tx graph.Tx, tenant string, row Row, pattern vertexPattern, params Params) ([]*graph.Vertex, error) {
 	if binding, ok := row[pattern.Var]; ok {
 		switch typed := binding.(type) {
 		case *graph.Vertex:
-			if nodePatternMatches(typed, pattern, params, row) {
+			if vertexPatternMatches(typed, pattern, params, row) {
 				return []*graph.Vertex{typed}, nil
 			}
 			return nil, nil
@@ -4401,17 +4401,17 @@ func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx
 				}
 				return nil, err
 			}
-			if nodePatternMatches(vertex, pattern, params, row) {
+			if vertexPatternMatches(vertex, pattern, params, row) {
 				return []*graph.Vertex{vertex}, nil
 			}
 			return nil, nil
 		}
 	}
 
-	if plan, ok, err := e.planNodePatternPropertyIndexLookup(tenant, pattern, params, row); err != nil {
+	if plan, ok, err := e.planVertexPatternPropertyIndexLookup(tenant, pattern, params, row); err != nil {
 		return nil, err
 	} else if ok {
-		matches, err := e.lookupNodePatternCandidatesByPropertyIndex(ctx, tx, tenant, pattern, params, row, plan)
+		matches, err := e.lookupVertexPatternCandidatesByPropertyIndex(ctx, tx, tenant, pattern, params, row, plan)
 		if err != nil {
 			return nil, err
 		}
@@ -4420,7 +4420,7 @@ func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx
 
 	out := make([]*graph.Vertex, 0)
 	if err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
-		if nodePatternMatches(vertex, pattern, params, row) {
+		if vertexPatternMatches(vertex, pattern, params, row) {
 			out = append(out, vertex)
 		}
 		return nil
@@ -4430,23 +4430,23 @@ func (e *Executor) resolveNodePatternCandidates(ctx context.Context, tx graph.Tx
 	return out, nil
 }
 
-type nodePropertyIndexLookupPlan struct {
+type vertexPropertyIndexLookupPlan struct {
 	schema   string
 	property string
 	value    any
 }
 
-func (e *Executor) planNodePatternPropertyIndexLookup(tenant string, pattern nodePattern, params Params, row Row) (nodePropertyIndexLookupPlan, bool, error) {
+func (e *Executor) planVertexPatternPropertyIndexLookup(tenant string, pattern vertexPattern, params Params, row Row) (vertexPropertyIndexLookupPlan, bool, error) {
 	if e == nil || e.indexCatalog == nil {
-		return nodePropertyIndexLookupPlan{}, false, nil
+		return vertexPropertyIndexLookupPlan{}, false, nil
 	}
 	if len(pattern.AllOfLabels) == 0 && len(pattern.AnyOfLabels) == 0 {
-		return nodePropertyIndexLookupPlan{}, false, nil
+		return vertexPropertyIndexLookupPlan{}, false, nil
 	}
 
 	props, err := parsePropertyMap(pattern.PropertiesRaw, params, row)
 	if err != nil || len(props) == 0 {
-		return nodePropertyIndexLookupPlan{}, false, nil
+		return vertexPropertyIndexLookupPlan{}, false, nil
 	}
 
 	labels := append([]string{}, pattern.AllOfLabels...)
@@ -4454,7 +4454,7 @@ func (e *Executor) planNodePatternPropertyIndexLookup(tenant string, pattern nod
 		labels = append(labels, pattern.AnyOfLabels...)
 	}
 	if len(labels) == 0 {
-		return nodePropertyIndexLookupPlan{}, false, nil
+		return vertexPropertyIndexLookupPlan{}, false, nil
 	}
 
 	propKeys := make([]string, 0, len(props))
@@ -4465,7 +4465,7 @@ func (e *Executor) planNodePatternPropertyIndexLookup(tenant string, pattern nod
 		propKeys = append(propKeys, prop)
 	}
 	if len(propKeys) == 0 {
-		return nodePropertyIndexLookupPlan{}, false, nil
+		return vertexPropertyIndexLookupPlan{}, false, nil
 	}
 	sort.Strings(propKeys)
 
@@ -4476,14 +4476,14 @@ func (e *Executor) planNodePatternPropertyIndexLookup(tenant string, pattern nod
 			if !indexed {
 				continue
 			}
-			return nodePropertyIndexLookupPlan{schema: label, property: prop, value: props[prop]}, true, nil
+			return vertexPropertyIndexLookupPlan{schema: label, property: prop, value: props[prop]}, true, nil
 		}
 	}
 
-	return nodePropertyIndexLookupPlan{}, false, nil
+	return vertexPropertyIndexLookupPlan{}, false, nil
 }
 
-func (e *Executor) lookupNodePatternCandidatesByPropertyIndex(ctx context.Context, tx graph.Tx, tenant string, pattern nodePattern, params Params, row Row, plan nodePropertyIndexLookupPlan) ([]*graph.Vertex, error) {
+func (e *Executor) lookupVertexPatternCandidatesByPropertyIndex(ctx context.Context, tx graph.Tx, tenant string, pattern vertexPattern, params Params, row Row, plan vertexPropertyIndexLookupPlan) ([]*graph.Vertex, error) {
 	encoded := valueToBytes(plan.value)
 	ids := map[string]struct{}{}
 	err := tx.ScanPropertyIndex(ctx, tenant, plan.schema, plan.property, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
@@ -4509,7 +4509,7 @@ func (e *Executor) lookupNodePatternCandidatesByPropertyIndex(ctx context.Contex
 			e.metrics.ObserveIndexLookup("property_index", "error", 0)
 			return nil, err
 		}
-		if !nodePatternMatches(vertex, pattern, params, row) {
+		if !vertexPatternMatches(vertex, pattern, params, row) {
 			continue
 		}
 		matches = append(matches, vertex)
@@ -4525,7 +4525,7 @@ func (e *Executor) lookupNodePatternCandidatesByPropertyIndex(ctx context.Contex
 	return matches, nil
 }
 
-func nodePatternMatches(vertex *graph.Vertex, pattern nodePattern, params Params, row Row) bool {
+func vertexPatternMatches(vertex *graph.Vertex, pattern vertexPattern, params Params, row Row) bool {
 	if vertex == nil {
 		return false
 	}
@@ -4940,20 +4940,20 @@ func bindCreateSingleEdgePathValues(ctx context.Context, tx graph.Tx, rows []Row
 
 func bindCreateChainPathValues(ctx context.Context, tx graph.Tx, rows []Row, pathVar string, pattern createChainPattern) error {
 	for _, row := range rows {
-		nodes := make([]*graph.Vertex, 0, len(pattern.Nodes))
+		vertexes := make([]*graph.Vertex, 0, len(pattern.Vertexes))
 		edges := make([]*graph.Edge, 0, len(pattern.Rels))
 		dirs := make([]string, 0, len(pattern.Rels))
-		for _, node := range pattern.Nodes {
-			nodes = append(nodes, vertexFromRowBinding(row, node.Var))
+		for _, vertex := range pattern.Vertexes {
+			vertexes = append(vertexes, vertexFromRowBinding(row, vertex.Var))
 		}
 		for i, rel := range pattern.Rels {
 			edge := edgeFromRowBinding(row, rel.Var)
-			if edge == nil && i+1 < len(nodes) {
+			if edge == nil && i+1 < len(vertexes) {
 				edgeType, err := normalizeCreateRelationshipType(rel.Type)
 				if err != nil {
 					return err
 				}
-				edge, err = lookupBoundPathEdge(ctx, tx, nodes[i], nodes[i+1], edgeType, rel.Direction)
+				edge, err = lookupBoundPathEdge(ctx, tx, vertexes[i], vertexes[i+1], edgeType, rel.Direction)
 				if err != nil {
 					return err
 				}
@@ -4968,16 +4968,16 @@ func bindCreateChainPathValues(ctx context.Context, tx graph.Tx, rows []Row, pat
 			}
 			left := (*graph.Vertex)(nil)
 			right := (*graph.Vertex)(nil)
-			if len(nodes) > 0 {
-				left = nodes[0]
+			if len(vertexes) > 0 {
+				left = vertexes[0]
 			}
-			if len(nodes) > 1 {
-				right = nodes[1]
+			if len(vertexes) > 1 {
+				right = vertexes[1]
 			}
 			row[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: right, Direction: firstOrDefault(dirs, "forward")}
 			continue
 		}
-		row[pathVar] = multiHopPathValue(nodes, edges, dirs)
+		row[pathVar] = multiHopPathValue(vertexes, edges, dirs)
 	}
 	return nil
 }
@@ -5021,15 +5021,15 @@ func parseCreateChainPattern(raw string) (createChainPattern, bool) {
 		return createChainPattern{}, false
 	}
 
-	nodeMatch := createChainNodeTokenRE.FindStringSubmatch(remaining)
-	if len(nodeMatch) != 4 {
+	vertexMatch := createChainVertexTokenRE.FindStringSubmatch(remaining)
+	if len(vertexMatch) != 4 {
 		return createChainPattern{}, false
 	}
 	pattern := createChainPattern{
-		Nodes: []createChainNodePattern{{Var: nodeMatch[1], Labels: splitLabels(nodeMatch[2]), PropsRaw: nodeMatch[3]}},
-		Rels:  make([]createChainRelPattern, 0),
+		Vertexes: []createChainVertexPattern{{Var: vertexMatch[1], Labels: splitLabels(vertexMatch[2]), PropsRaw: vertexMatch[3]}},
+		Rels:     make([]createChainRelPattern, 0),
 	}
-	remaining = strings.TrimSpace(remaining[len(nodeMatch[0]):])
+	remaining = strings.TrimSpace(remaining[len(vertexMatch[0]):])
 
 	for remaining != "" {
 		rel, consumed, ok := parseCreateChainRelToken(remaining)
@@ -5039,15 +5039,15 @@ func parseCreateChainPattern(raw string) (createChainPattern, bool) {
 		pattern.Rels = append(pattern.Rels, rel)
 		remaining = strings.TrimSpace(remaining[consumed:])
 
-		nextNode := createChainNodeTokenRE.FindStringSubmatch(remaining)
-		if len(nextNode) != 4 {
+		nextVertex := createChainVertexTokenRE.FindStringSubmatch(remaining)
+		if len(nextVertex) != 4 {
 			return createChainPattern{}, false
 		}
-		pattern.Nodes = append(pattern.Nodes, createChainNodePattern{Var: nextNode[1], Labels: splitLabels(nextNode[2]), PropsRaw: nextNode[3]})
-		remaining = strings.TrimSpace(remaining[len(nextNode[0]):])
+		pattern.Vertexes = append(pattern.Vertexes, createChainVertexPattern{Var: nextVertex[1], Labels: splitLabels(nextVertex[2]), PropsRaw: nextVertex[3]})
+		remaining = strings.TrimSpace(remaining[len(nextVertex[0]):])
 	}
 
-	if len(pattern.Rels) == 0 || len(pattern.Nodes) != len(pattern.Rels)+1 {
+	if len(pattern.Rels) == 0 || len(pattern.Vertexes) != len(pattern.Rels)+1 {
 		return createChainPattern{}, false
 	}
 	return pattern, true
@@ -5540,15 +5540,15 @@ func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, row
 	out := make([]Row, 0, len(rows))
 	for _, row := range rows {
 		merged := cloneRow(row)
-		vertices := make([]*graph.Vertex, len(pattern.Nodes))
+		vertices := make([]*graph.Vertex, len(pattern.Vertexes))
 		createdAny := false
 
-		for i, node := range pattern.Nodes {
-			props, err := parsePropertyMap(node.PropsRaw, params, merged)
+		for i, vertexPattern := range pattern.Vertexes {
+			props, err := parsePropertyMap(vertexPattern.PropsRaw, params, merged)
 			if err != nil {
 				return nil, err
 			}
-			vertex, vertexCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, merged, node.Var, node.Labels, props, merge)
+			vertex, vertexCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, merged, vertexPattern.Var, vertexPattern.Labels, props, merge)
 			if err != nil {
 				return nil, err
 			}
@@ -5556,8 +5556,8 @@ func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, row
 				createdAny = true
 			}
 			vertices[i] = vertex
-			if node.Var != "" {
-				merged[node.Var] = vertex
+			if vertexPattern.Var != "" {
+				merged[vertexPattern.Var] = vertex
 			}
 		}
 
@@ -6308,7 +6308,7 @@ func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, deta
 				return nil, err
 			}
 			if hasEdges {
-				return nil, graph.NewError(graph.ErrKindConflict, "DeleteConnectedNode", nil)
+				return nil, graph.NewError(graph.ErrKindConflict, "DeleteConnectedVertex", nil)
 			}
 			if err := tx.DeleteVertex(ctx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 				return nil, err
@@ -6389,8 +6389,8 @@ func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any) 
 				return nil, err
 			}
 		}
-		for _, node := range typed.Nodes {
-			if err := deleteVertex(node); err != nil {
+		for _, vertex := range typed.Vertexes {
+			if err := deleteVertex(vertex); err != nil {
 				return nil, err
 			}
 		}
@@ -8104,7 +8104,7 @@ func cypherSortRank(value any) int {
 		if isRelationshipMapShape(typed) {
 			return 20
 		}
-		if isNodeMapShape(typed) {
+		if isVertexMapShape(typed) {
 			return 10
 		}
 		return 0
@@ -8133,7 +8133,7 @@ func cypherSortRank(value any) int {
 	}
 }
 
-func isNodeMapShape(value map[string]any) bool {
+func isVertexMapShape(value map[string]any) bool {
 	if value == nil {
 		return false
 	}
@@ -9394,8 +9394,8 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "sqrt"); ok {
 		return evalSqrtFunction(arg, row, params)
 	}
-	if arg, ok := parseFunctionCall(raw, "nodes"); ok {
-		return evalNodesFunction(arg, row, params)
+	if arg, ok := parseFunctionCall(raw, "vertexes"); ok {
+		return evalVertexesFunction(arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "relationships"); ok {
 		return evalRelationshipsFunction(arg, row, params)
@@ -9412,11 +9412,11 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 	if arg, ok := parseFunctionCall(raw, "sign"); ok {
 		return evalSignFunction(arg, row, params)
 	}
-	if arg, ok := parseFunctionCall(raw, "startNode"); ok {
-		return evalStartNodeFunction(arg, row, params)
+	if arg, ok := parseFunctionCall(raw, "startVertex"); ok {
+		return evalStartVertexFunction(arg, row, params)
 	}
-	if arg, ok := parseFunctionCall(raw, "endNode"); ok {
-		return evalEndNodeFunction(arg, row, params)
+	if arg, ok := parseFunctionCall(raw, "endVertex"); ok {
+		return evalEndVertexFunction(arg, row, params)
 	}
 	if arg, ok := parseFunctionCall(raw, "date.truncate"); ok {
 		return evalTemporalTruncateFunction("date", arg, row, params)
@@ -11617,14 +11617,14 @@ func evalValueTypeFunction(arg string, row Row, params Params) (any, error) {
 	case []any, []string:
 		return "LIST", nil
 	case *graph.Vertex, deletedVertexBinding:
-		return "NODE", nil
+		return "VERTEX", nil
 	case *graph.Edge, deletedEdgeBinding:
 		return "RELATIONSHIP", nil
 	case cypherPathValue, multiHopCypherPath:
 		return "PATH", nil
 	case map[string]any:
 		if _, hasLabels := typed["labels"]; hasLabels {
-			return "NODE", nil
+			return "VERTEX", nil
 		}
 		if _, hasType := typed["type"]; hasType {
 			return "RELATIONSHIP", nil
@@ -11847,10 +11847,10 @@ func evalSqrtFunction(arg string, row Row, params Params) (any, error) {
 	return json.Number(formatFloatResult(math.Sqrt(f))), nil
 }
 
-func evalNodesFunction(arg string, row Row, params Params) (any, error) {
+func evalVertexesFunction(arg string, row Row, params Params) (any, error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
-		return nil, graph.NewError(graph.ErrKindSemantic, "nodes() requires one argument", nil)
+		return nil, graph.NewError(graph.ErrKindSemantic, "vertexes() requires one argument", nil)
 	}
 	value, err := evalExpressionWithScope(arg, row, params)
 	if err != nil {
@@ -11862,13 +11862,13 @@ func evalNodesFunction(arg string, row Row, params Params) (any, error) {
 	if isNullPathValue(value) {
 		return nil, nil
 	}
-	nodes, _, ok := pathComponents(value)
+	vertexes, _, ok := pathComponents(value)
 	if !ok {
 		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
 	}
-	out := make([]any, 0, len(nodes))
-	for _, node := range nodes {
-		out = append(out, node)
+	out := make([]any, 0, len(vertexes))
+	for _, vertex := range vertexes {
+		out = append(out, vertex)
 	}
 	return out, nil
 }
@@ -11968,10 +11968,10 @@ func evalSignFunction(arg string, row Row, params Params) (any, error) {
 	return 0, nil
 }
 
-func evalStartNodeFunction(arg string, row Row, params Params) (any, error) {
+func evalStartVertexFunction(arg string, row Row, params Params) (any, error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
-		return nil, graph.NewError(graph.ErrKindSemantic, "startNode() requires one argument", nil)
+		return nil, graph.NewError(graph.ErrKindSemantic, "startVertex() requires one argument", nil)
 	}
 	value, err := evalExpressionWithScope(arg, row, params)
 	if err != nil {
@@ -11984,16 +11984,16 @@ func evalStartNodeFunction(arg string, row Row, params Params) (any, error) {
 	if !ok {
 		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
 	}
-	if node, ok := findBoundVertexByID(row, edge.SrcID); ok {
-		return node, nil
+	if vertex, ok := findBoundVertexByID(row, edge.SrcID); ok {
+		return vertex, nil
 	}
 	return map[string]any{"id": edge.SrcID}, nil
 }
 
-func evalEndNodeFunction(arg string, row Row, params Params) (any, error) {
+func evalEndVertexFunction(arg string, row Row, params Params) (any, error) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
-		return nil, graph.NewError(graph.ErrKindSemantic, "endNode() requires one argument", nil)
+		return nil, graph.NewError(graph.ErrKindSemantic, "endVertex() requires one argument", nil)
 	}
 	value, err := evalExpressionWithScope(arg, row, params)
 	if err != nil {
@@ -12006,8 +12006,8 @@ func evalEndNodeFunction(arg string, row Row, params Params) (any, error) {
 	if !ok {
 		return nil, graph.NewError(graph.ErrKindSemantic, "invalid argument type", nil)
 	}
-	if node, ok := findBoundVertexByID(row, edge.DstID); ok {
-		return node, nil
+	if vertex, ok := findBoundVertexByID(row, edge.DstID); ok {
+		return vertex, nil
 	}
 	return map[string]any{"id": edge.DstID}, nil
 }
@@ -12015,22 +12015,22 @@ func evalEndNodeFunction(arg string, row Row, params Params) (any, error) {
 func pathComponents(value any) ([]*graph.Vertex, []*graph.Edge, bool) {
 	switch typed := value.(type) {
 	case cypherPathValue:
-		nodes := make([]*graph.Vertex, 0, 2)
+		vertexes := make([]*graph.Vertex, 0, 2)
 		edges := make([]*graph.Edge, 0, 1)
 		if typed.Left != nil {
-			nodes = append(nodes, typed.Left)
+			vertexes = append(vertexes, typed.Left)
 		}
 		if typed.Edge != nil {
 			edges = append(edges, typed.Edge)
 		}
 		if typed.Right != nil {
-			nodes = append(nodes, typed.Right)
+			vertexes = append(vertexes, typed.Right)
 		}
-		return nodes, edges, true
+		return vertexes, edges, true
 	case multiHopCypherPath:
-		nodes := append([]*graph.Vertex(nil), typed.Nodes...)
+		vertexes := append([]*graph.Vertex(nil), typed.Vertexes...)
 		edges := append([]*graph.Edge(nil), typed.Edges...)
-		return nodes, edges, true
+		return vertexes, edges, true
 	default:
 		return nil, nil, false
 	}
@@ -12041,7 +12041,7 @@ func isNullPathValue(value any) bool {
 	case cypherPathValue:
 		return typed.Left == nil && typed.Edge == nil && typed.Right == nil
 	case multiHopCypherPath:
-		return len(typed.Nodes) == 0 && len(typed.Edges) == 0
+		return len(typed.Vertexes) == 0 && len(typed.Edges) == 0
 	default:
 		return false
 	}
@@ -14646,19 +14646,19 @@ func cypherNullableEqual(lhs, rhs any) (equal bool, isNull bool) {
 }
 
 func comparePathEquality(lhs, rhs any) (bool, bool) {
-	leftNodes, leftEdges, ok := pathValueComponents(lhs)
+	leftVertexes, leftEdges, ok := pathValueComponents(lhs)
 	if !ok {
 		return false, false
 	}
-	rightNodes, rightEdges, ok := pathValueComponents(rhs)
+	rightVertexes, rightEdges, ok := pathValueComponents(rhs)
 	if !ok {
 		return false, false
 	}
-	if len(leftNodes) != len(rightNodes) || len(leftEdges) != len(rightEdges) {
+	if len(leftVertexes) != len(rightVertexes) || len(leftEdges) != len(rightEdges) {
 		return false, true
 	}
-	for i := 0; i < len(leftNodes); i++ {
-		if leftNodes[i] != rightNodes[i] {
+	for i := 0; i < len(leftVertexes); i++ {
+		if leftVertexes[i] != rightVertexes[i] {
 			return false, true
 		}
 	}
@@ -14686,23 +14686,23 @@ func pathValueComponents(value any) ([]string, []string, bool) {
 
 	switch typed := value.(type) {
 	case cypherPathValue:
-		nodes := []string{vertexID(typed.Left)}
+		vertexes := []string{vertexID(typed.Left)}
 		edges := []string{}
 		if typed.Edge != nil || typed.Right != nil {
 			edges = append(edges, edgeID(typed.Edge))
-			nodes = append(nodes, vertexID(typed.Right))
+			vertexes = append(vertexes, vertexID(typed.Right))
 		}
-		return nodes, edges, true
+		return vertexes, edges, true
 	case multiHopCypherPath:
-		nodes := make([]string, 0, len(typed.Nodes))
-		for _, node := range typed.Nodes {
-			nodes = append(nodes, vertexID(node))
+		vertexes := make([]string, 0, len(typed.Vertexes))
+		for _, vertex := range typed.Vertexes {
+			vertexes = append(vertexes, vertexID(vertex))
 		}
 		edges := make([]string, 0, len(typed.Edges))
 		for _, edge := range typed.Edges {
 			edges = append(edges, edgeID(edge))
 		}
-		return nodes, edges, true
+		return vertexes, edges, true
 	default:
 		return nil, nil, false
 	}

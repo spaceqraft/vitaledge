@@ -92,7 +92,7 @@ Current implementation status:
 - Implemented: projection and aggregation enhancements for `count(...)`, `collect(...)`, `labels(...)`, and `type(...)`, including WITH alias propagation and ORDER BY/LIMIT handling in projection flow.
 - Implemented: broad built-in function coverage across string, math, list, predicate/scalar, temporal, spatial, and vector families.
 - Implemented: EXISTS subquery support in WHERE for supported MATCH subquery bodies.
-- Implemented: persisted statistics-as-data side effects for tenant totals, per-label node counts, and per-edge-type counts.
+- Implemented: persisted statistics-as-data side effects for tenant totals, per-label vertex counts, and per-edge-type counts.
 - Implemented: stats snapshot read API consumed by EXPLAIN and statistics procedures, including EXPLAIN diagnostics for snapshot coverage completeness and backfill-required status.
 - Implemented: startup schema migration (`no-stats` -> `stats`) that backfills persisted statistics for legacy stores and records schema version metadata.
 
@@ -258,7 +258,7 @@ Required output:
 
 1. Logical and physical plan nodes.
 2. Plan-influencing details used by planning:
-   - node/edge cardinality facts relevant to query predicates and expansions,
+   - vertex/edge cardinality facts relevant to query predicates and expansions,
    - index candidates and chosen access path rationale,
    - predicate cardinality signals.
 3. Cardinality entries with quality classification: `exact`, `estimate`, `sample`.

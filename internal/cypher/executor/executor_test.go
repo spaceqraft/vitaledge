@@ -219,24 +219,24 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
 	}
-	nodes, ok := logicalPlan["nodes"].([]map[string]any)
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
 	if !ok {
-		t.Fatalf("expected logicalPlan.nodes []map[string]any, got %T", logicalPlan["nodes"])
+		t.Fatalf("expected logicalPlan.vertexes []map[string]any, got %T", logicalPlan["vertexes"])
 	}
-	if len(nodes) == 0 {
-		t.Fatalf("expected non-empty logical plan nodes")
+	if len(vertexes) == 0 {
+		t.Fatalf("expected non-empty logical plan vertexes")
 	}
-	if firstOp, _ := nodes[0]["op"].(string); firstOp != "INDEX_SCAN" {
-		t.Fatalf("expected first logical node to be INDEX_SCAN, got %#v", nodes[0]["op"])
+	if firstOp, _ := vertexes[0]["op"].(string); firstOp != "INDEX_SCAN" {
+		t.Fatalf("expected first logical vertex to be INDEX_SCAN, got %#v", vertexes[0]["op"])
 	}
-	if accessPath, _ := nodes[0]["accessPath"].(string); accessPath == "" {
-		t.Fatalf("expected first logical node to include accessPath")
+	if accessPath, _ := vertexes[0]["accessPath"].(string); accessPath == "" {
+		t.Fatalf("expected first logical vertex to include accessPath")
 	}
 	foundProject := false
 	foundSort := false
 	foundLimit := false
-	for _, node := range nodes {
-		op, _ := node["op"].(string)
+	for _, vertex := range vertexes {
+		op, _ := vertex["op"].(string)
 		switch op {
 		case "PROJECT":
 			foundProject = true
@@ -247,10 +247,10 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 		}
 	}
 	if !foundProject || !foundSort || !foundLimit {
-		t.Fatalf("expected operator-shaped plan to include PROJECT/SORT/LIMIT, got nodes %#v", nodes)
+		t.Fatalf("expected operator-shaped plan to include PROJECT/SORT/LIMIT, got vertexes %#v", vertexes)
 	}
-	if rootNodeID, _ := logicalPlan["rootNodeId"].(string); rootNodeID == "" {
-		t.Fatalf("expected non-empty rootNodeId")
+	if rootVertexID, _ := logicalPlan["rootVertexId"].(string); rootVertexID == "" {
+		t.Fatalf("expected non-empty rootVertexId")
 	}
 	influencers, ok := explainPayload["influencers"].(map[string]any)
 	if !ok {
@@ -267,8 +267,8 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if totals, _ := coverage["totals"].(string); totals != "snapshot" {
 		t.Fatalf("expected statsSnapshot coverage totals=snapshot, got %#v", coverage["totals"])
 	}
-	if nodeCountsCoverage, _ := coverage["nodeCounts"].(string); nodeCountsCoverage != "snapshot" {
-		t.Fatalf("expected statsSnapshot coverage nodeCounts=snapshot, got %#v", coverage["nodeCounts"])
+	if vertexCountsCoverage, _ := coverage["vertexCounts"].(string); vertexCountsCoverage != "snapshot" {
+		t.Fatalf("expected statsSnapshot coverage vertexCounts=snapshot, got %#v", coverage["vertexCounts"])
 	}
 	if edgeCountsCoverage, _ := coverage["edgeCounts"].(string); edgeCountsCoverage != "snapshot" {
 		t.Fatalf("expected statsSnapshot coverage edgeCounts=snapshot, got %#v", coverage["edgeCounts"])
@@ -282,12 +282,12 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if backfillRequired, _ := statsSnapshot["backfillRequired"].(bool); backfillRequired {
 		t.Fatalf("expected statsSnapshot backfillRequired=false, got %#v", statsSnapshot["backfillRequired"])
 	}
-	nodeCounts, ok := influencers["nodeCounts"].([]map[string]any)
+	vertexCounts, ok := influencers["vertexCounts"].([]map[string]any)
 	if !ok {
-		t.Fatalf("expected nodeCounts []map[string]any, got %T", influencers["nodeCounts"])
+		t.Fatalf("expected vertexCounts []map[string]any, got %T", influencers["vertexCounts"])
 	}
-	if len(nodeCounts) == 0 {
-		t.Fatalf("expected non-empty nodeCounts")
+	if len(vertexCounts) == 0 {
+		t.Fatalf("expected non-empty vertexCounts")
 	}
 	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
 	if !ok {
@@ -332,8 +332,8 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected cardinality []map[string]any, got %T", explainPayload["cardinality"])
 	}
-	if len(cardinality) != len(nodes) {
-		t.Fatalf("expected cardinality entries to match nodes, got %d and %d", len(cardinality), len(nodes))
+	if len(cardinality) != len(vertexes) {
+		t.Fatalf("expected cardinality entries to match vertexes, got %d and %d", len(cardinality), len(vertexes))
 	}
 	if rowsOut, _ := cardinality[0]["rowsOut"].(int); rowsOut != 1 {
 		t.Fatalf("expected first cardinality rowsOut=1, got %#v", cardinality[0]["rowsOut"])
@@ -382,8 +382,8 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected runtimeStats.plan map, got %T", runtimeStats["plan"])
 	}
-	if totalNodes, _ := planStats["totalNodes"].(int); totalNodes < 1 {
-		t.Fatalf("expected totalNodes >= 1, got %#v", planStats["totalNodes"])
+	if totalVertexes, _ := planStats["totalVertexes"].(int); totalVertexes < 1 {
+		t.Fatalf("expected totalVertexes >= 1, got %#v", planStats["totalVertexes"])
 	}
 	indexStats, ok := runtimeStats["index"].(map[string]any)
 	if !ok {
@@ -445,37 +445,37 @@ func TestExecuteExplainFastLabelHistogramPlan(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
 	}
-	nodes, ok := logicalPlan["nodes"].([]map[string]any)
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
 	if !ok {
-		t.Fatalf("expected logicalPlan.nodes []map[string]any, got %T", logicalPlan["nodes"])
+		t.Fatalf("expected logicalPlan.vertexes []map[string]any, got %T", logicalPlan["vertexes"])
 	}
-	if len(nodes) < 2 {
-		t.Fatalf("expected at least 2 plan nodes, got %d", len(nodes))
+	if len(vertexes) < 2 {
+		t.Fatalf("expected at least 2 plan vertexes, got %d", len(vertexes))
 	}
-	firstOp, _ := nodes[0]["op"].(string)
-	if firstOp != "ALL_NODES_SCAN" {
-		t.Fatalf("expected first plan node ALL_NODES_SCAN, got %#v", nodes[0]["op"])
+	firstOp, _ := vertexes[0]["op"].(string)
+	if firstOp != "ALL_VERTEXES_SCAN" {
+		t.Fatalf("expected first plan vertex ALL_VERTEXES_SCAN, got %#v", vertexes[0]["op"])
 	}
 
 	foundFastAggregate := false
-	for _, node := range nodes {
-		op, _ := node["op"].(string)
+	for _, vertex := range vertexes {
+		op, _ := vertex["op"].(string)
 		if op != "AGGREGATE" {
 			continue
 		}
-		impl, _ := node["implementation"].(string)
+		impl, _ := vertex["implementation"].(string)
 		if impl != "fast_label_histogram" {
 			continue
 		}
-		projection, _ := node["projection"].([]string)
+		projection, _ := vertex["projection"].([]string)
 		if !reflect.DeepEqual(projection, []string{"l", "lc"}) {
-			t.Fatalf("expected fast aggregate projection [l lc], got %#v", node["projection"])
+			t.Fatalf("expected fast aggregate projection [l lc], got %#v", vertex["projection"])
 		}
 		foundFastAggregate = true
 		break
 	}
 	if !foundFastAggregate {
-		t.Fatalf("expected AGGREGATE node with implementation=fast_label_histogram, got nodes %#v", nodes)
+		t.Fatalf("expected AGGREGATE vertex with implementation=fast_label_histogram, got vertexes %#v", vertexes)
 	}
 }
 
@@ -534,24 +534,24 @@ func TestExecuteExplainFastEdgeCountPlan(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected logicalPlan map for %q, got %T", query, explainPayload["logicalPlan"])
 		}
-		nodes, ok := logicalPlan["nodes"].([]map[string]any)
+		vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
 		if !ok {
-			t.Fatalf("expected logicalPlan.nodes []map for %q, got %T", query, logicalPlan["nodes"])
+			t.Fatalf("expected logicalPlan.vertexes []map for %q, got %T", query, logicalPlan["vertexes"])
 		}
 		found := false
-		for _, node := range nodes {
-			op, _ := node["op"].(string)
+		for _, vertex := range vertexes {
+			op, _ := vertex["op"].(string)
 			if op != "AGGREGATE" {
 				continue
 			}
-			impl, _ := node["implementation"].(string)
+			impl, _ := vertex["implementation"].(string)
 			if impl == "fast_edge_count" {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Fatalf("expected AGGREGATE fast_edge_count for %q, got nodes %#v", query, nodes)
+			t.Fatalf("expected AGGREGATE fast_edge_count for %q, got vertexes %#v", query, vertexes)
 		}
 	}
 }
@@ -611,29 +611,29 @@ func TestExecuteExplainFastEdgeDeletePlan(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected logicalPlan map for %q, got %T", query, explainPayload["logicalPlan"])
 		}
-		nodes, ok := logicalPlan["nodes"].([]map[string]any)
+		vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
 		if !ok {
-			t.Fatalf("expected logicalPlan.nodes []map for %q, got %T", query, logicalPlan["nodes"])
+			t.Fatalf("expected logicalPlan.vertexes []map for %q, got %T", query, logicalPlan["vertexes"])
 		}
 		found := false
-		for _, node := range nodes {
-			op, _ := node["op"].(string)
+		for _, vertex := range vertexes {
+			op, _ := vertex["op"].(string)
 			if op != "DELETE" {
 				continue
 			}
-			impl, _ := node["implementation"].(string)
+			impl, _ := vertex["implementation"].(string)
 			if impl == "fast_edge_delete" {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Fatalf("expected DELETE fast_edge_delete for %q, got nodes %#v", query, nodes)
+			t.Fatalf("expected DELETE fast_edge_delete for %q, got vertexes %#v", query, vertexes)
 		}
 	}
 }
 
-func TestExecuteExplainFastNodeCountPlan(t *testing.T) {
+func TestExecuteExplainFastVertexCountPlan(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -678,24 +678,24 @@ func TestExecuteExplainFastNodeCountPlan(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected logicalPlan map for %q, got %T", query, explainPayload["logicalPlan"])
 		}
-		nodes, ok := logicalPlan["nodes"].([]map[string]any)
+		vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
 		if !ok {
-			t.Fatalf("expected logicalPlan.nodes []map for %q, got %T", query, logicalPlan["nodes"])
+			t.Fatalf("expected logicalPlan.vertexes []map for %q, got %T", query, logicalPlan["vertexes"])
 		}
 		found := false
-		for _, node := range nodes {
-			op, _ := node["op"].(string)
+		for _, vertex := range vertexes {
+			op, _ := vertex["op"].(string)
 			if op != "AGGREGATE" {
 				continue
 			}
-			impl, _ := node["implementation"].(string)
-			if impl == "fast_node_count" {
+			impl, _ := vertex["implementation"].(string)
+			if impl == "fast_vertex_count" {
 				found = true
 				break
 			}
 		}
 		if !found {
-			t.Fatalf("expected AGGREGATE fast_node_count for %q, got nodes %#v", query, nodes)
+			t.Fatalf("expected AGGREGATE fast_vertex_count for %q, got vertexes %#v", query, vertexes)
 		}
 
 		cardinality, ok := explainPayload["cardinality"].([]map[string]any)
@@ -703,10 +703,10 @@ func TestExecuteExplainFastNodeCountPlan(t *testing.T) {
 			t.Fatalf("expected cardinality entries for %q, got %#v", query, explainPayload["cardinality"])
 		}
 		if rowsOut, _ := cardinality[0]["rowsOut"].(int); rowsOut != 3 {
-			t.Fatalf("expected ALL_NODES_SCAN rowsOut=3 for %q, got %#v", query, cardinality[0]["rowsOut"])
+			t.Fatalf("expected ALL_VERTEXES_SCAN rowsOut=3 for %q, got %#v", query, cardinality[0]["rowsOut"])
 		}
 		if quality, _ := cardinality[0]["quality"].(string); quality != "exact" {
-			t.Fatalf("expected ALL_NODES_SCAN quality exact for %q, got %#v", query, cardinality[0]["quality"])
+			t.Fatalf("expected ALL_VERTEXES_SCAN quality exact for %q, got %#v", query, cardinality[0]["quality"])
 		}
 		if rowsOut, _ := cardinality[1]["rowsOut"].(int); rowsOut != 1 {
 			t.Fatalf("expected AGGREGATE rowsOut=1 for %q, got %#v", query, cardinality[1]["rowsOut"])
@@ -988,7 +988,7 @@ func TestExecuteMatchIndexMetricsRecorded(t *testing.T) {
 	}
 }
 
-func TestExecuteMergeNodePropertyIndexMetricsRecorded(t *testing.T) {
+func TestExecuteMergeVertexPropertyIndexMetricsRecorded(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -1229,25 +1229,25 @@ func TestExecuteExplainWriteContextMatchReportsIndexScan(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected logicalPlan map, got %T", payload["logicalPlan"])
 	}
-	nodes, ok := logicalPlan["nodes"].([]map[string]any)
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
 	if !ok {
-		t.Fatalf("expected logicalPlan.nodes []map[string]any, got %T", logicalPlan["nodes"])
+		t.Fatalf("expected logicalPlan.vertexes []map[string]any, got %T", logicalPlan["vertexes"])
 	}
 
 	foundIndexScan := false
-	for _, node := range nodes {
-		op, _ := node["op"].(string)
+	for _, vertex := range vertexes {
+		op, _ := vertex["op"].(string)
 		if op != "INDEX_SCAN" {
 			continue
 		}
-		accessPath, _ := node["accessPath"].(string)
+		accessPath, _ := vertex["accessPath"].(string)
 		if accessPath == "property_index(Movie.movie_id)" {
 			foundIndexScan = true
 			break
 		}
 	}
 	if !foundIndexScan {
-		t.Fatalf("expected write-context MATCH to report property index scan, got nodes %#v", nodes)
+		t.Fatalf("expected write-context MATCH to report property index scan, got vertexes %#v", vertexes)
 	}
 }
 
@@ -1500,7 +1500,7 @@ func TestExecuteOptionalMatchPreservesRowWhenNoMatches(t *testing.T) {
 	}
 }
 
-func TestExecuteOptionalMatchKeepsBoundNodeOnMiss(t *testing.T) {
+func TestExecuteOptionalMatchKeepsBoundVertexOnMiss(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -1532,7 +1532,7 @@ func TestExecuteOptionalMatchKeepsBoundNodeOnMiss(t *testing.T) {
 		t.Fatalf("expected 1 row, got %d", len(res.Rows))
 	}
 	if res.Rows[0]["a"] == nil {
-		t.Fatalf("expected bound node a to be preserved on OPTIONAL miss, row=%#v", res.Rows[0])
+		t.Fatalf("expected bound vertex a to be preserved on OPTIONAL miss, row=%#v", res.Rows[0])
 	}
 	if res.Rows[0]["r"] != nil {
 		t.Fatalf("expected r to be nil on OPTIONAL miss, row=%#v", res.Rows[0])
@@ -1762,7 +1762,7 @@ func TestExecuteMatchSetRemoveAndDelete(t *testing.T) {
 	}
 }
 
-func TestExecuteSetNodeLabels(t *testing.T) {
+func TestExecuteSetVertexLabels(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -1797,7 +1797,7 @@ func TestExecuteSetNodeLabels(t *testing.T) {
 	}
 }
 
-func TestExecuteSetNodeLabelIgnoresNullBinding(t *testing.T) {
+func TestExecuteSetVertexLabelIgnoresNullBinding(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -1827,7 +1827,7 @@ func TestSetCaseSimple(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
 
-	// Create two nodes: a "person" with role and a "dept" with two phone fields.
+	// Create two vertexes: a "person" with role and a "dept" with two phone fields.
 	setup, err := parser.ParseStatement(
 		"CREATE (p:Person {id:'p1', role:'business'}), (d:Dept {id:'d1', departmentPhone:'555-DEPT', businessPhone:'555-BIZ'})")
 	if err != nil {
@@ -1870,7 +1870,7 @@ func TestSetCaseGeneric(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	setup, err := parser.ParseStatement(
-		"CREATE (n:Node {id:'n1', score:42})")
+		"CREATE (n:Vertex {id:'n1', score:42})")
 	if err != nil {
 		t.Fatalf("setup parse failed: %v", err)
 	}
@@ -1880,7 +1880,7 @@ func TestSetCaseGeneric(t *testing.T) {
 	}
 
 	stmt, err := parser.ParseStatement(
-		"MATCH (n:Node {id:'n1'}) " +
+		"MATCH (n:Vertex {id:'n1'}) " +
 			"SET n.grade = CASE " +
 			"  WHEN n.score >= 90 THEN 'A' " +
 			"  WHEN n.score >= 70 THEN 'B' " +
@@ -1910,7 +1910,7 @@ func TestSetCaseMultiProperty(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	setup, err := parser.ParseStatement(
-		"CREATE (n:Node {id:'n2', flag:true})")
+		"CREATE (n:Vertex {id:'n2', flag:true})")
 	if err != nil {
 		t.Fatalf("setup parse failed: %v", err)
 	}
@@ -1920,7 +1920,7 @@ func TestSetCaseMultiProperty(t *testing.T) {
 	}
 
 	stmt, err := parser.ParseStatement(
-		"MATCH (n:Node {id:'n2'}) " +
+		"MATCH (n:Vertex {id:'n2'}) " +
 			"SET n.label = CASE n.flag WHEN true THEN 'active' ELSE 'inactive' END, " +
 			"    n.note = 'set' " +
 			"RETURN n.label AS label, n.note AS note")
@@ -2132,7 +2132,7 @@ func TestExecuteMergeRelationshipOnCreateSetMapForms(t *testing.T) {
 	}
 }
 
-func TestExecuteMergeMatchAnonymousNodePattern(t *testing.T) {
+func TestExecuteMergeMatchAnonymousVertexPattern(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -2263,10 +2263,10 @@ func TestExecuteMergeOnMatchAndOnCreateLabels(t *testing.T) {
 	}
 
 	labelCounts := map[string]int{}
-	totalNodes := 0
+	totalVertexes := 0
 	if err := store.View(ctx, func(tx graph.Tx) error {
 		return tx.ScanVertices(ctx, "acme", 0, func(vertex *graph.Vertex) error {
-			totalNodes++
+			totalVertexes++
 			for _, label := range vertex.Labels {
 				labelCounts[label]++
 			}
@@ -2276,8 +2276,8 @@ func TestExecuteMergeOnMatchAndOnCreateLabels(t *testing.T) {
 		t.Fatalf("scan failed: %v", err)
 	}
 
-	if totalNodes != 3 {
-		t.Fatalf("expected 3 total nodes after merge, got %d", totalNodes)
+	if totalVertexes != 3 {
+		t.Fatalf("expected 3 total vertexes after merge, got %d", totalVertexes)
 	}
 	if labelCounts["L"] != 1 || labelCounts["M1"] != 1 || labelCounts["M2"] != 1 {
 		t.Fatalf("expected one L/M1/M2 label each, got %#v", labelCounts)
@@ -2396,7 +2396,7 @@ func TestExecuteUnwindWithReturnProjectsRows(t *testing.T) {
 	}
 }
 
-func TestExecuteMatchAllNodesReturnBinding(t *testing.T) {
+func TestExecuteMatchAllVertexesReturnBinding(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -2478,13 +2478,13 @@ func TestExecuteMatchReturnBindingEmitsStringProperties(t *testing.T) {
 		t.Fatalf("expected 1 row, got %d", len(res.Rows))
 	}
 
-	node, ok := res.Rows[0]["n"].(map[string]any)
+	vertex, ok := res.Rows[0]["n"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected projected node map, got %T", res.Rows[0]["n"])
+		t.Fatalf("expected projected vertex map, got %T", res.Rows[0]["n"])
 	}
-	props, ok := node["properties"].(map[string]any)
+	props, ok := vertex["properties"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected projected node properties map, got %T", node["properties"])
+		t.Fatalf("expected projected vertex properties map, got %T", vertex["properties"])
 	}
 	if got, ok := props["name"].(string); !ok || got != "Alice" {
 		t.Fatalf("expected string property Alice, got %#v", props["name"])
@@ -2795,7 +2795,7 @@ func TestExecuteMatchUndirectedAdjacentAnonymousLeft(t *testing.T) {
 		t.Fatalf("seed failed: %v", err)
 	}
 
-	stmt, err := parser.ParseStatement("MATCH (:Person {name: 'Oliver Stone'})--(n) RETURN n AS connectedNodes")
+	stmt, err := parser.ParseStatement("MATCH (:Person {name: 'Oliver Stone'})--(n) RETURN n AS connectedVertexes")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -2806,20 +2806,20 @@ func TestExecuteMatchUndirectedAdjacentAnonymousLeft(t *testing.T) {
 		t.Fatalf("execute failed: %v", err)
 	}
 	if len(res.Rows) != 2 {
-		t.Fatalf("expected 2 connected nodes, got %d", len(res.Rows))
+		t.Fatalf("expected 2 connected vertexes, got %d", len(res.Rows))
 	}
 
 	ids := map[string]bool{}
 	for _, row := range res.Rows {
-		node, ok := row["connectedNodes"].(map[string]any)
+		vertex, ok := row["connectedVertexes"].(map[string]any)
 		if !ok {
-			t.Fatalf("expected connectedNodes map, got %T", row["connectedNodes"])
+			t.Fatalf("expected connectedVertexes map, got %T", row["connectedVertexes"])
 		}
-		id, _ := node["id"].(string)
+		id, _ := vertex["id"].(string)
 		ids[id] = true
 	}
 	if !ids["m1"] || !ids["d1"] || len(ids) != 2 {
-		t.Fatalf("unexpected connected node ids: %#v", ids)
+		t.Fatalf("unexpected connected vertex ids: %#v", ids)
 	}
 }
 
@@ -2847,7 +2847,7 @@ func TestExecuteMatchUndirectedAdjacentBoundLeft(t *testing.T) {
 		t.Fatalf("seed failed: %v", err)
 	}
 
-	stmt, err := parser.ParseStatement("MATCH (person:Person {name: 'Oliver Stone'})--(n) RETURN n AS connectedNodes")
+	stmt, err := parser.ParseStatement("MATCH (person:Person {name: 'Oliver Stone'})--(n) RETURN n AS connectedVertexes")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -2858,7 +2858,7 @@ func TestExecuteMatchUndirectedAdjacentBoundLeft(t *testing.T) {
 		t.Fatalf("execute failed: %v", err)
 	}
 	if len(res.Rows) != 2 {
-		t.Fatalf("expected 2 connected nodes, got %d", len(res.Rows))
+		t.Fatalf("expected 2 connected vertexes, got %d", len(res.Rows))
 	}
 }
 
@@ -3087,11 +3087,11 @@ func TestExecuteMatchUndirectedRelationshipWithEdgeProperties(t *testing.T) {
 	for _, row := range res.Rows {
 		a, ok := row["a"].(map[string]any)
 		if !ok {
-			t.Fatalf("expected a to be a node map, got %T", row["a"])
+			t.Fatalf("expected a to be a vertex map, got %T", row["a"])
 		}
 		b, ok := row["b"].(map[string]any)
 		if !ok {
-			t.Fatalf("expected b to be a node map, got %T", row["b"])
+			t.Fatalf("expected b to be a vertex map, got %T", row["b"])
 		}
 		aID, _ := a["id"].(string)
 		bID, _ := b["id"].(string)
@@ -3357,7 +3357,7 @@ func TestExecuteReturnSimpleNamedPath(t *testing.T) {
 	}
 }
 
-func TestExecuteReturnThreeNodeNamedPath(t *testing.T) {
+func TestExecuteReturnThreeVertexNamedPath(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -3789,7 +3789,7 @@ func TestExecuteBuiltinProcedureUniquePhysicalEdgeCount(t *testing.T) {
 	}
 }
 
-func TestExecuteBuiltinProcedureNodeCount(t *testing.T) {
+func TestExecuteBuiltinProcedureVertexCount(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -3817,9 +3817,9 @@ func TestExecuteBuiltinProcedureNodeCount(t *testing.T) {
 		query string
 		want  string
 	}{
-		{query: "CALL db.stats.nodeCount()", want: "4"},
-		{query: "CALL db.stats.nodeCount('Movie')", want: "2"},
-		{query: "CALL db.stats.nodeCount('Movie') YIELD nodeCount AS c", want: "2"},
+		{query: "CALL db.stats.vertexCount()", want: "4"},
+		{query: "CALL db.stats.vertexCount('Movie')", want: "2"},
+		{query: "CALL db.stats.vertexCount('Movie') YIELD vertexCount AS c", want: "2"},
 	}
 
 	for _, tc := range tests {
@@ -3835,7 +3835,7 @@ func TestExecuteBuiltinProcedureNodeCount(t *testing.T) {
 			t.Fatalf("expected one row for %q, got %d", tc.query, len(res.Rows))
 		}
 
-		column := "nodeCount"
+		column := "vertexCount"
 		if strings.Contains(tc.query, " AS c") {
 			column = "c"
 		}
@@ -4157,7 +4157,7 @@ func TestExecuteReturnNamedPathFwdUndirected(t *testing.T) {
 	}
 	p := fmt.Sprint(res.Rows[0]["p"])
 	if !strings.Contains(p, ":A") || !strings.Contains(p, ":C") {
-		t.Fatalf("path string missing expected nodes: %q", p)
+		t.Fatalf("path string missing expected vertexes: %q", p)
 	}
 }
 
@@ -4555,12 +4555,12 @@ func TestExecuteReverseAdjacentThenReverseRelationshipChain(t *testing.T) {
 	}
 }
 
-func TestParseNodePatternBareAndLabel(t *testing.T) {
-	if _, err := parseNodePattern("(n)"); err != nil {
-		t.Fatalf("expected bare node pattern to parse: %v", err)
+func TestParseVertexPatternBareAndLabel(t *testing.T) {
+	if _, err := parseVertexPattern("(n)"); err != nil {
+		t.Fatalf("expected bare vertex pattern to parse: %v", err)
 	}
-	if _, err := parseNodePattern("(n:User)"); err != nil {
-		t.Fatalf("expected labeled node pattern to parse: %v", err)
+	if _, err := parseVertexPattern("(n:User)"); err != nil {
+		t.Fatalf("expected labeled vertex pattern to parse: %v", err)
 	}
 }
 
@@ -5160,7 +5160,7 @@ func TestEvalExpressionWithScopePredicateScalarBuiltInsThirdTranche(t *testing.T
 		{expr: "valueType('x')", want: "STRING"},
 		{expr: "valueType([1,2])", want: "LIST"},
 		{expr: "valueType({a:1})", want: "MAP"},
-		{expr: "valueType(n)", want: "NODE"},
+		{expr: "valueType(n)", want: "VERTEX"},
 		{expr: "valueType(r)", want: "RELATIONSHIP"},
 		{expr: "valueType(p)", want: "PATH"},
 	}
@@ -5872,10 +5872,10 @@ func TestDeleteBindingSemanticsForReturn(t *testing.T) {
 
 	stmt, err = parser.ParseStatement("CREATE (:A {num: 0})")
 	if err != nil {
-		t.Fatalf("parse node seed failed: %v", err)
+		t.Fatalf("parse vertex seed failed: %v", err)
 	}
 	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
-		t.Fatalf("execute node seed failed: %v", err)
+		t.Fatalf("execute vertex seed failed: %v", err)
 	}
 
 	stmt, err = parser.ParseStatement("MATCH (n:A) DELETE n RETURN n.num")
@@ -5884,7 +5884,7 @@ func TestDeleteBindingSemanticsForReturn(t *testing.T) {
 	}
 	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err == nil {
-		t.Fatalf("expected deleted node property access error")
+		t.Fatalf("expected deleted vertex property access error")
 	}
 	if !graph.IsKind(err, graph.ErrKindNotFound) {
 		t.Fatalf("expected ErrKindNotFound, got: %v", err)
@@ -5995,7 +5995,7 @@ func TestParseProjectionItemsDoesNotSplitIdentifiersContainingAS(t *testing.T) {
 	}
 }
 
-func TestExecuteCreateAnonymousNodesWithSameIDPropertyDoNotOverwrite(t *testing.T) {
+func TestExecuteCreateAnonymousVertexesWithSameIDPropertyDoNotOverwrite(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -6296,7 +6296,7 @@ func TestExecuteRemainingFunctionSurfacePathAndRelationship(t *testing.T) {
 		t.Fatalf("execute seed failed: %v", err)
 	}
 
-	stmt, err = parser.ParseStatement("MATCH p=(a)-[r:REL]->(b) RETURN size(nodes(p)) AS nn, size(relationships(p)) AS nr, length(p) AS l, startNode(r).id AS s, endNode(r).id AS e, sign(-5) AS sn, sign(0) AS sz, sign(4) AS sp, last([1,2,3]) AS lv, last([]) AS le")
+	stmt, err = parser.ParseStatement("MATCH p=(a)-[r:REL]->(b) RETURN size(vertexes(p)) AS nn, size(relationships(p)) AS nr, length(p) AS l, startVertex(r).id AS s, endVertex(r).id AS e, sign(-5) AS sn, sign(0) AS sz, sign(4) AS sp, last([1,2,3]) AS lv, last([]) AS le")
 	if err != nil {
 		t.Fatalf("parse query failed: %v", err)
 	}
@@ -6356,7 +6356,7 @@ func TestExecutePathFunctionsReturnNullOnNullPath(t *testing.T) {
 		t.Fatalf("execute seed failed: %v", err)
 	}
 
-	stmt, err = parser.ParseStatement("MATCH (a:A) OPTIONAL MATCH p = (a)-[r]->() RETURN nodes(p) AS np, relationships(p) AS rp, length(p) AS lp")
+	stmt, err = parser.ParseStatement("MATCH (a:A) OPTIONAL MATCH p = (a)-[r]->() RETURN vertexes(p) AS np, relationships(p) AS rp, length(p) AS lp")
 	if err != nil {
 		t.Fatalf("parse query failed: %v", err)
 	}

@@ -1186,6 +1186,51 @@ func TestRecommendationStage2EdgeIndexPushdownAdaptiveSkipsUnselectiveWorkload(t
 	}
 }
 
+func TestRecommendationStage2EdgeIndexPushdownSelectiveWorkloadBuildsScopedIndexCandidates(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := seedRecommendationBenchmarkGraph(ctx, store); err != nil {
+		t.Fatalf("seed benchmark graph failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement(recommendationBenchmarkSelectiveQuery)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddEdgePropertyIndex("bench-rec", "RATED", "rating")
+	collector := NewCollector()
+	exec := New(store, Options{Metrics: collector, IndexCatalog: catalog})
+	if _, err := exec.BackfillEdgePropertyIndex(ctx, "bench-rec", "RATED", "rating"); err != nil {
+		t.Fatalf("backfill edge index failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "bench-rec"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected non-empty recommendation rows")
+	}
+
+	counters, err := runtimeCountersFromWarnings(res.Warnings)
+	if err != nil {
+		t.Fatalf("runtime counters parse failed: %v", err)
+	}
+	if counters["fast_path.stage2.index_lookup_cache_misses"] <= 0 {
+		t.Fatalf("expected selective workload to exercise stage2 index probe path, got %#v", counters)
+	}
+	if counters["fast_path.stage2.index_candidates_total"] <= 0 && counters["fast_path.stage2.index_probe_cap_exceeded"] <= 0 && counters["fast_path.stage2.index_probe_source_scope_skipped_wide"] <= 0 {
+		t.Fatalf("expected selective workload to report probe diagnostics (candidates, cap, or wide-scope skip), got %#v", counters)
+	}
+	if counters["fast_path.stage2.index_pushdown_applied"] != 0 && counters["fast_path.stage2.index_pushdown_rows"] <= 0 {
+		t.Fatalf("expected pushdown rows when pushdown is applied, got %#v", counters)
+	}
+}
+
 func runtimeCountersFromWarnings(warnings []Diagnostic) (map[string]int64, error) {
 	payload := map[string]int64{}
 	for _, warning := range warnings {

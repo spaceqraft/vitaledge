@@ -104,6 +104,7 @@ const edgeRangeIndexCandidateLimit = 200000
 const stage2IndexPushdownMaxIndexedCandidates = 512
 const stage2IndexPushdownMaxAverageEdgesPerSource = 16
 const stage2IndexPushdownProbeCandidateLimit = 1536
+const stage2IndexPushdownSourceScopedProbeMaxSources = 8
 
 type wherePatternPredicateCache struct {
 	outNeighbors map[string]map[string]struct{}
@@ -1207,8 +1208,18 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	stage2IndexPushdownDecisionCache := map[string]bool{}
 	stage2IndexPushdownUsed := false
 	stage2PredicateShapeSkipNoted := false
-	e.observeRuntimeCounter(params, "fast_path.stage2.peer_rows_input", int64(len(rows)))
-
+	stage2SourceScopeSkipNoted := false
+	stage2PredicateShapeEligible, stage2PredicateShapeDecisive := stage2IndexPushdownPredicateShapeDecision(pattern, matchSpec.Where, params)
+	stage2IndexProbeLimit := stage2IndexPushdownProbeCandidateLimit
+	if maxPushdownCandidates := stage2IndexPushdownMaxIndexedCandidates + 1; stage2IndexProbeLimit > maxPushdownCandidates {
+		stage2IndexProbeLimit = maxPushdownCandidates
+	}
+	type stage2PeerInput struct {
+		row  Row
+		peer *graph.Vertex
+	}
+	stage2Inputs := make([]stage2PeerInput, 0, len(rows))
+	stage2SourcePeerIDs := map[string]struct{}{}
 	for _, row := range rows {
 		peer, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
@@ -1220,6 +1231,20 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 		if peer == nil {
 			continue
 		}
+		stage2Inputs = append(stage2Inputs, stage2PeerInput{row: row, peer: peer})
+		if peerID := strings.TrimSpace(peer.ID); peerID != "" {
+			stage2SourcePeerIDs[peerID] = struct{}{}
+		}
+	}
+	var stage2ProbeSourceFilter map[string]struct{}
+	if len(stage2SourcePeerIDs) > 0 && len(stage2SourcePeerIDs) <= stage2IndexPushdownSourceScopedProbeMaxSources {
+		stage2ProbeSourceFilter = stage2SourcePeerIDs
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage2.peer_rows_input", int64(len(rows)))
+
+	for _, input := range stage2Inputs {
+		row := input.row
+		peer := input.peer
 
 		numericConstraints, hasNumericConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params)
 		excludedRightIDs, hasExcludedRightIDs, err := extractDirectedWhereRightExclusionSet(ctx, tx, tenant, matchSpec.Where, pattern.Right.Var, row, params)
@@ -1339,7 +1364,11 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 		}
 
 		if e.stage2EdgeIndexPushdownEnabled {
-			if !stage2IndexPushdownEligibleByPredicateShape(pattern, matchSpec.Where, row, params) {
+			predicateShapeEligible := stage2PredicateShapeEligible
+			if !stage2PredicateShapeDecisive {
+				predicateShapeEligible = stage2IndexPushdownEligibleByPredicateShape(pattern, matchSpec.Where, row, params)
+			}
+			if !predicateShapeEligible {
 				if !stage2PredicateShapeSkipNoted {
 					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_predicate_shape", 1)
 					stage2PredicateShapeSkipNoted = true
@@ -1353,11 +1382,19 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 						e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_hits", 1)
 					} else {
 						e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_misses", 1)
-						edges, indexed, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, matchSpec.Where, "", row, params, stage2IndexPushdownProbeCandidateLimit)
+						if stage2ProbeSourceFilter == nil && len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources && !stage2SourceScopeSkipNoted {
+							e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_source_scope_skipped_wide", 1)
+							stage2SourceScopeSkipNoted = true
+						}
+						edges, indexed, probeCapExceeded, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, matchSpec.Where, "", row, params, stage2ProbeSourceFilter, stage2IndexProbeLimit)
 						if err != nil {
 							return nil, nil, false, err
 						}
 						applyPushdown := false
+						if probeCapExceeded {
+							e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_cap_exceeded", 1)
+							e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_probe_cap", 1)
+						}
 						if indexed {
 							edgesBySource := map[string][]*graph.Edge{}
 							for _, candidateEdge := range edges {
@@ -1503,6 +1540,27 @@ func stage2IndexPushdownEligibleByPredicateShape(pattern directedRelationshipPat
 		}
 	}
 	return false
+}
+
+func stage2IndexPushdownPredicateShapeDecision(pattern directedRelationshipPattern, whereRaw string, params Params) (eligible bool, decisive bool) {
+	if strings.TrimSpace(pattern.EdgeProps) != "" {
+		if _, _, ok := edgePropertyEquality(pattern.EdgeProps, params, nil); ok {
+			return true, true
+		}
+	}
+	constraints, hasConstraints := extractEdgeWhereNumericConstraints(whereRaw, pattern.EdgeVar, nil, params)
+	if !hasConstraints {
+		return false, false
+	}
+	for _, constraint := range constraints {
+		if constraint.isContradictory() {
+			return true, true
+		}
+		if constraint.lowerSet && constraint.upperSet {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 func edgeNumericRangeConstraintCacheKey(constraint edgeNumericRangeConstraint) string {
@@ -3477,7 +3535,7 @@ func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph
 			return nil, err
 		}
 		skipWhereEval := directedWhereCoveredByExtractedPrefilters(spec.Where, pattern.EdgeVar, pattern.Right.Var, row, params, hasNumericConstraints, hasExcludedRightIDs)
-		if indexedEdges, indexed, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, spec.Where, pattern.Left.Var, row, params, 0); err != nil {
+		if indexedEdges, indexed, _, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, spec.Where, pattern.Left.Var, row, params, nil, 0); err != nil {
 			return nil, err
 		} else if indexed {
 			matched := false
@@ -3658,7 +3716,7 @@ func (e *Executor) expandReverseDirectedRelationshipMatch(ctx context.Context, t
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		if indexedEdges, indexed, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, spec.Where, pattern.Left.Var, row, params, 0); err != nil {
+		if indexedEdges, indexed, _, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, spec.Where, pattern.Left.Var, row, params, nil, 0); err != nil {
 			return nil, err
 		} else if indexed {
 			matched := false
@@ -6802,20 +6860,22 @@ func extractEdgeWhereNumericConstraints(whereRaw, edgeVar string, row Row, param
 	return constraints, true
 }
 
-func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.Tx, tenant, edgeType string, edgeAnyOf []string, edgeProps, edgeVar, whereRaw string, leftVar string, row Row, params Params, candidateLimit int) ([]*graph.Edge, bool, error) {
+func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.Tx, tenant, edgeType string, edgeAnyOf []string, edgeProps, edgeVar, whereRaw string, leftVar string, row Row, params Params, sourceVertexIDs map[string]struct{}, candidateLimit int) ([]*graph.Edge, bool, bool, error) {
 	if e.indexCatalog == nil {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	if candidateLimit <= 0 {
 		candidateLimit = edgeRangeIndexCandidateLimit
 	}
 	types := edgePatternCandidateTypes(edgeType, edgeAnyOf)
 	if len(types) == 0 {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
+	hasSourceFilter := len(sourceVertexIDs) > 0
 
 	strategy := "edge_property_index"
 	ids := map[string]struct{}{}
+	preloadedEdges := map[string]*graph.Edge{}
 	errEdgeIndexCapReached := errors.New("edge index candidate limit reached")
 
 	if prop, value, ok := edgePropertyEquality(edgeProps, params, row); ok {
@@ -6823,7 +6883,7 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 			indexed := e.indexCatalog.HasEdgePropertyIndex(tenant, candidateType, prop)
 			e.metrics.ObserveIndexCandidate(tenant, candidateType, prop, indexed)
 			if !indexed {
-				return nil, false, nil
+				return nil, false, false, nil
 			}
 		}
 
@@ -6833,6 +6893,22 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 				if entry == nil || entry.EntityClass != "edge" {
 					return nil
 				}
+				if hasSourceFilter {
+					edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
+					if err != nil {
+						if graph.IsKind(err, graph.ErrKindNotFound) {
+							return nil
+						}
+						return err
+					}
+					if edge == nil {
+						return nil
+					}
+					if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
+						return nil
+					}
+					preloadedEdges[entry.EntityID] = edge
+				}
 				ids[entry.EntityID] = struct{}{}
 				if len(ids) > candidateLimit {
 					return errEdgeIndexCapReached
@@ -6841,10 +6917,10 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 			})
 			if err != nil {
 				if errors.Is(err, errEdgeIndexCapReached) {
-					return nil, false, nil
+					return nil, false, true, nil
 				}
 				e.metrics.ObserveIndexLookup(strategy, "error", 0)
-				return nil, true, err
+				return nil, true, false, err
 			}
 		}
 	} else {
@@ -6854,12 +6930,12 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 		// source). Skip range pushdown so the caller uses the adjacency path.
 		if leftVar != "" {
 			if v, ok := row[leftVar]; ok && v != nil {
-				return nil, false, nil
+				return nil, false, false, nil
 			}
 		}
 		constraints, ok := extractEdgeWhereNumericConstraints(whereRaw, edgeVar, row, params)
 		if !ok {
-			return nil, false, nil
+			return nil, false, false, nil
 		}
 
 		props := make([]string, 0, len(constraints))
@@ -6886,11 +6962,11 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 			}
 		}
 		if selectedProp == "" {
-			return nil, false, nil
+			return nil, false, false, nil
 		}
 		if selectedConstraint.isContradictory() {
 			e.metrics.ObserveIndexLookup("edge_property_index_range", "miss", 0)
-			return nil, true, nil
+			return nil, true, false, nil
 		}
 
 		strategy = "edge_property_index_range"
@@ -6902,6 +6978,22 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 				if !selectedConstraint.matchesValue(decodeStoredPropertyValue(entry.Value)) {
 					return nil
 				}
+				if hasSourceFilter {
+					edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
+					if err != nil {
+						if graph.IsKind(err, graph.ErrKindNotFound) {
+							return nil
+						}
+						return err
+					}
+					if edge == nil {
+						return nil
+					}
+					if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
+						return nil
+					}
+					preloadedEdges[entry.EntityID] = edge
+				}
 				ids[entry.EntityID] = struct{}{}
 				if len(ids) > candidateLimit {
 					return errEdgeIndexCapReached
@@ -6910,23 +7002,27 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 			})
 			if err != nil {
 				if errors.Is(err, errEdgeIndexCapReached) {
-					return nil, false, nil
+					return nil, false, true, nil
 				}
 				e.metrics.ObserveIndexLookup(strategy, "error", 0)
-				return nil, true, err
+				return nil, true, false, err
 			}
 		}
 	}
 
 	out := make([]*graph.Edge, 0, len(ids))
 	for id := range ids {
-		edge, err := tx.GetEdge(ctx, tenant, id)
-		if err != nil {
-			if graph.IsKind(err, graph.ErrKindNotFound) {
-				continue
+		edge := preloadedEdges[id]
+		if edge == nil {
+			var err error
+			edge, err = tx.GetEdge(ctx, tenant, id)
+			if err != nil {
+				if graph.IsKind(err, graph.ErrKindNotFound) {
+					continue
+				}
+				e.metrics.ObserveIndexLookup("edge_property_index", "error", 0)
+				return nil, true, false, err
 			}
-			e.metrics.ObserveIndexLookup("edge_property_index", "error", 0)
-			return nil, true, err
 		}
 		if !edgeTypeMatches(edge, edgeType, edgeAnyOf) {
 			continue
@@ -6938,13 +7034,13 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 	}
 	if len(out) == 0 {
 		e.metrics.ObserveIndexLookup(strategy, "miss", 0)
-		return nil, true, nil
+		return nil, true, false, nil
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].ID < out[j].ID
 	})
 	e.metrics.ObserveIndexLookup(strategy, "hit", len(out))
-	return out, true, nil
+	return out, true, false, nil
 }
 
 func vertexMatchesProperty(vertex *graph.Vertex, prop string, encoded []byte, label string) bool {

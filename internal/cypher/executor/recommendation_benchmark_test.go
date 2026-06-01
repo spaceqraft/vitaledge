@@ -153,6 +153,8 @@ func benchmarkRecommendationQueryWithQuery(b *testing.B, mode recommendationBenc
 	reportCounterPerOp("stage2_index_edges_considered/op", "fast_path.stage2.index_edges_considered")
 	reportCounterPerOp("stage2_index_pushdown_skipped_unselective/op", "fast_path.stage2.index_pushdown_skipped_unselective")
 	reportCounterPerOp("stage2_index_pushdown_skipped_predicate_shape/op", "fast_path.stage2.index_pushdown_skipped_predicate_shape")
+	reportCounterPerOp("stage2_index_probe_cap_exceeded/op", "fast_path.stage2.index_probe_cap_exceeded")
+	reportCounterPerOp("stage2_index_probe_source_scope_skipped_wide/op", "fast_path.stage2.index_probe_source_scope_skipped_wide")
 	reportCounterPerOp("stage2_index_cache_hits/op", "fast_path.stage2.index_lookup_cache_hits")
 	reportCounterPerOp("stage2_index_cache_misses/op", "fast_path.stage2.index_lookup_cache_misses")
 }

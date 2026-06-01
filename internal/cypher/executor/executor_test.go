@@ -7641,3 +7641,5 @@ func (r *executorMetricsRecorder) ObserveIndexLookup(strategy, outcome string, m
 }
 
 func (r *executorMetricsRecorder) ObserveDeleteCounter(_ string, _ int64) {}
+
+func (r *executorMetricsRecorder) ObserveRuntimeCounter(_ string, _ int64) {}

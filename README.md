@@ -40,6 +40,7 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Smoke benchmark: `make bench-smoke`
 - Graph store benchmark baseline: `make bench-graph-store`
 - Cypher ingest benchmark (indexed vs non-indexed UNWIND..MERGE): `make bench-merge-index`
+- Recommendation query optimization benchmark hooks: `go test ./internal/cypher/executor -run '^$' -bench 'BenchmarkRecommendationQueryStep1TopKPushdown|BenchmarkRecommendationQueryStep2LateMaterialization' -benchtime=1x`
 - Milestone benchmark baseline (local JSONL snapshot): `make bench-milestone`
 - Mixed CLI soak profile (concurrent write/noop-write/read): `make soak-mixed`
 
@@ -168,6 +169,18 @@ The resolved value is exposed through gRPC capabilities as `max_write_batch_byte
 
 The same batch-size fields are returned in each `Execute` and `Explain` response inside `stats`, so single-threaded clients can adapt immediately without polling capabilities.
 
+Runtime counter diagnostics are emitted in `Execute` warnings for fast-path recommendation/query optimizations.
+
+- warning code: `RUNTIME_COUNTERS`
+- payload: JSON object of per-query counters (for example stage edge visits, prefilter drops, top-k application, and output rows)
+- CLI behavior: warnings are printed to stderr when `IncludeWarnings=true` (default in `vitaledge-cli` execution path)
+
+Example warning payload:
+
+```text
+warning [RUNTIME_COUNTERS]: {"fast_path.stage2.edges_visited":12345,"fast_path.stage2.antijoin_prefilter_drops":6789}
+```
+
 Prometheus metrics endpoint is optional and configurable:
 
 - flag: `--metrics-listen :9100`
@@ -182,6 +195,12 @@ When enabled, the process serves:
 
 - `GET /metrics` (Prometheus text exposition)
 - `GET /healthz` (simple liveness check)
+
+Runtime counter metrics are exported at `/metrics` as:
+
+- `vitaledge_executor_runtime_counters_total{counter="<counter-name>"}`
+
+These counters are monotonic process-level totals and complement per-query `RUNTIME_COUNTERS` diagnostics for immediate local reflection and long-horizon operational trend analysis.
 
 ## EXPLAIN For Index Tuning
 

@@ -49,6 +49,7 @@ type Snapshot struct {
 	IndexCandidates map[IndexCandidateKey]int64
 	IndexLookups    map[IndexLookupKey]IndexLookupValue
 	DeleteCounters  map[string]int64
+	RuntimeCounters map[string]int64
 }
 
 type Collector struct {
@@ -58,6 +59,7 @@ type Collector struct {
 	indexCandidates map[IndexCandidateKey]int64
 	indexLookups    map[IndexLookupKey]IndexLookupValue
 	deleteCounters  map[string]int64
+	runtimeCounters map[string]int64
 }
 
 var _ Metrics = (*Collector)(nil)
@@ -83,6 +85,7 @@ func NewCollector() *Collector {
 		indexCandidates: map[IndexCandidateKey]int64{},
 		indexLookups:    map[IndexLookupKey]IndexLookupValue{},
 		deleteCounters:  map[string]int64{},
+		runtimeCounters: map[string]int64{},
 	}
 }
 
@@ -149,6 +152,15 @@ func (c *Collector) ObserveDeleteCounter(event string, delta int64) {
 	c.deleteCounters[event] += delta
 }
 
+func (c *Collector) ObserveRuntimeCounter(name string, delta int64) {
+	if c == nil || delta == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.runtimeCounters[name] += delta
+}
+
 func (c *Collector) Snapshot() Snapshot {
 	if c == nil {
 		return Snapshot{}
@@ -181,12 +193,18 @@ func (c *Collector) Snapshot() Snapshot {
 		deleteCounters[key] = value
 	}
 
+	runtimeCounters := make(map[string]int64, len(c.runtimeCounters))
+	for key, value := range c.runtimeCounters {
+		runtimeCounters[key] = value
+	}
+
 	return Snapshot{
 		Statements:      statements,
 		RowsReturned:    c.rowsReturned,
 		IndexCandidates: indexCandidates,
 		IndexLookups:    indexLookups,
 		DeleteCounters:  deleteCounters,
+		RuntimeCounters: runtimeCounters,
 	}
 }
 

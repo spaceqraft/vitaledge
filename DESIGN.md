@@ -140,6 +140,24 @@ Current concrete diagnostics and tuning signals:
 5. Runtime planning counters (`runtimeStats`) for store/plan/index/cardinality summaries.
 6. Warning diagnostics keyed by explicit fallback conditions (`MISSING_PROPERTY_INDEX`, `FULL_SCAN_FALLBACK`, `ESTIMATE_ONLY_INDEX_SIGNAL`, `WRITE_QUERY_DRY_RUN`, `MISSING_TENANT_CONTEXT`).
 
+### Runtime Counter Instrumentation (DX Transparency)
+
+Decision:
+
+1. Query execution should emit machine-readable runtime counter diagnostics for hot optimization paths.
+2. The same counters should be exported as process-level Prometheus metrics for operational visibility.
+
+Current implementation envelope:
+
+1. Fast recommendation clause-pair paths emit per-query warning diagnostics with code `RUNTIME_COUNTERS` and JSON payload values.
+2. Counter families include stage edge visits, prefilter drops, top-k pushdown usage, and stage output row counts.
+3. Process-level accumulation is exported as `vitaledge_executor_runtime_counters_total{counter=...}` on `/metrics`.
+
+Rationale:
+
+1. This makes optimizer behavior observable without requiring profiler attachment or ad-hoc logging.
+2. It supports the VitalEdge DX goal of understandable performance behavior for large graph workloads.
+
 ### Statistics-as-data and backfill policy
 
 Decision:

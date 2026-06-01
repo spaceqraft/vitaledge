@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -932,6 +933,28 @@ func TestRecommendationReturnAggregationShapeProducesExpectedCandidateScores(t *
 	totalSim, ok := numericValue(res.Rows[0]["total_sim"])
 	if !ok || math.Abs(totalSim-1.8) > 1e-9 {
 		t.Fatalf("expected total_sim 1.8, got %#v", res.Rows[0]["total_sim"])
+	}
+
+	if len(res.Warnings) == 0 {
+		t.Fatalf("expected runtime counter diagnostic warning")
+	}
+	var payload map[string]int64
+	foundRuntimeCounters := false
+	for _, warning := range res.Warnings {
+		if warning.Code != "RUNTIME_COUNTERS" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(warning.Message), &payload); err != nil {
+			t.Fatalf("runtime counter warning payload must be json: %v", err)
+		}
+		foundRuntimeCounters = true
+		break
+	}
+	if !foundRuntimeCounters {
+		t.Fatalf("expected RUNTIME_COUNTERS warning, got %#v", res.Warnings)
+	}
+	if payload["fast_path.stage2.edges_visited"] <= 0 {
+		t.Fatalf("expected fast_path.stage2.edges_visited counter > 0, got %#v", payload)
 	}
 }
 

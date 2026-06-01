@@ -88,6 +88,7 @@ Current implementation status:
 - Implemented: edge property index catalog/config support plus startup migration backfill for configured `(tenant, edge_type, property)` tuples.
 - Implemented: relationship traversal edge-property index pushdown for pattern equality and common numeric WHERE ranges, with conservative fallback and residual predicate filtering.
 - Implemented: executor metrics for statement outcomes, rows returned, index candidates, and index lookup outcomes; concrete in-process collector plus top unindexed-candidate reporting.
+- Implemented: runtime counter instrumentation for fast recommendation/query paths, including per-query diagnostics (`RUNTIME_COUNTERS`) and Prometheus export (`vitaledge_executor_runtime_counters_total`).
 - Implemented: startup wiring for graph path, tenant defaults, index config loading, and metrics reporting.
 - Implemented: lightweight TCP integration tests for request parsing/execution/JSON response path.
 - Implemented: expanded Cypher compatibility for relationship patterns (directed, reverse-directed, undirected, type alternation, relationship properties), two-hop chain matching, and chained MATCH clause execution with shared bindings.
@@ -97,6 +98,7 @@ Current implementation status:
 - Implemented: persisted statistics-as-data side effects for tenant totals, per-label vertex counts, and per-edge-type counts.
 - Implemented: stats snapshot read API consumed by EXPLAIN and statistics procedures, including EXPLAIN diagnostics for snapshot coverage completeness and backfill-required status.
 - Implemented: startup schema migration (`no-stats` -> `stats`) that backfills persisted statistics for legacy stores and records schema version metadata.
+- Implemented: recommendation-query benchmark hooks for step-wise optimization reflection (`BenchmarkRecommendationQueryStep1TopKPushdown`, `BenchmarkRecommendationQueryStep2LateMaterialization`).
 
 Phase 1 deliverable status:
 
@@ -108,6 +110,7 @@ Remaining Phase 1 gaps before close:
 
 - Phase 1 performance evidence has now been captured in this document (see Phase 1 closure evidence below).
 - Operability baseline for Phase 1 is satisfied via in-process metrics collectors and periodic metrics/recommendation reporting; production sink/export wiring remains a Phase 2+ hardening task.
+- Runtime optimization transparency baseline completed: query-level runtime counters are emitted as warnings for immediate developer reflection, and aggregated counters are exported through Prometheus for operational trending.
 - Planner/explainability backlog (Phase 2): explain-plan output coverage is still listed as a Phase 2 deliverable and is not yet evidenced for all supported query forms.
 
 MVP-critical items not yet complete:

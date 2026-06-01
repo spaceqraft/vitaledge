@@ -19,6 +19,7 @@ func TestCollectorSnapshot(t *testing.T) {
 	collector.ObserveIndexLookup("property_index", "hit", 2)
 	collector.ObserveDeleteCounter("rows_seen", 10)
 	collector.ObserveDeleteCounter("edges_deleted", 7)
+	collector.ObserveRuntimeCounter("fast_path.stage2.edges_visited", 42)
 
 	snapshot := collector.Snapshot()
 
@@ -45,6 +46,9 @@ func TestCollectorSnapshot(t *testing.T) {
 	}
 	if snapshot.DeleteCounters["edges_deleted"] != 7 {
 		t.Fatalf("expected edges_deleted 7, got %d", snapshot.DeleteCounters["edges_deleted"])
+	}
+	if snapshot.RuntimeCounters["fast_path.stage2.edges_visited"] != 42 {
+		t.Fatalf("expected runtime counter 42, got %d", snapshot.RuntimeCounters["fast_path.stage2.edges_visited"])
 	}
 }
 

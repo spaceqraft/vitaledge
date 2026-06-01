@@ -75,7 +75,7 @@ func (h *grpcQueryHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*
 		rows = append(rows, &v1.Row{Values: rowValues})
 	}
 
-	return &v1.QueryResponse{
+	resp := &v1.QueryResponse{
 		Columns: result.Columns,
 		Rows:    rows,
 		Stats: &v1.QueryStats{
@@ -85,7 +85,13 @@ func (h *grpcQueryHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*
 			EffectiveMaxWriteBatchBytes:  grpcEffectiveWriteBatchBytes(h.maxWriteBatchBytes),
 			MaxWriteBatchBytesTuned:      h.maxWriteBatchBytesTuned,
 		},
-	}, nil
+	}
+	if req.GetOptions() == nil || req.GetOptions().GetIncludeWarnings() {
+		for _, warning := range result.Warnings {
+			resp.Warnings = append(resp.Warnings, &v1.Diagnostic{Code: warning.Code, Message: warning.Message})
+		}
+	}
+	return resp, nil
 }
 
 func (h *grpcQueryHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*v1.ExplainResponse, error) {
@@ -122,7 +128,7 @@ func (h *grpcQueryHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*
 		return nil, status.Errorf(codes.Internal, "failed to encode explain payload: %v", err)
 	}
 
-	return &v1.ExplainResponse{
+	resp := &v1.ExplainResponse{
 		ExplainJson: explainJSON,
 		Stats: &v1.QueryStats{
 			RowsReturned:                 int64(result.Stats.RowsReturned),
@@ -131,7 +137,13 @@ func (h *grpcQueryHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*
 			EffectiveMaxWriteBatchBytes:  grpcEffectiveWriteBatchBytes(h.maxWriteBatchBytes),
 			MaxWriteBatchBytesTuned:      h.maxWriteBatchBytesTuned,
 		},
-	}, nil
+	}
+	if req.GetOptions() == nil || req.GetOptions().GetIncludeWarnings() {
+		for _, warning := range result.Warnings {
+			resp.Warnings = append(resp.Warnings, &v1.Diagnostic{Code: warning.Code, Message: warning.Message})
+		}
+	}
+	return resp, nil
 }
 
 func grpcDurationMs(duration time.Duration) int64 {

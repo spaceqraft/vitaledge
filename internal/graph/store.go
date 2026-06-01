@@ -19,6 +19,7 @@ type TxOptions struct {
 type Tx interface {
 	GetVertex(ctx context.Context, tenant, vertexID string) (*Vertex, error)
 	ScanVertices(ctx context.Context, tenant string, limit int, fn func(*Vertex) error) error
+	ScanVerticesFrom(ctx context.Context, tenant, startAfterVertexID string, limit int, fn func(*Vertex) error) error
 	PutVertex(ctx context.Context, vertex *Vertex) error
 	DeleteVertex(ctx context.Context, tenant, vertexID string) error
 	GetStatsSnapshot(ctx context.Context, tenant string) (*StatsSnapshot, error)
@@ -30,6 +31,7 @@ type Tx interface {
 	ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(*Edge) error) error
 	ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(*Edge) error) error
 	ScanPropertyIndex(ctx context.Context, tenant, schema, property string, encodedValue []byte, limit int, fn func(*PropertyIndexEntry) error) error
+	ScanPropertyIndexAll(ctx context.Context, tenant, schema, property string, limit int, fn func(*PropertyIndexEntry) error) error
 
 	PutPropertyIndex(ctx context.Context, entry *PropertyIndexEntry) error
 	DeletePropertyIndex(ctx context.Context, entry *PropertyIndexEntry) error

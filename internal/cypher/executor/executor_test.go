@@ -387,6 +387,154 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	}
 }
 
+func TestExecuteExplainReportsFastPathExecutionStrategies(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-target", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-peer", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-shared", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-candidate", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-1", Type: "RATED", SrcID: "u-target", DstID: "m-shared", Properties: graph.PropertyMap{"rating": []byte("4")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-2", Type: "RATED", SrcID: "u-peer", DstID: "m-shared", Properties: graph.PropertyMap{"rating": []byte("5")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-3", Type: "RATED", SrcID: "u-peer", DstID: "m-candidate", Properties: graph.PropertyMap{"rating": []byte("5")}}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement(`EXPLAIN
+MATCH (target:User)-[rt:RATED]->(shared:Movie)<-[rp:RATED]-(peer:User)
+WHERE abs(rp.rating - rt.rating) <= 1
+WITH target, peer, count(shared) AS shared_count, avg(abs(rt.rating-rp.rating)) AS avg_diff
+MATCH (peer)-[rp2:RATED]->(candidate:Movie)
+WHERE rp2.rating >= 4 AND NOT (target)-[:RATED]->(candidate)
+RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS support, sum(shared_count) AS total_sim`)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+
+	fastPaths, ok := explainPayload["executionStrategies"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected executionStrategies []map[string]any, got %T", explainPayload["executionStrategies"])
+	}
+	if len(fastPaths) < 2 {
+		t.Fatalf("expected at least 2 fast-path strategy signals, got %#v", fastPaths)
+	}
+
+	seenImplementations := map[string]struct{}{}
+	for _, path := range fastPaths {
+		if impl, _ := path["implementation"].(string); impl != "" {
+			seenImplementations[impl] = struct{}{}
+		}
+	}
+	if _, ok := seenImplementations["fast_target_shared_peer_aggregation_clause_pair"]; !ok {
+		t.Fatalf("missing fast target/shared-peer strategy marker: %#v", fastPaths)
+	}
+	if _, ok := seenImplementations["fast_peer_candidate_return_aggregation_clause_pair"]; !ok {
+		t.Fatalf("missing fast peer/candidate strategy marker: %#v", fastPaths)
+	}
+
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	vertexes, ok := logicalPlan["vertexes"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan.vertexes []map[string]any, got %T", logicalPlan["vertexes"])
+	}
+	seenPlanImplementations := map[string]struct{}{}
+	for _, vertex := range vertexes {
+		if impl, _ := vertex["implementation"].(string); impl != "" {
+			seenPlanImplementations[impl] = struct{}{}
+		}
+	}
+	if _, ok := seenPlanImplementations["fast_target_shared_peer_aggregation_clause_pair"]; !ok {
+		t.Fatalf("missing fast target/shared-peer implementation on plan vertexes: %#v", vertexes)
+	}
+	if _, ok := seenPlanImplementations["fast_peer_candidate_return_aggregation_clause_pair"]; !ok {
+		t.Fatalf("missing fast peer/candidate implementation on plan vertexes: %#v", vertexes)
+	}
+
+	foundCoveredScan := false
+	for _, vertex := range vertexes {
+		op, _ := vertex["op"].(string)
+		if op != "EDGE_SCAN" {
+			continue
+		}
+		impl, _ := vertex["implementation"].(string)
+		if impl != "prefilter_covered_directed_relationship_scan" {
+			continue
+		}
+		if covered, _ := vertex["wherePrefilterCoverage"].(bool); !covered {
+			t.Fatalf("expected covered scan vertex to mark wherePrefilterCoverage=true: %#v", vertex)
+		}
+		if numeric, _ := vertex["numericPrefilter"].(bool); !numeric {
+			t.Fatalf("expected covered scan vertex to mark numericPrefilter=true: %#v", vertex)
+		}
+		if antiJoin, _ := vertex["antiJoinPrefilter"].(bool); !antiJoin {
+			t.Fatalf("expected covered scan vertex to mark antiJoinPrefilter=true: %#v", vertex)
+		}
+		if strategy, _ := vertex["executionStrategy"].(string); strategy != "fast_peer_candidate_return_aggregation_clause_pair" {
+			t.Fatalf("expected covered scan vertex to reference peer/candidate fast path: %#v", vertex)
+		}
+		foundCoveredScan = true
+		break
+	}
+	if !foundCoveredScan {
+		t.Fatalf("missing prefilter-covered directed relationship scan annotation on plan vertexes: %#v", vertexes)
+	}
+
+	runtimeStats, ok := explainPayload["runtimeStats"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats map, got %T", explainPayload["runtimeStats"])
+	}
+	execution, ok := runtimeStats["execution"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.execution map, got %T", runtimeStats["execution"])
+	}
+	if fastPathCandidates, _ := execution["fastPathCandidates"].(int); fastPathCandidates < 2 {
+		t.Fatalf("expected fastPathCandidates >= 2, got %#v", execution["fastPathCandidates"])
+	}
+
+	warnings, ok := explainPayload["warnings"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected warnings []map[string]any, got %T", explainPayload["warnings"])
+	}
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
+			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL when fast paths are recognized: %#v", warnings)
+		}
+	}
+}
+
 func TestExecuteExplainLargeTenantKeepsExactPredicateSignals(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -2222,6 +2370,57 @@ func TestExecuteExistsFunctionAndExistsSubqueryRemainDistinct(t *testing.T) {
 	}
 	if got := res.Rows[0]["name"]; got != "Bob" {
 		t.Fatalf("unexpected EXISTS { ... } row: %#v", got)
+	}
+}
+
+func TestExecuteMatchWhereNotRelationshipPatternPredicate(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: graph.PropertyMap{"user_id": []byte("1")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: graph.PropertyMap{"user_id": []byte("2")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"movie_id": []byte("1")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"movie_id": []byte("2")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m3", Labels: []string{"Movie"}, Properties: graph.PropertyMap{"movie_id": []byte("3")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "RATED", SrcID: "u1", DstID: "m2"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "RATED", SrcID: "u2", DstID: "m3"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (target:User {user_id: '1'}), (candidate:Movie) WHERE NOT (target)-[:RATED]->(candidate) RETURN candidate.movie_id AS movieID ORDER BY movieID ASC")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := fmt.Sprint(res.Rows[0]["movieID"]); got != "3" {
+		t.Fatalf("unexpected movieID: %#v", got)
 	}
 }
 

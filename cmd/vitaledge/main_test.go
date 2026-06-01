@@ -52,6 +52,76 @@ func openTestStore(t *testing.T) graph.GraphStore {
 	return store
 }
 
+func TestApplyIndexMigrationsBackfillsConfiguredIndexes(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant: "acme",
+			ID:     "u1",
+			Labels: []string{"User"},
+			Properties: map[string][]byte{
+				"email": []byte("alice@example.com"),
+			},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{
+			Tenant: "acme",
+			ID:     "e1",
+			Type:   "RATED",
+			SrcID:  "u1",
+			DstID:  "m1",
+			Properties: map[string][]byte{
+				"rating": []byte("5"),
+			},
+		})
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "email")
+	catalog.AddEdgePropertyIndex("acme", "RATED", "rating")
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: catalog})
+	if err := applyIndexMigrations(ctx, exec, catalog); err != nil {
+		t.Fatalf("applyIndexMigrations failed: %v", err)
+	}
+
+	vertexFound := false
+	edgeFound := false
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		if err := tx.ScanPropertyIndex(ctx, "acme", "User", "email", []byte("alice@example.com"), 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil && entry.EntityClass == "vertex" && entry.EntityID == "u1" {
+				vertexFound = true
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.ScanPropertyIndex(ctx, "acme", "RATED", "rating", []byte("5"), 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil && entry.EntityClass == "edge" && entry.EntityID == "e1" {
+				edgeFound = true
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("scan property indexes failed: %v", err)
+	}
+	if !vertexFound {
+		t.Fatalf("expected vertex property index entry from migration")
+	}
+	if !edgeFound {
+		t.Fatalf("expected edge property index entry from migration")
+	}
+}
+
 func TestWritePrometheusMetricsFromCollector(t *testing.T) {
 	collector := executor.NewCollector()
 	collector.ObserveStatement(ast.StatementKindQuery, "ok", 25*time.Millisecond)

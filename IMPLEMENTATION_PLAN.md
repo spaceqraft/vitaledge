@@ -85,6 +85,8 @@ Current implementation status:
 - Implemented: executor core clause pipeline for MATCH, OPTIONAL MATCH, WHERE, RETURN, CREATE, MERGE, SET, REMOVE, DELETE, WITH, and UNWIND.
 - Implemented: index-first anchored source lookup for configured property indexes, with fallback behavior and explicit missing-index errors for unsupported property lookup patterns.
 - Implemented: configuration-based index DDL loading into runtime index catalog.
+- Implemented: edge property index catalog/config support plus startup migration backfill for configured `(tenant, edge_type, property)` tuples.
+- Implemented: relationship traversal edge-property index pushdown for pattern equality and common numeric WHERE ranges, with conservative fallback and residual predicate filtering.
 - Implemented: executor metrics for statement outcomes, rows returned, index candidates, and index lookup outcomes; concrete in-process collector plus top unindexed-candidate reporting.
 - Implemented: startup wiring for graph path, tenant defaults, index config loading, and metrics reporting.
 - Implemented: lightweight TCP integration tests for request parsing/execution/JSON response path.

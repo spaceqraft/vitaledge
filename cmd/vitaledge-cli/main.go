@@ -373,6 +373,13 @@ func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string
 	if len(resp.GetExplainJson()) > 0 {
 		var decoded map[string]any
 		if err := json.Unmarshal(resp.GetExplainJson(), &decoded); err == nil {
+			fmt.Fprintln(out, "--- EXPLAIN JSON ---")
+			if pretty, err := json.MarshalIndent(decoded, "", "  "); err == nil {
+				fmt.Fprintln(out, string(pretty))
+			} else {
+				fmt.Fprintln(out, string(resp.GetExplainJson()))
+			}
+			fmt.Fprintln(out, "--- EXPLAIN NARRATIVE ---")
 			renderExplainNarrative(out, decoded)
 		} else {
 			fmt.Fprintln(out, string(resp.GetExplainJson()))
@@ -409,6 +416,9 @@ func renderExplainNarrative(out io.Writer, explain map[string]any) {
 			if impl := asString(vertex["implementation"]); impl != "" {
 				details = append(details, "implementation="+impl)
 			}
+			if prefilters := explainNarrativePrefilterSummary(vertex); prefilters != "" {
+				details = append(details, prefilters)
+			}
 			if predicate := asString(vertex["predicate"]); predicate != "" {
 				details = append(details, "predicate="+predicate)
 			}
@@ -416,6 +426,69 @@ func renderExplainNarrative(out io.Writer, explain map[string]any) {
 				fmt.Fprintf(out, " (%s)", strings.Join(details, ", "))
 			}
 			fmt.Fprintln(out)
+		}
+	}
+
+	fastPaths := asMapSlice(explain["executionStrategies"])
+	if len(fastPaths) > 0 {
+		fmt.Fprintln(out, "Fast paths:")
+		for _, path := range fastPaths {
+			name := asString(path["name"])
+			if name == "" {
+				name = asString(path["implementation"])
+			}
+			line := fmt.Sprintf("- %s", name)
+			if impl := asString(path["implementation"]); impl != "" {
+				line += " implementation=" + impl
+			}
+			if pair := asString(path["clausePair"]); pair != "" {
+				line += " clausePair=" + pair
+			}
+			if status := asString(path["status"]); status != "" {
+				line += " status=" + status
+			}
+			if value, ok := path["wherePrefilterCoverage"].(bool); ok {
+				line += fmt.Sprintf(" wherePrefilterCoverage=%t", value)
+			}
+			fmt.Fprintln(out, line)
+		}
+	}
+
+	indexDecisions := asMapSlice(explain["indexDecisions"])
+	if len(indexDecisions) > 0 {
+		fmt.Fprintln(out, "Index decisions:")
+		for _, d := range indexDecisions {
+			schema := asString(d["schema"])
+			property := asString(d["property"])
+			entityClass := asString(d["entityClass"])
+			selected, _ := d["selected"].(bool)
+			reason := asString(d["reason"])
+			tuningImpact := asString(d["tuningImpact"])
+			recommendation := asString(d["recommendation"])
+			accessPath := asString(d["accessPath"])
+			scanPop := d["scanPopulation"]
+			selectedStr := "NO"
+			if selected {
+				selectedStr = "YES"
+			}
+			line := fmt.Sprintf("  %s.%s (%s) selected=%s reason=%s", schema, property, entityClass, selectedStr, reason)
+			if accessPath != "" {
+				line += " accessPath=" + accessPath
+			}
+			if !selected && tuningImpact != "" {
+				line += fmt.Sprintf(" tuningImpact=%s recommendation=%s", tuningImpact, recommendation)
+			}
+			if scanPop != nil {
+				line += fmt.Sprintf(" scanPopulation=%v", scanPop)
+			}
+			fmt.Fprintln(out, line)
+		}
+	}
+
+	if costEstimate, ok := explain["costEstimate"].(map[string]any); ok && len(costEstimate) > 0 {
+		fmt.Fprintln(out, "Cost estimate:")
+		for k, v := range costEstimate {
+			fmt.Fprintf(out, "  %s: %v\n", k, v)
 		}
 	}
 
@@ -432,6 +505,26 @@ func renderExplainNarrative(out io.Writer, explain map[string]any) {
 			fmt.Fprintf(out, "- [%s] %s\n", code, message)
 		}
 	}
+}
+
+func explainNarrativePrefilterSummary(vertex map[string]any) string {
+	if vertex == nil {
+		return ""
+	}
+	parts := make([]string, 0, 3)
+	if numeric, _ := vertex["numericPrefilter"].(bool); numeric {
+		parts = append(parts, "numeric")
+	}
+	if antiJoin, _ := vertex["antiJoinPrefilter"].(bool); antiJoin {
+		parts = append(parts, "anti-join")
+	}
+	if covered, _ := vertex["wherePrefilterCoverage"].(bool); covered {
+		parts = append(parts, "residual-where-covered")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "prefilters=" + strings.Join(parts, "+")
 }
 
 func explainPlanPath(vertexes []map[string]any, rootVertexID string) []map[string]any {

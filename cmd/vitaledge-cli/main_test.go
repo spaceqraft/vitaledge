@@ -39,10 +39,19 @@ func TestRunExplainRendersHumanReadableNarrative(t *testing.T) {
 	payload := map[string]any{
 		"query": map[string]any{"text": "MATCH (n) RETURN count(n)"},
 		"logicalPlan": map[string]any{
-			"rootVertexId": "N2",
+			"rootVertexId": "N3",
 			"vertexes": []map[string]any{
 				{"id": "N1", "op": "ALL_VERTEXES_SCAN", "accessPath": "all_vertices", "children": []string{}},
-				{"id": "N2", "op": "AGGREGATE", "implementation": "fast_vertex_count", "children": []string{"N1"}},
+				{"id": "N2", "op": "EDGE_SCAN", "implementation": "prefilter_covered_directed_relationship_scan", "numericPrefilter": true, "antiJoinPrefilter": true, "wherePrefilterCoverage": true, "children": []string{"N1"}},
+				{"id": "N3", "op": "AGGREGATE", "implementation": "fast_vertex_count", "children": []string{"N2"}},
+			},
+		},
+		"executionStrategies": []map[string]any{
+			{
+				"name":           "peer_candidate_return_aggregation",
+				"implementation": "fast_peer_candidate_return_aggregation_clause_pair",
+				"clausePair":     "MATCH+RETURN",
+				"status":         "eligible",
 			},
 		},
 		"warnings": []map[string]any{{"code": "FULL_SCAN_FALLBACK", "message": "example"}},
@@ -69,8 +78,14 @@ func TestRunExplainRendersHumanReadableNarrative(t *testing.T) {
 	if !strings.Contains(rendered, "Execution path:") {
 		t.Fatalf("expected execution path section, got: %s", rendered)
 	}
-	if !strings.Contains(rendered, "1. ALL_VERTEXES_SCAN") || !strings.Contains(rendered, "2. AGGREGATE") {
+	if !strings.Contains(rendered, "Fast paths:") || !strings.Contains(rendered, "fast_peer_candidate_return_aggregation_clause_pair") {
+		t.Fatalf("expected fast paths section, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "1. ALL_VERTEXES_SCAN") || !strings.Contains(rendered, "2. EDGE_SCAN") || !strings.Contains(rendered, "3. AGGREGATE") {
 		t.Fatalf("expected ordered plan steps, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "prefilters=numeric+anti-join+residual-where-covered") {
+		t.Fatalf("expected scan prefilter summary, got: %s", rendered)
 	}
 	if !strings.Contains(rendered, "[FULL_SCAN_FALLBACK] example") {
 		t.Fatalf("expected warnings section, got: %s", rendered)

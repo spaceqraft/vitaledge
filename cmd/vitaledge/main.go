@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -36,23 +37,23 @@ const pebbleMemTableSizeBytesEnv = "VITALEDGE_PEBBLE_MEMTABLE_SIZE_BYTES"
 const pebbleMemTableStopWritesThresholdEnv = "VITALEDGE_PEBBLE_MEMTABLE_STOP_WRITES_THRESHOLD"
 
 type Config struct {
-	GraphPath                      string
-	DefaultTenant                  string
-	IndexConfigPath                string
-	IndexCatalog                   *indexschema.Catalog
-	ExecutorMetrics                *executor.Collector
-	MetricsListenAddress           string
-	GRPCListenAddress              string
-	ConfiguredMaxWriteBatchBytes   int
-	MaxWriteBatchBytes             int
-	MaxWriteBatchBytesAutoTuned    bool
-	HostMemoryBytes                uint64
-	GoMemoryLimitBytes             int64
-	PebbleBlockCacheBytes          int64
-	PebbleMemTableSizeBytes        int
+	GraphPath                         string
+	DefaultTenant                     string
+	IndexConfigPath                   string
+	IndexCatalog                      *indexschema.Catalog
+	ExecutorMetrics                   *executor.Collector
+	MetricsListenAddress              string
+	GRPCListenAddress                 string
+	ConfiguredMaxWriteBatchBytes      int
+	MaxWriteBatchBytes                int
+	MaxWriteBatchBytesAutoTuned       bool
+	HostMemoryBytes                   uint64
+	GoMemoryLimitBytes                int64
+	PebbleBlockCacheBytes             int64
+	PebbleMemTableSizeBytes           int
 	PebbleMemTableStopWritesThreshold int
-	Store                          graph.GraphStore
-	Executor                       *executor.Executor
+	Store                             graph.GraphStore
+	Executor                          *executor.Executor
 }
 
 type Server struct {
@@ -89,10 +90,10 @@ func (s *Server) Start() error {
 		log.Printf("Metrics endpoint is listening on %s/metrics", s.MetricsListenAddress)
 	}
 	grpcServer, grpcListener, err := startGRPCServer(s.GRPCListenAddress, &grpcQueryHandler{
-		executor:                    s.executor,
-		defaultTenant:               s.DefaultTenant,
+		executor:                     s.executor,
+		defaultTenant:                s.DefaultTenant,
 		configuredMaxWriteBatchBytes: int64(s.ConfiguredMaxWriteBatchBytes),
-		maxWriteBatchBytes:          int64(s.MaxWriteBatchBytes),
+		maxWriteBatchBytes:           int64(s.MaxWriteBatchBytes),
 		maxWriteBatchBytesTuned:      s.MaxWriteBatchBytesAutoTuned,
 	})
 	if err != nil {
@@ -140,6 +141,10 @@ func main() {
 	}
 	config.Store = store
 	config.Executor = executor.New(store, executor.Options{Metrics: config.ExecutorMetrics, IndexCatalog: config.IndexCatalog})
+	if err := applyIndexMigrations(context.Background(), config.Executor, config.IndexCatalog); err != nil {
+		log.Fatalf("startup index migration error: %v", err)
+	}
+	config.Executor.StartIndexBuildWorker(context.Background())
 
 	if config.IndexCatalog != nil {
 		log.Printf("Loaded index schema catalog")
@@ -242,21 +247,21 @@ func loadConfigFromStartup() (Config, error) {
 	}
 
 	cfg := Config{
-		GraphPath:                        graphPath,
-		DefaultTenant:                    tenant,
-		IndexConfigPath:                  indexConfigPath,
-		IndexCatalog:                     indexschema.NewCatalog(),
-		MetricsListenAddress:             metricsListenAddress,
-		GRPCListenAddress:                grpcListenAddress,
-		ConfiguredMaxWriteBatchBytes:     configuredMaxWriteBatchBytes,
-		MaxWriteBatchBytes:               effectiveMaxWriteBatchBytes,
-		MaxWriteBatchBytesAutoTuned:      autoTuned,
-		HostMemoryBytes:                  hostMemoryBytes,
-		GoMemoryLimitBytes:               goMemoryLimitBytes,
-		PebbleBlockCacheBytes:            pebbleBlockCacheBytes,
-		PebbleMemTableSizeBytes:          pebbleMemTableSizeBytes,
+		GraphPath:                         graphPath,
+		DefaultTenant:                     tenant,
+		IndexConfigPath:                   indexConfigPath,
+		IndexCatalog:                      indexschema.NewCatalog(),
+		MetricsListenAddress:              metricsListenAddress,
+		GRPCListenAddress:                 grpcListenAddress,
+		ConfiguredMaxWriteBatchBytes:      configuredMaxWriteBatchBytes,
+		MaxWriteBatchBytes:                effectiveMaxWriteBatchBytes,
+		MaxWriteBatchBytesAutoTuned:       autoTuned,
+		HostMemoryBytes:                   hostMemoryBytes,
+		GoMemoryLimitBytes:                goMemoryLimitBytes,
+		PebbleBlockCacheBytes:             pebbleBlockCacheBytes,
+		PebbleMemTableSizeBytes:           pebbleMemTableSizeBytes,
 		PebbleMemTableStopWritesThreshold: pebbleMemTableStopWritesThreshold,
-		ExecutorMetrics:                  executor.NewCollector(),
+		ExecutorMetrics:                   executor.NewCollector(),
 	}
 	if strings.TrimSpace(indexConfigPath) == "" {
 		return cfg, nil
@@ -291,9 +296,35 @@ func openGraphStore(path string, maxWriteBatchBytes int, pebbleBlockCacheBytes i
 		return nil, fmt.Errorf("pebble memtable stop writes threshold must be >= 0")
 	}
 	return pebblestore.OpenWithOptions(path, pebblestore.StoreOptions{
-		MaxWriteBatchBytes:               maxWriteBatchBytes,
-		PebbleBlockCacheBytes:            pebbleBlockCacheBytes,
-		PebbleMemTableSizeBytes:          pebbleMemTableSizeBytes,
+		MaxWriteBatchBytes:                maxWriteBatchBytes,
+		PebbleBlockCacheBytes:             pebbleBlockCacheBytes,
+		PebbleMemTableSizeBytes:           pebbleMemTableSizeBytes,
 		PebbleMemTableStopWritesThreshold: pebbleMemTableStopWritesThreshold,
 	})
+}
+
+func applyIndexMigrations(ctx context.Context, exec *executor.Executor, catalog *indexschema.Catalog) error {
+	if exec == nil || catalog == nil {
+		return nil
+	}
+	vertexBackfilled := 0
+	edgeBackfilled := 0
+	for _, idx := range catalog.PropertyIndexes() {
+		count, err := exec.BackfillPropertyIndex(ctx, idx.Tenant, idx.Schema, idx.Property)
+		if err != nil {
+			return err
+		}
+		vertexBackfilled += count
+	}
+	for _, idx := range catalog.EdgePropertyIndexes() {
+		count, err := exec.BackfillEdgePropertyIndex(ctx, idx.Tenant, idx.EdgeType, idx.Property)
+		if err != nil {
+			return err
+		}
+		edgeBackfilled += count
+	}
+	if vertexBackfilled > 0 || edgeBackfilled > 0 {
+		log.Printf("Applied index migration backfill: vertex_entries=%d edge_entries=%d", vertexBackfilled, edgeBackfilled)
+	}
+	return nil
 }

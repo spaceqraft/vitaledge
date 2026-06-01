@@ -203,6 +203,79 @@ func (e *Executor) resolveProcedure(name string, params Params) (resolvedProcedu
 
 func (e *Executor) resolveBuiltinProcedure(name string) (resolvedProcedure, bool) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "db.index.createproperty":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.createProperty",
+				Inputs: []ProcedureArg{
+					{Name: "schema", Type: "STRING", Nullable: false},
+					{Name: "property", Type: "STRING", Nullable: false},
+					{Name: "ifNotExists", Type: "BOOLEAN", Nullable: true},
+				},
+				Outputs: []ProcedureArg{
+					{Name: "created", Type: "BOOLEAN", Nullable: false},
+					{Name: "indexedEntities", Type: "INTEGER", Nullable: false},
+				},
+			},
+			handler: e.builtinCreatePropertyIndexProcedure,
+		}, true
+	case "db.index.createedgeproperty":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.createEdgeProperty",
+				Inputs: []ProcedureArg{
+					{Name: "edgeType", Type: "STRING", Nullable: false},
+					{Name: "property", Type: "STRING", Nullable: false},
+					{Name: "ifNotExists", Type: "BOOLEAN", Nullable: true},
+				},
+				Outputs: []ProcedureArg{
+					{Name: "created", Type: "BOOLEAN", Nullable: false},
+					{Name: "indexedEntities", Type: "INTEGER", Nullable: false},
+				},
+			},
+			handler: e.builtinCreateEdgePropertyIndexProcedure,
+		}, true
+	case "db.index.edgebuildjobs":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.edgeBuildJobs",
+				Outputs: []ProcedureArg{
+					{Name: "tenant", Type: "STRING", Nullable: false},
+					{Name: "edgeType", Type: "STRING", Nullable: false},
+					{Name: "property", Type: "STRING", Nullable: false},
+					{Name: "pending", Type: "BOOLEAN", Nullable: false},
+					{Name: "checkpointVertexID", Type: "STRING", Nullable: false},
+					{Name: "totalEdges", Type: "INTEGER", Nullable: false},
+					{Name: "indexedEdges", Type: "INTEGER", Nullable: false},
+				},
+			},
+			handler: e.builtinEdgeBuildJobsProcedure,
+		}, true
+	case "db.index.processedgebuildjobs":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.processEdgeBuildJobs",
+				Outputs: []ProcedureArg{
+					{Name: "processed", Type: "INTEGER", Nullable: false},
+					{Name: "pending", Type: "INTEGER", Nullable: false},
+				},
+			},
+			handler: e.builtinProcessEdgeBuildJobsProcedure,
+		}, true
+	case "db.index.restartedgepropertybuild":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.restartEdgePropertyBuild",
+				Inputs: []ProcedureArg{
+					{Name: "edgeType", Type: "STRING", Nullable: false},
+					{Name: "property", Type: "STRING", Nullable: false},
+				},
+				Outputs: []ProcedureArg{
+					{Name: "enqueued", Type: "BOOLEAN", Nullable: false},
+				},
+			},
+			handler: e.builtinRestartEdgePropertyBuildProcedure,
+		}, true
 	case "db.stats.edgecount":
 		return resolvedProcedure{
 			decl: ProcedureDecl{
@@ -222,6 +295,88 @@ func (e *Executor) resolveBuiltinProcedure(name string) (resolvedProcedure, bool
 	default:
 		return resolvedProcedure{}, false
 	}
+}
+
+func (e *Executor) builtinCreatePropertyIndexProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+	schema, property, ifNotExists, err := parseCreatePropertyIndexArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	created, indexedEntities, err := e.CreatePropertyIndex(ctx, tenant, schema, property, ifNotExists)
+	if err != nil {
+		return nil, err
+	}
+	return []Row{{"created": created, "indexedEntities": indexedEntities}}, nil
+}
+
+func (e *Executor) builtinCreateEdgePropertyIndexProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+	edgeType, property, ifNotExists, err := parseCreateEdgePropertyIndexArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	created, indexedEntities, err := e.CreateEdgePropertyIndexAsync(ctx, tenant, edgeType, property, ifNotExists)
+	if err != nil {
+		return nil, err
+	}
+	return []Row{{"created": created, "indexedEntities": indexedEntities}}, nil
+}
+
+func (e *Executor) builtinEdgeBuildJobsProcedure(ctx context.Context, _ []any, _ Params) ([]Row, error) {
+	progress, err := e.listPendingEdgeIndexBuildProgress(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]Row, 0, len(progress))
+	for _, item := range progress {
+		rows = append(rows, Row{
+			"tenant":             item.Tenant,
+			"edgeType":           item.EdgeType,
+			"property":           item.Property,
+			"pending":            item.Pending,
+			"checkpointVertexID": item.CheckpointVertexID,
+			"totalEdges":         item.TotalEdges,
+			"indexedEdges":       item.IndexedEdges,
+		})
+	}
+	return rows, nil
+}
+
+func (e *Executor) builtinProcessEdgeBuildJobsProcedure(ctx context.Context, _ []any, _ Params) ([]Row, error) {
+	processed, err := e.processPendingEdgeIndexBuildJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pendingJobs, err := e.listEdgeIndexBuildJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return []Row{{"processed": processed, "pending": len(pendingJobs)}}, nil
+}
+
+func (e *Executor) builtinRestartEdgePropertyBuildProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+	edgeType, property, err := parseRestartEdgePropertyBuildArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	if e.indexCatalog != nil {
+		e.indexCatalog.AddEdgePropertyIndex(tenant, edgeType, property)
+	}
+	if err := e.enqueueEdgeIndexBuildJob(ctx, tenant, edgeType, property); err != nil {
+		return nil, err
+	}
+	return []Row{{"enqueued": true}}, nil
 }
 
 func (e *Executor) builtinEdgeCountProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
@@ -413,6 +568,71 @@ func parseOptionalLabelArg(args []any) (string, error) {
 		return "", graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"label\"", nil)
 	}
 	return strings.TrimSpace(s), nil
+}
+
+func parseCreatePropertyIndexArgs(args []any) (schema, property string, ifNotExists bool, err error) {
+	if len(args) < 2 || len(args) > 3 {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid number of arguments", nil)
+	}
+
+	schemaValue, ok := args[0].(string)
+	if !ok {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"schema\"", nil)
+	}
+	propertyValue, ok := args[1].(string)
+	if !ok {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"property\"", nil)
+	}
+
+	if len(args) == 3 && args[2] != nil {
+		parsed, ok := args[2].(bool)
+		if !ok {
+			return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"ifNotExists\"", nil)
+		}
+		ifNotExists = parsed
+	}
+
+	return strings.TrimSpace(schemaValue), strings.TrimSpace(propertyValue), ifNotExists, nil
+}
+
+func parseCreateEdgePropertyIndexArgs(args []any) (edgeType, property string, ifNotExists bool, err error) {
+	if len(args) < 2 || len(args) > 3 {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid number of arguments", nil)
+	}
+
+	edgeTypeValue, ok := args[0].(string)
+	if !ok {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"edgeType\"", nil)
+	}
+	propertyValue, ok := args[1].(string)
+	if !ok {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"property\"", nil)
+	}
+
+	if len(args) == 3 && args[2] != nil {
+		parsed, ok := args[2].(bool)
+		if !ok {
+			return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"ifNotExists\"", nil)
+		}
+		ifNotExists = parsed
+	}
+
+	return strings.TrimSpace(edgeTypeValue), strings.TrimSpace(propertyValue), ifNotExists, nil
+}
+
+func parseRestartEdgePropertyBuildArgs(args []any) (edgeType, property string, err error) {
+	if len(args) != 2 {
+		return "", "", graph.NewError(graph.ErrKindSemantic, "invalid number of arguments", nil)
+	}
+	edgeTypeValue, ok := args[0].(string)
+	if !ok {
+		return "", "", graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"edgeType\"", nil)
+	}
+	propertyValue, ok := args[1].(string)
+	if !ok {
+		return "", "", graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"property\"", nil)
+	}
+	return strings.TrimSpace(edgeTypeValue), strings.TrimSpace(propertyValue), nil
 }
 
 func parseCallClauseRaw(raw string) (callSpec, error) {

@@ -312,6 +312,62 @@ func (t *tx) ScanVertices(ctx context.Context, tenant string, limit int, fn func
 	return nil
 }
 
+func (t *tx) ScanVerticesFrom(ctx context.Context, tenant, startAfterVertexID string, limit int, fn func(*graph.Vertex) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_vertices_from", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant and callback are required", nil)
+	}
+
+	prefix := keyspace.VertexPrefix(tenant)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create vertex iterator", err)
+	}
+	defer iter.Close()
+
+	startAfterVertexID = strings.TrimSpace(startAfterVertexID)
+	seekKey := prefix
+	if startAfterVertexID != "" {
+		seekKey = keyspace.VertexKey(tenant, startAfterVertexID)
+	}
+	seen := 0
+	for ok := iter.SeekGE(seekKey); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		vertexID := vertexIDFromKey(iter.Key())
+		if vertexID == "" {
+			return graph.NewError(graph.ErrKindStorage, "malformed vertex key", nil)
+		}
+		if startAfterVertexID != "" && vertexID == startAfterVertexID {
+			continue
+		}
+		var v graph.Vertex
+		if err := json.Unmarshal(iter.Value(), &v); err != nil {
+			return graph.NewError(graph.ErrKindStorage, "decode vertex", err)
+		}
+		if err := fn(&v); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan vertices", err)
+	}
+	return nil
+}
+
 func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 	started := time.Now()
 	defer func() { t.observeOperation("put_vertex", err, started) }()
@@ -617,6 +673,19 @@ func (t *tx) ScanPropertyIndex(ctx context.Context, tenant, schema, property str
 		return graph.NewError(graph.ErrKindInvalidInput, "tenant, schema, property, and callback are required", nil)
 	}
 	return t.scanPropertyIndex(ctx, keyspace.PropertyIndexValuePrefix(tenant, schema, property, encodedValue), tenant, schema, property, limit, fn)
+}
+
+func (t *tx) ScanPropertyIndexAll(ctx context.Context, tenant, schema, property string, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_property_index_all", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || schema == "" || property == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, schema, property, and callback are required", nil)
+	}
+	return t.scanPropertyIndex(ctx, keyspace.PropertyIndexPrefix(tenant, schema, property), tenant, schema, property, limit, fn)
 }
 
 func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEntry) (err error) {
@@ -1265,6 +1334,14 @@ func edgeIDFromAdjKey(key []byte) string {
 		return ""
 	}
 	return string(key[i+1:])
+}
+
+func vertexIDFromKey(key []byte) string {
+	parts := bytes.Split(key, []byte{'/'})
+	if len(parts) < 3 {
+		return ""
+	}
+	return string(parts[len(parts)-1])
 }
 
 func propertyIndexEntryFromKey(key, value []byte, tenant, schema, property string) (*graph.PropertyIndexEntry, error) {

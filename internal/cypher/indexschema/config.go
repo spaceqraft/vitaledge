@@ -13,12 +13,19 @@ import (
 var ErrInvalidConfig = errors.New("invalid index schema config")
 
 type Config struct {
-	PropertyIndexes []PropertyIndexConfig `json:"property_indexes"`
+	PropertyIndexes     []PropertyIndexConfig     `json:"property_indexes"`
+	EdgePropertyIndexes []EdgePropertyIndexConfig `json:"edge_property_indexes"`
 }
 
 type PropertyIndexConfig struct {
 	Tenant   string `json:"tenant"`
 	Schema   string `json:"schema"`
+	Property string `json:"property"`
+}
+
+type EdgePropertyIndexConfig struct {
+	Tenant   string `json:"tenant"`
+	EdgeType string `json:"edge_type"`
 	Property string `json:"property"`
 }
 
@@ -74,6 +81,9 @@ func CatalogFromConfig(cfg Config) (*Catalog, error) {
 	for _, idx := range cfg.PropertyIndexes {
 		catalog.AddPropertyIndex(strings.TrimSpace(idx.Tenant), strings.TrimSpace(idx.Schema), strings.TrimSpace(idx.Property))
 	}
+	for _, idx := range cfg.EdgePropertyIndexes {
+		catalog.AddEdgePropertyIndex(strings.TrimSpace(idx.Tenant), strings.TrimSpace(idx.EdgeType), strings.TrimSpace(idx.Property))
+	}
 	return catalog, nil
 }
 
@@ -81,6 +91,11 @@ func validateConfig(cfg Config) error {
 	for i, idx := range cfg.PropertyIndexes {
 		if strings.TrimSpace(idx.Tenant) == "" || strings.TrimSpace(idx.Schema) == "" || strings.TrimSpace(idx.Property) == "" {
 			return fmt.Errorf("%w: property_indexes[%d] requires tenant, schema, and property", ErrInvalidConfig, i)
+		}
+	}
+	for i, idx := range cfg.EdgePropertyIndexes {
+		if strings.TrimSpace(idx.Tenant) == "" || strings.TrimSpace(idx.EdgeType) == "" || strings.TrimSpace(idx.Property) == "" {
+			return fmt.Errorf("%w: edge_property_indexes[%d] requires tenant, edge_type, and property", ErrInvalidConfig, i)
 		}
 	}
 	return nil

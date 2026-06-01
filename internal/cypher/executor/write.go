@@ -2,9 +2,11 @@ package executor
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -94,6 +96,30 @@ const mergeCreatedMarkerKey = "__ve_merge_created"
 const projectionEvalExecutorParam = "__ve_projection_eval_executor"
 const projectionEvalTxParam = "__ve_projection_eval_tx"
 const projectionEvalCtxParam = "__ve_projection_eval_ctx"
+const wherePatternPredicateCacheParam = "__ve_where_pattern_predicate_cache"
+const queryEntityCacheParam = "__ve_query_entity_cache"
+const queryAdjacencyCacheParam = "__ve_query_adjacency_cache"
+const edgeRangeIndexCandidateLimit = 200000
+
+type wherePatternPredicateCache struct {
+	outNeighbors map[string]map[string]struct{}
+	inNeighbors  map[string]map[string]struct{}
+}
+
+type queryEntityCache struct {
+	vertexes map[string]*graph.Vertex
+	missing  map[string]struct{}
+}
+
+type queryAdjacencyCache struct {
+	outEdges map[string][]*graph.Edge
+	inEdges  map[string][]*graph.Edge
+}
+
+type edgeIDScannerTx interface {
+	ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
+	ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
+}
 
 func withProjectionEvalRuntime(ctx context.Context, tx graph.Tx, params Params, exec *Executor) Params {
 	if params == nil {
@@ -221,7 +247,26 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 	resultColumns := []string{}
 	returnSeen := false
 
-	for _, clause := range part.Clauses {
+	for idx := 0; idx < len(part.Clauses); idx++ {
+		clause := part.Clauses[idx]
+		if idx+1 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith {
+			if fastRows, fastColumns, ok, fastErr := e.tryFastTargetSharedPeerAggregationClausePair(ctx, tx, rows, clause, part.Clauses[idx+1], params, resultColumns); fastErr != nil {
+				return nil, nil, false, fastErr
+			} else if ok {
+				rows = fastRows
+				resultColumns = fastColumns
+				idx++
+				continue
+			}
+		}
+		if idx+1 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindReturn {
+			if fastRows, fastColumns, ok, fastErr := e.tryFastPeerCandidateReturnAggregationClausePair(ctx, tx, rows, clause, part.Clauses[idx+1], params, resultColumns); fastErr != nil {
+				return nil, nil, false, fastErr
+			} else if ok {
+				return fastRows, fastColumns, true, nil
+			}
+		}
+
 		var stepErr error
 		switch clause.Kind {
 		case ast.ClauseKindMatch:
@@ -260,9 +305,562 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 		if stepErr != nil {
 			return nil, nil, false, stepErr
 		}
+		if isWriteClauseKind(clause.Kind) {
+			resetQueryEntityCache(params)
+			resetQueryAdjacencyCache(params)
+			resetWherePatternPredicateCache(params)
+		}
 	}
 
 	return rows, resultColumns, returnSeen, nil
+}
+
+type fastTargetSharedPeerProjection struct {
+	targetExpr         string
+	targetKey          string
+	peerExpr           string
+	peerKey            string
+	sharedCountExpr    string
+	sharedCountKey     string
+	avgDiffExpr        string
+	avgDiffKey         string
+	firstEdgeProperty  string
+	secondEdgeProperty string
+}
+
+func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
+	if len(rows) != 1 || len(rows[0]) != 0 {
+		return nil, nil, false, nil
+	}
+	if tx == nil {
+		return nil, nil, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
+	if err != nil || matchSpec.Optional {
+		return nil, nil, false, nil
+	}
+
+	chain, err := parseTwoHopDirectedChainPattern(matchSpec.Pattern)
+	if err != nil {
+		return nil, nil, false, nil
+	}
+	if chain.SecondForward {
+		return nil, nil, false, nil
+	}
+
+	withSpec, err := projectionClauseSpecFromClause(withClause)
+	if err != nil {
+		return nil, nil, false, nil
+	}
+	if withSpec.Distinct || len(withSpec.OrderBy) != 0 || strings.TrimSpace(withSpec.SkipRaw) != "" || strings.TrimSpace(withSpec.LimitRaw) != "" {
+		return nil, nil, false, nil
+	}
+	items, err := parseProjectionItems(withSpec.ProjectionRaw)
+	if err != nil {
+		return nil, nil, false, nil
+	}
+	projection, ok := parseFastTargetSharedPeerProjection(items, chain)
+	if !ok {
+		return nil, nil, false, nil
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	targetCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, rows[0], chain.Left, params)
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	type peerAggregate struct {
+		target     *graph.Vertex
+		peer       *graph.Vertex
+		shared     int
+		sumAbsDiff float64
+	}
+	aggs := map[string]*peerAggregate{}
+
+	for _, target := range targetCandidates {
+		if target == nil {
+			continue
+		}
+		baseRow := cloneRow(rows[0])
+		if chain.Left.Var != "" {
+			baseRow[chain.Left.Var] = target
+		}
+
+		firstScanType := chain.FirstEdgeType
+		if len(chain.FirstEdgeAnyOf) > 0 {
+			firstScanType = ""
+		}
+		if err := scanOutEdgesQueryCached(ctx, tx, tenant, target.ID, firstScanType, params, func(edge1 *graph.Edge) error {
+			if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
+				return nil
+			}
+			if !edgePatternMatches(edge1, chain.FirstEdgeProps, params, baseRow) {
+				return nil
+			}
+
+			shared, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
+			if err != nil {
+				return err
+			}
+			if shared == nil {
+				return nil
+			}
+
+			midRow := cloneRow(baseRow)
+			if chain.FirstEdgeVar != "" {
+				midRow[chain.FirstEdgeVar] = edge1
+			}
+			if chain.Mid.Var != "" {
+				midRow[chain.Mid.Var] = shared
+			}
+			if !vertexPatternMatches(shared, chain.Mid, params, midRow) {
+				return nil
+			}
+
+			secondScanType := chain.SecondEdgeType
+			if len(chain.SecondEdgeAnyOf) > 0 {
+				secondScanType = ""
+			}
+			secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, chain.SecondEdgeVar, midRow, params)
+
+			return scanInEdgesQueryCached(ctx, tx, tenant, shared.ID, secondScanType, params, func(edge2 *graph.Edge) error {
+				if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
+					return nil
+				}
+				if !edgePatternMatches(edge2, chain.SecondEdgeProps, params, midRow) {
+					return nil
+				}
+				if hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, secondWhereConstraints) {
+					return nil
+				}
+
+				peer, err := getVertexQueryCached(ctx, tx, tenant, edge2.SrcID, params)
+				if err != nil {
+					return err
+				}
+				if peer == nil {
+					return nil
+				}
+				if !vertexBindingMatches(midRow, chain.Right.Var, peer) {
+					return nil
+				}
+
+				merged := cloneRow(midRow)
+				if chain.Right.Var != "" {
+					merged[chain.Right.Var] = peer
+				}
+				if chain.SecondEdgeVar != "" {
+					merged[chain.SecondEdgeVar] = edge2
+				}
+				if !vertexPatternMatches(peer, chain.Right, params, merged) {
+					return nil
+				}
+				if strings.TrimSpace(matchSpec.Where) != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return nil
+					}
+				}
+
+				firstValue, firstOK := edgeNumericProperty(edge1, projection.firstEdgeProperty)
+				secondValue, secondOK := edgeNumericProperty(edge2, projection.secondEdgeProperty)
+				if !firstOK || !secondOK {
+					return nil
+				}
+
+				key := target.ID + "|" + peer.ID
+				agg, exists := aggs[key]
+				if !exists {
+					agg = &peerAggregate{target: target, peer: peer}
+					aggs[key] = agg
+				}
+				agg.shared++
+				agg.sumAbsDiff += math.Abs(firstValue - secondValue)
+				return nil
+			})
+		}); err != nil {
+			return nil, nil, false, err
+		}
+	}
+
+	out := make([]Row, 0, len(aggs))
+	for _, agg := range aggs {
+		if agg.shared <= 0 {
+			continue
+		}
+		row := Row{}
+		row[projection.targetKey] = agg.target
+		row[projection.peerKey] = agg.peer
+		row[projection.sharedCountKey] = agg.shared
+		row[projection.avgDiffKey] = agg.sumAbsDiff / float64(agg.shared)
+		out = append(out, row)
+	}
+
+	if withSpec.WhereRaw != "" {
+		filtered := make([]Row, 0, len(out))
+		for _, row := range out {
+			ok, err := e.evalWhereExpression(ctx, tx, withSpec.WhereRaw, row, params)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if ok {
+				filtered = append(filtered, row)
+			}
+		}
+		out = filtered
+	}
+
+	columns := []string{projection.targetKey, projection.peerKey, projection.sharedCountKey, projection.avgDiffKey}
+	if len(columns) == 0 && len(priorColumns) > 0 {
+		columns = append([]string(nil), priorColumns...)
+	}
+	return out, columns, true, nil
+}
+
+func parseFastTargetSharedPeerProjection(items []projectionSpec, chain twoHopDirectedChainPattern) (fastTargetSharedPeerProjection, bool) {
+	if len(items) != 4 {
+		return fastTargetSharedPeerProjection{}, false
+	}
+	projection := fastTargetSharedPeerProjection{}
+	for _, item := range items {
+		if item.Expression == "*" || item.CollectArg != "" {
+			return fastTargetSharedPeerProjection{}, false
+		}
+		key := item.Expression
+		if item.Alias != "" {
+			key = item.Alias
+		}
+
+		switch {
+		case item.Expression == chain.Left.Var && item.CountArg == "" && item.AggFunc == "":
+			projection.targetExpr = item.Expression
+			projection.targetKey = key
+		case item.Expression == chain.Right.Var && item.CountArg == "" && item.AggFunc == "":
+			projection.peerExpr = item.Expression
+			projection.peerKey = key
+		case item.CountArg != "":
+			countArg, distinct := parseCountDistinctArg(item.CountArg)
+			if distinct || strings.TrimSpace(countArg) != chain.Mid.Var {
+				return fastTargetSharedPeerProjection{}, false
+			}
+			projection.sharedCountExpr = item.Expression
+			projection.sharedCountKey = key
+		case strings.EqualFold(item.AggFunc, "avg"):
+			firstProp, secondProp, ok := parseAbsEdgeDifferenceAggregateArg(item.AggArg, chain.FirstEdgeVar, chain.SecondEdgeVar)
+			if !ok {
+				return fastTargetSharedPeerProjection{}, false
+			}
+			projection.avgDiffExpr = item.Expression
+			projection.avgDiffKey = key
+			projection.firstEdgeProperty = firstProp
+			projection.secondEdgeProperty = secondProp
+		default:
+			return fastTargetSharedPeerProjection{}, false
+		}
+	}
+
+	if projection.targetKey == "" || projection.peerKey == "" || projection.sharedCountKey == "" || projection.avgDiffKey == "" || projection.firstEdgeProperty == "" || projection.secondEdgeProperty == "" {
+		return fastTargetSharedPeerProjection{}, false
+	}
+	return projection, true
+}
+
+func parseAbsEdgeDifferenceAggregateArg(raw, firstEdgeVar, secondEdgeVar string) (string, string, bool) {
+	inner, ok := parseFunctionCall(strings.TrimSpace(raw), "abs")
+	if !ok {
+		return "", "", false
+	}
+	left, right, op, ok := splitTopLevelOperatorSetLast(inner, "+", "-")
+	if !ok || strings.TrimSpace(op) != "-" {
+		return "", "", false
+	}
+
+	if firstProp, ok := edgePropertyReference(left, firstEdgeVar); ok {
+		if secondProp, ok := edgePropertyReference(right, secondEdgeVar); ok {
+			return firstProp, secondProp, true
+		}
+	}
+	if firstProp, ok := edgePropertyReference(right, firstEdgeVar); ok {
+		if secondProp, ok := edgePropertyReference(left, secondEdgeVar); ok {
+			return firstProp, secondProp, true
+		}
+	}
+	return "", "", false
+}
+
+func edgeNumericProperty(edge *graph.Edge, property string) (float64, bool) {
+	if edge == nil || edge.Properties == nil {
+		return 0, false
+	}
+	raw, ok := edge.Properties[strings.TrimSpace(property)]
+	if !ok {
+		return 0, false
+	}
+	numeric, ok := comparableNumericValue(decodeStoredPropertyValue(raw))
+	if !ok {
+		return 0, false
+	}
+	return numeric, true
+}
+
+type fastPeerCandidateReturnProjection struct {
+	nonAggregates     []projectionSpec
+	avgEdgeProperty   string
+	avgKey            string
+	countKey          string
+	sumSimilarityExpr string
+	sumSimilarityKey  string
+	orderedOutputKeys []string
+}
+
+type fastPeerCandidateAggregate struct {
+	values        Row
+	edgeCount     int
+	avgSum        float64
+	avgCount      int
+	similaritySum float64
+}
+
+func parseFastPeerCandidateReturnProjection(items []projectionSpec, pattern directedRelationshipPattern) (fastPeerCandidateReturnProjection, bool) {
+	if len(items) == 0 {
+		return fastPeerCandidateReturnProjection{}, false
+	}
+	out := fastPeerCandidateReturnProjection{}
+	for _, item := range items {
+		if item.Expression == "*" || item.CollectArg != "" {
+			return fastPeerCandidateReturnProjection{}, false
+		}
+		key := item.Expression
+		if item.Alias != "" {
+			key = item.Alias
+		}
+		out.orderedOutputKeys = append(out.orderedOutputKeys, key)
+
+		switch {
+		case strings.EqualFold(item.AggFunc, "avg"):
+			avgProp, ok := edgePropertyReference(item.AggArg, pattern.EdgeVar)
+			if !ok || avgProp == "" {
+				return fastPeerCandidateReturnProjection{}, false
+			}
+			out.avgEdgeProperty = avgProp
+			out.avgKey = key
+		case item.CountArg != "":
+			countArg, distinct := parseCountDistinctArg(item.CountArg)
+			if distinct || strings.TrimSpace(countArg) != strings.TrimSpace(pattern.EdgeVar) {
+				return fastPeerCandidateReturnProjection{}, false
+			}
+			out.countKey = key
+		case strings.EqualFold(item.AggFunc, "sum"):
+			if strings.TrimSpace(item.AggArg) == "" {
+				return fastPeerCandidateReturnProjection{}, false
+			}
+			out.sumSimilarityExpr = strings.TrimSpace(item.AggArg)
+			out.sumSimilarityKey = key
+		default:
+			out.nonAggregates = append(out.nonAggregates, item)
+		}
+	}
+
+	if out.avgEdgeProperty == "" || out.avgKey == "" || out.countKey == "" || out.sumSimilarityExpr == "" || out.sumSimilarityKey == "" {
+		return fastPeerCandidateReturnProjection{}, false
+	}
+	return out, true
+}
+
+func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, returnClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
+	if tx == nil || len(rows) == 0 {
+		return nil, nil, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
+	if err != nil || matchSpec.Optional {
+		return nil, nil, false, nil
+	}
+
+	pattern, err := parseDirectedRelationshipPattern(matchSpec.Pattern)
+	if err != nil {
+		return nil, nil, false, nil
+	}
+	if strings.TrimSpace(pattern.Left.Var) == "" || strings.TrimSpace(pattern.Right.Var) == "" || strings.TrimSpace(pattern.EdgeVar) == "" {
+		return nil, nil, false, nil
+	}
+
+	retSpec, err := projectionClauseSpecFromClause(returnClause)
+	if err != nil {
+		return nil, nil, false, nil
+	}
+	if retSpec.Distinct || strings.TrimSpace(retSpec.WhereRaw) != "" {
+		return nil, nil, false, nil
+	}
+
+	items, err := parseProjectionItems(retSpec.ProjectionRaw)
+	if err != nil {
+		return nil, nil, false, nil
+	}
+	projection, ok := parseFastPeerCandidateReturnProjection(items, pattern)
+	if !ok {
+		return nil, nil, false, nil
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	params = withProjectionEvalRuntime(ctx, tx, params, e)
+	aggs := map[string]*fastPeerCandidateAggregate{}
+	groupOrder := make([]string, 0)
+
+	for _, row := range rows {
+		peer, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if !bound {
+			return nil, nil, false, nil
+		}
+		if peer == nil {
+			continue
+		}
+
+		numericConstraints, hasNumericConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params)
+		excludedRightIDs, hasExcludedRightIDs, err := extractDirectedWhereRightExclusionSet(ctx, tx, tenant, matchSpec.Where, pattern.Right.Var, row, params)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		skipWhereEval := directedWhereCoveredByExtractedPrefilters(matchSpec.Where, pattern.EdgeVar, pattern.Right.Var, row, params, hasNumericConstraints, hasExcludedRightIDs)
+
+		similarityValue, err := evalExpressionWithScope(projection.sumSimilarityExpr, row, params)
+		if err != nil {
+			return nil, nil, false, nil
+		}
+		similarityNumeric, similarityNumericOK := comparableNumericValue(similarityValue)
+
+		scanType := pattern.EdgeType
+		if len(pattern.EdgeAnyOf) > 0 {
+			scanType = ""
+		}
+		if err := scanOutEdgesQueryCached(ctx, tx, tenant, peer.ID, scanType, params, func(edge *graph.Edge) error {
+			if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
+				return nil
+			}
+			if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
+				return nil
+			}
+			if hasNumericConstraints && !edgeMatchesNumericConstraints(edge, numericConstraints) {
+				return nil
+			}
+			if hasExcludedRightIDs {
+				if _, blocked := excludedRightIDs[edge.DstID]; blocked {
+					return nil
+				}
+			}
+
+			candidate, err := getVertexQueryCached(ctx, tx, tenant, edge.DstID, params)
+			if err != nil {
+				return err
+			}
+			if candidate == nil {
+				return nil
+			}
+
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = peer
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = candidate
+			}
+			if pattern.EdgeVar != "" {
+				merged[pattern.EdgeVar] = edge
+			}
+			if !vertexPatternMatches(candidate, pattern.Right, params, merged) {
+				return nil
+			}
+			if strings.TrimSpace(matchSpec.Where) != "" && !skipWhereEval {
+				ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return nil
+				}
+			}
+
+			groupID := candidate.ID
+			if strings.TrimSpace(groupID) == "" {
+				return nil
+			}
+			agg, exists := aggs[groupID]
+			if !exists {
+				values := Row{}
+				for _, item := range projection.nonAggregates {
+					key := item.Expression
+					if item.Alias != "" {
+						key = item.Alias
+					}
+					value, err := evalExpressionWithScope(item.Expression, merged, params)
+					if err != nil {
+						return err
+					}
+					values[key] = value
+				}
+				agg = &fastPeerCandidateAggregate{values: values}
+				aggs[groupID] = agg
+				groupOrder = append(groupOrder, groupID)
+			}
+
+			agg.edgeCount++
+			if rating, ok := edgeNumericProperty(edge, projection.avgEdgeProperty); ok {
+				agg.avgSum += rating
+				agg.avgCount++
+			}
+			if similarityNumericOK {
+				agg.similaritySum += similarityNumeric
+			}
+			return nil
+		}); err != nil {
+			return nil, nil, false, err
+		}
+	}
+
+	out := make([]Row, 0, len(groupOrder))
+	for _, groupID := range groupOrder {
+		agg := aggs[groupID]
+		if agg == nil || agg.edgeCount == 0 {
+			continue
+		}
+		result := cloneRow(agg.values)
+		result[projection.countKey] = agg.edgeCount
+		if agg.avgCount == 0 {
+			result[projection.avgKey] = nil
+		} else {
+			result[projection.avgKey] = agg.avgSum / float64(agg.avgCount)
+		}
+		result[projection.sumSimilarityKey] = agg.similaritySum
+		out = append(out, result)
+	}
+
+	out, err = applyProjectionPostProcessing(out, retSpec, params)
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	columns := append([]string(nil), projection.orderedOutputKeys...)
+	if len(columns) == 0 && len(priorColumns) > 0 {
+		columns = append([]string(nil), priorColumns...)
+	}
+	out = trimProjectionRows(out, columns)
+	return out, columns, true, nil
 }
 
 func validateUnionKinds(kinds []ast.UnionKind) error {
@@ -292,12 +890,20 @@ func equalStringSlices(a, b []string) bool {
 
 func hasWriteClause(part ast.QueryPart) bool {
 	for _, clause := range part.Clauses {
-		switch clause.Kind {
-		case ast.ClauseKindCreate, ast.ClauseKindMerge, ast.ClauseKindSet, ast.ClauseKindRemove, ast.ClauseKindDelete:
+		if isWriteClauseKind(clause.Kind) {
 			return true
 		}
 	}
 	return false
+}
+
+func isWriteClauseKind(kind ast.ClauseKind) bool {
+	switch kind {
+	case ast.ClauseKindCreate, ast.ClauseKindMerge, ast.ClauseKindSet, ast.ClauseKindRemove, ast.ClauseKindDelete:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *Executor) tryFastEdgeCountQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
@@ -1012,9 +1618,6 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	if chain, err := parseDirectedVariableLengthThenDirectedVariableLengthPattern(patternRaw); err == nil {
 		return e.expandDirectedVariableLengthThenDirectedVariableLengthMatch(ctx, tx, rows, spec, chain, params, pathVar)
 	}
-	if chain, err := parseMixedRelationshipChainPattern(patternRaw); err == nil {
-		return e.expandMixedRelationshipChainMatch(ctx, tx, rows, spec, chain, params, pathVar)
-	}
 	if rewritten, ok := rewriteReverseVariableLengthPatternPredicate(patternRaw); ok {
 		if rel, err := parseDirectedVariableLengthRelationshipPattern(rewritten); err == nil {
 			return e.expandVariableLengthDirectedRelationshipMatch(ctx, tx, rows, spec, rel, params, pathVar)
@@ -1031,6 +1634,9 @@ func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row
 	}
 	if chain, err := parseTwoHopUndirectedRelationshipChainPattern(patternRaw); err == nil {
 		return e.expandTwoHopUndirectedRelationshipChainMatch(ctx, tx, rows, spec, chain, params, pathVar)
+	}
+	if chain, err := parseMixedRelationshipChainPattern(patternRaw); err == nil {
+		return e.expandMixedRelationshipChainMatch(ctx, tx, rows, spec, chain, params, pathVar)
 	}
 	if chain, err := parseMultiHopAdjacentChainPattern(patternRaw); err == nil {
 		matched, matchErr := e.expandMultiHopAdjacentChainMatch(ctx, tx, rows, spec, chain, params, pathVar)
@@ -2027,6 +2633,89 @@ func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph
 
 	out := make([]Row, 0)
 	for _, row := range rows {
+		numericConstraints, hasNumericConstraints := extractEdgeWhereNumericConstraints(spec.Where, pattern.EdgeVar, row, params)
+		excludedRightIDs, hasExcludedRightIDs, err := extractDirectedWhereRightExclusionSet(ctx, tx, tenant, spec.Where, pattern.Right.Var, row, params)
+		if err != nil {
+			return nil, err
+		}
+		skipWhereEval := directedWhereCoveredByExtractedPrefilters(spec.Where, pattern.EdgeVar, pattern.Right.Var, row, params, hasNumericConstraints, hasExcludedRightIDs)
+		if indexedEdges, indexed, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, spec.Where, pattern.Left.Var, row, params); err != nil {
+			return nil, err
+		} else if indexed {
+			matched := false
+			for _, edge := range indexedEdges {
+				if hasNumericConstraints && !edgeMatchesNumericConstraints(edge, numericConstraints) {
+					continue
+				}
+				if hasExcludedRightIDs {
+					if _, blocked := excludedRightIDs[edge.DstID]; blocked {
+						continue
+					}
+				}
+				if !edgeBindingMatches(row, pattern.EdgeVar, edge) {
+					continue
+				}
+				left, err := getVertexQueryCached(ctx, tx, tenant, edge.SrcID, params)
+				if err != nil {
+					return nil, err
+				}
+				if left == nil {
+					continue
+				}
+				if !vertexBindingMatches(row, pattern.Left.Var, left) {
+					continue
+				}
+				if !vertexPatternMatches(left, pattern.Left, params, row) {
+					continue
+				}
+				rowWithLeft := cloneRow(row)
+				if pattern.Left.Var != "" {
+					rowWithLeft[pattern.Left.Var] = left
+				}
+
+				right, err := getVertexQueryCached(ctx, tx, tenant, edge.DstID, params)
+				if err != nil {
+					return nil, err
+				}
+				if right == nil {
+					continue
+				}
+				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, right) {
+					continue
+				}
+				if !vertexPatternMatches(right, pattern.Right, params, rowWithLeft) {
+					continue
+				}
+
+				merged := cloneRow(rowWithLeft)
+				if pattern.Right.Var != "" {
+					merged[pattern.Right.Var] = right
+				}
+				if pattern.EdgeVar != "" {
+					merged[pattern.EdgeVar] = edge
+				}
+				if spec.Where != "" && !skipWhereEval {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						continue
+					}
+				}
+				matched = true
+				out = append(out, merged)
+			}
+			if spec.Optional && !matched {
+				merged := cloneRow(row)
+				setOptionalNoMatchBinding(merged, row, pattern.Left.Var)
+				setOptionalNoMatchBinding(merged, row, pattern.Right.Var)
+				setOptionalNoMatchBinding(merged, row, pattern.EdgeVar)
+				out = append(out, merged)
+			}
+			continue
+		}
+
 		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
@@ -2046,9 +2735,17 @@ func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph
 			if len(pattern.EdgeAnyOf) > 0 {
 				scanType = ""
 			}
-			if err := tx.ScanOutEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
+			if err := scanOutEdgesQueryCached(ctx, tx, tenant, left.ID, scanType, params, func(edge *graph.Edge) error {
 				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
 					return nil
+				}
+				if hasNumericConstraints && !edgeMatchesNumericConstraints(edge, numericConstraints) {
+					return nil
+				}
+				if hasExcludedRightIDs {
+					if _, blocked := excludedRightIDs[edge.DstID]; blocked {
+						return nil
+					}
 				}
 				if !edgeBindingMatches(rowWithLeft, pattern.EdgeVar, edge) {
 					return nil
@@ -2056,12 +2753,12 @@ func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph
 				if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
 					return nil
 				}
-				neighbor, err := tx.GetVertex(ctx, tenant, edge.DstID)
+				neighbor, err := getVertexQueryCached(ctx, tx, tenant, edge.DstID, params)
 				if err != nil {
-					if graph.IsKind(err, graph.ErrKindNotFound) {
-						return nil
-					}
 					return err
+				}
+				if neighbor == nil {
+					return nil
 				}
 				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, neighbor) {
 					return nil
@@ -2081,7 +2778,7 @@ func (e *Executor) expandDirectedRelationshipMatch(ctx context.Context, tx graph
 					merged[pattern.EdgeVar] = edge
 				}
 
-				if spec.Where != "" {
+				if spec.Where != "" && !skipWhereEval {
 					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
 					if err != nil {
 						return err
@@ -2123,6 +2820,75 @@ func (e *Executor) expandReverseDirectedRelationshipMatch(ctx context.Context, t
 
 	out := make([]Row, 0)
 	for _, row := range rows {
+		if indexedEdges, indexed, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, spec.Where, pattern.Left.Var, row, params); err != nil {
+			return nil, err
+		} else if indexed {
+			matched := false
+			for _, edge := range indexedEdges {
+				if !edgeBindingMatches(row, pattern.EdgeVar, edge) {
+					continue
+				}
+				left, err := getVertexQueryCached(ctx, tx, tenant, edge.DstID, params)
+				if err != nil {
+					return nil, err
+				}
+				if left == nil {
+					continue
+				}
+				if !vertexBindingMatches(row, pattern.Left.Var, left) {
+					continue
+				}
+				if !vertexPatternMatches(left, pattern.Left, params, row) {
+					continue
+				}
+				rowWithLeft := cloneRow(row)
+				if pattern.Left.Var != "" {
+					rowWithLeft[pattern.Left.Var] = left
+				}
+
+				right, err := getVertexQueryCached(ctx, tx, tenant, edge.SrcID, params)
+				if err != nil {
+					return nil, err
+				}
+				if right == nil {
+					continue
+				}
+				if !vertexBindingMatches(rowWithLeft, pattern.Right.Var, right) {
+					continue
+				}
+				if !vertexPatternMatches(right, pattern.Right, params, rowWithLeft) {
+					continue
+				}
+
+				merged := cloneRow(rowWithLeft)
+				if pattern.Right.Var != "" {
+					merged[pattern.Right.Var] = right
+				}
+				if pattern.EdgeVar != "" {
+					merged[pattern.EdgeVar] = edge
+				}
+				if spec.Where != "" {
+					ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
+					if err != nil {
+						return nil, err
+					}
+					if !ok {
+						continue
+					}
+				}
+				matched = true
+				out = append(out, merged)
+			}
+			if spec.Optional && !matched {
+				merged := cloneRow(row)
+				setOptionalNoMatchBinding(merged, row, pattern.Left.Var)
+				setOptionalNoMatchBinding(merged, row, pattern.Right.Var)
+				setOptionalNoMatchBinding(merged, row, pattern.EdgeVar)
+				out = append(out, merged)
+			}
+			continue
+		}
+
 		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
 		if err != nil {
 			return nil, err
@@ -2142,7 +2908,7 @@ func (e *Executor) expandReverseDirectedRelationshipMatch(ctx context.Context, t
 			if len(pattern.EdgeAnyOf) > 0 {
 				scanType = ""
 			}
-			if err := tx.ScanInEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
+			if err := scanInEdgesQueryCached(ctx, tx, tenant, left.ID, scanType, params, func(edge *graph.Edge) error {
 				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
 					return nil
 				}
@@ -2293,7 +3059,7 @@ func (e *Executor) expandUndirectedRelationshipMatch(ctx context.Context, tx gra
 			if len(pattern.EdgeAnyOf) > 0 {
 				scanType = ""
 			}
-			if err := tx.ScanOutEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
+			if err := scanOutEdgesQueryCached(ctx, tx, tenant, left.ID, scanType, params, func(edge *graph.Edge) error {
 				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
 					return nil
 				}
@@ -2301,7 +3067,7 @@ func (e *Executor) expandUndirectedRelationshipMatch(ctx context.Context, tx gra
 			}); err != nil {
 				return nil, err
 			}
-			if err := tx.ScanInEdges(ctx, tenant, left.ID, scanType, 0, func(edge *graph.Edge) error {
+			if err := scanInEdgesQueryCached(ctx, tx, tenant, left.ID, scanType, params, func(edge *graph.Edge) error {
 				if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
 					return nil
 				}
@@ -2996,6 +3762,12 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 		rows = []Row{{}}
 	}
 
+	type cachedTwoHopCandidate struct {
+		edge  *graph.Edge
+		right *graph.Vertex
+	}
+	secondHopCache := map[string][]cachedTwoHopCandidate{}
+
 	out := make([]Row, 0)
 	for _, row := range rows {
 		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
@@ -3014,7 +3786,7 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 				firstScanType = ""
 			}
 
-			if err := tx.ScanOutEdges(ctx, tenant, left.ID, firstScanType, 0, func(edge1 *graph.Edge) error {
+			if err := scanOutEdgesQueryCached(ctx, tx, tenant, left.ID, firstScanType, params, func(edge1 *graph.Edge) error {
 				if !edgeTypeMatches(edge1, pattern.FirstEdgeType, pattern.FirstEdgeAnyOf) {
 					return nil
 				}
@@ -3022,12 +3794,12 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 					return nil
 				}
 
-				mid, err := tx.GetVertex(ctx, tenant, edge1.DstID)
+				mid, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
 				if err != nil {
-					if graph.IsKind(err, graph.ErrKindNotFound) {
-						return nil
-					}
 					return err
+				}
+				if mid == nil {
+					return nil
 				}
 
 				mergedMid := cloneRow(row)
@@ -3051,21 +3823,58 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 				if len(pattern.SecondEdgeAnyOf) > 0 {
 					secondScanType = ""
 				}
+				secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(spec.Where, pattern.SecondEdgeVar, mergedMid, params)
 
-				collectRight := func(edge2 *graph.Edge, rightID string) error {
+				cacheKey := tenant + "|" + mid.ID + "|"
+				if pattern.SecondForward {
+					cacheKey += "out|"
+				} else {
+					cacheKey += "in|"
+				}
+				cacheKey += secondScanType
+
+				candidates, cacheHit := secondHopCache[cacheKey]
+				if !cacheHit {
+					candidates = make([]cachedTwoHopCandidate, 0)
+					collectCandidate := func(edge2 *graph.Edge, rightID string) error {
+						right, err := getVertexQueryCached(ctx, tx, tenant, rightID, params)
+						if err != nil {
+							return err
+						}
+						if right == nil {
+							return nil
+						}
+						candidates = append(candidates, cachedTwoHopCandidate{edge: edge2, right: right})
+						return nil
+					}
+					if pattern.SecondForward {
+						if err := scanOutEdgesQueryCached(ctx, tx, tenant, mid.ID, secondScanType, params, func(edge2 *graph.Edge) error {
+							return collectCandidate(edge2, edge2.DstID)
+						}); err != nil {
+							return err
+						}
+					} else {
+						if err := scanInEdgesQueryCached(ctx, tx, tenant, mid.ID, secondScanType, params, func(edge2 *graph.Edge) error {
+							return collectCandidate(edge2, edge2.SrcID)
+						}); err != nil {
+							return err
+						}
+					}
+					secondHopCache[cacheKey] = candidates
+				}
+
+				collectRight := func(edge2 *graph.Edge, right *graph.Vertex) error {
 					if !edgeTypeMatches(edge2, pattern.SecondEdgeType, pattern.SecondEdgeAnyOf) {
 						return nil
 					}
 					if !edgePatternMatches(edge2, pattern.SecondEdgeProps, params, mergedMid) {
 						return nil
 					}
-
-					right, err := tx.GetVertex(ctx, tenant, rightID)
-					if err != nil {
-						if graph.IsKind(err, graph.ErrKindNotFound) {
-							return nil
-						}
-						return err
+					if hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, secondWhereConstraints) {
+						return nil
+					}
+					if right == nil {
+						return nil
 					}
 					if !vertexBindingMatches(mergedMid, pattern.Right.Var, right) {
 						return nil
@@ -3106,16 +3915,8 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 					return nil
 				}
 
-				if pattern.SecondForward {
-					if err := tx.ScanOutEdges(ctx, tenant, mid.ID, secondScanType, 0, func(edge2 *graph.Edge) error {
-						return collectRight(edge2, edge2.DstID)
-					}); err != nil {
-						return err
-					}
-				} else {
-					if err := tx.ScanInEdges(ctx, tenant, mid.ID, secondScanType, 0, func(edge2 *graph.Edge) error {
-						return collectRight(edge2, edge2.SrcID)
-					}); err != nil {
+				for _, candidate := range candidates {
+					if err := collectRight(candidate.edge, candidate.right); err != nil {
 						return err
 					}
 				}
@@ -3886,6 +4687,7 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 
 				segment := pattern.Segments[index]
 				nextPattern := pattern.Vertexes[index+1]
+				segmentWhereConstraints, hasSegmentWhereConstraints := extractEdgeWhereNumericConstraints(spec.Where, segment.EdgeVar, currentRow, params)
 
 				minHops := segment.MinHops
 				maxHops := segment.MaxHops
@@ -3945,6 +4747,9 @@ func (e *Executor) expandMixedRelationshipChainMatch(ctx context.Context, tx gra
 							return nil
 						}
 						if !edgePatternMatches(edge, segment.EdgeProps, params, currentRow) {
+							return nil
+						}
+						if hasSegmentWhereConstraints && !edgeMatchesNumericConstraints(edge, segmentWhereConstraints) {
 							return nil
 						}
 						neighbor, err := tx.GetVertex(ctx, tenant, neighborID)
@@ -4649,6 +5454,652 @@ func anchoredSourcePropertyEquality(pattern anchoredOutPattern, params Params, r
 	return "", nil, false
 }
 
+func edgePropertyEquality(raw string, params Params, row Row) (string, any, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil, false
+	}
+	parsed, err := parsePropertyMap(raw, params, row)
+	if err != nil || len(parsed) != 1 {
+		return "", nil, false
+	}
+	for key, value := range parsed {
+		if strings.EqualFold(key, "id") {
+			return "", nil, false
+		}
+		return key, value, true
+	}
+	return "", nil, false
+}
+
+func edgePatternCandidateTypes(edgeType string, edgeAnyOf []string) []string {
+	edgeType = strings.TrimSpace(edgeType)
+	if edgeType != "" {
+		return []string{edgeType}
+	}
+	if len(edgeAnyOf) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	types := make([]string, 0, len(edgeAnyOf))
+	for _, t := range edgeAnyOf {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		types = append(types, t)
+	}
+	sort.Strings(types)
+	return types
+}
+
+type edgeNumericRangeConstraint struct {
+	lower          float64
+	lowerSet       bool
+	lowerInclusive bool
+	upper          float64
+	upperSet       bool
+	upperInclusive bool
+}
+
+func (c *edgeNumericRangeConstraint) applyLower(value float64, inclusive bool) bool {
+	if !c.lowerSet {
+		c.lower = value
+		c.lowerSet = true
+		c.lowerInclusive = inclusive
+		return true
+	}
+	if value > c.lower {
+		c.lower = value
+		c.lowerInclusive = inclusive
+		return true
+	}
+	if value == c.lower {
+		c.lowerInclusive = c.lowerInclusive && inclusive
+	}
+	return true
+}
+
+func (c *edgeNumericRangeConstraint) applyUpper(value float64, inclusive bool) bool {
+	if !c.upperSet {
+		c.upper = value
+		c.upperSet = true
+		c.upperInclusive = inclusive
+		return true
+	}
+	if value < c.upper {
+		c.upper = value
+		c.upperInclusive = inclusive
+		return true
+	}
+	if value == c.upper {
+		c.upperInclusive = c.upperInclusive && inclusive
+	}
+	return true
+}
+
+func (c edgeNumericRangeConstraint) isContradictory() bool {
+	if !c.lowerSet || !c.upperSet {
+		return false
+	}
+	if c.lower < c.upper {
+		return false
+	}
+	if c.lower > c.upper {
+		return true
+	}
+	return !(c.lowerInclusive && c.upperInclusive)
+}
+
+func (c edgeNumericRangeConstraint) matchesValue(value any) bool {
+	numeric, ok := comparableNumericValue(value)
+	if !ok {
+		return false
+	}
+	if c.lowerSet {
+		if numeric < c.lower {
+			return false
+		}
+		if numeric == c.lower && !c.lowerInclusive {
+			return false
+		}
+	}
+	if c.upperSet {
+		if numeric > c.upper {
+			return false
+		}
+		if numeric == c.upper && !c.upperInclusive {
+			return false
+		}
+	}
+	return true
+}
+
+func flattenWhereConjuncts(raw string) ([]string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+	if strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") && parensAreBalanced(raw[1:len(raw)-1]) {
+		return flattenWhereConjuncts(raw[1 : len(raw)-1])
+	}
+	if _, _, ok := splitTopLevelCompressedBoolean(raw, "OR"); ok {
+		return nil, false
+	}
+	if _, _, ok := splitTopLevelKeyword(raw, "OR"); ok {
+		return nil, false
+	}
+	if _, _, ok := splitTopLevelCompressedBoolean(raw, "XOR"); ok {
+		return nil, false
+	}
+	if _, _, ok := splitTopLevelKeyword(raw, "XOR"); ok {
+		return nil, false
+	}
+	if left, right, ok := splitTopLevelCompressedBoolean(raw, "AND"); ok {
+		leftConjuncts, leftOK := flattenWhereConjuncts(left)
+		rightConjuncts, rightOK := flattenWhereConjuncts(right)
+		if !leftOK || !rightOK {
+			return nil, false
+		}
+		return append(leftConjuncts, rightConjuncts...), true
+	}
+	if left, right, ok := splitTopLevelKeyword(raw, "AND"); ok {
+		leftConjuncts, leftOK := flattenWhereConjuncts(left)
+		rightConjuncts, rightOK := flattenWhereConjuncts(right)
+		if !leftOK || !rightOK {
+			return nil, false
+		}
+		return append(leftConjuncts, rightConjuncts...), true
+	}
+	return []string{raw}, true
+}
+
+func edgePropertyReference(expr string, edgeVar string) (string, bool) {
+	edgeVar = strings.TrimSpace(edgeVar)
+	if edgeVar == "" {
+		return "", false
+	}
+	base, fields, ok := splitTopLevelFieldAccess(expr)
+	if !ok || len(fields) != 1 {
+		return "", false
+	}
+	base = strings.TrimSpace(base)
+	if inner, wrapped := unwrapOuterParentheses(base); wrapped {
+		base = strings.TrimSpace(inner)
+	}
+	if base != edgeVar {
+		return "", false
+	}
+	property := strings.TrimSpace(fields[0])
+	if property == "" || strings.EqualFold(property, "id") || strings.EqualFold(property, "type") {
+		return "", false
+	}
+	return property, true
+}
+
+func reverseComparisonOperator(op string) string {
+	switch strings.TrimSpace(op) {
+	case "<":
+		return ">"
+	case "<=":
+		return ">="
+	case ">":
+		return "<"
+	case ">=":
+		return "<="
+	case "=":
+		return "="
+	default:
+		return ""
+	}
+}
+
+func mergeEdgeNumericRangeConstraint(dst *edgeNumericRangeConstraint, src edgeNumericRangeConstraint) {
+	if dst == nil {
+		return
+	}
+	if src.lowerSet {
+		dst.applyLower(src.lower, src.lowerInclusive)
+	}
+	if src.upperSet {
+		dst.applyUpper(src.upper, src.upperInclusive)
+	}
+}
+
+func contradictoryEdgeNumericRangeConstraint() edgeNumericRangeConstraint {
+	constraint := edgeNumericRangeConstraint{}
+	constraint.applyLower(1, true)
+	constraint.applyUpper(0, true)
+	return constraint
+}
+
+func extractEdgeAbsDifferenceConstraint(conjunct, edgeVar string, row Row, params Params) (string, edgeNumericRangeConstraint, bool) {
+	left, right, op, ok := splitTopLevelComparison(strings.TrimSpace(conjunct))
+	if !ok {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+
+	comparisonOp := strings.TrimSpace(op)
+	absExpr := ""
+	scalarExpr := ""
+	if _, ok := parseFunctionCall(left, "abs"); ok {
+		absExpr = left
+		scalarExpr = right
+	} else if _, ok := parseFunctionCall(right, "abs"); ok {
+		absExpr = right
+		scalarExpr = left
+		comparisonOp = reverseComparisonOperator(comparisonOp)
+		if comparisonOp == "" {
+			return "", edgeNumericRangeConstraint{}, false
+		}
+	} else {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+
+	arg, ok := parseFunctionCall(absExpr, "abs")
+	if !ok {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+
+	leftTerm, rightTerm, termOp, ok := splitTopLevelOperatorSetLast(arg, "+", "-")
+	if !ok || strings.TrimSpace(termOp) != "-" {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+
+	leftProp, leftIsEdge := edgePropertyReference(leftTerm, edgeVar)
+	rightProp, rightIsEdge := edgePropertyReference(rightTerm, edgeVar)
+	if leftIsEdge == rightIsEdge {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+
+	property := leftProp
+	anchorExpr := rightTerm
+	if rightIsEdge {
+		property = rightProp
+		anchorExpr = leftTerm
+	}
+
+	anchorValue, err := evalExpressionWithScope(anchorExpr, row, params)
+	if err != nil {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+	anchor, ok := comparableNumericValue(anchorValue)
+	if !ok {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+
+	scalarValue, err := evalExpressionWithScope(scalarExpr, row, params)
+	if err != nil {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+	radius, ok := comparableNumericValue(scalarValue)
+	if !ok {
+		return "", edgeNumericRangeConstraint{}, false
+	}
+
+	constraint := edgeNumericRangeConstraint{}
+	switch comparisonOp {
+	case "<=":
+		if radius < 0 {
+			return property, contradictoryEdgeNumericRangeConstraint(), true
+		}
+		constraint.applyLower(anchor-radius, true)
+		constraint.applyUpper(anchor+radius, true)
+		return property, constraint, true
+	case "<":
+		if radius <= 0 {
+			return property, contradictoryEdgeNumericRangeConstraint(), true
+		}
+		constraint.applyLower(anchor-radius, false)
+		constraint.applyUpper(anchor+radius, false)
+		return property, constraint, true
+	default:
+		return "", edgeNumericRangeConstraint{}, false
+	}
+}
+
+func edgeMatchesNumericConstraints(edge *graph.Edge, constraints map[string]edgeNumericRangeConstraint) bool {
+	if edge == nil {
+		return false
+	}
+	for property, constraint := range constraints {
+		if edge.Properties == nil {
+			return false
+		}
+		raw, ok := edge.Properties[property]
+		if !ok {
+			return false
+		}
+		if !constraint.matchesValue(decodeStoredPropertyValue(raw)) {
+			return false
+		}
+	}
+	return true
+}
+
+func extractDirectedWhereRightExclusionSet(ctx context.Context, tx graph.Tx, tenant, whereRaw, rightVar string, row Row, params Params) (map[string]struct{}, bool, error) {
+	rightVar = strings.TrimSpace(rightVar)
+	if rightVar == "" {
+		return nil, false, nil
+	}
+	conjuncts, ok := flattenWhereConjuncts(whereRaw)
+	if !ok || len(conjuncts) == 0 {
+		return nil, false, nil
+	}
+	for _, conjunct := range conjuncts {
+		conjunct = strings.TrimSpace(conjunct)
+		if !hasLogicalNotPrefix(conjunct) {
+			continue
+		}
+		operand := strings.TrimSpace(conjunct[3:])
+		pattern, err := parseDirectedRelationshipPattern(operand)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(pattern.EdgeVar) != "" || strings.TrimSpace(pattern.EdgeProps) != "" || len(pattern.EdgeAnyOf) != 0 {
+			continue
+		}
+		if strings.TrimSpace(pattern.Right.Var) != rightVar {
+			continue
+		}
+		src, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return nil, false, err
+		}
+		if !bound || src == nil {
+			continue
+		}
+		neighbors, err := loadWherePatternPredicateNeighbors(ctx, tx, tenant, src.ID, strings.TrimSpace(pattern.EdgeType), true, params)
+		if err != nil {
+			return nil, false, err
+		}
+		if neighbors == nil {
+			neighbors = map[string]struct{}{}
+		}
+		return neighbors, true, nil
+	}
+	return nil, false, nil
+}
+
+func directedWhereCoveredByExtractedPrefilters(whereRaw, edgeVar, rightVar string, row Row, params Params, hasNumericConstraints, hasExcludedRightIDs bool) bool {
+	conjuncts, ok := flattenWhereConjuncts(whereRaw)
+	if !ok || len(conjuncts) == 0 {
+		return false
+	}
+
+	for _, conjunct := range conjuncts {
+		conjunct = strings.TrimSpace(conjunct)
+		if conjunct == "" {
+			continue
+		}
+
+		if hasLogicalNotPrefix(conjunct) {
+			if !hasExcludedRightIDs {
+				return false
+			}
+			operand := strings.TrimSpace(conjunct[3:])
+			pattern, err := parseDirectedRelationshipPattern(operand)
+			if err != nil {
+				return false
+			}
+			if strings.TrimSpace(pattern.EdgeVar) != "" || strings.TrimSpace(pattern.EdgeProps) != "" || len(pattern.EdgeAnyOf) != 0 {
+				return false
+			}
+			if strings.TrimSpace(pattern.Right.Var) != strings.TrimSpace(rightVar) {
+				return false
+			}
+			continue
+		}
+
+		left, right, _, ok := splitTopLevelComparison(conjunct)
+		if !ok {
+			return false
+		}
+		leftProp, leftIsEdge := edgePropertyReference(left, edgeVar)
+		rightProp, rightIsEdge := edgePropertyReference(right, edgeVar)
+		if leftIsEdge == rightIsEdge {
+			return false
+		}
+		if !hasNumericConstraints {
+			return false
+		}
+
+		scalarExpr := right
+		if rightIsEdge {
+			scalarExpr = left
+		}
+		if strings.TrimSpace(leftProp) == "" && strings.TrimSpace(rightProp) == "" {
+			return false
+		}
+		scalarValue, err := evalExpressionWithScope(scalarExpr, row, params)
+		if err != nil {
+			return false
+		}
+		if _, numericOK := comparableNumericValue(scalarValue); !numericOK {
+			return false
+		}
+	}
+	return true
+}
+
+func extractEdgeWhereNumericConstraints(whereRaw, edgeVar string, row Row, params Params) (map[string]edgeNumericRangeConstraint, bool) {
+	edgeVar = strings.TrimSpace(edgeVar)
+	if edgeVar == "" {
+		return nil, false
+	}
+	conjuncts, ok := flattenWhereConjuncts(whereRaw)
+	if !ok || len(conjuncts) == 0 {
+		return nil, false
+	}
+	constraints := map[string]edgeNumericRangeConstraint{}
+	for _, conjunct := range conjuncts {
+		if property, absConstraint, ok := extractEdgeAbsDifferenceConstraint(conjunct, edgeVar, row, params); ok {
+			merged := constraints[property]
+			mergeEdgeNumericRangeConstraint(&merged, absConstraint)
+			constraints[property] = merged
+			continue
+		}
+
+		left, right, op, ok := splitTopLevelComparison(strings.TrimSpace(conjunct))
+		if !ok {
+			continue
+		}
+		leftProp, leftIsEdge := edgePropertyReference(left, edgeVar)
+		rightProp, rightIsEdge := edgePropertyReference(right, edgeVar)
+		if leftIsEdge && rightIsEdge {
+			continue
+		}
+		if !leftIsEdge && !rightIsEdge {
+			continue
+		}
+
+		property := leftProp
+		scalarExpr := right
+		normalizedOp := strings.TrimSpace(op)
+		if rightIsEdge {
+			property = rightProp
+			scalarExpr = left
+			normalizedOp = reverseComparisonOperator(op)
+			if normalizedOp == "" {
+				continue
+			}
+		}
+
+		scalarValue, err := evalExpressionWithScope(scalarExpr, row, params)
+		if err != nil {
+			continue
+		}
+		numeric, numericOK := comparableNumericValue(scalarValue)
+		if !numericOK {
+			continue
+		}
+
+		constraint := constraints[property]
+		switch normalizedOp {
+		case ">":
+			constraint.applyLower(numeric, false)
+		case ">=":
+			constraint.applyLower(numeric, true)
+		case "<":
+			constraint.applyUpper(numeric, false)
+		case "<=":
+			constraint.applyUpper(numeric, true)
+		case "=":
+			constraint.applyLower(numeric, true)
+			constraint.applyUpper(numeric, true)
+		default:
+			continue
+		}
+		merged := constraints[property]
+		mergeEdgeNumericRangeConstraint(&merged, constraint)
+		constraints[property] = merged
+	}
+	if len(constraints) == 0 {
+		return nil, false
+	}
+	return constraints, true
+}
+
+func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.Tx, tenant, edgeType string, edgeAnyOf []string, edgeProps, edgeVar, whereRaw string, leftVar string, row Row, params Params) ([]*graph.Edge, bool, error) {
+	if e.indexCatalog == nil {
+		return nil, false, nil
+	}
+	types := edgePatternCandidateTypes(edgeType, edgeAnyOf)
+	if len(types) == 0 {
+		return nil, false, nil
+	}
+
+	strategy := "edge_property_index"
+	ids := map[string]struct{}{}
+
+	if prop, value, ok := edgePropertyEquality(edgeProps, params, row); ok {
+		for _, candidateType := range types {
+			indexed := e.indexCatalog.HasEdgePropertyIndex(tenant, candidateType, prop)
+			e.metrics.ObserveIndexCandidate(tenant, candidateType, prop, indexed)
+			if !indexed {
+				return nil, false, nil
+			}
+		}
+
+		encoded := valueToBytes(value)
+		for _, candidateType := range types {
+			err := tx.ScanPropertyIndex(ctx, tenant, candidateType, prop, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
+				if entry == nil || entry.EntityClass != "edge" {
+					return nil
+				}
+				ids[entry.EntityID] = struct{}{}
+				return nil
+			})
+			if err != nil {
+				e.metrics.ObserveIndexLookup(strategy, "error", 0)
+				return nil, true, err
+			}
+		}
+	} else {
+		// When the source vertex is already bound in the current row, a per-vertex
+		// adjacency scan + residual filter is far cheaper than a global property
+		// index range scan (which iterates the full edge index before narrowing by
+		// source). Skip range pushdown so the caller uses the adjacency path.
+		if leftVar != "" {
+			if v, ok := row[leftVar]; ok && v != nil {
+				return nil, false, nil
+			}
+		}
+		constraints, ok := extractEdgeWhereNumericConstraints(whereRaw, edgeVar, row, params)
+		if !ok {
+			return nil, false, nil
+		}
+
+		props := make([]string, 0, len(constraints))
+		for property := range constraints {
+			props = append(props, property)
+		}
+		sort.Strings(props)
+
+		selectedProp := ""
+		selectedConstraint := edgeNumericRangeConstraint{}
+		for _, property := range props {
+			allIndexed := true
+			for _, candidateType := range types {
+				indexed := e.indexCatalog.HasEdgePropertyIndex(tenant, candidateType, property)
+				e.metrics.ObserveIndexCandidate(tenant, candidateType, property, indexed)
+				if !indexed {
+					allIndexed = false
+				}
+			}
+			if allIndexed {
+				selectedProp = property
+				selectedConstraint = constraints[property]
+				break
+			}
+		}
+		if selectedProp == "" {
+			return nil, false, nil
+		}
+		if selectedConstraint.isContradictory() {
+			e.metrics.ObserveIndexLookup("edge_property_index_range", "miss", 0)
+			return nil, true, nil
+		}
+
+		strategy = "edge_property_index_range"
+		errEdgeRangeCapReached := errors.New("edge range index candidate limit reached")
+		for _, candidateType := range types {
+			err := tx.ScanPropertyIndexAll(ctx, tenant, candidateType, selectedProp, 0, func(entry *graph.PropertyIndexEntry) error {
+				if entry == nil || entry.EntityClass != "edge" {
+					return nil
+				}
+				if !selectedConstraint.matchesValue(decodeStoredPropertyValue(entry.Value)) {
+					return nil
+				}
+				ids[entry.EntityID] = struct{}{}
+				if len(ids) > edgeRangeIndexCandidateLimit {
+					return errEdgeRangeCapReached
+				}
+				return nil
+			})
+			if err != nil {
+				if errors.Is(err, errEdgeRangeCapReached) {
+					return nil, false, nil
+				}
+				e.metrics.ObserveIndexLookup(strategy, "error", 0)
+				return nil, true, err
+			}
+		}
+	}
+
+	out := make([]*graph.Edge, 0, len(ids))
+	for id := range ids {
+		edge, err := tx.GetEdge(ctx, tenant, id)
+		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				continue
+			}
+			e.metrics.ObserveIndexLookup("edge_property_index", "error", 0)
+			return nil, true, err
+		}
+		if !edgeTypeMatches(edge, edgeType, edgeAnyOf) {
+			continue
+		}
+		if !edgePatternMatches(edge, edgeProps, params, row) {
+			continue
+		}
+		out = append(out, edge)
+	}
+	if len(out) == 0 {
+		e.metrics.ObserveIndexLookup(strategy, "miss", 0)
+		return nil, true, nil
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].ID < out[j].ID
+	})
+	e.metrics.ObserveIndexLookup(strategy, "hit", len(out))
+	return out, true, nil
+}
+
 func vertexMatchesProperty(vertex *graph.Vertex, prop string, encoded []byte, label string) bool {
 	if vertex == nil {
 		return false
@@ -5300,6 +6751,32 @@ func (e *Executor) putVertexWithIndexes(ctx context.Context, tx graph.Tx, vertex
 	return nil
 }
 
+func (e *Executor) putEdgeWithIndexes(ctx context.Context, tx graph.Tx, edge *graph.Edge) error {
+	if err := tx.PutEdge(ctx, edge); err != nil {
+		return err
+	}
+	if e.indexCatalog == nil || edge == nil || strings.TrimSpace(edge.Type) == "" {
+		return nil
+	}
+	for property, encoded := range edge.Properties {
+		if !e.indexCatalog.HasEdgePropertyIndex(edge.Tenant, edge.Type, property) {
+			continue
+		}
+		valueCopy := append([]byte(nil), encoded...)
+		if err := tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      edge.Tenant,
+			Schema:      edge.Type,
+			Property:    property,
+			Value:       valueCopy,
+			EntityID:    edge.ID,
+			EntityClass: "edge",
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func mergePropertyValueEqual(expected, actual any) bool {
 	if reflect.DeepEqual(expected, actual) {
 		return true
@@ -5513,7 +6990,7 @@ func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row,
 			}
 		}
 
-		edge, edgeCreated, err := createOrMergeEdge(ctx, tx, leftVertex, rightVertex, edgeType, edgeProps, merge, direction)
+		edge, edgeCreated, err := e.createOrMergeEdge(ctx, tx, leftVertex, rightVertex, edgeType, edgeProps, merge, direction)
 		if err != nil {
 			return nil, err
 		}
@@ -5573,7 +7050,7 @@ func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, row
 			if err != nil {
 				return nil, err
 			}
-			edge, edgeCreated, err := createOrMergeEdge(ctx, tx, vertices[i], vertices[i+1], relType, relProps, merge, rel.Direction)
+			edge, edgeCreated, err := e.createOrMergeEdge(ctx, tx, vertices[i], vertices[i+1], relType, relProps, merge, rel.Direction)
 			if err != nil {
 				return nil, err
 			}
@@ -5593,7 +7070,7 @@ func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, row
 	return out, nil
 }
 
-func createOrMergeEdge(ctx context.Context, tx graph.Tx, leftVertex, rightVertex *graph.Vertex, edgeType string, edgeProps map[string]any, merge bool, direction createEdgeDirection) (*graph.Edge, bool, error) {
+func (e *Executor) createOrMergeEdge(ctx context.Context, tx graph.Tx, leftVertex, rightVertex *graph.Vertex, edgeType string, edgeProps map[string]any, merge bool, direction createEdgeDirection) (*graph.Edge, bool, error) {
 	if merge && hasNilPropertyValue(edgeProps) {
 		return nil, false, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
 	}
@@ -5640,7 +7117,7 @@ func createOrMergeEdge(ctx context.Context, tx graph.Tx, leftVertex, rightVertex
 		DstID:      dstVertex.ID,
 		Properties: normalizeEdgeProperties(edgeProps),
 	}
-	if err := tx.PutEdge(ctx, edge); err != nil {
+	if err := e.putEdgeWithIndexes(ctx, tx, edge); err != nil {
 		return nil, false, err
 	}
 	return edge, true, nil
@@ -5827,7 +7304,7 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						}
 						mutated.Properties[field] = encoded
 					}
-					if err := tx.PutEdge(ctx, mutated); err != nil {
+					if err := e.putEdgeWithIndexes(ctx, tx, mutated); err != nil {
 						return nil, err
 					}
 					working = cloneRow(working)
@@ -5892,7 +7369,7 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						}
 						mutated.Properties[key] = encoded
 					}
-					if err := tx.PutEdge(ctx, mutated); err != nil {
+					if err := e.putEdgeWithIndexes(ctx, tx, mutated); err != nil {
 						return nil, err
 					}
 					working = cloneRow(working)
@@ -5955,7 +7432,7 @@ func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, 
 						}
 						mutated.Properties[key] = encoded
 					}
-					if err := tx.PutEdge(ctx, mutated); err != nil {
+					if err := e.putEdgeWithIndexes(ctx, tx, mutated); err != nil {
 						return nil, err
 					}
 					working = cloneRow(working)
@@ -6177,7 +7654,7 @@ func (e *Executor) applyRemoveClause(ctx context.Context, tx graph.Tx, rows []Ro
 					mutated := cloneEdge(typed)
 					ensurePropertiesEdge(mutated)
 					delete(mutated.Properties, field)
-					if err := tx.PutEdge(ctx, mutated); err != nil {
+					if err := e.putEdgeWithIndexes(ctx, tx, mutated); err != nil {
 						return nil, err
 					}
 					working = cloneRow(working)
@@ -6613,21 +8090,19 @@ func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows 
 				key = item.Alias
 			}
 			projected[key] = value
-			keyValues = append(keyValues, normalizeResultValue(value))
+			keyValues = append(keyValues, value)
 		}
 
-		keyBytes, err := json.Marshal(keyValues)
+		groupKey, err := projectionAggregateGroupKey(keyValues)
 		if err != nil {
 			return nil, nil, graph.NewError(graph.ErrKindUnsupported, "aggregation key is not serializable", err)
 		}
-		groupKey := string(keyBytes)
 		group, ok := groups[groupKey]
 		if !ok {
 			group = &projectionGroup{projected: projected, source: cloneRow(row), counts: map[int]int{}, countSeen: map[int]map[string]struct{}{}, collects: map[int][]any{}, collectSeen: map[int]map[string]struct{}{}, aggs: map[int]*projectionAggregate{}, aggExprCounts: map[string]int{}, aggExprCountSeen: map[string]map[string]struct{}{}, aggExprCollects: map[string][]any{}, aggExprCollectSeen: map[string]map[string]struct{}{}, aggExprAggs: map[string]*projectionAggregate{}}
 			groups[groupKey] = group
 			groupOrder = append(groupOrder, groupKey)
 		}
-
 		for idx, item := range items {
 			calls := extractAggregateCalls(item.Expression)
 			if len(calls) > 0 && item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" {
@@ -7840,16 +9315,120 @@ func isIdentifierPart(ch byte) bool {
 	return isIdentifierStart(ch) || (ch >= '0' && ch <= '9')
 }
 
+func projectionAggregateGroupKey(values []any) (string, error) {
+	if len(values) == 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	b.Grow(len(values) * 16)
+	for _, value := range values {
+		if err := appendProjectionAggregateGroupKeyValue(&b, value); err != nil {
+			return "", err
+		}
+		b.WriteByte('\x1f')
+	}
+	return b.String(), nil
+}
+
+func appendProjectionAggregateGroupKeyValue(b *strings.Builder, value any) error {
+	switch typed := value.(type) {
+	case nil:
+		b.WriteString("n")
+		return nil
+	case bool:
+		if typed {
+			b.WriteString("b1")
+		} else {
+			b.WriteString("b0")
+		}
+		return nil
+	case string:
+		b.WriteString("s")
+		b.WriteString(typed)
+		return nil
+	case json.Number:
+		b.WriteString("j")
+		b.WriteString(typed.String())
+		return nil
+	case int:
+		b.WriteString("i")
+		b.WriteString(strconv.FormatInt(int64(typed), 10))
+		return nil
+	case int8:
+		b.WriteString("i")
+		b.WriteString(strconv.FormatInt(int64(typed), 10))
+		return nil
+	case int16:
+		b.WriteString("i")
+		b.WriteString(strconv.FormatInt(int64(typed), 10))
+		return nil
+	case int32:
+		b.WriteString("i")
+		b.WriteString(strconv.FormatInt(int64(typed), 10))
+		return nil
+	case int64:
+		b.WriteString("i")
+		b.WriteString(strconv.FormatInt(typed, 10))
+		return nil
+	case uint:
+		b.WriteString("u")
+		b.WriteString(strconv.FormatUint(uint64(typed), 10))
+		return nil
+	case uint8:
+		b.WriteString("u")
+		b.WriteString(strconv.FormatUint(uint64(typed), 10))
+		return nil
+	case uint16:
+		b.WriteString("u")
+		b.WriteString(strconv.FormatUint(uint64(typed), 10))
+		return nil
+	case uint32:
+		b.WriteString("u")
+		b.WriteString(strconv.FormatUint(uint64(typed), 10))
+		return nil
+	case uint64:
+		b.WriteString("u")
+		b.WriteString(strconv.FormatUint(typed, 10))
+		return nil
+	case float32:
+		b.WriteString("f")
+		b.WriteString(strconv.FormatFloat(float64(typed), 'g', -1, 64))
+		return nil
+	case float64:
+		b.WriteString("f")
+		b.WriteString(strconv.FormatFloat(typed, 'g', -1, 64))
+		return nil
+	case *graph.Vertex:
+		b.WriteString("v")
+		if typed != nil {
+			b.WriteString(typed.Tenant)
+			b.WriteByte('\x1e')
+			b.WriteString(typed.ID)
+		}
+		return nil
+	case *graph.Edge:
+		b.WriteString("e")
+		if typed != nil {
+			b.WriteString(typed.Tenant)
+			b.WriteByte('\x1e')
+			b.WriteString(typed.ID)
+		}
+		return nil
+	}
+
+	normalized := normalizeResultValue(value)
+	keyBytes, err := json.Marshal(normalized)
+	if err != nil {
+		return err
+	}
+	b.WriteString("c")
+	b.Write(keyBytes)
+	return nil
+}
+
 func applyProjectionPostProcessing(rows []Row, clause projectionClauseSpec, params Params) ([]Row, error) {
 	if clause.Distinct {
 		rows = distinctProjectionRows(rows)
-	}
-	if len(clause.OrderBy) > 0 && len(rows) > 1 {
-		sorted, err := sortProjectedRows(rows, clause.OrderBy, params)
-		if err != nil {
-			return nil, err
-		}
-		rows = sorted
 	}
 
 	skip, err := evalOptionalInt(rawExpression(clause.SkipRaw), params)
@@ -7862,6 +9441,22 @@ func applyProjectionPostProcessing(rows []Row, clause projectionClauseSpec, para
 	}
 
 	hasLimit := strings.TrimSpace(clause.LimitRaw) != ""
+	if hasLimit && limit == 0 {
+		return []Row{}, nil
+	}
+
+	if len(clause.OrderBy) > 0 && len(rows) > 1 {
+		sortLimit := 0
+		if hasLimit && limit > 0 {
+			sortLimit = skip + limit
+		}
+		sorted, err := sortProjectedRows(rows, clause.OrderBy, params, sortLimit)
+		if err != nil {
+			return nil, err
+		}
+		rows = sorted
+	}
+
 	return applySkipLimit(rows, skip, limit, hasLimit), nil
 }
 
@@ -7905,14 +9500,15 @@ func trimProjectionRows(rows []Row, columns []string) []Row {
 	return out
 }
 
-func sortProjectedRows(rows []Row, orderBy []projectionOrderBySpec, params Params) ([]Row, error) {
-	type sortRow struct {
-		row  Row
-		keys []any
-	}
+type projectionSortRow struct {
+	row        Row
+	keys       []any
+	inputIndex int
+}
 
-	indexed := make([]sortRow, 0, len(rows))
-	for _, row := range rows {
+func sortProjectedRows(rows []Row, orderBy []projectionOrderBySpec, params Params, sortLimit int) ([]Row, error) {
+	indexed := make([]projectionSortRow, 0, len(rows))
+	for idx, row := range rows {
 		keys := make([]any, 0, len(orderBy))
 		for _, item := range orderBy {
 			value, err := evalExpressionWithScope(item.Expression, row, params)
@@ -7921,29 +9517,78 @@ func sortProjectedRows(rows []Row, orderBy []projectionOrderBySpec, params Param
 			}
 			keys = append(keys, value)
 		}
-		indexed = append(indexed, sortRow{row: row, keys: keys})
+		indexed = append(indexed, projectionSortRow{row: row, keys: keys, inputIndex: idx})
 	}
 
-	sort.SliceStable(indexed, func(i, j int) bool {
-		for idx, item := range orderBy {
-			cmp := compareSortValues(indexed[i].keys[idx], indexed[j].keys[idx])
-			if cmp == 0 {
+	if sortLimit > 0 && sortLimit < len(indexed) {
+		top := &projectionTopKHeap{orderBy: orderBy, rows: make([]projectionSortRow, 0, sortLimit)}
+		for _, item := range indexed {
+			if len(top.rows) < sortLimit {
+				heap.Push(top, item)
 				continue
 			}
-			if item.Descending {
-				return cmp > 0
+			if compareProjectionSortRows(item, top.rows[0], orderBy) < 0 {
+				top.rows[0] = item
+				heap.Fix(top, 0)
 			}
-			return cmp < 0
 		}
-		return false
+		indexed = top.rows
+	}
+
+	sort.Slice(indexed, func(i, j int) bool {
+		return compareProjectionSortRows(indexed[i], indexed[j], orderBy) < 0
 	})
 
-	out := make([]Row, 0, len(rows))
+	out := make([]Row, 0, len(indexed))
 	for _, item := range indexed {
 		out = append(out, item.row)
 	}
 
 	return out, nil
+}
+
+func compareProjectionSortRows(left, right projectionSortRow, orderBy []projectionOrderBySpec) int {
+	for idx, item := range orderBy {
+		cmp := compareSortValues(left.keys[idx], right.keys[idx])
+		if cmp == 0 {
+			continue
+		}
+		if item.Descending {
+			cmp = -cmp
+		}
+		return cmp
+	}
+	if left.inputIndex < right.inputIndex {
+		return -1
+	}
+	if left.inputIndex > right.inputIndex {
+		return 1
+	}
+	return 0
+}
+
+type projectionTopKHeap struct {
+	rows    []projectionSortRow
+	orderBy []projectionOrderBySpec
+}
+
+func (h projectionTopKHeap) Len() int { return len(h.rows) }
+
+func (h projectionTopKHeap) Less(i, j int) bool {
+	return compareProjectionSortRows(h.rows[i], h.rows[j], h.orderBy) > 0
+}
+
+func (h projectionTopKHeap) Swap(i, j int) { h.rows[i], h.rows[j] = h.rows[j], h.rows[i] }
+
+func (h *projectionTopKHeap) Push(x any) {
+	h.rows = append(h.rows, x.(projectionSortRow))
+}
+
+func (h *projectionTopKHeap) Pop() any {
+	last := len(h.rows) - 1
+	item := h.rows[last]
+	h.rows = h.rows[:last]
+	return item
 }
 
 func compareSortValues(left, right any) int {
@@ -13997,11 +15642,365 @@ func (e *Executor) evalWhereRelationshipPatternPredicate(ctx context.Context, tx
 		return false, false, nil
 	}
 
+	if matched, handled, err := e.evalFastWhereRelationshipPatternPredicate(ctx, tx, patternRaw, row, params); handled {
+		return matched, true, err
+	}
+
 	matches, err := e.applyMatchClause(ctx, tx, []Row{cloneRow(row)}, ast.Clause{Kind: ast.ClauseKindMatch, Raw: "MATCH " + patternRaw}, params)
 	if err != nil {
 		return false, true, err
 	}
 	return len(matches) > 0, true, nil
+}
+
+func (e *Executor) evalFastWhereRelationshipPatternPredicate(ctx context.Context, tx graph.Tx, patternRaw string, row Row, params Params) (bool, bool, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return false, true, err
+	}
+
+	if pattern, err := parseDirectedRelationshipPattern(patternRaw); err == nil {
+		if strings.TrimSpace(pattern.EdgeVar) != "" || strings.TrimSpace(pattern.EdgeProps) != "" || len(pattern.EdgeAnyOf) != 0 {
+			return false, false, nil
+		}
+		src, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return false, true, err
+		}
+		if !bound {
+			return false, false, nil
+		}
+		dst, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Right, params)
+		if err != nil {
+			return false, true, err
+		}
+		if !bound {
+			return false, false, nil
+		}
+		if src == nil || dst == nil {
+			return false, true, nil
+		}
+		matched, err := relationshipExistsByDirection(ctx, tx, params, tenant, src.ID, dst.ID, strings.TrimSpace(pattern.EdgeType), true)
+		return matched, true, err
+	}
+
+	if pattern, err := parseReverseDirectedRelationshipPattern(patternRaw); err == nil {
+		if strings.TrimSpace(pattern.EdgeVar) != "" || strings.TrimSpace(pattern.EdgeProps) != "" || len(pattern.EdgeAnyOf) != 0 {
+			return false, false, nil
+		}
+		src, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Right, params)
+		if err != nil {
+			return false, true, err
+		}
+		if !bound {
+			return false, false, nil
+		}
+		dst, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Left, params)
+		if err != nil {
+			return false, true, err
+		}
+		if !bound {
+			return false, false, nil
+		}
+		if src == nil || dst == nil {
+			return false, true, nil
+		}
+		matched, err := relationshipExistsByDirection(ctx, tx, params, tenant, src.ID, dst.ID, strings.TrimSpace(pattern.EdgeType), true)
+		return matched, true, err
+	}
+
+	return false, false, nil
+}
+
+func resolveBoundPredicateVertex(ctx context.Context, tx graph.Tx, tenant string, row Row, pattern vertexPattern, params Params) (*graph.Vertex, bool, error) {
+	varName := strings.TrimSpace(pattern.Var)
+	if varName == "" {
+		return nil, false, nil
+	}
+
+	binding, ok := row[varName]
+	if !ok {
+		return nil, false, nil
+	}
+	if binding == nil {
+		return nil, true, nil
+	}
+
+	var vertex *graph.Vertex
+	switch typed := binding.(type) {
+	case *graph.Vertex:
+		vertex = typed
+	case string:
+		resolved, err := getVertexQueryCached(ctx, tx, tenant, typed, params)
+		if err != nil {
+			return nil, true, err
+		}
+		if resolved == nil {
+			return nil, true, nil
+		}
+		vertex = resolved
+	default:
+		return nil, false, nil
+	}
+
+	if vertex == nil || !vertexPatternMatches(vertex, pattern, params, row) {
+		return nil, true, nil
+	}
+
+	return vertex, true, nil
+}
+
+func relationshipExistsByDirection(ctx context.Context, tx graph.Tx, params Params, tenant, srcID, dstID, edgeType string, forward bool) (bool, error) {
+	srcID = strings.TrimSpace(srcID)
+	dstID = strings.TrimSpace(dstID)
+	if srcID == "" || dstID == "" {
+		return false, nil
+	}
+
+	cache := ensureWherePatternPredicateCache(params)
+	cacheKey := wherePatternPredicateCacheKey(tenant, srcID, edgeType)
+
+	neighbors := cache.outNeighbors[cacheKey]
+	if !forward {
+		neighbors = cache.inNeighbors[cacheKey]
+	}
+	if neighbors == nil {
+		loaded, err := loadWherePatternPredicateNeighbors(ctx, tx, tenant, srcID, edgeType, forward, params)
+		if err != nil {
+			return false, err
+		}
+		neighbors = loaded
+		if forward {
+			cache.outNeighbors[cacheKey] = neighbors
+		} else {
+			cache.inNeighbors[cacheKey] = neighbors
+		}
+	}
+
+	_, ok := neighbors[dstID]
+	return ok, nil
+}
+
+func ensureWherePatternPredicateCache(params Params) *wherePatternPredicateCache {
+	if params == nil {
+		return &wherePatternPredicateCache{outNeighbors: map[string]map[string]struct{}{}, inNeighbors: map[string]map[string]struct{}{}}
+	}
+	if existing, ok := params[wherePatternPredicateCacheParam].(*wherePatternPredicateCache); ok && existing != nil {
+		if existing.outNeighbors == nil {
+			existing.outNeighbors = map[string]map[string]struct{}{}
+		}
+		if existing.inNeighbors == nil {
+			existing.inNeighbors = map[string]map[string]struct{}{}
+		}
+		return existing
+	}
+	cache := &wherePatternPredicateCache{outNeighbors: map[string]map[string]struct{}{}, inNeighbors: map[string]map[string]struct{}{}}
+	params[wherePatternPredicateCacheParam] = cache
+	return cache
+}
+
+func resetWherePatternPredicateCache(params Params) {
+	if params == nil {
+		return
+	}
+	delete(params, wherePatternPredicateCacheParam)
+}
+
+func ensureQueryEntityCache(params Params) *queryEntityCache {
+	if params == nil {
+		return &queryEntityCache{vertexes: map[string]*graph.Vertex{}, missing: map[string]struct{}{}}
+	}
+	if existing, ok := params[queryEntityCacheParam].(*queryEntityCache); ok && existing != nil {
+		if existing.vertexes == nil {
+			existing.vertexes = map[string]*graph.Vertex{}
+		}
+		if existing.missing == nil {
+			existing.missing = map[string]struct{}{}
+		}
+		return existing
+	}
+	cache := &queryEntityCache{vertexes: map[string]*graph.Vertex{}, missing: map[string]struct{}{}}
+	params[queryEntityCacheParam] = cache
+	return cache
+}
+
+func resetQueryEntityCache(params Params) {
+	if params == nil {
+		return
+	}
+	delete(params, queryEntityCacheParam)
+}
+
+func ensureQueryAdjacencyCache(params Params) *queryAdjacencyCache {
+	if params == nil {
+		return &queryAdjacencyCache{outEdges: map[string][]*graph.Edge{}, inEdges: map[string][]*graph.Edge{}}
+	}
+	if existing, ok := params[queryAdjacencyCacheParam].(*queryAdjacencyCache); ok && existing != nil {
+		if existing.outEdges == nil {
+			existing.outEdges = map[string][]*graph.Edge{}
+		}
+		if existing.inEdges == nil {
+			existing.inEdges = map[string][]*graph.Edge{}
+		}
+		return existing
+	}
+	cache := &queryAdjacencyCache{outEdges: map[string][]*graph.Edge{}, inEdges: map[string][]*graph.Edge{}}
+	params[queryAdjacencyCacheParam] = cache
+	return cache
+}
+
+func resetQueryAdjacencyCache(params Params) {
+	if params == nil {
+		return
+	}
+	delete(params, queryAdjacencyCacheParam)
+}
+
+func queryAdjacencyCacheKey(tenant, vertexID, edgeType string) string {
+	return strings.TrimSpace(tenant) + "\x00" + strings.TrimSpace(vertexID) + "\x00" + strings.TrimSpace(edgeType)
+}
+
+func cloneEdgeForCache(edge *graph.Edge) *graph.Edge {
+	if edge == nil {
+		return nil
+	}
+	cloned := *edge
+	if edge.Properties != nil {
+		props := make(graph.PropertyMap, len(edge.Properties))
+		for key, raw := range edge.Properties {
+			copied := make([]byte, len(raw))
+			copy(copied, raw)
+			props[key] = copied
+		}
+		cloned.Properties = props
+	}
+	return &cloned
+}
+
+func scanOutEdgesQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID, edgeType string, params Params, fn func(*graph.Edge) error) error {
+	if params == nil {
+		return tx.ScanOutEdges(ctx, tenant, vertexID, edgeType, 0, fn)
+	}
+	cache := ensureQueryAdjacencyCache(params)
+	key := queryAdjacencyCacheKey(tenant, vertexID, edgeType)
+	edges, ok := cache.outEdges[key]
+	if !ok {
+		edges = make([]*graph.Edge, 0)
+		if err := tx.ScanOutEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
+			if edge != nil {
+				edges = append(edges, cloneEdgeForCache(edge))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		cache.outEdges[key] = edges
+	}
+	for _, edge := range edges {
+		if err := fn(edge); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func scanInEdgesQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID, edgeType string, params Params, fn func(*graph.Edge) error) error {
+	if params == nil {
+		return tx.ScanInEdges(ctx, tenant, vertexID, edgeType, 0, fn)
+	}
+	cache := ensureQueryAdjacencyCache(params)
+	key := queryAdjacencyCacheKey(tenant, vertexID, edgeType)
+	edges, ok := cache.inEdges[key]
+	if !ok {
+		edges = make([]*graph.Edge, 0)
+		if err := tx.ScanInEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
+			if edge != nil {
+				edges = append(edges, cloneEdgeForCache(edge))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		cache.inEdges[key] = edges
+	}
+	for _, edge := range edges {
+		if err := fn(edge); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func queryEntityCacheKey(tenant, vertexID string) string {
+	return strings.TrimSpace(tenant) + "\x00" + strings.TrimSpace(vertexID)
+}
+
+func getVertexQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID string, params Params) (*graph.Vertex, error) {
+	vertexID = strings.TrimSpace(vertexID)
+	if vertexID == "" {
+		return nil, nil
+	}
+	if params == nil {
+		vertex, err := tx.GetVertex(ctx, tenant, vertexID)
+		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return vertex, nil
+	}
+
+	cache := ensureQueryEntityCache(params)
+	key := queryEntityCacheKey(tenant, vertexID)
+	if vertex, ok := cache.vertexes[key]; ok {
+		return vertex, nil
+	}
+	if _, missing := cache.missing[key]; missing {
+		return nil, nil
+	}
+
+	vertex, err := tx.GetVertex(ctx, tenant, vertexID)
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			cache.missing[key] = struct{}{}
+			return nil, nil
+		}
+		return nil, err
+	}
+	cache.vertexes[key] = vertex
+	return vertex, nil
+}
+
+func wherePatternPredicateCacheKey(tenant, vertexID, edgeType string) string {
+	return strings.TrimSpace(tenant) + "\x00" + strings.TrimSpace(vertexID) + "\x00" + strings.TrimSpace(edgeType)
+}
+
+func loadWherePatternPredicateNeighbors(ctx context.Context, tx graph.Tx, tenant, vertexID, edgeType string, forward bool, params Params) (map[string]struct{}, error) {
+	neighbors := map[string]struct{}{}
+
+	if forward {
+		if err := scanOutEdgesQueryCached(ctx, tx, tenant, vertexID, edgeType, params, func(edge *graph.Edge) error {
+			if edge != nil {
+				neighbors[edge.DstID] = struct{}{}
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		return neighbors, nil
+	}
+
+	if err := scanInEdgesQueryCached(ctx, tx, tenant, vertexID, edgeType, params, func(edge *graph.Edge) error {
+		if edge != nil {
+			neighbors[edge.SrcID] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return neighbors, nil
 }
 
 func rewriteReverseVariableLengthPatternPredicate(raw string) (string, bool) {

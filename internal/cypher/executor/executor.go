@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
@@ -64,6 +65,9 @@ type IndexCatalog interface {
 	HasPropertyIndex(tenant, schema, property string) bool
 	AddPropertyIndex(tenant, schema, property string) bool
 	RemovePropertyIndex(tenant, schema, property string) bool
+	HasEdgePropertyIndex(tenant, edgeType, property string) bool
+	AddEdgePropertyIndex(tenant, edgeType, property string) bool
+	RemoveEdgePropertyIndex(tenant, edgeType, property string) bool
 }
 
 type Options struct {
@@ -75,6 +79,10 @@ type Executor struct {
 	store        graph.GraphStore
 	metrics      Metrics
 	indexCatalog IndexCatalog
+
+	indexJobWorkerOnce   sync.Once
+	indexJobWorkerMu     sync.Mutex
+	indexJobWorkerCancel context.CancelFunc
 }
 
 type noopMetrics struct{}

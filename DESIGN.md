@@ -78,6 +78,24 @@ Direction:
 
 This shifts Phase 2 emphasis from "more supported syntax" toward "cleaner phase handoff, explainability, and semantics-preserving execution architecture."
 
+## Edge Property Index Pushdown (Current Semantics)
+
+Current relationship traversal optimization uses configured edge property indexes in two ways:
+
+1. Equality pushdown from relationship pattern properties, e.g. `MATCH (a)-[r:TYPE {k:$v}]->(b)`.
+2. Numeric range pushdown from WHERE conjuncts over relationship properties, e.g. `r.rating >= 4` or `r.rating > 4 AND r.rating <= 5`.
+
+Correctness and fallback policy:
+
+1. Pushdown is conservative; unsupported or ambiguous WHERE forms are not pushed down.
+2. Residual predicate evaluation always runs, so non-pushdown predicates continue filtering rows after candidate retrieval.
+3. Contradictory numeric ranges are detected early and short-circuit to empty results.
+4. Broad range scans are protected by an internal candidate cap; when exceeded, execution falls back to adjacency expansion.
+
+Operational note:
+
+1. Edge property indexes are catalog-driven and backfilled automatically at startup from index schema configuration.
+
 ## EXPLAIN Specification Decision
 
 ### Decision

@@ -18,6 +18,7 @@ type explainAnalysis struct {
 	edgeCounts       []map[string]any
 	predicateSignals []map[string]any
 	indexDecisions   []map[string]any
+	fastPaths        []map[string]any
 	cardinality      []map[string]any
 	costEstimate     map[string]any
 	runtimeStats     map[string]any
@@ -90,10 +91,11 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	analysis.predicateSignals = buildExplainPredicateSignals(stmt, params, tenant, stats)
 	planNodes := buildExplainPlanNodes(stmt, e.indexCatalog, tenant, params)
 	analysis.indexDecisions = buildExplainIndexDecisions(stmt, params, e.indexCatalog, tenant, stats, planNodes)
+	analysis.fastPaths = collectExplainFastPaths(stmt, params)
 	analysis.cardinality = buildExplainCardinalityFromPlanNodes(planNodes, params, stats)
 	analysis.costEstimate = buildExplainCostEstimate(planNodes, analysis.cardinality, analysis.indexDecisions)
 	analysis.warnings = buildExplainWarnings(stmt, analysis, planNodes, tenant)
-	analysis.runtimeStats = buildExplainRuntimeStats(planNodes, analysis.cardinality, analysis.indexDecisions, analysis.warnings, stats)
+	analysis.runtimeStats = buildExplainRuntimeStats(planNodes, analysis.cardinality, analysis.indexDecisions, analysis.fastPaths, analysis.warnings, stats)
 	return analysis, nil
 }
 
@@ -139,11 +141,12 @@ func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params
 			},
 			"predicateSignals": analysis.predicateSignals,
 		},
-		"cardinality":    analysis.cardinality,
-		"costEstimate":   analysis.costEstimate,
-		"runtimeStats":   analysis.runtimeStats,
-		"indexDecisions": analysis.indexDecisions,
-		"warnings":       analysis.warnings,
+		"cardinality":         analysis.cardinality,
+		"costEstimate":        analysis.costEstimate,
+		"runtimeStats":        analysis.runtimeStats,
+		"indexDecisions":      analysis.indexDecisions,
+		"executionStrategies": analysis.fastPaths,
+		"warnings":            analysis.warnings,
 		"metadata": map[string]any{
 			"transport": "json",
 		},
@@ -529,12 +532,22 @@ func buildExplainIndexDecisions(stmt ast.Statement, params Params, catalog Index
 
 		schema := strings.TrimSpace(candidate.Schema)
 		property := strings.TrimSpace(candidate.Property)
+		entityClass := strings.TrimSpace(candidate.EntityClass)
+		if entityClass == "" {
+			entityClass = "vertex"
+		}
 		if schema == "" || property == "" {
 			continue
 		}
 
-		selected := catalog != nil && catalog.HasPropertyIndex(tenant, schema, property)
+		selected := false
 		scanPopulation := explainSchemaPopulation(stats, schema)
+		if entityClass == "edge" {
+			selected = catalog != nil && catalog.HasEdgePropertyIndex(tenant, schema, property)
+			scanPopulation = explainEdgeTypePopulation(stats, schema)
+		} else {
+			selected = catalog != nil && catalog.HasPropertyIndex(tenant, schema, property)
+		}
 		matchedCount := candidate.MatchedCount
 		if matchedCount < 0 {
 			matchedCount = 0
@@ -576,6 +589,7 @@ func buildExplainIndexDecisions(stmt ast.Statement, params Params, catalog Index
 
 		decision := map[string]any{
 			"vertexId":             vertexID,
+			"entityClass":          entityClass,
 			"schema":               schema,
 			"property":             property,
 			"candidate":            true,
@@ -600,6 +614,7 @@ func buildExplainIndexDecisions(stmt ast.Statement, params Params, catalog Index
 }
 
 type explainIndexCandidate struct {
+	EntityClass  string
 	VertexID     string
 	Schema       string
 	Property     string
@@ -620,11 +635,68 @@ func collectExplainIndexCandidates(stmt ast.Statement, params Params, stats expl
 				continue
 			}
 			candidates = append(candidates, explainIndexCandidate{
+				EntityClass:  "vertex",
 				Schema:       strings.TrimSpace(schema),
 				Property:     strings.TrimSpace(property),
 				MatchedCount: matchedCount,
 				Quality:      quality,
 			})
+		}
+	}
+	appendEdgePattern := func(edgeType string, props map[string]any, quality string) {
+		edgeType = strings.TrimSpace(edgeType)
+		if edgeType == "" {
+			return
+		}
+		for property := range props {
+			if strings.EqualFold(property, "id") {
+				continue
+			}
+			candidates = append(candidates, explainIndexCandidate{
+				EntityClass:  "edge",
+				Schema:       edgeType,
+				Property:     strings.TrimSpace(property),
+				MatchedCount: 0,
+				Quality:      quality,
+			})
+		}
+	}
+	appendEdgePatternAnyOf := func(edgeTypes []string, props map[string]any, quality string) {
+		for _, edgeType := range edgeTypes {
+			appendEdgePattern(edgeType, props, quality)
+		}
+	}
+	appendEdgePatternFromRaw := func(raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		if pattern, err := parseDirectedRelationshipPattern(raw); err == nil {
+			if props, err := explainPropertyMap(pattern.EdgeProps, params); err == nil && len(props) > 0 {
+				appendEdgePattern(pattern.EdgeType, props, "estimate")
+				appendEdgePatternAnyOf(pattern.EdgeAnyOf, props, "estimate")
+			} else if keys := explainPropertyKeys(pattern.EdgeProps); len(keys) > 0 {
+				appendEdgePattern(pattern.EdgeType, keys, "estimate")
+				appendEdgePatternAnyOf(pattern.EdgeAnyOf, keys, "estimate")
+			}
+		}
+		if pattern, err := parseReverseDirectedRelationshipPattern(raw); err == nil {
+			if props, err := explainPropertyMap(pattern.EdgeProps, params); err == nil && len(props) > 0 {
+				appendEdgePattern(pattern.EdgeType, props, "estimate")
+				appendEdgePatternAnyOf(pattern.EdgeAnyOf, props, "estimate")
+			} else if keys := explainPropertyKeys(pattern.EdgeProps); len(keys) > 0 {
+				appendEdgePattern(pattern.EdgeType, keys, "estimate")
+				appendEdgePatternAnyOf(pattern.EdgeAnyOf, keys, "estimate")
+			}
+		}
+		if pattern, err := parseUndirectedRelationshipPattern(raw); err == nil {
+			if props, err := explainPropertyMap(pattern.EdgeProps, params); err == nil && len(props) > 0 {
+				appendEdgePattern(pattern.EdgeType, props, "estimate")
+				appendEdgePatternAnyOf(pattern.EdgeAnyOf, props, "estimate")
+			} else if keys := explainPropertyKeys(pattern.EdgeProps); len(keys) > 0 {
+				appendEdgePattern(pattern.EdgeType, keys, "estimate")
+				appendEdgePatternAnyOf(pattern.EdgeAnyOf, keys, "estimate")
+			}
 		}
 	}
 
@@ -649,6 +721,7 @@ func collectExplainIndexCandidates(stmt ast.Statement, params Params, stats expl
 					appendNodePattern(anchored.SourceLabel, keys, 0, "estimate")
 				}
 			}
+			appendEdgePatternFromRaw(match.Pattern)
 		}
 	case *ast.QueryStatement:
 		for _, part := range s.Parts {
@@ -676,6 +749,7 @@ func collectExplainIndexCandidates(stmt ast.Statement, params Params, stats expl
 						appendNodePattern(anchored.SourceLabel, keys, 0, "estimate")
 					}
 				}
+				appendEdgePatternFromRaw(patternRaw)
 			}
 		}
 	}
@@ -813,6 +887,17 @@ func explainSchemaPopulation(stats explainStoreStats, schema string) int {
 		return count
 	}
 	return stats.vertexTotal
+}
+
+func explainEdgeTypePopulation(stats explainStoreStats, edgeType string) int {
+	edgeType = strings.TrimSpace(edgeType)
+	if edgeType == "" {
+		return stats.edgeTotal
+	}
+	if count, ok := stats.edgeCounts[edgeType]; ok {
+		return count
+	}
+	return stats.edgeTotal
 }
 
 func explainIndexTuningImpact(selectivity float64) string {
@@ -1015,7 +1100,7 @@ func buildExplainCostEstimate(planVertexes []map[string]any, cardinality []map[s
 	}
 }
 
-func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any, warnings []map[string]any, stats explainStoreStats) map[string]any {
+func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any, fastPaths []map[string]any, warnings []map[string]any, stats explainStoreStats) map[string]any {
 	scanVertexes := 0
 	filterVertexes := 0
 	projectionVertexes := 0
@@ -1091,6 +1176,18 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 		edgesScanned = stats.edgeTotal
 	}
 
+	implementations := make([]string, 0, len(fastPaths))
+	prefilterBypassCandidates := 0
+	for _, path := range fastPaths {
+		implementation, _ := path["implementation"].(string)
+		if strings.TrimSpace(implementation) != "" {
+			implementations = append(implementations, implementation)
+		}
+		if covered, _ := path["wherePrefilterCoverage"].(bool); covered {
+			prefilterBypassCandidates++
+		}
+	}
+
 	return map[string]any{
 		"store": map[string]any{
 			"verticesScanned": verticesScanned,
@@ -1115,6 +1212,11 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 			"rowsRead":   rowsRead,
 			"rowsOutput": rowsOutput,
 			"quality":    cardinalityQuality,
+		},
+		"execution": map[string]any{
+			"fastPathCandidates":        len(fastPaths),
+			"implementations":           implementations,
+			"prefilterBypassCandidates": prefilterBypassCandidates,
 		},
 	}
 }
@@ -1192,13 +1294,95 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planVer
 		}
 	}
 
-	if len(warnings) == 0 && explainPlanHasUnsupportedShape(planVertexes) {
+	if len(warnings) == 0 && explainPlanHasUnsupportedShape(planVertexes) && len(analysis.fastPaths) == 0 {
 		addWarning(map[string]any{
 			"code":    "PLAN_ANALYSIS_PARTIAL",
 			"message": "Plan analysis is partial for unsupported query shapes",
 		})
 	}
 	return warnings
+}
+
+func collectExplainFastPaths(stmt ast.Statement, params Params) []map[string]any {
+	signals := make([]map[string]any, 0)
+	seen := map[string]struct{}{}
+	addSignal := func(signal map[string]any) {
+		if signal == nil {
+			return
+		}
+		implementation, _ := signal["implementation"].(string)
+		if strings.TrimSpace(implementation) == "" {
+			return
+		}
+		if _, ok := seen[implementation]; ok {
+			return
+		}
+		seen[implementation] = struct{}{}
+		signals = append(signals, signal)
+	}
+
+	collectFromClauses := func(clauses []ast.Clause) {
+		for idx := 0; idx+1 < len(clauses); idx++ {
+			signal, ok := explainFastPathClausePairSignal(clauses[idx], clauses[idx+1], params)
+			if ok {
+				addSignal(signal)
+			}
+		}
+	}
+
+	switch s := stmt.(type) {
+	case *ast.ExplainStatement:
+		return collectExplainFastPaths(s.Statement, params)
+	case *ast.QueryStatement:
+		for _, part := range s.Parts {
+			collectFromClauses(part.Clauses)
+		}
+	case *ast.MatchQueryStatement:
+		if len(s.MatchClauses) == 0 {
+			return signals
+		}
+		matchPattern := strings.TrimSpace(s.MatchClauses[0].Pattern)
+		matchRaw := "MATCH " + matchPattern
+		if s.MatchClauses[0].Optional {
+			matchRaw = "OPTIONAL MATCH " + matchPattern
+		}
+		collectFromClauses([]ast.Clause{
+			{Kind: ast.ClauseKindMatch, Raw: matchRaw, MatchPattern: matchPattern, MatchOptional: s.MatchClauses[0].Optional, Where: s.MatchClauses[0].Where},
+			{Kind: ast.ClauseKindReturn, Projection: &s.Return},
+		})
+	}
+
+	return signals
+}
+
+func explainDirectedWhereHasRightExclusionPattern(whereRaw, rightVar string) bool {
+	rightVar = strings.TrimSpace(rightVar)
+	if rightVar == "" {
+		return false
+	}
+	conjuncts, ok := flattenWhereConjuncts(whereRaw)
+	if !ok || len(conjuncts) == 0 {
+		return false
+	}
+	for _, conjunct := range conjuncts {
+		conjunct = strings.TrimSpace(conjunct)
+		if !hasLogicalNotPrefix(conjunct) {
+			continue
+		}
+		operand := strings.TrimSpace(conjunct[3:])
+		pattern, err := parseDirectedRelationshipPattern(operand)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(pattern.EdgeVar) != "" || strings.TrimSpace(pattern.EdgeProps) != "" || len(pattern.EdgeAnyOf) != 0 {
+			continue
+		}
+		if strings.TrimSpace(pattern.Right.Var) != rightVar {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func explainPlanHasUnsupportedShape(planVertexes []map[string]any) bool {
@@ -1232,6 +1416,81 @@ func explainAllNodesScanBackedByFastVertexCount(planVertexes []map[string]any, v
 		}
 	}
 	return false
+}
+
+func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params Params) (map[string]any, bool) {
+	if matchClause.Kind != ast.ClauseKindMatch {
+		return nil, false
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
+	if err != nil || matchSpec.Optional {
+		return nil, false
+	}
+
+	switch nextClause.Kind {
+	case ast.ClauseKindWith:
+		chain, err := parseTwoHopDirectedChainPattern(matchSpec.Pattern)
+		if err != nil || chain.SecondForward {
+			return nil, false
+		}
+		withSpec, err := projectionClauseSpecFromClause(nextClause)
+		if err != nil {
+			return nil, false
+		}
+		if withSpec.Distinct || len(withSpec.OrderBy) != 0 || strings.TrimSpace(withSpec.SkipRaw) != "" || strings.TrimSpace(withSpec.LimitRaw) != "" {
+			return nil, false
+		}
+		items, err := parseProjectionItems(withSpec.ProjectionRaw)
+		if err != nil {
+			return nil, false
+		}
+		if _, ok := parseFastTargetSharedPeerProjection(items, chain); !ok {
+			return nil, false
+		}
+		return map[string]any{
+			"name":           "target_shared_peer_aggregation",
+			"implementation": "fast_target_shared_peer_aggregation_clause_pair",
+			"clausePair":     "MATCH+WITH",
+			"status":         "eligible",
+		}, true
+
+	case ast.ClauseKindReturn:
+		pattern, err := parseDirectedRelationshipPattern(matchSpec.Pattern)
+		if err != nil {
+			return nil, false
+		}
+		if strings.TrimSpace(pattern.Left.Var) == "" || strings.TrimSpace(pattern.Right.Var) == "" || strings.TrimSpace(pattern.EdgeVar) == "" {
+			return nil, false
+		}
+		retSpec, err := projectionClauseSpecFromClause(nextClause)
+		if err != nil || retSpec.Distinct || strings.TrimSpace(retSpec.WhereRaw) != "" {
+			return nil, false
+		}
+		items, err := parseProjectionItems(retSpec.ProjectionRaw)
+		if err != nil {
+			return nil, false
+		}
+		if _, ok := parseFastPeerCandidateReturnProjection(items, pattern); !ok {
+			return nil, false
+		}
+
+		_, hasNumericConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, Row{}, params)
+		hasRightExclusion := explainDirectedWhereHasRightExclusionPattern(matchSpec.Where, pattern.Right.Var)
+		wherePrefilterCoverage := directedWhereCoveredByExtractedPrefilters(matchSpec.Where, pattern.EdgeVar, pattern.Right.Var, Row{}, params, hasNumericConstraints, hasRightExclusion)
+
+		return map[string]any{
+			"name":                   "peer_candidate_return_aggregation",
+			"implementation":         "fast_peer_candidate_return_aggregation_clause_pair",
+			"clausePair":             "MATCH+RETURN",
+			"status":                 "eligible",
+			"numericPrefilter":       hasNumericConstraints,
+			"antiJoinPrefilter":      hasRightExclusion,
+			"wherePrefilterCoverage": wherePrefilterCoverage,
+		}, true
+	}
+
+	return nil, false
 }
 
 func buildExplainQueryOptions(stmt ast.Statement) map[string]any {
@@ -1405,8 +1664,12 @@ func (b *explainPlanBuilder) build(stmt ast.Statement) {
 		b.addProjectionClause(ast.Clause{Kind: ast.ClauseKindReturn, Projection: &s.Return})
 	case *ast.QueryStatement:
 		for _, part := range s.Parts {
-			for _, clause := range part.Clauses {
-				b.addClause(clause)
+			for idx := 0; idx < len(part.Clauses); idx++ {
+				if idx+1 < len(part.Clauses) && b.addFastPathClausePair(part.Clauses[idx], part.Clauses[idx+1]) {
+					idx++
+					continue
+				}
+				b.addClause(part.Clauses[idx])
 			}
 		}
 	case *ast.StandaloneCallStatement:
@@ -1442,6 +1705,110 @@ func (b *explainPlanBuilder) addClause(clause ast.Clause) {
 			attrs["predicate"] = raw
 		}
 		b.add(string(clause.Kind), attrs)
+	}
+}
+
+func (b *explainPlanBuilder) addFastPathClausePair(matchClause, nextClause ast.Clause) bool {
+	if matchClause.Kind != ast.ClauseKindMatch {
+		return false
+	}
+
+	signal, ok := explainFastPathClausePairSignal(matchClause, nextClause, b.params)
+	if !ok {
+		return false
+	}
+	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
+	if err != nil {
+		return false
+	}
+
+	matchStart := len(b.nodes)
+	whereExpr := matchClause.Where
+	if whereExpr == nil && strings.TrimSpace(matchSpec.Where) != "" {
+		whereExpr = &ast.Expression{Raw: strings.TrimSpace(matchSpec.Where)}
+	}
+	b.addMatchClause(matchSpec.Optional, "MATCH "+matchSpec.Pattern, whereExpr)
+	projectionStart := len(b.nodes)
+	b.annotateMatchRangeWithFastPath(matchStart, projectionStart, signal)
+	b.addClause(nextClause)
+	b.annotateProjectionRangeWithFastPath(projectionStart, signal)
+	return true
+}
+
+func (b *explainPlanBuilder) annotateMatchRangeWithFastPath(start, end int, signal map[string]any) {
+	if start < 0 || start >= len(b.nodes) || signal == nil {
+		return
+	}
+	if end > len(b.nodes) {
+		end = len(b.nodes)
+	}
+	clausePair, _ := signal["clausePair"].(string)
+	if clausePair != "MATCH+RETURN" {
+		return
+	}
+
+	for idx := start; idx < end; idx++ {
+		node := b.nodes[idx]
+		op, _ := node["op"].(string)
+		if op != "EDGE_SCAN" && op != "OPTIONAL_EDGE_SCAN" {
+			continue
+		}
+		if existing, _ := node["implementation"].(string); strings.TrimSpace(existing) == "" {
+			if covered, _ := signal["wherePrefilterCoverage"].(bool); covered {
+				node["implementation"] = "prefilter_covered_directed_relationship_scan"
+			} else {
+				node["implementation"] = "prefiltered_directed_relationship_scan"
+			}
+		}
+		if implementation, _ := signal["implementation"].(string); strings.TrimSpace(implementation) != "" {
+			node["executionStrategy"] = implementation
+		}
+		if name, _ := signal["name"].(string); strings.TrimSpace(name) != "" {
+			node["strategyName"] = name
+		}
+		if status, _ := signal["status"].(string); strings.TrimSpace(status) != "" {
+			node["strategyStatus"] = status
+		}
+		if value, ok := signal["wherePrefilterCoverage"].(bool); ok {
+			node["wherePrefilterCoverage"] = value
+		}
+		if value, ok := signal["numericPrefilter"].(bool); ok {
+			node["numericPrefilter"] = value
+		}
+		if value, ok := signal["antiJoinPrefilter"].(bool); ok {
+			node["antiJoinPrefilter"] = value
+		}
+		return
+	}
+}
+
+func (b *explainPlanBuilder) annotateProjectionRangeWithFastPath(start int, signal map[string]any) {
+	if start < 0 || start >= len(b.nodes) || signal == nil {
+		return
+	}
+	for idx := start; idx < len(b.nodes); idx++ {
+		node := b.nodes[idx]
+		op, _ := node["op"].(string)
+		if op != "PROJECT" && op != "AGGREGATE" {
+			continue
+		}
+		if implementation, _ := signal["implementation"].(string); strings.TrimSpace(implementation) != "" {
+			if existing, _ := node["implementation"].(string); strings.TrimSpace(existing) == "" {
+				node["implementation"] = implementation
+			} else {
+				node["executionStrategy"] = implementation
+			}
+		}
+		if name, _ := signal["name"].(string); strings.TrimSpace(name) != "" {
+			node["strategyName"] = name
+		}
+		if status, _ := signal["status"].(string); strings.TrimSpace(status) != "" {
+			node["strategyStatus"] = status
+		}
+		if value, ok := signal["wherePrefilterCoverage"].(bool); ok {
+			node["wherePrefilterCoverage"] = value
+		}
+		return
 	}
 }
 
@@ -1560,43 +1927,43 @@ func (b *explainPlanBuilder) addFastUndirectedEdgeScan(optional bool, pattern ex
 }
 
 func (b *explainPlanBuilder) addDirectedRelationshipScan(optional bool, pattern directedRelationshipPattern, where *ast.Expression) {
-	b.addRelationshipSegmentScan(optional, "out", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, 0, 0)
+	b.addRelationshipSegmentScan(optional, "out", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, where, 0, 0)
 	if where != nil && strings.TrimSpace(where.Raw) != "" {
 		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(where.Raw)})
 	}
 }
 
 func (b *explainPlanBuilder) addDirectedVariableLengthRelationshipScan(optional bool, pattern directedVariableLengthRelationshipPattern, where *ast.Expression) {
-	b.addRelationshipSegmentScan(optional, "out", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.MinHops, pattern.MaxHops)
+	b.addRelationshipSegmentScan(optional, "out", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, where, pattern.MinHops, pattern.MaxHops)
 	if where != nil && strings.TrimSpace(where.Raw) != "" {
 		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(where.Raw)})
 	}
 }
 
 func (b *explainPlanBuilder) addReverseDirectedRelationshipScan(optional bool, pattern reverseDirectedRelationshipPattern, where *ast.Expression) {
-	b.addRelationshipSegmentScan(optional, "in", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, 0, 0)
+	b.addRelationshipSegmentScan(optional, "in", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, where, 0, 0)
 	if where != nil && strings.TrimSpace(where.Raw) != "" {
 		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(where.Raw)})
 	}
 }
 
 func (b *explainPlanBuilder) addUndirectedRelationshipScan(optional bool, pattern undirectedRelationshipPattern, where *ast.Expression) {
-	b.addRelationshipSegmentScan(optional, "undirected", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, 0, 0)
+	b.addRelationshipSegmentScan(optional, "undirected", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, where, 0, 0)
 	if where != nil && strings.TrimSpace(where.Raw) != "" {
 		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(where.Raw)})
 	}
 }
 
 func (b *explainPlanBuilder) addUndirectedVariableLengthRelationshipScan(optional bool, pattern undirectedVariableLengthRelationshipPattern, where *ast.Expression) {
-	b.addRelationshipSegmentScan(optional, "undirected", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.MinHops, pattern.MaxHops)
+	b.addRelationshipSegmentScan(optional, "undirected", pattern.Left, pattern.Right, pattern.EdgeVar, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, where, pattern.MinHops, pattern.MaxHops)
 	if where != nil && strings.TrimSpace(where.Raw) != "" {
 		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(where.Raw)})
 	}
 }
 
 func (b *explainPlanBuilder) addDirectedVariableLengthThenDirectedVariableLengthScan(optional bool, pattern directedVariableLengthThenDirectedVariableLengthPattern, where *ast.Expression) {
-	b.addRelationshipSegmentScan(optional, "out", pattern.Left, pattern.Mid, pattern.FirstEdgeVar, pattern.FirstEdgeType, pattern.FirstEdgeAnyOf, pattern.FirstEdgeProps, pattern.FirstMinHops, pattern.FirstMaxHops)
-	b.addRelationshipSegmentScan(optional, "out", pattern.Mid, pattern.Right, pattern.SecondEdgeVar, pattern.SecondEdgeType, pattern.SecondEdgeAnyOf, pattern.SecondEdgeProps, pattern.SecondMinHops, pattern.SecondMaxHops)
+	b.addRelationshipSegmentScan(optional, "out", pattern.Left, pattern.Mid, pattern.FirstEdgeVar, pattern.FirstEdgeType, pattern.FirstEdgeAnyOf, pattern.FirstEdgeProps, where, pattern.FirstMinHops, pattern.FirstMaxHops)
+	b.addRelationshipSegmentScan(optional, "out", pattern.Mid, pattern.Right, pattern.SecondEdgeVar, pattern.SecondEdgeType, pattern.SecondEdgeAnyOf, pattern.SecondEdgeProps, where, pattern.SecondMinHops, pattern.SecondMaxHops)
 	if where != nil && strings.TrimSpace(where.Raw) != "" {
 		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(where.Raw)})
 	}
@@ -1623,14 +1990,14 @@ func (b *explainPlanBuilder) addMixedRelationshipChainScan(optional bool, patter
 			minHops = segment.MinHops
 			maxHops = segment.MaxHops
 		}
-		b.addRelationshipSegmentScan(optional, direction, pattern.Vertexes[i], pattern.Vertexes[i+1], segment.EdgeVar, segment.EdgeType, segment.EdgeAnyOf, segment.EdgeProps, minHops, maxHops)
+		b.addRelationshipSegmentScan(optional, direction, pattern.Vertexes[i], pattern.Vertexes[i+1], segment.EdgeVar, segment.EdgeType, segment.EdgeAnyOf, segment.EdgeProps, where, minHops, maxHops)
 	}
 	if where != nil && strings.TrimSpace(where.Raw) != "" {
 		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(where.Raw)})
 	}
 }
 
-func (b *explainPlanBuilder) addRelationshipSegmentScan(optional bool, direction string, left vertexPattern, right vertexPattern, edgeVar, edgeType string, edgeAnyOf []string, edgeProps string, minHops, maxHops int) {
+func (b *explainPlanBuilder) addRelationshipSegmentScan(optional bool, direction string, left vertexPattern, right vertexPattern, edgeVar, edgeType string, edgeAnyOf []string, edgeProps string, where *ast.Expression, minHops, maxHops int) {
 	op := "EDGE_SCAN"
 	if optional {
 		op = "OPTIONAL_EDGE_SCAN"
@@ -1639,6 +2006,27 @@ func (b *explainPlanBuilder) addRelationshipSegmentScan(optional bool, direction
 	edgeType = strings.TrimSpace(edgeType)
 	if edgeType != "" {
 		accessPath = fmt.Sprintf("edge_type(%s)", edgeType)
+		if b.catalog != nil {
+			if prop, _, ok := explainEdgePropertyEquality(edgeProps, b.params); ok && b.catalog.HasEdgePropertyIndex(b.tenant, edgeType, prop) {
+				accessPath = fmt.Sprintf("property_index(%s.%s)", edgeType, prop)
+			} else if where != nil {
+				whereRaw := strings.TrimSpace(where.Raw)
+				constraints, ok := extractEdgeWhereNumericConstraints(whereRaw, edgeVar, Row{}, b.params)
+				if ok {
+					properties := make([]string, 0, len(constraints))
+					for property := range constraints {
+						properties = append(properties, property)
+					}
+					sort.Strings(properties)
+					for _, property := range properties {
+						if b.catalog.HasEdgePropertyIndex(b.tenant, edgeType, property) {
+							accessPath = fmt.Sprintf("property_index(%s.%s)", edgeType, property)
+							break
+						}
+					}
+				}
+			}
+		}
 	}
 	matchDirection := strings.TrimSpace(direction)
 	if matchDirection == "" {
@@ -1710,6 +2098,20 @@ func (b *explainPlanBuilder) addRelationshipSegmentScan(optional bool, direction
 	if strings.TrimSpace(right.PropertiesRaw) != "" {
 		b.add("FILTER", map[string]any{"predicate": strings.TrimSpace(right.PropertiesRaw)})
 	}
+}
+
+func explainEdgePropertyEquality(raw string, params Params) (string, any, bool) {
+	props, err := explainPropertyMap(raw, params)
+	if err != nil || len(props) != 1 {
+		return "", nil, false
+	}
+	for key, value := range props {
+		if strings.EqualFold(key, "id") {
+			return "", nil, false
+		}
+		return strings.TrimSpace(key), value, true
+	}
+	return "", nil, false
 }
 
 func (b *explainPlanBuilder) addNodeScan(optional bool, pattern vertexPattern, where *ast.Expression) {

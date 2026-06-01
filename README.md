@@ -66,6 +66,70 @@ Property indexes can also be created at runtime through gRPC index DDL:
 
 Runtime index DDL backfills existing vertices for the requested `(tenant, schema, property)` tuple so index-backed lookups become available immediately.
 
+Index DDL is also available through Cypher query execution (standalone `CALL`):
+
+```cypher
+CALL db.index.createProperty('User', 'email') YIELD created, indexedEntities
+CALL db.index.createProperty('User', 'email', true) YIELD created, indexedEntities
+
+CALL db.index.createEdgeProperty('RATED', 'rating') YIELD created, indexedEntities
+CALL db.index.createEdgeProperty('RATED', 'rating', true) YIELD created, indexedEntities
+```
+
+For query DDL, tenant context is read from request parameters (for example `{"tenant":"acme"}`).
+
+`db.index.createProperty` creates/backfills a vertex property index for `(tenant, schema, property)`.
+
+`db.index.createEdgeProperty` creates/backfills an edge property index for `(tenant, edgeType, property)`.
+
+`db.index.createEdgeProperty` is fulfilled asynchronously to avoid long request timeouts on large datasets:
+
+- The call returns quickly after persisting a durable build job (`created=true`, `indexedEntities=0` when newly enqueued).
+- Background workers process the build job and backfill index entries out-of-band.
+- Pending jobs are stored durably and resumed on process restart, so fulfillment continues across restarts until completion.
+
+Operational procedures for async edge index builds:
+
+```cypher
+CALL db.index.edgeBuildJobs() YIELD tenant, edgeType, property, pending, totalEdges, indexedEdges
+CALL db.index.processEdgeBuildJobs() YIELD processed, pending
+CALL db.index.restartEdgePropertyBuild('RATED', 'rating') YIELD enqueued
+```
+
+- `db.index.edgeBuildJobs` lists pending durable edge-index build jobs and reports coarse progress (`indexedEdges` vs `totalEdges`).
+- `db.index.edgeBuildJobs` also reports `checkpointVertexID`, which is the last committed restart checkpoint for a pending job.
+- `db.index.processEdgeBuildJobs` runs one immediate processing pass (useful for manual catch-up) and returns `processed` and remaining `pending` jobs.
+- `db.index.restartEdgePropertyBuild` re-enqueues a durable backfill job for an existing edge index tuple.
+
+Server logs now include worker progress lines on pass start and per-job completion, including indexed entry counts and duration.
+
+Edge property indexes are configured through the same startup schema file and are backfilled automatically at startup:
+
+- config field: `edge_property_indexes`
+- item fields: `tenant`, `edge_type`, `property`
+
+Example config:
+
+```json
+{
+	"property_indexes": [
+		{ "tenant": "acme", "schema": "User", "property": "email" },
+		{ "tenant": "acme", "schema": "Device", "property": "serial" }
+	],
+	"edge_property_indexes": [
+		{ "tenant": "acme", "edge_type": "RATED", "property": "rating" }
+	]
+}
+```
+
+Current edge index pushdown behavior in MATCH traversals:
+
+- Equality pushdown on relationship-pattern properties (example: `[r:RATED {rating: 5.0}]`).
+- Numeric range pushdown from WHERE conjuncts on relationship properties (examples: `r.rating >= 4.0`, `r.rating > 4.0 AND r.rating <= 5.0`).
+- Residual predicates still apply after index candidate retrieval (for example `r.note = 'top'`), so correctness is preserved when only part of WHERE is pushdown-eligible.
+- Contradictory numeric ranges short-circuit to zero candidates.
+- Very broad range scans are guarded by an internal candidate cap and safely fall back to adjacency traversal.
+
 Graph store and tenant defaults are configurable at startup:
 
 - flag: `--graph-path data/graph.db`
@@ -412,6 +476,9 @@ Example config:
 	"property_indexes": [
 		{ "tenant": "acme", "schema": "User", "property": "email" },
 		{ "tenant": "acme", "schema": "Device", "property": "serial" }
+	],
+	"edge_property_indexes": [
+		{ "tenant": "acme", "edge_type": "RATED", "property": "rating" }
 	]
 }
 ```

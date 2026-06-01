@@ -44,7 +44,6 @@ type edgeIndexBuildProgress struct {
 	Property           string
 	Pending            bool
 	CheckpointVertexID string
-	TotalEdges         int
 	IndexedEdges       int
 }
 
@@ -312,20 +311,6 @@ func (e *Executor) estimateEdgeIndexBuildProgress(ctx context.Context, job edgeI
 		}
 	}
 	err = e.store.View(ctx, func(tx graph.Tx) error {
-		total := 0
-		if err := tx.ScanVertices(ctx, job.Tenant, 0, func(vertex *graph.Vertex) error {
-			if vertex == nil || strings.TrimSpace(vertex.ID) == "" {
-				return nil
-			}
-			return tx.ScanOutEdges(ctx, job.Tenant, vertex.ID, job.EdgeType, 0, func(edge *graph.Edge) error {
-				if edge != nil {
-					total++
-				}
-				return nil
-			})
-		}); err != nil {
-			return err
-		}
 		indexed := 0
 		if err := tx.ScanPropertyIndexAll(ctx, job.Tenant, job.EdgeType, job.Property, 0, func(entry *graph.PropertyIndexEntry) error {
 			if entry != nil && entry.EntityClass == "edge" {
@@ -334,13 +319,11 @@ func (e *Executor) estimateEdgeIndexBuildProgress(ctx context.Context, job edgeI
 			return nil
 		}); err != nil {
 			if graph.IsKind(err, graph.ErrKindNotFound) {
-				progress.TotalEdges = total
 				progress.IndexedEdges = 0
 				return nil
 			}
 			return err
 		}
-		progress.TotalEdges = total
 		progress.IndexedEdges = indexed
 		return nil
 	})

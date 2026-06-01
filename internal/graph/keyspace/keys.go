@@ -67,6 +67,38 @@ func PropertyIndexNumericPrefix(tenant, schema, property string) []byte {
 	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexNumPrefix, tenant, schema, property))
 }
 
+func PropertyIndexBooleanPrefix(tenant, schema, property string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexPrefix+"b", tenant, schema, property))
+}
+
+func PropertyIndexBooleanKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/%s", indexPrefix+"b", tenant, schema, property, orderedValue, entityID))
+}
+
+func PropertyIndexBooleanValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexPrefix+"b", tenant, schema, property, orderedValue))
+}
+
+func PropertyIndexBooleanValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/\xff", indexPrefix+"b", tenant, schema, property, orderedValue))
+}
+
+func PropertyIndexDateTimePrefix(tenant, schema, property string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexPrefix+"t", tenant, schema, property))
+}
+
+func PropertyIndexDateTimeKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/%s", indexPrefix+"t", tenant, schema, property, orderedValue, entityID))
+}
+
+func PropertyIndexDateTimeValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexPrefix+"t", tenant, schema, property, orderedValue))
+}
+
+func PropertyIndexDateTimeValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/\xff", indexPrefix+"t", tenant, schema, property, orderedValue))
+}
+
 func PropertyIndexNumericKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
 	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/%s", indexNumPrefix, tenant, schema, property, orderedValue, entityID))
 }

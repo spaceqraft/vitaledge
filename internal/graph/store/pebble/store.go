@@ -754,6 +754,82 @@ func (t *tx) ScanPropertyIndexNumericRange(ctx context.Context, tenant, schema, 
 	return nil
 }
 
+func (t *tx) ScanPropertyIndexBooleanRange(ctx context.Context, tenant, schema, property string, lower bool, lowerSet bool, lowerInclusive bool, upper bool, upperSet bool, upperInclusive bool, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_property_index_boolean_range", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || schema == "" || property == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, schema, property, and callback are required", nil)
+	}
+
+	prefix := keyspace.PropertyIndexBooleanPrefix(tenant, schema, property)
+	lowerBound := prefix
+	upperBound := prefixUpperBound(prefix)
+
+	if lowerSet {
+		ordered := orderedBoolBytes(lower)
+		if lowerInclusive {
+			lowerBound = keyspace.PropertyIndexBooleanValuePrefix(tenant, schema, property, ordered)
+		} else {
+			lowerBound = keyspace.PropertyIndexBooleanValueUpperBound(tenant, schema, property, ordered)
+		}
+	}
+	if upperSet {
+		ordered := orderedBoolBytes(upper)
+		if upperInclusive {
+			upperBound = keyspace.PropertyIndexBooleanValueUpperBound(tenant, schema, property, ordered)
+		} else {
+			upperBound = keyspace.PropertyIndexBooleanValuePrefix(tenant, schema, property, ordered)
+		}
+	}
+	if len(upperBound) > 0 && bytes.Compare(lowerBound, upperBound) >= 0 {
+		return nil
+	}
+
+	return t.scanPropertyIndexOrderedRange(ctx, tenant, schema, property, lowerBound, upperBound, limit, fn, booleanPropertyIndexEntryFromKey)
+}
+
+func (t *tx) ScanPropertyIndexDateTimeRange(ctx context.Context, tenant, schema, property string, lower time.Time, lowerSet bool, lowerInclusive bool, upper time.Time, upperSet bool, upperInclusive bool, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_property_index_datetime_range", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || schema == "" || property == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, schema, property, and callback are required", nil)
+	}
+
+	prefix := keyspace.PropertyIndexDateTimePrefix(tenant, schema, property)
+	lowerBound := prefix
+	upperBound := prefixUpperBound(prefix)
+
+	if lowerSet {
+		ordered := orderedTimeBytes(lower.UTC())
+		if lowerInclusive {
+			lowerBound = keyspace.PropertyIndexDateTimeValuePrefix(tenant, schema, property, ordered)
+		} else {
+			lowerBound = keyspace.PropertyIndexDateTimeValueUpperBound(tenant, schema, property, ordered)
+		}
+	}
+	if upperSet {
+		ordered := orderedTimeBytes(upper.UTC())
+		if upperInclusive {
+			upperBound = keyspace.PropertyIndexDateTimeValueUpperBound(tenant, schema, property, ordered)
+		} else {
+			upperBound = keyspace.PropertyIndexDateTimeValuePrefix(tenant, schema, property, ordered)
+		}
+	}
+	if len(upperBound) > 0 && bytes.Compare(lowerBound, upperBound) >= 0 {
+		return nil
+	}
+
+	return t.scanPropertyIndexOrderedRange(ctx, tenant, schema, property, lowerBound, upperBound, limit, fn, datetimePropertyIndexEntryFromKey)
+}
+
 func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEntry) (err error) {
 	started := time.Now()
 	defer func() { t.observeOperation("put_property_index", err, started) }()
@@ -771,6 +847,18 @@ func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEnt
 	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
 		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.set(numericKey, numericPropertyIndexPayload(entry.EntityClass, entry.Value), "write numeric property index"); err != nil {
+			return err
+		}
+	}
+	if orderedValue, ok := booleanOrderedValueFromEncoded(entry.Value); ok {
+		booleanKey := keyspace.PropertyIndexBooleanKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
+		if err := t.set(booleanKey, numericPropertyIndexPayload(entry.EntityClass, entry.Value), "write boolean property index"); err != nil {
+			return err
+		}
+	}
+	if orderedValue, ok := datetimeOrderedValueFromEncoded(entry.Value); ok {
+		datetimeKey := keyspace.PropertyIndexDateTimeKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
+		if err := t.set(datetimeKey, numericPropertyIndexPayload(entry.EntityClass, entry.Value), "write datetime property index"); err != nil {
 			return err
 		}
 	}
@@ -794,6 +882,18 @@ func (t *tx) DeletePropertyIndex(ctx context.Context, entry *graph.PropertyIndex
 	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
 		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.delete(numericKey, "delete numeric property index"); err != nil {
+			return err
+		}
+	}
+	if orderedValue, ok := booleanOrderedValueFromEncoded(entry.Value); ok {
+		booleanKey := keyspace.PropertyIndexBooleanKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
+		if err := t.delete(booleanKey, "delete boolean property index"); err != nil {
+			return err
+		}
+	}
+	if orderedValue, ok := datetimeOrderedValueFromEncoded(entry.Value); ok {
+		datetimeKey := keyspace.PropertyIndexDateTimeKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
+		if err := t.delete(datetimeKey, "delete datetime property index"); err != nil {
 			return err
 		}
 	}
@@ -1494,6 +1594,202 @@ func numericOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return orderedFloat64Bytes(numeric), true
+}
+
+func booleanOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
+	text := strings.TrimSpace(string(raw))
+	switch text {
+	case "false":
+		return orderedBoolBytes(false), true
+	case "true":
+		return orderedBoolBytes(true), true
+	default:
+		return nil, false
+	}
+}
+
+func datetimeOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
+	temporal, ok := parseStoredMapString(string(raw))
+	if !ok {
+		return nil, false
+	}
+	if !strings.EqualFold(strings.TrimSpace(fmt.Sprint(temporal["__temporal_type"])), "datetime") {
+		return nil, false
+	}
+	t, ok := storedTemporalDateTime(temporal)
+	if !ok {
+		return nil, false
+	}
+	return orderedTimeBytes(t.UTC()), true
+}
+
+func orderedBoolBytes(v bool) []byte {
+	if v {
+		return []byte{1}
+	}
+	return []byte{0}
+}
+
+func orderedInt64Bytes(v int64) []byte {
+	bits := uint64(v) ^ (uint64(1) << 63)
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, bits)
+	return out
+}
+
+func orderedTimeBytes(t time.Time) []byte {
+	return orderedInt64Bytes(t.UnixNano())
+}
+
+func (t *tx) scanPropertyIndexOrderedRange(ctx context.Context, tenant, schema, property string, lowerBound, upperBound []byte, limit int, fn func(*graph.PropertyIndexEntry) error, decode func([]byte, []byte, string, string, string) (*graph.PropertyIndexEntry, error)) error {
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: lowerBound, UpperBound: upperBound})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create property index iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		entry, err := decode(iter.Key(), iter.Value(), tenant, schema, property)
+		if err != nil {
+			return err
+		}
+		if err := fn(entry); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan property index", err)
+	}
+	return nil
+}
+
+func booleanPropertyIndexEntryFromKey(key, payload []byte, tenant, schema, property string) (*graph.PropertyIndexEntry, error) {
+	return numericPropertyIndexEntryFromKey(key, payload, tenant, schema, property)
+}
+
+func datetimePropertyIndexEntryFromKey(key, payload []byte, tenant, schema, property string) (*graph.PropertyIndexEntry, error) {
+	return numericPropertyIndexEntryFromKey(key, payload, tenant, schema, property)
+}
+
+func parseStoredMapString(raw string) (map[string]any, bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "map[") || !strings.HasSuffix(raw, "]") {
+		return nil, false
+	}
+	body := strings.TrimSpace(raw[len("map[") : len(raw)-1])
+	if body == "" {
+		return map[string]any{}, true
+	}
+	out := map[string]any{}
+	for _, part := range strings.Fields(body) {
+		pair := strings.SplitN(part, ":", 2)
+		if len(pair) != 2 {
+			continue
+		}
+		out[pair[0]] = pair[1]
+	}
+	return out, true
+}
+
+func storedTemporalDateTime(src map[string]any) (time.Time, bool) {
+	year, ok := storedMapInt(src, "year")
+	if !ok {
+		return time.Time{}, false
+	}
+	month, ok := storedMapInt(src, "month")
+	if !ok {
+		month = 1
+	}
+	day, ok := storedMapInt(src, "day")
+	if !ok {
+		day = 1
+	}
+	hour, _ := storedMapInt(src, "hour")
+	minute, _ := storedMapInt(src, "minute")
+	second, _ := storedMapInt(src, "second")
+	nanosecond, _ := storedMapInt(src, "nanosecond")
+
+	loc := time.UTC
+	if tzRaw, ok := src["timezone"]; ok {
+		tz := strings.TrimSpace(fmt.Sprint(tzRaw))
+		if tz != "" {
+			if offset, err := parseOffsetSeconds(tz); err == nil {
+				loc = time.FixedZone("", offset)
+			} else if loaded, err := time.LoadLocation(tz); err == nil {
+				loc = loaded
+			}
+		}
+	}
+
+	if month < 1 || month > 12 || day < 1 || day > 31 {
+		return time.Time{}, false
+	}
+	return time.Date(year, time.Month(month), day, hour, minute, second, nanosecond, loc), true
+}
+
+func storedMapInt(value map[string]any, key string) (int, bool) {
+	raw, ok := value[key]
+	if !ok {
+		return 0, false
+	}
+	switch typed := raw.(type) {
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	default:
+		return 0, false
+	}
+}
+
+func parseOffsetSeconds(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "Z") {
+		return 0, nil
+	}
+	if strings.HasPrefix(raw, "+") || strings.HasPrefix(raw, "-") {
+		sign := 1
+		if raw[0] == '-' {
+			sign = -1
+		}
+		parts := strings.Split(strings.TrimPrefix(strings.TrimPrefix(raw, "+"), "-"), ":")
+		if len(parts) != 2 && len(parts) != 3 {
+			return 0, fmt.Errorf("invalid offset %q", raw)
+		}
+		hours, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return 0, err
+		}
+		minutes, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, err
+		}
+		seconds := 0
+		if len(parts) == 3 {
+			seconds, err = strconv.Atoi(parts[2])
+			if err != nil {
+				return 0, err
+			}
+		}
+		return sign * (hours*3600 + minutes*60 + seconds), nil
+	}
+	return 0, fmt.Errorf("invalid offset %q", raw)
 }
 
 func orderedFloat64Bytes(v float64) []byte {

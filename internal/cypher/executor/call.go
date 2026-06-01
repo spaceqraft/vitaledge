@@ -277,7 +277,6 @@ func (e *Executor) resolveBuiltinProcedure(name string) (resolvedProcedure, bool
 					{Name: "property", Type: "STRING", Nullable: false},
 					{Name: "pending", Type: "BOOLEAN", Nullable: false},
 					{Name: "checkpointVertexID", Type: "STRING", Nullable: false},
-					{Name: "totalEdges", Type: "INTEGER", Nullable: false},
 					{Name: "indexedEdges", Type: "INTEGER", Nullable: false},
 				},
 			},
@@ -406,7 +405,6 @@ func (e *Executor) builtinEdgeBuildJobsProcedure(ctx context.Context, _ []any, _
 			"property":           item.Property,
 			"pending":            item.Pending,
 			"checkpointVertexID": item.CheckpointVertexID,
-			"totalEdges":         item.TotalEdges,
 			"indexedEdges":       item.IndexedEdges,
 		})
 	}

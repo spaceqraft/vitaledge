@@ -123,12 +123,12 @@ For query DDL, tenant context is read from request parameters (for example `{"te
 Operational procedures for async edge index builds:
 
 ```cypher
-CALL db.index.edgeBuildJobs() YIELD tenant, edgeType, property, pending, totalEdges, indexedEdges
+CALL db.index.edgeBuildJobs() YIELD tenant, edgeType, property, pending, indexedEdges
 CALL db.index.processEdgeBuildJobs() YIELD processed, pending
 CALL db.index.restartEdgePropertyBuild('RATED', 'rating') YIELD enqueued
 ```
 
-- `db.index.edgeBuildJobs` lists pending durable edge-index build jobs and reports coarse progress (`indexedEdges` vs `totalEdges`).
+- `db.index.edgeBuildJobs` lists pending durable edge-index build jobs and reports coarse progress via `indexedEdges`.
 - `db.index.edgeBuildJobs` also reports `checkpointVertexID`, which is the last committed restart checkpoint for a pending job.
 - `db.index.processEdgeBuildJobs` runs one immediate processing pass (useful for manual catch-up) and returns `processed` and remaining `pending` jobs.
 - `db.index.restartEdgePropertyBuild` re-enqueues a durable backfill job for an existing edge index tuple.

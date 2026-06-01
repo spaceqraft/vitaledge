@@ -525,6 +525,128 @@ func TestPropertyIndexNumericRangeScan(t *testing.T) {
 	}
 }
 
+func TestPropertyIndexBooleanRangeScan(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	entries := []*graph.PropertyIndexEntry{
+		{Tenant: "acme", Schema: "Feature", Property: "enabled", Value: []byte("false"), EntityID: "f0", EntityClass: "vertex"},
+		{Tenant: "acme", Schema: "Feature", Property: "enabled", Value: []byte("true"), EntityID: "f1", EntityClass: "vertex"},
+	}
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		for _, entry := range entries {
+			if err := tx.PutPropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("put boolean index entries failed: %v", err)
+	}
+
+	var got []string
+	err = store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexBooleanRange(ctx, "acme", "Feature", "enabled", true, true, true, true, true, true, 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				got = append(got, entry.EntityID)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("boolean range scan failed: %v", err)
+	}
+	if strings.Join(got, ",") != "f1" {
+		t.Fatalf("unexpected boolean range entity ids: %#v", got)
+	}
+
+	booleanPrefix := keyspace.PropertyIndexBooleanPrefix("acme", "Feature", "enabled")
+	if gotCount := countByPrefix(t, store, booleanPrefix); gotCount != 2 {
+		t.Fatalf("expected two boolean shadow index keys, got %d", gotCount)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		for _, entry := range entries {
+			if err := tx.DeletePropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("delete boolean index entries failed: %v", err)
+	}
+	if gotCount := countByPrefix(t, store, booleanPrefix); gotCount != 0 {
+		t.Fatalf("expected boolean shadow index keys to be deleted, got %d", gotCount)
+	}
+}
+
+func TestPropertyIndexDateTimeRangeScan(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	entries := []*graph.PropertyIndexEntry{
+		{Tenant: "acme", Schema: "Event", Property: "startedAt", Value: []byte("map[__temporal_type:datetime day:1 hour:9 minute:0 month:5 nanosecond:0 second:0 timezone:+00:00 year:2024]"), EntityID: "e1", EntityClass: "vertex"},
+		{Tenant: "acme", Schema: "Event", Property: "startedAt", Value: []byte("map[__temporal_type:datetime day:1 hour:12 minute:0 month:5 nanosecond:0 second:0 timezone:+00:00 year:2024]"), EntityID: "e2", EntityClass: "vertex"},
+		{Tenant: "acme", Schema: "Event", Property: "startedAt", Value: []byte("map[__temporal_type:datetime day:1 hour:15 minute:0 month:5 nanosecond:0 second:0 timezone:+00:00 year:2024]"), EntityID: "e3", EntityClass: "vertex"},
+	}
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		for _, entry := range entries {
+			if err := tx.PutPropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("put datetime index entries failed: %v", err)
+	}
+
+	var got []string
+	start := time.Date(2024, 5, 1, 10, 0, 0, 0, time.UTC)
+	end := time.Date(2024, 5, 1, 14, 0, 0, 0, time.UTC)
+	err = store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexDateTimeRange(ctx, "acme", "Event", "startedAt", start, true, true, end, true, true, 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				got = append(got, entry.EntityID)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("datetime range scan failed: %v", err)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "e2" {
+		t.Fatalf("unexpected datetime range entity ids: %#v", got)
+	}
+
+	datetimePrefix := keyspace.PropertyIndexDateTimePrefix("acme", "Event", "startedAt")
+	if gotCount := countByPrefix(t, store, datetimePrefix); gotCount != 3 {
+		t.Fatalf("expected three datetime shadow index keys, got %d", gotCount)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		for _, entry := range entries {
+			if err := tx.DeletePropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("delete datetime index entries failed: %v", err)
+	}
+	if gotCount := countByPrefix(t, store, datetimePrefix); gotCount != 0 {
+		t.Fatalf("expected datetime shadow index keys to be deleted, got %d", gotCount)
+	}
+}
+
 func TestReadOnlyTxRejectsWrites(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)

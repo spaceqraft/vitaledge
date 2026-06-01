@@ -1901,7 +1901,7 @@ func TestEdgeBuildJobProceduresExposeProgressAndManualControls(t *testing.T) {
 		t.Fatalf("create async edge index failed: %v", err)
 	}
 
-	statusStmt, err := parser.ParseStatement("CALL db.index.edgeBuildJobs() YIELD tenant, edgeType, property, pending, totalEdges, indexedEdges RETURN tenant, edgeType, property, pending, totalEdges, indexedEdges")
+	statusStmt, err := parser.ParseStatement("CALL db.index.edgeBuildJobs() YIELD tenant, edgeType, property, pending, indexedEdges RETURN tenant, edgeType, property, pending, indexedEdges")
 	if err != nil {
 		t.Fatalf("parse status call failed: %v", err)
 	}
@@ -1919,10 +1919,6 @@ func TestEdgeBuildJobProceduresExposeProgressAndManualControls(t *testing.T) {
 	if row["pending"] != true {
 		t.Fatalf("expected pending=true, got %#v", row["pending"])
 	}
-	if row["totalEdges"] != 2 {
-		t.Fatalf("expected totalEdges=2, got %#v", row["totalEdges"])
-	}
-
 	processStmt, err := parser.ParseStatement("CALL db.index.processEdgeBuildJobs() YIELD processed, pending RETURN processed, pending")
 	if err != nil {
 		t.Fatalf("parse process call failed: %v", err)

@@ -1,6 +1,9 @@
 package graph
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // TxMode controls transaction mutability.
 type TxMode int
@@ -33,6 +36,8 @@ type Tx interface {
 	ScanPropertyIndex(ctx context.Context, tenant, schema, property string, encodedValue []byte, limit int, fn func(*PropertyIndexEntry) error) error
 	ScanPropertyIndexAll(ctx context.Context, tenant, schema, property string, limit int, fn func(*PropertyIndexEntry) error) error
 	ScanPropertyIndexNumericRange(ctx context.Context, tenant, schema, property string, lower float64, lowerSet bool, lowerInclusive bool, upper float64, upperSet bool, upperInclusive bool, limit int, fn func(*PropertyIndexEntry) error) error
+	ScanPropertyIndexBooleanRange(ctx context.Context, tenant, schema, property string, lower bool, lowerSet bool, lowerInclusive bool, upper bool, upperSet bool, upperInclusive bool, limit int, fn func(*PropertyIndexEntry) error) error
+	ScanPropertyIndexDateTimeRange(ctx context.Context, tenant, schema, property string, lower time.Time, lowerSet bool, lowerInclusive bool, upper time.Time, upperSet bool, upperInclusive bool, limit int, fn func(*PropertyIndexEntry) error) error
 
 	PutPropertyIndex(ctx context.Context, entry *PropertyIndexEntry) error
 	DeletePropertyIndex(ctx context.Context, entry *PropertyIndexEntry) error

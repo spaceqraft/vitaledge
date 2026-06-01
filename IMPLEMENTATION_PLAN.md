@@ -515,6 +515,14 @@ Primary outputs:
 - Index selection strategy.
 - Adaptive scan bounds.
 
+Short type-by-type index strategy:
+
+- Strings: keep lexical property indexes for equality and prefix-style access patterns.
+- Numbers: use order-preserving shadow indexes for equality and bounded numeric ranges.
+- Booleans: use compact order-preserving shadow indexes for cheap equality lookups and low storage overhead.
+- Datetime: use order-preserving shadow indexes on normalized instants so equality and temporal ranges stay indexable.
+- Arrays/maps: do not index as ordered values; keep them out of range-oriented paths.
+
 Quality gates:
 
 - Benchmark threshold checks in CI (non-blocking initially, then blocking).

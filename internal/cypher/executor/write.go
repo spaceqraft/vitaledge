@@ -1035,21 +1035,26 @@ func edgeNumericProperty(edge *graph.Edge, property string) (float64, bool) {
 }
 
 type fastPeerCandidateReturnProjection struct {
-	nonAggregates     []projectionSpec
-	avgEdgeProperty   string
-	avgKey            string
-	countKey          string
-	sumSimilarityExpr string
-	sumSimilarityKey  string
-	orderedOutputKeys []string
+	nonAggregates                []projectionSpec
+	avgEdgeProperty              string
+	avgKey                       string
+	countKey                     string
+	sumSimilarityExpr            string
+	sumSimilarityKey             string
+	orderedOutputKeys            []string
+	rightVar                     string
+	leftVar                      string
+	edgeVar                      string
+	lateMaterializeNonAggregates bool
 }
 
 type fastPeerCandidateAggregate struct {
-	sampleScope   Row
-	edgeCount     int
-	avgSum        float64
-	avgCount      int
-	similaritySum float64
+	sampleScope     Row
+	sampleCandidate *graph.Vertex
+	edgeCount       int
+	avgSum          float64
+	avgCount        int
+	similaritySum   float64
 }
 
 type fastPeerCandidateTopKSpec struct {
@@ -1068,7 +1073,7 @@ func parseFastPeerCandidateReturnProjection(items []projectionSpec, pattern dire
 	if len(items) == 0 {
 		return fastPeerCandidateReturnProjection{}, false
 	}
-	out := fastPeerCandidateReturnProjection{}
+	out := fastPeerCandidateReturnProjection{rightVar: strings.TrimSpace(pattern.Right.Var), leftVar: strings.TrimSpace(pattern.Left.Var), edgeVar: strings.TrimSpace(pattern.EdgeVar)}
 	for _, item := range items {
 		if item.Expression == "*" || item.CollectArg != "" {
 			return fastPeerCandidateReturnProjection{}, false
@@ -1107,7 +1112,49 @@ func parseFastPeerCandidateReturnProjection(items []projectionSpec, pattern dire
 	if out.avgEdgeProperty == "" || out.avgKey == "" || out.countKey == "" || out.sumSimilarityExpr == "" || out.sumSimilarityKey == "" {
 		return fastPeerCandidateReturnProjection{}, false
 	}
+	out.lateMaterializeNonAggregates = canLateMaterializePeerCandidateNonAggregates(out.nonAggregates, out)
 	return out, true
+}
+
+func canLateMaterializePeerCandidateNonAggregates(nonAggregates []projectionSpec, projection fastPeerCandidateReturnProjection) bool {
+	rightVar := strings.TrimSpace(projection.rightVar)
+	if rightVar == "" {
+		return false
+	}
+	leftVar := strings.TrimSpace(projection.leftVar)
+	edgeVar := strings.TrimSpace(projection.edgeVar)
+
+	for _, item := range nonAggregates {
+		expr := strings.TrimSpace(item.Expression)
+		if expr == "" {
+			continue
+		}
+		if expressionReferencesVariable(expr, leftVar) || expressionReferencesVariable(expr, edgeVar) {
+			return false
+		}
+	}
+	return true
+}
+
+func expressionReferencesVariable(expr, varName string) bool {
+	varName = strings.TrimSpace(varName)
+	if varName == "" {
+		return false
+	}
+	expr = strings.TrimSpace(expr)
+	if expr == varName {
+		return true
+	}
+	if strings.Contains(expr, varName+".") {
+		return true
+	}
+	if strings.Contains(expr, "("+varName+")") {
+		return true
+	}
+	if strings.Contains(expr, " "+varName+" ") {
+		return true
+	}
+	return false
 }
 
 func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, returnClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
@@ -1257,10 +1304,18 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 
 			agg, exists := aggs[groupID]
 			if !exists {
-				agg = &fastPeerCandidateAggregate{sampleScope: cloneRow(merged)}
+				agg = &fastPeerCandidateAggregate{}
+				if projection.lateMaterializeNonAggregates {
+					agg.sampleCandidate = candidate
+				} else {
+					agg.sampleScope = cloneRow(merged)
+				}
 				aggs[groupID] = agg
 				groupOrder = append(groupOrder, groupID)
 				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_created", 1)
+				if projection.lateMaterializeNonAggregates {
+					e.observeRuntimeCounter(params, "fast_path.stage2.late_materialization_candidates", 1)
+				}
 			}
 
 			agg.edgeCount++
@@ -1327,12 +1382,19 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 
 func buildFastPeerCandidateResultRow(agg *fastPeerCandidateAggregate, projection fastPeerCandidateReturnProjection, params Params) (Row, error) {
 	result := Row{}
+	scope := agg.sampleScope
+	if projection.lateMaterializeNonAggregates {
+		scope = Row{}
+		if strings.TrimSpace(projection.rightVar) != "" {
+			scope[projection.rightVar] = agg.sampleCandidate
+		}
+	}
 	for _, item := range projection.nonAggregates {
 		key := item.Expression
 		if item.Alias != "" {
 			key = item.Alias
 		}
-		value, err := evalExpressionWithScope(item.Expression, agg.sampleScope, params)
+		value, err := evalExpressionWithScope(item.Expression, scope, params)
 		if err != nil {
 			return nil, err
 		}

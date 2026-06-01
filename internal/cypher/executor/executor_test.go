@@ -450,9 +450,15 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 	}
 
 	seenImplementations := map[string]struct{}{}
+	lateMaterializationSeen := false
 	for _, path := range fastPaths {
 		if impl, _ := path["implementation"].(string); impl != "" {
 			seenImplementations[impl] = struct{}{}
+		}
+		if impl, _ := path["implementation"].(string); impl == "fast_peer_candidate_return_aggregation_clause_pair" {
+			if enabled, ok := path["lateMaterialization"].(bool); ok && enabled {
+				lateMaterializationSeen = true
+			}
 		}
 	}
 	if _, ok := seenImplementations["fast_target_shared_peer_aggregation_clause_pair"]; !ok {
@@ -460,6 +466,9 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 	}
 	if _, ok := seenImplementations["fast_peer_candidate_return_aggregation_clause_pair"]; !ok {
 		t.Fatalf("missing fast peer/candidate strategy marker: %#v", fastPaths)
+	}
+	if !lateMaterializationSeen {
+		t.Fatalf("expected lateMaterialization=true on peer/candidate fast-path strategy: %#v", fastPaths)
 	}
 
 	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
@@ -484,8 +493,14 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 	}
 
 	foundCoveredScan := false
+	lateMaterializationPlanSeen := false
 	for _, vertex := range vertexes {
 		op, _ := vertex["op"].(string)
+		if impl, _ := vertex["implementation"].(string); impl == "fast_peer_candidate_return_aggregation_clause_pair" {
+			if enabled, ok := vertex["lateMaterialization"].(bool); ok && enabled {
+				lateMaterializationPlanSeen = true
+			}
+		}
 		if op != "EDGE_SCAN" {
 			continue
 		}
@@ -506,10 +521,13 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 			t.Fatalf("expected covered scan vertex to reference peer/candidate fast path: %#v", vertex)
 		}
 		foundCoveredScan = true
-		break
+		continue
 	}
 	if !foundCoveredScan {
 		t.Fatalf("missing prefilter-covered directed relationship scan annotation on plan vertexes: %#v", vertexes)
+	}
+	if !lateMaterializationPlanSeen {
+		t.Fatalf("expected lateMaterialization=true on peer/candidate projection node: %#v", vertexes)
 	}
 
 	runtimeStats, ok := explainPayload["runtimeStats"].(map[string]any)
@@ -522,6 +540,9 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 	}
 	if fastPathCandidates, _ := execution["fastPathCandidates"].(int); fastPathCandidates < 2 {
 		t.Fatalf("expected fastPathCandidates >= 2, got %#v", execution["fastPathCandidates"])
+	}
+	if lateMatCandidates, _ := execution["lateMaterializationCandidates"].(int); lateMatCandidates < 1 {
+		t.Fatalf("expected lateMaterializationCandidates >= 1, got %#v", execution["lateMaterializationCandidates"])
 	}
 
 	warnings, ok := explainPayload["warnings"].([]map[string]any)

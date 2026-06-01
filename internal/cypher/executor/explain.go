@@ -1249,6 +1249,7 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 	prefilterBypassCandidates := 0
 	whereShortcutCandidates := 0
 	topKPushdownCandidates := 0
+	lateMaterializationCandidates := 0
 	for _, path := range fastPaths {
 		implementation, _ := path["implementation"].(string)
 		if strings.TrimSpace(implementation) != "" {
@@ -1262,6 +1263,9 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 		}
 		if eligible, _ := path["topKPushdown"].(bool); eligible {
 			topKPushdownCandidates++
+		}
+		if eligible, _ := path["lateMaterialization"].(bool); eligible {
+			lateMaterializationCandidates++
 		}
 	}
 
@@ -1291,11 +1295,12 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 			"quality":    cardinalityQuality,
 		},
 		"execution": map[string]any{
-			"fastPathCandidates":        len(fastPaths),
-			"implementations":           implementations,
-			"prefilterBypassCandidates": prefilterBypassCandidates,
-			"whereShortcutCandidates":   whereShortcutCandidates,
-			"topKPushdownCandidates":    topKPushdownCandidates,
+			"fastPathCandidates":            len(fastPaths),
+			"implementations":               implementations,
+			"prefilterBypassCandidates":     prefilterBypassCandidates,
+			"whereShortcutCandidates":       whereShortcutCandidates,
+			"topKPushdownCandidates":        topKPushdownCandidates,
+			"lateMaterializationCandidates": lateMaterializationCandidates,
 		},
 	}
 }
@@ -1575,6 +1580,7 @@ func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params 
 			"antiJoinPrefilter":      hasRightExclusion,
 			"wherePrefilterCoverage": wherePrefilterCoverage,
 			"topKPushdown":           topKPushdown,
+			"lateMaterialization":    projection.lateMaterializeNonAggregates,
 		}, true
 	}
 
@@ -1916,6 +1922,9 @@ func (b *explainPlanBuilder) annotateProjectionRangeWithFastPath(start int, sign
 		}
 		if value, ok := signal["topKPushdown"].(bool); ok {
 			node["topKPushdown"] = value
+		}
+		if value, ok := signal["lateMaterialization"].(bool); ok {
+			node["lateMaterialization"] = value
 		}
 		return
 	}

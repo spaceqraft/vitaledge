@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/paegun/vitaledge/internal/cypher/parser"
@@ -11,6 +12,8 @@ import (
 
 const recommendationBenchmarkQuery = "MATCH (target:User {user_id: 1})-[r1:RATED]->(shared:Movie)<-[r2:RATED]-(peer:User) WHERE peer <> target AND abs(r1.rating - r2.rating) <= 1.5 WITH target, peer, count(shared) AS shared_count, avg(abs(r1.rating - r2.rating)) AS avg_diff WHERE shared_count >= 3 WITH target, peer, shared_count * (1.0 / (1.0 + avg_diff)) AS similarity ORDER BY similarity DESC LIMIT 30 MATCH (peer)-[rp:RATED]->(candidate:Movie) WHERE rp.rating >= 4.0 AND NOT (target)-[:RATED]->(candidate) RETURN candidate.movie_id AS movie_id, candidate.title AS title, candidate.year AS year, coalesce(candidate.base_score, 0.0) AS base_score, avg(rp.rating) AS peer_avg, count(rp) AS peer_count, sum(similarity) AS total_sim ORDER BY total_sim DESC LIMIT 10"
 
+var recommendationBenchmarkMultiTargetQuery = strings.Replace(recommendationBenchmarkQuery, "{user_id: 1}", "{cohort: 1}", 1)
+
 type recommendationBenchmarkMode int
 
 const (
@@ -18,15 +21,38 @@ const (
 	recommendationBenchmarkModeStep2LateMaterialization
 )
 
+type recommendationBenchmarkTargetMode int
+
+const (
+	recommendationBenchmarkTargetModeSingle recommendationBenchmarkTargetMode = iota
+	recommendationBenchmarkTargetModeMulti
+)
+
+type recommendationBenchmarkStage1ExpansionMode int
+
+const (
+	recommendationBenchmarkStage1ExpansionAuto recommendationBenchmarkStage1ExpansionMode = iota
+	recommendationBenchmarkStage1ExpansionNested
+	recommendationBenchmarkStage1ExpansionSharedSeed
+)
+
 func BenchmarkRecommendationQueryStep1TopKPushdown(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep1TopK)
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep1TopK, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
 }
 
 func BenchmarkRecommendationQueryStep2LateMaterialization(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization)
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
 }
 
-func benchmarkRecommendationQuery(b *testing.B, mode recommendationBenchmarkMode) {
+func BenchmarkRecommendationQueryMultiTargetStage1NestedBaseline(b *testing.B) {
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeMulti, recommendationBenchmarkStage1ExpansionNested)
+}
+
+func BenchmarkRecommendationQueryMultiTargetStage1SharedSeedExpansion(b *testing.B) {
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeMulti, recommendationBenchmarkStage1ExpansionSharedSeed)
+}
+
+func benchmarkRecommendationQuery(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode, stage1ExpansionMode recommendationBenchmarkStage1ExpansionMode) {
 	ctx := context.Background()
 	store := openBenchmarkStore(b)
 	defer func() { _ = store.Close() }()
@@ -35,14 +61,22 @@ func benchmarkRecommendationQuery(b *testing.B, mode recommendationBenchmarkMode
 		b.Fatalf("seed benchmark graph failed: %v", err)
 	}
 
-	stmt, err := parser.ParseStatement(recommendationBenchmarkQuery)
+	query := recommendationBenchmarkQuery
+	if targetMode == recommendationBenchmarkTargetModeMulti {
+		query = recommendationBenchmarkMultiTargetQuery
+	}
+	stmt, err := parser.ParseStatement(query)
 	if err != nil {
 		b.Fatalf("parse failed: %v", err)
 	}
 
-	opts := Options{Metrics: NewCollector()}
+	collector := NewCollector()
+	opts := Options{Metrics: collector}
 	if mode == recommendationBenchmarkModeStep1TopK {
 		opts.DisableStage2LateMaterialization = true
+	}
+	if stage1ExpansionMode == recommendationBenchmarkStage1ExpansionNested {
+		opts.DisableStage1SharedSeedExpansion = true
 	}
 	exec := New(store, opts)
 	params := Params{"tenant": "bench-rec"}
@@ -58,6 +92,24 @@ func benchmarkRecommendationQuery(b *testing.B, mode recommendationBenchmarkMode
 			b.Fatalf("expected non-empty recommendation rows")
 		}
 	}
+	b.StopTimer()
+
+	snapshot := collector.Snapshot()
+	runtimeCounters := snapshot.RuntimeCounters
+	reportCounterPerOp := func(metricName, counterName string) {
+		if b.N <= 0 {
+			return
+		}
+		b.ReportMetric(float64(runtimeCounters[counterName])/float64(b.N), metricName)
+	}
+	reportCounterPerOp("stage1_first_edges/op", "fast_path.stage1.first_hop.edges_visited")
+	reportCounterPerOp("stage1_second_edges/op", "fast_path.stage1.second_hop.edges_visited")
+	reportCounterPerOp("stage1_shared_seed_rows/op", "fast_path.stage1.first_hop.shared_seed_rows")
+	reportCounterPerOp("stage1_shared_vertices/op", "fast_path.stage1.shared_vertices_seeded")
+	reportCounterPerOp("stage1_seed_rows_considered/op", "fast_path.stage1.seed_rows_considered")
+	reportCounterPerOp("stage1_seed_rows_bucket_dropped/op", "fast_path.stage1.seed_rows_bucket_dropped")
+	reportCounterPerOp("stage1_where_shortcuts/op", "fast_path.stage1.where_eval_shortcuts")
+	reportCounterPerOp("stage1_where_checks/op", "fast_path.stage1.where_eval_checks")
 }
 
 func seedRecommendationBenchmarkGraph(ctx context.Context, store graph.GraphStore) error {
@@ -77,11 +129,15 @@ func seedRecommendationBenchmarkGraph(ctx context.Context, store graph.GraphStor
 	}
 
 	return store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: "u-1", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1)}}); err != nil {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: "u-1", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1), "cohort": valueToBytes(1)}}); err != nil {
 			return err
 		}
 		for p := 2; p <= peerCount+1; p++ {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("u-%d", p), Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(p)}}); err != nil {
+			cohort := 0
+			if p <= 17 {
+				cohort = 1
+			}
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("u-%d", p), Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(p), "cohort": valueToBytes(cohort)}}); err != nil {
 				return err
 			}
 		}

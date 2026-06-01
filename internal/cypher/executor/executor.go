@@ -80,6 +80,9 @@ type IndexCatalog interface {
 type Options struct {
 	Metrics      Metrics
 	IndexCatalog IndexCatalog
+	// DisableStage1SharedSeedExpansion forces the stage-1 recommendation fast
+	// path to use direct nested expansion instead of shared-seed expansion.
+	DisableStage1SharedSeedExpansion bool
 	// DisableStage2TopKPushdown forces the stage-2 recommendation fast path to
 	// run full projection post-processing instead of top-k pushdown.
 	DisableStage2TopKPushdown bool
@@ -92,6 +95,7 @@ type Executor struct {
 	store                            graph.GraphStore
 	metrics                          Metrics
 	indexCatalog                     IndexCatalog
+	stage1SharedSeedExpansionEnabled bool
 	stage2TopKPushdownEnabled        bool
 	stage2LateMaterializationEnabled bool
 
@@ -123,6 +127,7 @@ func New(store graph.GraphStore, opts Options) *Executor {
 		store:                            store,
 		metrics:                          metrics,
 		indexCatalog:                     opts.IndexCatalog,
+		stage1SharedSeedExpansionEnabled: !opts.DisableStage1SharedSeedExpansion,
 		stage2TopKPushdownEnabled:        !opts.DisableStage2TopKPushdown,
 		stage2LateMaterializationEnabled: !opts.DisableStage2LateMaterialization,
 	}

@@ -388,6 +388,12 @@ type fastTargetSharedPeerProjection struct {
 	secondEdgeProperty string
 }
 
+type stage1WhereShortcutPlan struct {
+	enabled                bool
+	requirePeerNotTarget   bool
+	requireSecondEdgeCover bool
+}
+
 func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
 	if len(rows) != 1 || len(rows[0]) != 0 {
 		return nil, nil, false, nil
@@ -442,65 +448,252 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 		shared     int
 		sumAbsDiff float64
 	}
+	type firstHopSeed struct {
+		target                    *graph.Vertex
+		firstValue                float64
+		midRow                    Row
+		secondWhereConstraints    map[string]edgeNumericRangeConstraint
+		hasSecondWhereConstraints bool
+	}
 	aggs := map[string]*peerAggregate{}
-
-	for _, target := range targetCandidates {
-		if target == nil {
-			continue
+	whereShortcut := buildStage1WhereShortcutPlan(matchSpec.Where, chain)
+	accumulate := func(target *graph.Vertex, peer *graph.Vertex, firstValue, secondValue float64) {
+		if target == nil || peer == nil {
+			return
 		}
-		baseRow := cloneRow(rows[0])
-		if chain.Left.Var != "" {
-			baseRow[chain.Left.Var] = target
+		key := target.ID + "|" + peer.ID
+		agg, exists := aggs[key]
+		if !exists {
+			agg = &peerAggregate{target: target, peer: peer}
+			aggs[key] = agg
+		}
+		agg.shared++
+		agg.sumAbsDiff += math.Abs(firstValue - secondValue)
+	}
+
+	if !e.stage1SharedSeedExpansionEnabled || len(targetCandidates) <= 1 {
+		for _, target := range targetCandidates {
+			if target == nil {
+				continue
+			}
+			baseRow := cloneRow(rows[0])
+			if chain.Left.Var != "" {
+				baseRow[chain.Left.Var] = target
+			}
+
+			firstScanType := chain.FirstEdgeType
+			if len(chain.FirstEdgeAnyOf) > 0 {
+				firstScanType = ""
+			}
+			if err := scanOutEdgesQueryCached(ctx, tx, tenant, target.ID, firstScanType, params, func(edge1 *graph.Edge) error {
+				e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.edges_visited", 1)
+				if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
+					return nil
+				}
+				if !edgePatternMatches(edge1, chain.FirstEdgeProps, params, baseRow) {
+					return nil
+				}
+
+				shared, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
+				if err != nil {
+					return err
+				}
+				if shared == nil {
+					return nil
+				}
+
+				midRow := cloneRow(baseRow)
+				if chain.FirstEdgeVar != "" {
+					midRow[chain.FirstEdgeVar] = edge1
+				}
+				if chain.Mid.Var != "" {
+					midRow[chain.Mid.Var] = shared
+				}
+				if !vertexPatternMatches(shared, chain.Mid, params, midRow) {
+					return nil
+				}
+
+				secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, chain.SecondEdgeVar, midRow, params)
+				secondScanType := chain.SecondEdgeType
+				if len(chain.SecondEdgeAnyOf) > 0 {
+					secondScanType = ""
+				}
+				return scanInEdgesQueryCached(ctx, tx, tenant, shared.ID, secondScanType, params, func(edge2 *graph.Edge) error {
+					e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.edges_visited", 1)
+					if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
+						return nil
+					}
+					if !edgePatternMatches(edge2, chain.SecondEdgeProps, params, midRow) {
+						return nil
+					}
+					if hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, secondWhereConstraints) {
+						e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.numeric_prefilter_drops", 1)
+						return nil
+					}
+
+					peer, err := getVertexQueryCached(ctx, tx, tenant, edge2.SrcID, params)
+					if err != nil {
+						return err
+					}
+					if peer == nil {
+						return nil
+					}
+					if !vertexBindingMatches(midRow, chain.Right.Var, peer) {
+						return nil
+					}
+
+					merged := cloneRow(midRow)
+					if chain.Right.Var != "" {
+						merged[chain.Right.Var] = peer
+					}
+					if chain.SecondEdgeVar != "" {
+						merged[chain.SecondEdgeVar] = edge2
+					}
+					if !vertexPatternMatches(peer, chain.Right, params, merged) {
+						return nil
+					}
+					if strings.TrimSpace(matchSpec.Where) != "" {
+						bypassWhereEval, droppedByShortcut := stage1WhereShortcutDecision(whereShortcut, target, peer, hasSecondWhereConstraints)
+						if droppedByShortcut {
+							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
+							return nil
+						}
+						if bypassWhereEval {
+							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_shortcuts", 1)
+						} else {
+							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_checks", 1)
+							ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
+							if err != nil {
+								return err
+							}
+							if !ok {
+								e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
+								return nil
+							}
+						}
+					}
+
+					firstValue, firstOK := edgeNumericProperty(edge1, projection.firstEdgeProperty)
+					secondValue, secondOK := edgeNumericProperty(edge2, projection.secondEdgeProperty)
+					if !firstOK || !secondOK {
+						return nil
+					}
+
+					accumulate(target, peer, firstValue, secondValue)
+					return nil
+				})
+			}); err != nil {
+				return nil, nil, false, err
+			}
+		}
+	} else {
+		type rangedSeed struct {
+			seed       firstHopSeed
+			constraint edgeNumericRangeConstraint
+		}
+		type sharedSeedBuckets struct {
+			unconstrained []firstHopSeed
+			exactByValue  map[float64][]firstHopSeed
+			ranged        []rangedSeed
+		}
+		sharedSeeds := map[string][]firstHopSeed{}
+		sharedSeedBucketsByID := map[string]sharedSeedBuckets{}
+		for _, target := range targetCandidates {
+			if target == nil {
+				continue
+			}
+			baseRow := cloneRow(rows[0])
+			if chain.Left.Var != "" {
+				baseRow[chain.Left.Var] = target
+			}
+
+			firstScanType := chain.FirstEdgeType
+			if len(chain.FirstEdgeAnyOf) > 0 {
+				firstScanType = ""
+			}
+			if err := scanOutEdgesQueryCached(ctx, tx, tenant, target.ID, firstScanType, params, func(edge1 *graph.Edge) error {
+				e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.edges_visited", 1)
+				if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
+					return nil
+				}
+				if !edgePatternMatches(edge1, chain.FirstEdgeProps, params, baseRow) {
+					return nil
+				}
+
+				shared, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
+				if err != nil {
+					return err
+				}
+				if shared == nil {
+					return nil
+				}
+
+				midRow := cloneRow(baseRow)
+				if chain.FirstEdgeVar != "" {
+					midRow[chain.FirstEdgeVar] = edge1
+				}
+				if chain.Mid.Var != "" {
+					midRow[chain.Mid.Var] = shared
+				}
+				if !vertexPatternMatches(shared, chain.Mid, params, midRow) {
+					return nil
+				}
+				firstValue, firstOK := edgeNumericProperty(edge1, projection.firstEdgeProperty)
+				if !firstOK {
+					return nil
+				}
+
+				secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, chain.SecondEdgeVar, midRow, params)
+				seed := firstHopSeed{
+					target:                    target,
+					firstValue:                firstValue,
+					midRow:                    midRow,
+					secondWhereConstraints:    secondWhereConstraints,
+					hasSecondWhereConstraints: hasSecondWhereConstraints,
+				}
+				sharedID := strings.TrimSpace(shared.ID)
+				if sharedID == "" {
+					return nil
+				}
+				sharedSeeds[sharedID] = append(sharedSeeds[sharedID], seed)
+
+				buckets := sharedSeedBucketsByID[sharedID]
+				targetConstraint, hasTargetConstraint := seed.secondWhereConstraints[projection.secondEdgeProperty]
+				switch {
+				case !seed.hasSecondWhereConstraints || len(seed.secondWhereConstraints) == 0 || !hasTargetConstraint:
+					buckets.unconstrained = append(buckets.unconstrained, seed)
+				case targetConstraint.isContradictory():
+					e.observeRuntimeCounter(params, "fast_path.stage1.seed_rows_bucket_dropped", 1)
+				case targetConstraint.lowerSet && targetConstraint.upperSet && targetConstraint.lower == targetConstraint.upper && targetConstraint.lowerInclusive && targetConstraint.upperInclusive:
+					if buckets.exactByValue == nil {
+						buckets.exactByValue = map[float64][]firstHopSeed{}
+					}
+					buckets.exactByValue[targetConstraint.lower] = append(buckets.exactByValue[targetConstraint.lower], seed)
+				default:
+					buckets.ranged = append(buckets.ranged, rangedSeed{seed: seed, constraint: targetConstraint})
+				}
+				sharedSeedBucketsByID[sharedID] = buckets
+				e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.shared_seed_rows", 1)
+				return nil
+			}); err != nil {
+				return nil, nil, false, err
+			}
 		}
 
-		firstScanType := chain.FirstEdgeType
-		if len(chain.FirstEdgeAnyOf) > 0 {
-			firstScanType = ""
+		e.observeRuntimeCounter(params, "fast_path.stage1.shared_vertices_seeded", int64(len(sharedSeeds)))
+		secondScanType := chain.SecondEdgeType
+		if len(chain.SecondEdgeAnyOf) > 0 {
+			secondScanType = ""
 		}
-		if err := scanOutEdgesQueryCached(ctx, tx, tenant, target.ID, firstScanType, params, func(edge1 *graph.Edge) error {
-			e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.edges_visited", 1)
-			if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
-				return nil
+		for sharedID, seeds := range sharedSeeds {
+			if len(seeds) == 0 {
+				continue
 			}
-			if !edgePatternMatches(edge1, chain.FirstEdgeProps, params, baseRow) {
-				return nil
-			}
-
-			shared, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
-			if err != nil {
-				return err
-			}
-			if shared == nil {
-				return nil
-			}
-
-			midRow := cloneRow(baseRow)
-			if chain.FirstEdgeVar != "" {
-				midRow[chain.FirstEdgeVar] = edge1
-			}
-			if chain.Mid.Var != "" {
-				midRow[chain.Mid.Var] = shared
-			}
-			if !vertexPatternMatches(shared, chain.Mid, params, midRow) {
-				return nil
-			}
-
-			secondScanType := chain.SecondEdgeType
-			if len(chain.SecondEdgeAnyOf) > 0 {
-				secondScanType = ""
-			}
-			secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, chain.SecondEdgeVar, midRow, params)
-
-			return scanInEdgesQueryCached(ctx, tx, tenant, shared.ID, secondScanType, params, func(edge2 *graph.Edge) error {
+			buckets := sharedSeedBucketsByID[sharedID]
+			e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.shared_vertices_expanded", 1)
+			if err := scanInEdgesQueryCached(ctx, tx, tenant, sharedID, secondScanType, params, func(edge2 *graph.Edge) error {
 				e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.edges_visited", 1)
 				if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
-					return nil
-				}
-				if !edgePatternMatches(edge2, chain.SecondEdgeProps, params, midRow) {
-					return nil
-				}
-				if hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, secondWhereConstraints) {
-					e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.numeric_prefilter_drops", 1)
 					return nil
 				}
 
@@ -511,49 +704,88 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 				if peer == nil {
 					return nil
 				}
-				if !vertexBindingMatches(midRow, chain.Right.Var, peer) {
+
+				secondValue, secondOK := edgeNumericProperty(edge2, projection.secondEdgeProperty)
+				if !secondOK {
 					return nil
 				}
 
-				merged := cloneRow(midRow)
-				if chain.Right.Var != "" {
-					merged[chain.Right.Var] = peer
-				}
-				if chain.SecondEdgeVar != "" {
-					merged[chain.SecondEdgeVar] = edge2
-				}
-				if !vertexPatternMatches(peer, chain.Right, params, merged) {
-					return nil
-				}
-				if strings.TrimSpace(matchSpec.Where) != "" {
-					ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
-					if err != nil {
-						return err
-					}
-					if !ok {
-						e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
+				applySeed := func(seed firstHopSeed) error {
+					e.observeRuntimeCounter(params, "fast_path.stage1.seed_rows_considered", 1)
+					if seed.target == nil {
 						return nil
 					}
-				}
+					if !edgePatternMatches(edge2, chain.SecondEdgeProps, params, seed.midRow) {
+						return nil
+					}
+					if seed.hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, seed.secondWhereConstraints) {
+						e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.numeric_prefilter_drops", 1)
+						return nil
+					}
+					if !vertexBindingMatches(seed.midRow, chain.Right.Var, peer) {
+						return nil
+					}
 
-				firstValue, firstOK := edgeNumericProperty(edge1, projection.firstEdgeProperty)
-				secondValue, secondOK := edgeNumericProperty(edge2, projection.secondEdgeProperty)
-				if !firstOK || !secondOK {
+					merged := cloneRow(seed.midRow)
+					if chain.Right.Var != "" {
+						merged[chain.Right.Var] = peer
+					}
+					if chain.SecondEdgeVar != "" {
+						merged[chain.SecondEdgeVar] = edge2
+					}
+					if !vertexPatternMatches(peer, chain.Right, params, merged) {
+						return nil
+					}
+					if strings.TrimSpace(matchSpec.Where) != "" {
+						bypassWhereEval, droppedByShortcut := stage1WhereShortcutDecision(whereShortcut, seed.target, peer, seed.hasSecondWhereConstraints)
+						if droppedByShortcut {
+							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
+							return nil
+						}
+						if bypassWhereEval {
+							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_shortcuts", 1)
+						} else {
+							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_checks", 1)
+							ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
+							if err != nil {
+								return err
+							}
+							if !ok {
+								e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
+								return nil
+							}
+						}
+					}
+
+					accumulate(seed.target, peer, seed.firstValue, secondValue)
 					return nil
 				}
 
-				key := target.ID + "|" + peer.ID
-				agg, exists := aggs[key]
-				if !exists {
-					agg = &peerAggregate{target: target, peer: peer}
-					aggs[key] = agg
+				for _, seed := range buckets.unconstrained {
+					if err := applySeed(seed); err != nil {
+						return err
+					}
 				}
-				agg.shared++
-				agg.sumAbsDiff += math.Abs(firstValue - secondValue)
+				if exactSeeds, ok := buckets.exactByValue[secondValue]; ok {
+					for _, seed := range exactSeeds {
+						if err := applySeed(seed); err != nil {
+							return err
+						}
+					}
+				}
+				for _, ranged := range buckets.ranged {
+					if !ranged.constraint.matchesValue(secondValue) {
+						e.observeRuntimeCounter(params, "fast_path.stage1.seed_rows_bucket_dropped", 1)
+						continue
+					}
+					if err := applySeed(ranged.seed); err != nil {
+						return err
+					}
+				}
 				return nil
-			})
-		}); err != nil {
-			return nil, nil, false, err
+			}); err != nil {
+				return nil, nil, false, err
+			}
 		}
 	}
 
@@ -593,6 +825,127 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 		columns = append([]string(nil), priorColumns...)
 	}
 	return out, columns, true, nil
+}
+
+func stage1WhereShortcutDecision(plan stage1WhereShortcutPlan, target *graph.Vertex, peer *graph.Vertex, hasSecondWhereConstraints bool) (bypassWhereEval bool, dropRow bool) {
+	if !plan.enabled {
+		return false, false
+	}
+	if plan.requirePeerNotTarget {
+		if target == nil || peer == nil {
+			return false, true
+		}
+		if strings.TrimSpace(target.ID) == "" || strings.TrimSpace(peer.ID) == "" {
+			return false, true
+		}
+		if target.ID == peer.ID {
+			return false, true
+		}
+	}
+	if plan.requireSecondEdgeCover && !hasSecondWhereConstraints {
+		return false, false
+	}
+	return true, false
+}
+
+func buildStage1WhereShortcutPlan(whereRaw string, chain twoHopDirectedChainPattern) stage1WhereShortcutPlan {
+	conjuncts, ok := flattenWhereConjuncts(whereRaw)
+	if !ok || len(conjuncts) == 0 {
+		return stage1WhereShortcutPlan{}
+	}
+
+	plan := stage1WhereShortcutPlan{}
+	leftVar := strings.TrimSpace(chain.Left.Var)
+	rightVar := strings.TrimSpace(chain.Right.Var)
+	for _, conjunct := range conjuncts {
+		conjunct = strings.TrimSpace(conjunct)
+		if conjunct == "" {
+			continue
+		}
+		if isStage1PeerNotTargetConjunct(conjunct, leftVar, rightVar) {
+			plan.requirePeerNotTarget = true
+			continue
+		}
+		if isStage1SecondEdgeConstraintConjunct(conjunct, strings.TrimSpace(chain.FirstEdgeVar), strings.TrimSpace(chain.SecondEdgeVar)) {
+			plan.requireSecondEdgeCover = true
+			continue
+		}
+		return stage1WhereShortcutPlan{}
+	}
+
+	if !plan.requirePeerNotTarget && !plan.requireSecondEdgeCover {
+		return stage1WhereShortcutPlan{}
+	}
+	plan.enabled = true
+	return plan
+}
+
+func isStage1PeerNotTargetConjunct(conjunct, leftVar, rightVar string) bool {
+	if leftVar == "" || rightVar == "" {
+		return false
+	}
+	left, right, op, ok := splitTopLevelComparison(conjunct)
+	if !ok {
+		return false
+	}
+	op = strings.TrimSpace(op)
+	if op != "<>" && op != "!=" {
+		return false
+	}
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return (left == leftVar && right == rightVar) || (left == rightVar && right == leftVar)
+}
+
+func isStage1SecondEdgeConstraintConjunct(conjunct, firstEdgeVar, secondEdgeVar string) bool {
+	left, right, _, ok := splitTopLevelComparison(conjunct)
+	if !ok {
+		return false
+	}
+	leftIsSecond := isEdgeVarReferenced(left, secondEdgeVar)
+	rightIsSecond := isEdgeVarReferenced(right, secondEdgeVar)
+	if leftIsSecond != rightIsSecond {
+		return true
+	}
+	if isAbsDifferenceWithSecondEdgeRef(left, firstEdgeVar, secondEdgeVar) {
+		return true
+	}
+	if isAbsDifferenceWithSecondEdgeRef(right, firstEdgeVar, secondEdgeVar) {
+		return true
+	}
+	return false
+}
+
+func isEdgeVarReferenced(expr, edgeVar string) bool {
+	if strings.TrimSpace(edgeVar) == "" {
+		return false
+	}
+	if _, ok := edgePropertyReference(expr, edgeVar); ok {
+		return true
+	}
+	return false
+}
+
+func isAbsDifferenceWithSecondEdgeRef(expr, firstEdgeVar, secondEdgeVar string) bool {
+	arg, ok := parseFunctionCall(strings.TrimSpace(expr), "abs")
+	if !ok {
+		return false
+	}
+	leftTerm, rightTerm, termOp, ok := splitTopLevelOperatorSetLast(arg, "+", "-")
+	if !ok || strings.TrimSpace(termOp) != "-" {
+		return false
+	}
+	leftSecond := isEdgeVarReferenced(leftTerm, secondEdgeVar)
+	rightSecond := isEdgeVarReferenced(rightTerm, secondEdgeVar)
+	if leftSecond == rightSecond {
+		return false
+	}
+	if strings.TrimSpace(firstEdgeVar) == "" {
+		return true
+	}
+	leftFirst := isEdgeVarReferenced(leftTerm, firstEdgeVar)
+	rightFirst := isEdgeVarReferenced(rightTerm, firstEdgeVar)
+	return leftFirst || rightFirst
 }
 
 func parseFastTargetSharedPeerProjection(items []projectionSpec, chain twoHopDirectedChainPattern) (fastTargetSharedPeerProjection, bool) {

@@ -99,6 +99,7 @@ const projectionEvalCtxParam = "__ve_projection_eval_ctx"
 const wherePatternPredicateCacheParam = "__ve_where_pattern_predicate_cache"
 const queryEntityCacheParam = "__ve_query_entity_cache"
 const queryAdjacencyCacheParam = "__ve_query_adjacency_cache"
+const runtimeCounterStateParam = "__ve_runtime_counter_state"
 const edgeRangeIndexCandidateLimit = 200000
 
 type wherePatternPredicateCache struct {
@@ -114,6 +115,59 @@ type queryEntityCache struct {
 type queryAdjacencyCache struct {
 	outEdges map[string][]*graph.Edge
 	inEdges  map[string][]*graph.Edge
+}
+
+type runtimeCounterState struct {
+	counters map[string]int64
+}
+
+func ensureRuntimeCounterState(params Params) *runtimeCounterState {
+	if params == nil {
+		return nil
+	}
+	if existing, ok := params[runtimeCounterStateParam].(*runtimeCounterState); ok && existing != nil {
+		if existing.counters == nil {
+			existing.counters = map[string]int64{}
+		}
+		return existing
+	}
+	state := &runtimeCounterState{counters: map[string]int64{}}
+	params[runtimeCounterStateParam] = state
+	return state
+}
+
+func resetRuntimeCounterState(params Params) {
+	if params == nil {
+		return
+	}
+	delete(params, runtimeCounterStateParam)
+}
+
+func buildRuntimeCounterDiagnostic(params Params) (Diagnostic, bool) {
+	if params == nil {
+		return Diagnostic{}, false
+	}
+	state, ok := params[runtimeCounterStateParam].(*runtimeCounterState)
+	if !ok || state == nil || len(state.counters) == 0 {
+		return Diagnostic{}, false
+	}
+	encoded, err := json.Marshal(state.counters)
+	if err != nil {
+		return Diagnostic{}, false
+	}
+	return Diagnostic{Code: "RUNTIME_COUNTERS", Message: string(encoded)}, true
+}
+
+func (e *Executor) observeRuntimeCounter(params Params, name string, delta int64) {
+	if delta <= 0 || strings.TrimSpace(name) == "" {
+		return
+	}
+	if state := ensureRuntimeCounterState(params); state != nil {
+		state.counters[name] += delta
+	}
+	if e != nil && e.metrics != nil {
+		e.metrics.ObserveRuntimeCounter(name, delta)
+	}
 }
 
 type edgeIDScannerTx interface {
@@ -151,6 +205,9 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 	if err := validateUnionKinds(stmt.Unions); err != nil {
 		return nil, err
 	}
+	resetRuntimeCounterState(params)
+	_ = ensureRuntimeCounterState(params)
+	defer resetRuntimeCounterState(params)
 
 	writeQuery := false
 	for _, part := range stmt.Parts {
@@ -239,6 +296,9 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 
 	result := &Result{Columns: resultColumns, Rows: resultRows, Stats: Stats{RowsReturned: len(resultRows)}}
 	result.Rows = normalizeResultRows(result.Rows)
+	if diagnostic, ok := buildRuntimeCounterDiagnostic(params); ok {
+		result.Warnings = append(result.Warnings, diagnostic)
+	}
 	return result, nil
 }
 
@@ -374,6 +434,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 	if err != nil {
 		return nil, nil, false, err
 	}
+	e.observeRuntimeCounter(params, "fast_path.stage1.target_candidates", int64(len(targetCandidates)))
 
 	type peerAggregate struct {
 		target     *graph.Vertex
@@ -397,6 +458,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 			firstScanType = ""
 		}
 		if err := scanOutEdgesQueryCached(ctx, tx, tenant, target.ID, firstScanType, params, func(edge1 *graph.Edge) error {
+			e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.edges_visited", 1)
 			if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
 				return nil
 			}
@@ -430,6 +492,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 			secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, chain.SecondEdgeVar, midRow, params)
 
 			return scanInEdgesQueryCached(ctx, tx, tenant, shared.ID, secondScanType, params, func(edge2 *graph.Edge) error {
+				e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.edges_visited", 1)
 				if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
 					return nil
 				}
@@ -437,6 +500,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 					return nil
 				}
 				if hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, secondWhereConstraints) {
+					e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.numeric_prefilter_drops", 1)
 					return nil
 				}
 
@@ -467,6 +531,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 						return err
 					}
 					if !ok {
+						e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
 						return nil
 					}
 				}
@@ -493,6 +558,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 	}
 
 	out := make([]Row, 0, len(aggs))
+	e.observeRuntimeCounter(params, "fast_path.stage1.peer_groups_before_with_filter", int64(len(aggs)))
 	for _, agg := range aggs {
 		if agg.shared <= 0 {
 			continue
@@ -506,6 +572,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 	}
 
 	if withSpec.WhereRaw != "" {
+		before := len(out)
 		filtered := make([]Row, 0, len(out))
 		for _, row := range out {
 			ok, err := e.evalWhereExpression(ctx, tx, withSpec.WhereRaw, row, params)
@@ -517,7 +584,9 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 			}
 		}
 		out = filtered
+		e.observeRuntimeCounter(params, "fast_path.stage1.with_filter_drops", int64(before-len(out)))
 	}
+	e.observeRuntimeCounter(params, "fast_path.stage1.rows_output", int64(len(out)))
 
 	columns := []string{projection.targetKey, projection.peerKey, projection.sharedCountKey, projection.avgDiffKey}
 	if len(columns) == 0 && len(priorColumns) > 0 {
@@ -623,11 +692,23 @@ type fastPeerCandidateReturnProjection struct {
 }
 
 type fastPeerCandidateAggregate struct {
-	values        Row
+	sampleScope   Row
 	edgeCount     int
 	avgSum        float64
 	avgCount      int
 	similaritySum float64
+}
+
+type fastPeerCandidateTopKSpec struct {
+	descending bool
+	skip       int
+	limit      int
+}
+
+type fastPeerCandidateRankedRow struct {
+	agg        *fastPeerCandidateAggregate
+	score      float64
+	inputIndex int
 }
 
 func parseFastPeerCandidateReturnProjection(items []projectionSpec, pattern directedRelationshipPattern) (fastPeerCandidateReturnProjection, bool) {
@@ -719,6 +800,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	params = withProjectionEvalRuntime(ctx, tx, params, e)
 	aggs := map[string]*fastPeerCandidateAggregate{}
 	groupOrder := make([]string, 0)
+	e.observeRuntimeCounter(params, "fast_path.stage2.peer_rows_input", int64(len(rows)))
 
 	for _, row := range rows {
 		peer, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Left, params)
@@ -738,6 +820,9 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 			return nil, nil, false, err
 		}
 		skipWhereEval := directedWhereCoveredByExtractedPrefilters(matchSpec.Where, pattern.EdgeVar, pattern.Right.Var, row, params, hasNumericConstraints, hasExcludedRightIDs)
+		if skipWhereEval {
+			e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_bypass_rows", 1)
+		}
 
 		similarityValue, err := evalExpressionWithScope(projection.sumSimilarityExpr, row, params)
 		if err != nil {
@@ -750,6 +835,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 			scanType = ""
 		}
 		if err := scanOutEdgesQueryCached(ctx, tx, tenant, peer.ID, scanType, params, func(edge *graph.Edge) error {
+			e.observeRuntimeCounter(params, "fast_path.stage2.edges_visited", 1)
 			if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
 				return nil
 			}
@@ -757,12 +843,31 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 				return nil
 			}
 			if hasNumericConstraints && !edgeMatchesNumericConstraints(edge, numericConstraints) {
+				e.observeRuntimeCounter(params, "fast_path.stage2.numeric_prefilter_drops", 1)
 				return nil
 			}
 			if hasExcludedRightIDs {
 				if _, blocked := excludedRightIDs[edge.DstID]; blocked {
+					e.observeRuntimeCounter(params, "fast_path.stage2.antijoin_prefilter_drops", 1)
 					return nil
 				}
+			}
+
+			groupID := strings.TrimSpace(edge.DstID)
+			if groupID == "" {
+				return nil
+			}
+			if agg, exists := aggs[groupID]; exists && skipWhereEval {
+				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_group_reuse_hits", 1)
+				agg.edgeCount++
+				if rating, ok := edgeNumericProperty(edge, projection.avgEdgeProperty); ok {
+					agg.avgSum += rating
+					agg.avgCount++
+				}
+				if similarityNumericOK {
+					agg.similaritySum += similarityNumeric
+				}
+				return nil
 			}
 
 			candidate, err := getVertexQueryCached(ctx, tx, tenant, edge.DstID, params)
@@ -792,31 +897,17 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 					return err
 				}
 				if !ok {
+					e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_drops", 1)
 					return nil
 				}
 			}
 
-			groupID := candidate.ID
-			if strings.TrimSpace(groupID) == "" {
-				return nil
-			}
 			agg, exists := aggs[groupID]
 			if !exists {
-				values := Row{}
-				for _, item := range projection.nonAggregates {
-					key := item.Expression
-					if item.Alias != "" {
-						key = item.Alias
-					}
-					value, err := evalExpressionWithScope(item.Expression, merged, params)
-					if err != nil {
-						return err
-					}
-					values[key] = value
-				}
-				agg = &fastPeerCandidateAggregate{values: values}
+				agg = &fastPeerCandidateAggregate{sampleScope: cloneRow(merged)}
 				aggs[groupID] = agg
 				groupOrder = append(groupOrder, groupID)
+				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_created", 1)
 			}
 
 			agg.edgeCount++
@@ -827,6 +918,12 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 			if similarityNumericOK {
 				agg.similaritySum += similarityNumeric
 			}
+			if !e.stage2LateMaterializationEnabled {
+				e.observeRuntimeCounter(params, "fast_path.stage2.eager_projection_updates", 1)
+				if _, err := buildFastPeerCandidateResultRow(agg, projection, params); err != nil {
+					return err
+				}
+			}
 			return nil
 		}); err != nil {
 			return nil, nil, false, err
@@ -834,25 +931,36 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	}
 
 	out := make([]Row, 0, len(groupOrder))
-	for _, groupID := range groupOrder {
-		agg := aggs[groupID]
-		if agg == nil || agg.edgeCount == 0 {
-			continue
-		}
-		result := cloneRow(agg.values)
-		result[projection.countKey] = agg.edgeCount
-		if agg.avgCount == 0 {
-			result[projection.avgKey] = nil
-		} else {
-			result[projection.avgKey] = agg.avgSum / float64(agg.avgCount)
-		}
-		result[projection.sumSimilarityKey] = agg.similaritySum
-		out = append(out, result)
-	}
-
-	out, err = applyProjectionPostProcessing(out, retSpec, params)
+	topKSpec, useTopK, err := fastPeerCandidateTopKSpecFromProjection(retSpec, projection, params)
 	if err != nil {
 		return nil, nil, false, err
+	}
+	if !e.stage2TopKPushdownEnabled {
+		useTopK = false
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_total", int64(len(groupOrder)))
+	if useTopK {
+		e.observeRuntimeCounter(params, "fast_path.stage2.topk_pushdown_applied", 1)
+		out, err = fastPeerCandidateTopKRows(aggs, groupOrder, projection, topKSpec, params)
+		if err != nil {
+			return nil, nil, false, err
+		}
+	} else {
+		for _, groupID := range groupOrder {
+			agg := aggs[groupID]
+			if agg == nil || agg.edgeCount == 0 {
+				continue
+			}
+			resultRow, err := buildFastPeerCandidateResultRow(agg, projection, params)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			out = append(out, resultRow)
+		}
+		out, err = applyProjectionPostProcessing(out, retSpec, params)
+		if err != nil {
+			return nil, nil, false, err
+		}
 	}
 
 	columns := append([]string(nil), projection.orderedOutputKeys...)
@@ -860,7 +968,136 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 		columns = append([]string(nil), priorColumns...)
 	}
 	out = trimProjectionRows(out, columns)
+	e.observeRuntimeCounter(params, "fast_path.stage2.rows_output", int64(len(out)))
 	return out, columns, true, nil
+}
+
+func buildFastPeerCandidateResultRow(agg *fastPeerCandidateAggregate, projection fastPeerCandidateReturnProjection, params Params) (Row, error) {
+	result := Row{}
+	for _, item := range projection.nonAggregates {
+		key := item.Expression
+		if item.Alias != "" {
+			key = item.Alias
+		}
+		value, err := evalExpressionWithScope(item.Expression, agg.sampleScope, params)
+		if err != nil {
+			return nil, err
+		}
+		result[key] = value
+	}
+	result[projection.countKey] = agg.edgeCount
+	if agg.avgCount == 0 {
+		result[projection.avgKey] = nil
+	} else {
+		result[projection.avgKey] = agg.avgSum / float64(agg.avgCount)
+	}
+	result[projection.sumSimilarityKey] = agg.similaritySum
+	return result, nil
+}
+
+func fastPeerCandidateTopKSpecFromProjection(retSpec projectionClauseSpec, projection fastPeerCandidateReturnProjection, params Params) (fastPeerCandidateTopKSpec, bool, error) {
+	if len(retSpec.OrderBy) != 1 {
+		return fastPeerCandidateTopKSpec{}, false, nil
+	}
+	if strings.TrimSpace(retSpec.LimitRaw) == "" {
+		return fastPeerCandidateTopKSpec{}, false, nil
+	}
+
+	orderExpr := strings.TrimSpace(retSpec.OrderBy[0].Expression)
+	if !strings.EqualFold(orderExpr, projection.sumSimilarityKey) && !strings.EqualFold(orderExpr, projection.sumSimilarityExpr) {
+		return fastPeerCandidateTopKSpec{}, false, nil
+	}
+
+	skip, err := evalOptionalInt(rawExpression(retSpec.SkipRaw), params)
+	if err != nil {
+		return fastPeerCandidateTopKSpec{}, false, err
+	}
+	limit, err := evalOptionalInt(rawExpression(retSpec.LimitRaw), params)
+	if err != nil {
+		return fastPeerCandidateTopKSpec{}, false, err
+	}
+	if limit <= 0 {
+		return fastPeerCandidateTopKSpec{descending: retSpec.OrderBy[0].Descending, skip: skip, limit: 0}, true, nil
+	}
+
+	return fastPeerCandidateTopKSpec{descending: retSpec.OrderBy[0].Descending, skip: skip, limit: limit}, true, nil
+}
+
+func fastPeerCandidateTopKRows(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, projection fastPeerCandidateReturnProjection, spec fastPeerCandidateTopKSpec, params Params) ([]Row, error) {
+	if spec.limit <= 0 {
+		return []Row{}, nil
+	}
+
+	keep := spec.skip + spec.limit
+	if keep <= 0 {
+		keep = spec.limit
+	}
+	ranked := make([]fastPeerCandidateRankedRow, 0, keep)
+
+	for idx, groupID := range groupOrder {
+		agg := aggs[groupID]
+		if agg == nil || agg.edgeCount == 0 {
+			continue
+		}
+		candidate := fastPeerCandidateRankedRow{agg: agg, score: agg.similaritySum, inputIndex: idx}
+		if len(ranked) < keep {
+			ranked = append(ranked, candidate)
+			continue
+		}
+
+		worstIdx := 0
+		for i := 1; i < len(ranked); i++ {
+			if compareFastPeerCandidateRank(ranked[worstIdx], ranked[i], spec.descending) < 0 {
+				worstIdx = i
+			}
+		}
+		if compareFastPeerCandidateRank(candidate, ranked[worstIdx], spec.descending) < 0 {
+			ranked[worstIdx] = candidate
+		}
+	}
+
+	sort.Slice(ranked, func(i, j int) bool {
+		return compareFastPeerCandidateRank(ranked[i], ranked[j], spec.descending) < 0
+	})
+
+	if spec.skip >= len(ranked) {
+		return []Row{}, nil
+	}
+	end := len(ranked)
+	if max := spec.skip + spec.limit; max < end {
+		end = max
+	}
+	out := make([]Row, 0, end-spec.skip)
+	for _, rankedRow := range ranked[spec.skip:end] {
+		row, err := buildFastPeerCandidateResultRow(rankedRow.agg, projection, params)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func compareFastPeerCandidateRank(left, right fastPeerCandidateRankedRow, descending bool) int {
+	if left.score != right.score {
+		if descending {
+			if left.score > right.score {
+				return -1
+			}
+			return 1
+		}
+		if left.score < right.score {
+			return -1
+		}
+		return 1
+	}
+	if left.inputIndex < right.inputIndex {
+		return -1
+	}
+	if left.inputIndex > right.inputIndex {
+		return 1
+	}
+	return 0
 }
 
 func validateUnionKinds(kinds []ast.UnionKind) error {

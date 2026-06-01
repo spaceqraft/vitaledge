@@ -43,14 +43,20 @@ type ProcedureDecl struct {
 type Row map[string]any
 
 type Result struct {
-	Columns []string
-	Rows    []Row
-	Stats   Stats
+	Columns  []string
+	Rows     []Row
+	Stats    Stats
+	Warnings []Diagnostic
 }
 
 type Stats struct {
 	RowsReturned int
 	Duration     time.Duration
+}
+
+type Diagnostic struct {
+	Code    string
+	Message string
 }
 
 type Metrics interface {
@@ -59,6 +65,7 @@ type Metrics interface {
 	ObserveIndexCandidate(tenant, schema, property string, indexed bool)
 	ObserveIndexLookup(strategy, outcome string, matches int)
 	ObserveDeleteCounter(event string, delta int64)
+	ObserveRuntimeCounter(name string, delta int64)
 }
 
 type IndexCatalog interface {
@@ -73,12 +80,20 @@ type IndexCatalog interface {
 type Options struct {
 	Metrics      Metrics
 	IndexCatalog IndexCatalog
+	// DisableStage2TopKPushdown forces the stage-2 recommendation fast path to
+	// run full projection post-processing instead of top-k pushdown.
+	DisableStage2TopKPushdown bool
+	// DisableStage2LateMaterialization forces eager per-update projection
+	// materialization in the stage-2 recommendation fast path.
+	DisableStage2LateMaterialization bool
 }
 
 type Executor struct {
-	store        graph.GraphStore
-	metrics      Metrics
-	indexCatalog IndexCatalog
+	store                            graph.GraphStore
+	metrics                          Metrics
+	indexCatalog                     IndexCatalog
+	stage2TopKPushdownEnabled        bool
+	stage2LateMaterializationEnabled bool
 
 	indexJobWorkerOnce   sync.Once
 	indexJobWorkerMu     sync.Mutex
@@ -97,12 +112,20 @@ func (noopMetrics) ObserveIndexLookup(_, _ string, _ int) {}
 
 func (noopMetrics) ObserveDeleteCounter(_ string, _ int64) {}
 
+func (noopMetrics) ObserveRuntimeCounter(_ string, _ int64) {}
+
 func New(store graph.GraphStore, opts Options) *Executor {
 	metrics := opts.Metrics
 	if metrics == nil {
 		metrics = noopMetrics{}
 	}
-	return &Executor{store: store, metrics: metrics, indexCatalog: opts.IndexCatalog}
+	return &Executor{
+		store:                            store,
+		metrics:                          metrics,
+		indexCatalog:                     opts.IndexCatalog,
+		stage2TopKPushdownEnabled:        !opts.DisableStage2TopKPushdown,
+		stage2LateMaterializationEnabled: !opts.DisableStage2LateMaterialization,
+	}
 }
 
 func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, params Params) (res *Result, err error) {

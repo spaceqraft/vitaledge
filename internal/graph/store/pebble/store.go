@@ -3,11 +3,13 @@ package pebblestore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -688,6 +690,70 @@ func (t *tx) ScanPropertyIndexAll(ctx context.Context, tenant, schema, property 
 	return t.scanPropertyIndex(ctx, keyspace.PropertyIndexPrefix(tenant, schema, property), tenant, schema, property, limit, fn)
 }
 
+func (t *tx) ScanPropertyIndexNumericRange(ctx context.Context, tenant, schema, property string, lower float64, lowerSet bool, lowerInclusive bool, upper float64, upperSet bool, upperInclusive bool, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_property_index_numeric_range", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || schema == "" || property == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, schema, property, and callback are required", nil)
+	}
+
+	prefix := keyspace.PropertyIndexNumericPrefix(tenant, schema, property)
+	lowerBound := prefix
+	upperBound := prefixUpperBound(prefix)
+
+	if lowerSet {
+		ordered := orderedFloat64Bytes(lower)
+		if lowerInclusive {
+			lowerBound = keyspace.PropertyIndexNumericValuePrefix(tenant, schema, property, ordered)
+		} else {
+			lowerBound = keyspace.PropertyIndexNumericValueUpperBound(tenant, schema, property, ordered)
+		}
+	}
+	if upperSet {
+		ordered := orderedFloat64Bytes(upper)
+		if upperInclusive {
+			upperBound = keyspace.PropertyIndexNumericValueUpperBound(tenant, schema, property, ordered)
+		} else {
+			upperBound = keyspace.PropertyIndexNumericValuePrefix(tenant, schema, property, ordered)
+		}
+	}
+	if len(upperBound) > 0 && bytes.Compare(lowerBound, upperBound) >= 0 {
+		return nil
+	}
+
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: lowerBound, UpperBound: upperBound})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create numeric property index iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		entry, err := numericPropertyIndexEntryFromKey(iter.Key(), iter.Value(), tenant, schema, property)
+		if err != nil {
+			return err
+		}
+		if err := fn(entry); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan numeric property index", err)
+	}
+	return nil
+}
+
 func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEntry) (err error) {
 	started := time.Now()
 	defer func() { t.observeOperation("put_property_index", err, started) }()
@@ -701,6 +767,12 @@ func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEnt
 	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID)
 	if err := t.set(key, []byte(entry.EntityClass), "write property index"); err != nil {
 		return err
+	}
+	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
+		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
+		if err := t.set(numericKey, numericPropertyIndexPayload(entry.EntityClass, entry.Value), "write numeric property index"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -718,6 +790,12 @@ func (t *tx) DeletePropertyIndex(ctx context.Context, entry *graph.PropertyIndex
 	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID)
 	if err := t.delete(key, "delete property index"); err != nil {
 		return err
+	}
+	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
+		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
+		if err := t.delete(numericKey, "delete numeric property index"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1363,6 +1441,71 @@ func propertyIndexEntryFromKey(key, value []byte, tenant, schema, property strin
 		EntityID:    entityID,
 		EntityClass: string(value),
 	}, nil
+}
+
+func numericPropertyIndexEntryFromKey(key, payload []byte, tenant, schema, property string) (*graph.PropertyIndexEntry, error) {
+	parts := bytes.Split(key, []byte{'/'})
+	if len(parts) < 6 {
+		return nil, graph.NewError(graph.ErrKindStorage, "malformed numeric property index key", nil)
+	}
+	entityID := string(parts[len(parts)-1])
+	entityClass, rawValue, err := parseNumericPropertyIndexPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	return &graph.PropertyIndexEntry{
+		Tenant:      tenant,
+		Schema:      schema,
+		Property:    property,
+		Value:       rawValue,
+		EntityID:    entityID,
+		EntityClass: entityClass,
+	}, nil
+}
+
+func numericPropertyIndexPayload(entityClass string, rawValue []byte) []byte {
+	payload := make([]byte, 0, len(entityClass)+1+len(rawValue))
+	payload = append(payload, []byte(entityClass)...)
+	payload = append(payload, 0)
+	payload = append(payload, rawValue...)
+	return payload
+}
+
+func parseNumericPropertyIndexPayload(payload []byte) (string, []byte, error) {
+	sep := bytes.IndexByte(payload, 0)
+	if sep < 0 {
+		return "", nil, graph.NewError(graph.ErrKindStorage, "malformed numeric property index payload", nil)
+	}
+	entityClass := string(payload[:sep])
+	rawValue := append([]byte(nil), payload[sep+1:]...)
+	if strings.TrimSpace(entityClass) == "" {
+		return "", nil, graph.NewError(graph.ErrKindStorage, "numeric property index payload missing entity class", nil)
+	}
+	return entityClass, rawValue, nil
+}
+
+func numericOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return nil, false
+	}
+	numeric, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(numeric) {
+		return nil, false
+	}
+	return orderedFloat64Bytes(numeric), true
+}
+
+func orderedFloat64Bytes(v float64) []byte {
+	bits := math.Float64bits(v)
+	if bits&(1<<63) != 0 {
+		bits = ^bits
+	} else {
+		bits ^= 1 << 63
+	}
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint64(out, bits)
+	return out
 }
 
 func (s *Store) lockEdge(tenant, edgeID string) func() {

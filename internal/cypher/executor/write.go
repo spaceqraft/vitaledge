@@ -102,8 +102,10 @@ const queryAdjacencyCacheParam = "__ve_query_adjacency_cache"
 const runtimeCounterStateParam = "__ve_runtime_counter_state"
 const edgeRangeIndexCandidateLimit = 200000
 const stage2IndexPushdownMaxIndexedCandidates = 512
+const stage2IndexPushdownMaxIndexedCandidatesOneSidedRange = 2048
 const stage2IndexPushdownMaxAverageEdgesPerSource = 16
 const stage2IndexPushdownProbeCandidateLimit = 1536
+const stage2IndexPushdownProbeCandidateLimitOneSidedRange = 4096
 const stage2IndexPushdownSourceScopedProbeMaxSources = 8
 
 type wherePatternPredicateCache struct {
@@ -1248,6 +1250,22 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 		return nil, nil, false, nil
 	}
 
+	topKSpec, useTopK, err := fastPeerCandidateTopKSpecFromProjection(retSpec, projection, params)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !e.stage2TopKPushdownEnabled {
+		useTopK = false
+	}
+	earlyStopEnabled := useTopK && topKSpec.descending && topKSpec.limit > 0
+	earlyStopKeep := topKSpec.skip + topKSpec.limit
+	if earlyStopKeep <= 0 {
+		earlyStopKeep = topKSpec.limit
+	}
+	if earlyStopKeep <= 0 {
+		earlyStopEnabled = false
+	}
+
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, nil, false, err
@@ -1262,13 +1280,37 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	stage2PredicateShapeSkipNoted := false
 	stage2SourceScopeSkipNoted := false
 	stage2PredicateShapeEligible, stage2PredicateShapeDecisive := stage2IndexPushdownPredicateShapeDecision(pattern, matchSpec.Where, params)
+	stage2OneSidedNumericRangeEligible := stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, matchSpec.Where, nil, params)
 	stage2IndexProbeLimit := stage2IndexPushdownProbeCandidateLimit
-	if maxPushdownCandidates := stage2IndexPushdownMaxIndexedCandidates + 1; stage2IndexProbeLimit > maxPushdownCandidates {
+	if stage2OneSidedNumericRangeEligible && stage2IndexProbeLimit < stage2IndexPushdownProbeCandidateLimitOneSidedRange {
+		stage2IndexProbeLimit = stage2IndexPushdownProbeCandidateLimitOneSidedRange
+	}
+	maxPushdownCandidates := stage2IndexPushdownMaxIndexedCandidates + 1
+	if stage2OneSidedNumericRangeEligible {
+		if relaxedMax := stage2IndexPushdownMaxIndexedCandidatesOneSidedRange + 1; relaxedMax > maxPushdownCandidates {
+			maxPushdownCandidates = relaxedMax
+		}
+	}
+	if stage2IndexProbeLimit > maxPushdownCandidates {
 		stage2IndexProbeLimit = maxPushdownCandidates
 	}
 	type stage2PeerInput struct {
 		row  Row
 		peer *graph.Vertex
+	}
+	type stage2PeerWorkItem struct {
+		row                   Row
+		peer                  *graph.Vertex
+		numericConstraints    map[string]edgeNumericRangeConstraint
+		hasNumericConstraints bool
+		excludedRightIDs      map[string]struct{}
+		hasExcludedRightIDs   bool
+		skipWhereEval         bool
+		similarityNumeric     float64
+		similarityNumericOK   bool
+		edges                 []*graph.Edge
+		indexedEdges          bool
+		remainingPotential    float64
 	}
 	stage2Inputs := make([]stage2PeerInput, 0, len(rows))
 	stage2SourcePeerIDs := map[string]struct{}{}
@@ -1294,125 +1336,9 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	}
 	e.observeRuntimeCounter(params, "fast_path.stage2.peer_rows_input", int64(len(rows)))
 
-	for _, input := range stage2Inputs {
-		row := input.row
-		peer := input.peer
-
-		numericConstraints, hasNumericConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params)
-		excludedRightIDs, hasExcludedRightIDs, err := extractDirectedWhereRightExclusionSet(ctx, tx, tenant, matchSpec.Where, pattern.Right.Var, row, params)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		skipWhereEval := directedWhereCoveredByExtractedPrefilters(matchSpec.Where, pattern.EdgeVar, pattern.Right.Var, row, params, hasNumericConstraints, hasExcludedRightIDs)
-		if skipWhereEval {
-			e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_bypass_rows", 1)
-		}
-
-		similarityValue, err := evalExpressionWithScope(projection.sumSimilarityExpr, row, params)
-		if err != nil {
-			return nil, nil, false, nil
-		}
-		similarityNumeric, similarityNumericOK := comparableNumericValue(similarityValue)
-
-		processCandidateEdge := func(edge *graph.Edge) error {
-			e.observeRuntimeCounter(params, "fast_path.stage2.edges_visited", 1)
-			if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
-				return nil
-			}
-			if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
-				return nil
-			}
-			if hasNumericConstraints && !edgeMatchesNumericConstraints(edge, numericConstraints) {
-				e.observeRuntimeCounter(params, "fast_path.stage2.numeric_prefilter_drops", 1)
-				return nil
-			}
-			if hasExcludedRightIDs {
-				if _, blocked := excludedRightIDs[edge.DstID]; blocked {
-					e.observeRuntimeCounter(params, "fast_path.stage2.antijoin_prefilter_drops", 1)
-					return nil
-				}
-			}
-
-			groupID := strings.TrimSpace(edge.DstID)
-			if groupID == "" {
-				return nil
-			}
-			if agg, exists := aggs[groupID]; exists && skipWhereEval {
-				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_group_reuse_hits", 1)
-				agg.edgeCount++
-				if rating, ok := edgeNumericProperty(edge, projection.avgEdgeProperty); ok {
-					agg.avgSum += rating
-					agg.avgCount++
-				}
-				if similarityNumericOK {
-					agg.similaritySum += similarityNumeric
-				}
-				return nil
-			}
-
-			candidate, err := getVertexQueryCached(ctx, tx, tenant, edge.DstID, params)
-			if err != nil {
-				return err
-			}
-			if candidate == nil {
-				return nil
-			}
-
-			merged := cloneRow(row)
-			if pattern.Left.Var != "" {
-				merged[pattern.Left.Var] = peer
-			}
-			if pattern.Right.Var != "" {
-				merged[pattern.Right.Var] = candidate
-			}
-			if pattern.EdgeVar != "" {
-				merged[pattern.EdgeVar] = edge
-			}
-			if !vertexPatternMatches(candidate, pattern.Right, params, merged) {
-				return nil
-			}
-			if strings.TrimSpace(matchSpec.Where) != "" && !skipWhereEval {
-				ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
-				if err != nil {
-					return err
-				}
-				if !ok {
-					e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_drops", 1)
-					return nil
-				}
-			}
-
-			agg, exists := aggs[groupID]
-			if !exists {
-				agg = &fastPeerCandidateAggregate{}
-				if projection.lateMaterializeNonAggregates {
-					agg.sampleCandidate = candidate
-				} else {
-					agg.sampleScope = cloneRow(merged)
-				}
-				aggs[groupID] = agg
-				groupOrder = append(groupOrder, groupID)
-				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_created", 1)
-				if projection.lateMaterializeNonAggregates {
-					e.observeRuntimeCounter(params, "fast_path.stage2.late_materialization_candidates", 1)
-				}
-			}
-
-			agg.edgeCount++
-			if rating, ok := edgeNumericProperty(edge, projection.avgEdgeProperty); ok {
-				agg.avgSum += rating
-				agg.avgCount++
-			}
-			if similarityNumericOK {
-				agg.similaritySum += similarityNumeric
-			}
-			if !e.stage2LateMaterializationEnabled {
-				e.observeRuntimeCounter(params, "fast_path.stage2.eager_projection_updates", 1)
-				if _, err := buildFastPeerCandidateResultRow(agg, projection, params); err != nil {
-					return err
-				}
-			}
-			return nil
+	collectPeerEdges := func(row Row, peer *graph.Vertex) ([]*graph.Edge, bool, error) {
+		if peer == nil || strings.TrimSpace(peer.ID) == "" {
+			return nil, false, nil
 		}
 
 		if e.stage2EdgeIndexPushdownEnabled {
@@ -1426,6 +1352,9 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 					stage2PredicateShapeSkipNoted = true
 				}
 			} else {
+				if stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, matchSpec.Where, row, params) {
+					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_eligible_one_sided_range", 1)
+				}
 				cacheKey, cacheable := stage2IndexLookupCacheKey(pattern, matchSpec.Where, row, params)
 				if cacheable {
 					lookupByIndex := false
@@ -1440,7 +1369,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 						}
 						edges, indexed, probeCapExceeded, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, matchSpec.Where, "", row, params, stage2ProbeSourceFilter, stage2IndexProbeLimit)
 						if err != nil {
-							return nil, nil, false, err
+							return nil, false, err
 						}
 						applyPushdown := false
 						if probeCapExceeded {
@@ -1477,38 +1406,222 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 						}
 						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_rows", 1)
 						indexedEdges := stage2IndexedEdgeCache[cacheKey][peer.ID]
-						for _, edge := range indexedEdges {
-							if edge == nil {
-								continue
-							}
-							e.observeRuntimeCounter(params, "fast_path.stage2.index_edges_considered", 1)
-							if err := processCandidateEdge(edge); err != nil {
-								return nil, nil, false, err
-							}
-						}
-						continue
+						return append([]*graph.Edge(nil), indexedEdges...), true, nil
 					}
 				}
 			}
 		}
 
-		scanType := pattern.EdgeType
-		if len(pattern.EdgeAnyOf) > 0 {
-			scanType = ""
-		}
-		if err := scanOutEdgesQueryCached(ctx, tx, tenant, peer.ID, scanType, params, processCandidateEdge); err != nil {
+		return nil, false, nil
+	}
+
+	workItems := make([]stage2PeerWorkItem, 0, len(stage2Inputs))
+	totalRemainingPotential := 0.0
+	earlyStopFrontier := map[string]struct{}{}
+	for _, input := range stage2Inputs {
+		row := input.row
+		peer := input.peer
+
+		numericConstraints, hasNumericConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params)
+		excludedRightIDs, hasExcludedRightIDs, err := extractDirectedWhereRightExclusionSet(ctx, tx, tenant, matchSpec.Where, pattern.Right.Var, row, params)
+		if err != nil {
 			return nil, nil, false, err
+		}
+		skipWhereEval := directedWhereCoveredByExtractedPrefilters(matchSpec.Where, pattern.EdgeVar, pattern.Right.Var, row, params, hasNumericConstraints, hasExcludedRightIDs)
+		if skipWhereEval {
+			e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_bypass_rows", 1)
+		}
+
+		similarityValue, err := evalExpressionWithScope(projection.sumSimilarityExpr, row, params)
+		if err != nil {
+			return nil, nil, false, nil
+		}
+		similarityNumeric, similarityNumericOK := comparableNumericValue(similarityValue)
+
+		edges, indexedEdges, err := collectPeerEdges(row, peer)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if !indexedEdges {
+			earlyStopEnabled = false
+		}
+
+		remainingPotential := 0.0
+		if similarityNumericOK && similarityNumeric > 0 && len(edges) > 0 {
+			remainingPotential = similarityNumeric * float64(len(edges))
+		}
+		workItems = append(workItems, stage2PeerWorkItem{
+			row:                   row,
+			peer:                  peer,
+			numericConstraints:    numericConstraints,
+			hasNumericConstraints: hasNumericConstraints,
+			excludedRightIDs:      excludedRightIDs,
+			hasExcludedRightIDs:   hasExcludedRightIDs,
+			skipWhereEval:         skipWhereEval,
+			similarityNumeric:     similarityNumeric,
+			similarityNumericOK:   similarityNumericOK,
+			edges:                 edges,
+			indexedEdges:          indexedEdges,
+			remainingPotential:    remainingPotential,
+		})
+		totalRemainingPotential += remainingPotential
+	}
+
+	for _, item := range workItems {
+		row := item.row
+		peer := item.peer
+
+		processCandidateEdge := func(edge *graph.Edge) error {
+			if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
+				return nil
+			}
+			if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
+				return nil
+			}
+			if item.hasNumericConstraints && !edgeMatchesNumericConstraints(edge, item.numericConstraints) {
+				e.observeRuntimeCounter(params, "fast_path.stage2.numeric_prefilter_drops", 1)
+				return nil
+			}
+			if item.hasExcludedRightIDs {
+				if _, blocked := item.excludedRightIDs[edge.DstID]; blocked {
+					e.observeRuntimeCounter(params, "fast_path.stage2.antijoin_prefilter_drops", 1)
+					return nil
+				}
+			}
+
+			groupID := strings.TrimSpace(edge.DstID)
+			if groupID == "" {
+				return nil
+			}
+			if len(earlyStopFrontier) > 0 {
+				if _, keep := earlyStopFrontier[groupID]; !keep {
+					e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_edges_skipped", 1)
+					return nil
+				}
+			}
+			e.observeRuntimeCounter(params, "fast_path.stage2.edges_visited", 1)
+			if agg, exists := aggs[groupID]; exists && item.skipWhereEval {
+				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_group_reuse_hits", 1)
+				agg.edgeCount++
+				if rating, ok := edgeNumericProperty(edge, projection.avgEdgeProperty); ok {
+					agg.avgSum += rating
+					agg.avgCount++
+				}
+				if item.similarityNumericOK {
+					agg.similaritySum += item.similarityNumeric
+				}
+				return nil
+			}
+
+			candidate, err := getVertexQueryCached(ctx, tx, tenant, edge.DstID, params)
+			if err != nil {
+				return err
+			}
+			if candidate == nil {
+				return nil
+			}
+
+			merged := cloneRow(row)
+			if pattern.Left.Var != "" {
+				merged[pattern.Left.Var] = peer
+			}
+			if pattern.Right.Var != "" {
+				merged[pattern.Right.Var] = candidate
+			}
+			if pattern.EdgeVar != "" {
+				merged[pattern.EdgeVar] = edge
+			}
+			if !vertexPatternMatches(candidate, pattern.Right, params, merged) {
+				return nil
+			}
+			if strings.TrimSpace(matchSpec.Where) != "" && !item.skipWhereEval {
+				ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_drops", 1)
+					return nil
+				}
+			}
+
+			agg, exists := aggs[groupID]
+			if !exists {
+				agg = &fastPeerCandidateAggregate{}
+				if projection.lateMaterializeNonAggregates {
+					agg.sampleCandidate = candidate
+				} else {
+					agg.sampleScope = cloneRow(merged)
+				}
+				aggs[groupID] = agg
+				groupOrder = append(groupOrder, groupID)
+				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_created", 1)
+				if projection.lateMaterializeNonAggregates {
+					e.observeRuntimeCounter(params, "fast_path.stage2.late_materialization_candidates", 1)
+				}
+			}
+
+			agg.edgeCount++
+			if rating, ok := edgeNumericProperty(edge, projection.avgEdgeProperty); ok {
+				agg.avgSum += rating
+				agg.avgCount++
+			}
+			if item.similarityNumericOK {
+				agg.similaritySum += item.similarityNumeric
+			}
+			if !e.stage2LateMaterializationEnabled {
+				e.observeRuntimeCounter(params, "fast_path.stage2.eager_projection_updates", 1)
+				if _, err := buildFastPeerCandidateResultRow(agg, projection, params); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		if item.indexedEdges {
+			for _, edge := range item.edges {
+				if edge == nil {
+					continue
+				}
+				e.observeRuntimeCounter(params, "fast_path.stage2.index_edges_considered", 1)
+				if err := processCandidateEdge(edge); err != nil {
+					return nil, nil, false, err
+				}
+			}
+		} else {
+			scanType := pattern.EdgeType
+			if len(pattern.EdgeAnyOf) > 0 {
+				scanType = ""
+			}
+			if err := scanOutEdgesQueryCached(ctx, tx, tenant, peer.ID, scanType, params, processCandidateEdge); err != nil {
+				return nil, nil, false, err
+			}
+		}
+
+		if earlyStopEnabled {
+			totalRemainingPotential -= item.remainingPotential
+			if totalRemainingPotential < 0 {
+				totalRemainingPotential = 0
+			}
+			e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_checks", 1)
+			boundaryScore, maxNonFrontierScore, frontierGroupIDs, ready := stage2TopKFrontierBoundary(aggs, groupOrder, earlyStopKeep, true)
+			if ready {
+				maxOutsideScore := totalRemainingPotential
+				if maxNonFrontierScore > math.Inf(-1) {
+					nonFrontierUpperBound := maxNonFrontierScore + totalRemainingPotential
+					if nonFrontierUpperBound > maxOutsideScore {
+						maxOutsideScore = nonFrontierUpperBound
+					}
+				}
+				if boundaryScore > maxOutsideScore && len(earlyStopFrontier) == 0 {
+					e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_triggers", 1)
+					earlyStopFrontier = frontierGroupIDs
+				}
+			}
 		}
 	}
 
 	out := make([]Row, 0, len(groupOrder))
-	topKSpec, useTopK, err := fastPeerCandidateTopKSpecFromProjection(retSpec, projection, params)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	if !e.stage2TopKPushdownEnabled {
-		useTopK = false
-	}
 	e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_total", int64(len(groupOrder)))
 	if useTopK {
 		e.observeRuntimeCounter(params, "fast_path.stage2.topk_pushdown_applied", 1)
@@ -1542,6 +1655,57 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	out = trimProjectionRows(out, columns)
 	e.observeRuntimeCounter(params, "fast_path.stage2.rows_output", int64(len(out)))
 	return out, columns, true, nil
+}
+
+func stage2TopKFrontierBoundary(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, keep int, descending bool) (boundaryScore float64, maxNonFrontierScore float64, frontierGroupIDs map[string]struct{}, ready bool) {
+	if keep <= 0 || !descending {
+		return 0, math.Inf(-1), nil, false
+	}
+
+	top := &fastPeerCandidateTopKHeap{descending: descending, rows: make([]fastPeerCandidateRankedRow, 0, keep)}
+	for idx, groupID := range groupOrder {
+		agg := aggs[groupID]
+		if agg == nil || agg.edgeCount == 0 {
+			continue
+		}
+		candidate := fastPeerCandidateRankedRow{agg: agg, score: agg.similaritySum, inputIndex: idx}
+		if top.Len() < keep {
+			heap.Push(top, candidate)
+			continue
+		}
+		if compareFastPeerCandidateRank(candidate, top.rows[0], descending) < 0 {
+			top.rows[0] = candidate
+			heap.Fix(top, 0)
+		}
+	}
+	if top.Len() < keep {
+		return 0, math.Inf(-1), nil, false
+	}
+
+	frontierIndexes := map[int]struct{}{}
+	frontierGroupIDs = map[string]struct{}{}
+	for _, ranked := range top.rows {
+		frontierIndexes[ranked.inputIndex] = struct{}{}
+		if ranked.inputIndex >= 0 && ranked.inputIndex < len(groupOrder) {
+			frontierGroupIDs[groupOrder[ranked.inputIndex]] = struct{}{}
+		}
+	}
+
+	maxNonFrontierScore = math.Inf(-1)
+	for idx, groupID := range groupOrder {
+		if _, ok := frontierIndexes[idx]; ok {
+			continue
+		}
+		agg := aggs[groupID]
+		if agg == nil || agg.edgeCount == 0 {
+			continue
+		}
+		if agg.similaritySum > maxNonFrontierScore {
+			maxNonFrontierScore = agg.similaritySum
+		}
+	}
+
+	return top.rows[0].score, maxNonFrontierScore, frontierGroupIDs, true
 }
 
 func stage2IndexLookupCacheKey(pattern directedRelationshipPattern, whereRaw string, row Row, params Params) (string, bool) {
@@ -1587,7 +1751,7 @@ func stage2IndexPushdownEligibleByPredicateShape(pattern directedRelationshipPat
 		if constraint.isContradictory() {
 			return true
 		}
-		if constraint.lowerSet && constraint.upperSet {
+		if constraint.lowerSet || constraint.upperSet {
 			return true
 		}
 	}
@@ -1608,11 +1772,27 @@ func stage2IndexPushdownPredicateShapeDecision(pattern directedRelationshipPatte
 		if constraint.isContradictory() {
 			return true, true
 		}
-		if constraint.lowerSet && constraint.upperSet {
+		if constraint.lowerSet || constraint.upperSet {
 			return true, true
 		}
 	}
 	return false, true
+}
+
+func stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern directedRelationshipPattern, whereRaw string, row Row, params Params) bool {
+	constraints, hasConstraints := extractEdgeWhereNumericConstraints(whereRaw, pattern.EdgeVar, row, params)
+	if !hasConstraints {
+		return false
+	}
+	for _, constraint := range constraints {
+		if constraint.isContradictory() {
+			continue
+		}
+		if constraint.lowerSet != constraint.upperSet {
+			return true
+		}
+	}
+	return false
 }
 
 func edgeNumericRangeConstraintCacheKey(constraint edgeNumericRangeConstraint) string {
@@ -5024,6 +5204,9 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 				}
 
 				collectRight := func(edge2 *graph.Edge, right *graph.Vertex) error {
+					if edge2 == nil || edge1 == nil || strings.TrimSpace(edge2.ID) == strings.TrimSpace(edge1.ID) {
+						return nil
+					}
 					if !edgeTypeMatches(edge2, pattern.SecondEdgeType, pattern.SecondEdgeAnyOf) {
 						return nil
 					}
@@ -7235,7 +7418,7 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 
 		strategy = "edge_property_index_range"
 		for _, candidateType := range types {
-			err := tx.ScanPropertyIndexAll(ctx, tenant, candidateType, selectedProp, 0, func(entry *graph.PropertyIndexEntry) error {
+			err := tx.ScanPropertyIndexNumericRange(ctx, tenant, candidateType, selectedProp, selectedConstraint.lower, selectedConstraint.lowerSet, selectedConstraint.lowerInclusive, selectedConstraint.upper, selectedConstraint.upperSet, selectedConstraint.upperInclusive, 0, func(entry *graph.PropertyIndexEntry) error {
 				if entry == nil || entry.EntityClass != "edge" {
 					return nil
 				}

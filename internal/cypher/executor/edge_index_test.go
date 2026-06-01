@@ -215,6 +215,191 @@ func TestCallCreateEdgePropertyIndexEnqueuesBackgroundBuild(t *testing.T) {
 	}
 }
 
+func TestCallDropPropertyIndexRemovesEntriesAndCatalog(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{
+			Tenant: "acme",
+			ID:     "u1",
+			Labels: []string{"User"},
+			Properties: map[string][]byte{
+				"email": valueToBytes("alice@example.com"),
+			},
+		})
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	createStmt, err := parser.ParseStatement("CALL db.index.createProperty('User', 'email') YIELD created, indexedEntities")
+	if err != nil {
+		t.Fatalf("parse create failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, createStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute create failed: %v", err)
+	}
+
+	dropStmt, err := parser.ParseStatement("CALL db.index.dropProperty('User', 'email') YIELD dropped, deletedEntities")
+	if err != nil {
+		t.Fatalf("parse drop failed: %v", err)
+	}
+	dropRes, err := exec.ExecuteStatement(ctx, dropStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute drop failed: %v", err)
+	}
+	if len(dropRes.Rows) != 1 {
+		t.Fatalf("expected one drop result row, got %d (%#v)", len(dropRes.Rows), dropRes.Rows)
+	}
+	if dropRes.Rows[0]["dropped"] != true {
+		t.Fatalf("expected dropped=true, got %#v", dropRes.Rows[0]["dropped"])
+	}
+	if dropRes.Rows[0]["deletedEntities"] != 1 {
+		t.Fatalf("expected deletedEntities=1, got %#v", dropRes.Rows[0]["deletedEntities"])
+	}
+	if catalog.HasPropertyIndex("acme", "User", "email") {
+		t.Fatalf("expected vertex property index to be removed from catalog")
+	}
+
+	remaining := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexAll(ctx, "acme", "User", "email", 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				remaining++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("scan property index all failed: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected no remaining vertex property index entries, got %d", remaining)
+	}
+
+	ifExistsStmt, err := parser.ParseStatement("CALL db.index.dropProperty('User', 'email', true) YIELD dropped, deletedEntities")
+	if err != nil {
+		t.Fatalf("parse ifExists drop failed: %v", err)
+	}
+	ifExistsRes, err := exec.ExecuteStatement(ctx, ifExistsStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute ifExists drop failed: %v", err)
+	}
+	if len(ifExistsRes.Rows) != 1 {
+		t.Fatalf("expected one ifExists drop row, got %d (%#v)", len(ifExistsRes.Rows), ifExistsRes.Rows)
+	}
+	if ifExistsRes.Rows[0]["dropped"] != false {
+		t.Fatalf("expected dropped=false with ifExists on missing index, got %#v", ifExistsRes.Rows[0]["dropped"])
+	}
+	if ifExistsRes.Rows[0]["deletedEntities"] != 0 {
+		t.Fatalf("expected deletedEntities=0 with ifExists on missing index, got %#v", ifExistsRes.Rows[0]["deletedEntities"])
+	}
+}
+
+func TestCallDropEdgePropertyIndexRemovesEntriesAndNumericShadow(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1", Properties: map[string][]byte{"rating": valueToBytes(5.0)}})
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	createStmt, err := parser.ParseStatement("CALL db.index.createEdgeProperty('RATED', 'rating') YIELD created, indexedEntities")
+	if err != nil {
+		t.Fatalf("parse create failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, createStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute create failed: %v", err)
+	}
+	if _, err := exec.processPendingEdgeIndexBuildJobs(ctx); err != nil {
+		t.Fatalf("process jobs failed: %v", err)
+	}
+
+	dropStmt, err := parser.ParseStatement("CALL db.index.dropEdgeProperty('RATED', 'rating') YIELD dropped, deletedEntities")
+	if err != nil {
+		t.Fatalf("parse drop failed: %v", err)
+	}
+	dropRes, err := exec.ExecuteStatement(ctx, dropStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute drop failed: %v", err)
+	}
+	if len(dropRes.Rows) != 1 {
+		t.Fatalf("expected one drop result row, got %d (%#v)", len(dropRes.Rows), dropRes.Rows)
+	}
+	if dropRes.Rows[0]["dropped"] != true {
+		t.Fatalf("expected dropped=true, got %#v", dropRes.Rows[0]["dropped"])
+	}
+	if dropRes.Rows[0]["deletedEntities"] != 1 {
+		t.Fatalf("expected deletedEntities=1, got %#v", dropRes.Rows[0]["deletedEntities"])
+	}
+	if catalog.HasEdgePropertyIndex("acme", "RATED", "rating") {
+		t.Fatalf("expected edge property index to be removed from catalog")
+	}
+
+	remaining := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexAll(ctx, "acme", "RATED", "rating", 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				remaining++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("scan property index all failed: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected no remaining edge property index entries, got %d", remaining)
+	}
+
+	numericShadow := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexNumericRange(ctx, "acme", "RATED", "rating", 5.0, true, true, 5.0, true, true, 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				numericShadow++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("scan numeric property index range failed: %v", err)
+	}
+	if numericShadow != 0 {
+		t.Fatalf("expected no remaining numeric shadow entries, got %d", numericShadow)
+	}
+
+	ifExistsStmt, err := parser.ParseStatement("CALL db.index.dropEdgeProperty('RATED', 'rating', true) YIELD dropped, deletedEntities")
+	if err != nil {
+		t.Fatalf("parse ifExists drop failed: %v", err)
+	}
+	ifExistsRes, err := exec.ExecuteStatement(ctx, ifExistsStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute ifExists drop failed: %v", err)
+	}
+	if len(ifExistsRes.Rows) != 1 {
+		t.Fatalf("expected one ifExists drop row, got %d (%#v)", len(ifExistsRes.Rows), ifExistsRes.Rows)
+	}
+	if ifExistsRes.Rows[0]["dropped"] != false {
+		t.Fatalf("expected dropped=false with ifExists on missing index, got %#v", ifExistsRes.Rows[0]["dropped"])
+	}
+	if ifExistsRes.Rows[0]["deletedEntities"] != 0 {
+		t.Fatalf("expected deletedEntities=0 with ifExists on missing edge index, got %#v", ifExistsRes.Rows[0]["deletedEntities"])
+	}
+}
+
 func TestEdgeIndexBuildJobResumesAcrossExecutorRestart(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -1396,7 +1581,7 @@ func TestRecommendationStage2EdgeIndexPushdownSelectiveWorkloadBuildsScopedIndex
 	defer func() { _ = store.Close() }()
 
 	ctx := context.Background()
-	if err := seedRecommendationBenchmarkGraph(ctx, store); err != nil {
+	if err := seedRecommendationBenchmarkRangePredicateActivationGraph(ctx, store); err != nil {
 		t.Fatalf("seed benchmark graph failed: %v", err)
 	}
 
@@ -1433,6 +1618,235 @@ func TestRecommendationStage2EdgeIndexPushdownSelectiveWorkloadBuildsScopedIndex
 	}
 	if counters["fast_path.stage2.index_pushdown_applied"] != 0 && counters["fast_path.stage2.index_pushdown_rows"] <= 0 {
 		t.Fatalf("expected pushdown rows when pushdown is applied, got %#v", counters)
+	}
+}
+
+func TestRecommendationStage2EdgeIndexPushdownRangePredicateActivatesPushdown(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := seedRecommendationBenchmarkRangePredicateActivationGraph(ctx, store); err != nil {
+		t.Fatalf("seed benchmark graph failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement(recommendationBenchmarkQuery)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalogBaseline := indexschema.NewCatalog()
+	catalogBaseline.AddEdgePropertyIndex("bench-rec", "RATED", "rating")
+	collectorBaseline := NewCollector()
+	execBaseline := New(store, Options{Metrics: collectorBaseline, IndexCatalog: catalogBaseline, DisableStage2EdgeIndexPushdown: true})
+	if _, err := execBaseline.BackfillEdgePropertyIndex(ctx, "bench-rec", "RATED", "rating"); err != nil {
+		t.Fatalf("baseline backfill failed: %v", err)
+	}
+	resBaseline, err := execBaseline.ExecuteStatement(ctx, stmt, Params{"tenant": "bench-rec"})
+	if err != nil {
+		t.Fatalf("baseline execute failed: %v", err)
+	}
+
+	catalogEnabled := indexschema.NewCatalog()
+	catalogEnabled.AddEdgePropertyIndex("bench-rec", "RATED", "rating")
+	collectorEnabled := NewCollector()
+	execEnabled := New(store, Options{Metrics: collectorEnabled, IndexCatalog: catalogEnabled})
+	if _, err := execEnabled.BackfillEdgePropertyIndex(ctx, "bench-rec", "RATED", "rating"); err != nil {
+		t.Fatalf("enabled backfill failed: %v", err)
+	}
+	resEnabled, err := execEnabled.ExecuteStatement(ctx, stmt, Params{"tenant": "bench-rec"})
+	if err != nil {
+		t.Fatalf("enabled execute failed: %v", err)
+	}
+
+	if len(resBaseline.Rows) == 0 || len(resEnabled.Rows) == 0 {
+		t.Fatalf("expected non-empty recommendation rows, baseline=%d enabled=%d", len(resBaseline.Rows), len(resEnabled.Rows))
+	}
+
+	baselineRows := append([]Row(nil), resBaseline.Rows...)
+	enabledRows := append([]Row(nil), resEnabled.Rows...)
+	sortRowsByMovieID(baselineRows)
+	sortRowsByMovieID(enabledRows)
+	baselineJSON, err := json.Marshal(baselineRows)
+	if err != nil {
+		t.Fatalf("marshal baseline rows failed: %v", err)
+	}
+	enabledJSON, err := json.Marshal(enabledRows)
+	if err != nil {
+		t.Fatalf("marshal enabled rows failed: %v", err)
+	}
+	if string(baselineJSON) != string(enabledJSON) {
+		t.Fatalf("expected identical rows, baseline=%s enabled=%s", string(baselineJSON), string(enabledJSON))
+	}
+
+	baselineCounters, err := runtimeCountersFromWarnings(resBaseline.Warnings)
+	if err != nil {
+		t.Fatalf("baseline runtime counters parse failed: %v", err)
+	}
+	enabledCounters, err := runtimeCountersFromWarnings(resEnabled.Warnings)
+	if err != nil {
+		t.Fatalf("enabled runtime counters parse failed: %v", err)
+	}
+	if baselineCounters["fast_path.stage2.index_pushdown_applied"] != 0 {
+		t.Fatalf("expected baseline without stage2 index pushdown, got %#v", baselineCounters)
+	}
+	if enabledCounters["fast_path.stage2.index_pushdown_applied"] <= 0 {
+		t.Fatalf("expected enabled run to apply stage2 index pushdown, got %#v", enabledCounters)
+	}
+	if enabledCounters["fast_path.stage2.index_pushdown_eligible_one_sided_range"] <= 0 {
+		t.Fatalf("expected enabled run to qualify one-sided numeric range eligibility, got %#v", enabledCounters)
+	}
+	if enabledCounters["fast_path.stage2.index_pushdown_skipped_predicate_shape"] != 0 {
+		t.Fatalf("expected range predicate to bypass predicate-shape skip, got %#v", enabledCounters)
+	}
+	if enabledCounters["fast_path.stage2.index_pushdown_rows"] <= 0 {
+		t.Fatalf("expected enabled run to process indexed rows, got %#v", enabledCounters)
+	}
+	if baselineCounters["fast_path.stage2.numeric_prefilter_drops"] <= enabledCounters["fast_path.stage2.numeric_prefilter_drops"] {
+		t.Fatalf("expected enabled run to reduce numeric prefilter drops relative to baseline, baseline=%#v enabled=%#v", baselineCounters, enabledCounters)
+	}
+}
+
+func TestRecommendationStage2TopKEarlyStopMatchesBaseline(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-target", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1)}}); err != nil {
+			return err
+		}
+		for i := 1; i <= 3; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("m-shared-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(100 + i)}}); err != nil {
+				return err
+			}
+			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: fmt.Sprintf("e-target-%d", i), Type: "RATED", SrcID: "u-target", DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+				return err
+			}
+		}
+
+		for i := 1; i <= 10; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("m-top-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i)}}); err != nil {
+				return err
+			}
+		}
+		for i := 1; i <= 5; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("m-weak-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(1000 + i)}}); err != nil {
+				return err
+			}
+		}
+
+		edgeSeq := 0
+		nextEdgeID := func() string {
+			edgeSeq++
+			return fmt.Sprintf("e-%d", edgeSeq)
+		}
+
+		for p := 1; p <= 20; p++ {
+			peerID := fmt.Sprintf("u-strong-%d", p)
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: peerID, Labels: []string{"User"}}); err != nil {
+				return err
+			}
+			for i := 1; i <= 3; i++ {
+				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+					return err
+				}
+			}
+			for i := 1; i <= 10; i++ {
+				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-top-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+					return err
+				}
+			}
+		}
+
+		for p := 1; p <= 5; p++ {
+			peerID := fmt.Sprintf("u-weak-%d", p)
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: peerID, Labels: []string{"User"}}); err != nil {
+				return err
+			}
+			for i := 1; i <= 3; i++ {
+				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}); err != nil {
+					return err
+				}
+			}
+			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-weak-%d", p), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	query := "MATCH (target:User {user_id: 1})-[r1:RATED]->(shared:Movie)<-[r2:RATED]-(peer:User) WHERE peer <> target AND abs(r1.rating - r2.rating) <= 1.5 WITH target, peer, count(shared) AS shared_count, avg(abs(r1.rating - r2.rating)) AS avg_diff WHERE shared_count >= 3 WITH target, peer, shared_count * (1.0 / (1.0 + avg_diff)) AS similarity ORDER BY similarity DESC LIMIT 30 MATCH (peer)-[rp:RATED]->(candidate:Movie) WHERE rp.rating = 5.0 AND NOT (target)-[:RATED]->(candidate) RETURN candidate.movie_id AS movie_id, avg(rp.rating) AS peer_avg, count(rp) AS peer_count, sum(similarity) AS total_sim ORDER BY total_sim DESC LIMIT 10"
+	stmt, err := parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	baselineCatalog := indexschema.NewCatalog()
+	baselineCatalog.AddEdgePropertyIndex("acme", "RATED", "rating")
+	baselineCollector := NewCollector()
+	baselineExec := New(store, Options{Metrics: baselineCollector, IndexCatalog: baselineCatalog, DisableStage2TopKPushdown: true})
+	if _, err := baselineExec.BackfillEdgePropertyIndex(ctx, "acme", "RATED", "rating"); err != nil {
+		t.Fatalf("baseline backfill failed: %v", err)
+	}
+	baselineRes, err := baselineExec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("baseline execute failed: %v", err)
+	}
+
+	enabledCatalog := indexschema.NewCatalog()
+	enabledCatalog.AddEdgePropertyIndex("acme", "RATED", "rating")
+	enabledCollector := NewCollector()
+	enabledExec := New(store, Options{Metrics: enabledCollector, IndexCatalog: enabledCatalog})
+	if _, err := enabledExec.BackfillEdgePropertyIndex(ctx, "acme", "RATED", "rating"); err != nil {
+		t.Fatalf("enabled backfill failed: %v", err)
+	}
+	enabledRes, err := enabledExec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("enabled execute failed: %v", err)
+	}
+
+	baselineRows := append([]Row(nil), baselineRes.Rows...)
+	enabledRows := append([]Row(nil), enabledRes.Rows...)
+	sortRowsByMovieID(baselineRows)
+	sortRowsByMovieID(enabledRows)
+
+	baselineJSON, err := json.Marshal(baselineRows)
+	if err != nil {
+		t.Fatalf("marshal baseline rows failed: %v", err)
+	}
+	enabledJSON, err := json.Marshal(enabledRows)
+	if err != nil {
+		t.Fatalf("marshal enabled rows failed: %v", err)
+	}
+	if string(baselineJSON) != string(enabledJSON) {
+		t.Fatalf("expected identical rows, baseline=%s enabled=%s", string(baselineJSON), string(enabledJSON))
+	}
+
+	baselineCounters, err := runtimeCountersFromWarnings(baselineRes.Warnings)
+	if err != nil {
+		t.Fatalf("baseline runtime counters parse failed: %v", err)
+	}
+	enabledCounters, err := runtimeCountersFromWarnings(enabledRes.Warnings)
+	if err != nil {
+		t.Fatalf("enabled runtime counters parse failed: %v", err)
+	}
+	if enabledCounters["fast_path.stage2.early_stop_checks"] <= 0 {
+		t.Fatalf("expected stage2 early-stop checks > 0, got %#v", enabledCounters)
+	}
+	if enabledCounters["fast_path.stage2.early_stop_triggers"] <= 0 {
+		t.Fatalf("expected stage2 early-stop triggers > 0, got %#v", enabledCounters)
+	}
+	if enabledCounters["fast_path.stage2.early_stop_edges_skipped"] <= 0 {
+		t.Fatalf("expected stage2 early-stop skipped edges > 0, got %#v", enabledCounters)
+	}
+	if enabledCounters["fast_path.stage2.index_pushdown_applied"] <= 0 {
+		t.Fatalf("expected stage2 index pushdown applied for early-stop scenario, got %#v", enabledCounters)
+	}
+	if enabledCounters["fast_path.stage2.edges_visited"] >= baselineCounters["fast_path.stage2.edges_visited"] {
+		t.Fatalf("expected early-stop run to visit fewer stage2 edges, baseline=%#v enabled=%#v", baselineCounters, enabledCounters)
 	}
 }
 

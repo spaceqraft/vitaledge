@@ -95,16 +95,24 @@ Index DDL is also available through Cypher query execution (standalone `CALL`):
 ```cypher
 CALL db.index.createProperty('User', 'email') YIELD created, indexedEntities
 CALL db.index.createProperty('User', 'email', true) YIELD created, indexedEntities
+CALL db.index.dropProperty('User', 'email') YIELD dropped, deletedEntities
+CALL db.index.dropProperty('User', 'email', true) YIELD dropped, deletedEntities
 
 CALL db.index.createEdgeProperty('RATED', 'rating') YIELD created, indexedEntities
 CALL db.index.createEdgeProperty('RATED', 'rating', true) YIELD created, indexedEntities
+CALL db.index.dropEdgeProperty('RATED', 'rating') YIELD dropped, deletedEntities
+CALL db.index.dropEdgeProperty('RATED', 'rating', true) YIELD dropped, deletedEntities
 ```
 
 For query DDL, tenant context is read from request parameters (for example `{"tenant":"acme"}`).
 
 `db.index.createProperty` creates/backfills a vertex property index for `(tenant, schema, property)`.
 
+`db.index.dropProperty` removes a vertex property index for `(tenant, schema, property)` and deletes its persisted index entries.
+
 `db.index.createEdgeProperty` creates/backfills an edge property index for `(tenant, edgeType, property)`.
+
+`db.index.dropEdgeProperty` removes an edge property index for `(tenant, edgeType, property)`, deletes persisted index entries, and clears pending build work for that tuple.
 
 `db.index.createEdgeProperty` is fulfilled asynchronously to avoid long request timeouts on large datasets:
 

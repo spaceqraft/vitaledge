@@ -27,6 +27,18 @@ func TestPropertyIndexKey(t *testing.T) {
 	}
 }
 
+func TestPropertyIndexNumericKeys(t *testing.T) {
+	if got := string(PropertyIndexNumericPrefix("t1", "RATED", "rating")); got != "in/t1/RATED/rating/" {
+		t.Fatalf("unexpected numeric property index prefix: %s", got)
+	}
+	if got := string(PropertyIndexNumericKey("t1", "RATED", "rating", []byte{0x01, 0xff}, "e1")); got != "in/t1/RATED/rating/01ff/e1" {
+		t.Fatalf("unexpected numeric property index key: %s", got)
+	}
+	if got := string(PropertyIndexNumericValuePrefix("t1", "RATED", "rating", []byte{0x01, 0xff})); got != "in/t1/RATED/rating/01ff/" {
+		t.Fatalf("unexpected numeric property index value prefix: %s", got)
+	}
+}
+
 func TestStatsKeys(t *testing.T) {
 	if got := string(StatsVertexTotalKey("t1")); got != "s/t1/vertex_total" {
 		t.Fatalf("unexpected vertex total stats key: %s", got)

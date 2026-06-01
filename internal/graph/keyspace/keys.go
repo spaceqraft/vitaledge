@@ -3,13 +3,14 @@ package keyspace
 import "fmt"
 
 const (
-	vertexPrefix = "v"
-	edgePrefix   = "e"
-	outPrefix    = "a/out"
-	inPrefix     = "a/in"
-	indexPrefix  = "i"
-	statsPrefix  = "s"
-	metaPrefix   = "m"
+	vertexPrefix   = "v"
+	edgePrefix     = "e"
+	outPrefix      = "a/out"
+	inPrefix       = "a/in"
+	indexPrefix    = "i"
+	indexNumPrefix = "in"
+	statsPrefix    = "s"
+	metaPrefix     = "m"
 )
 
 func VertexKey(tenant, vertexID string) []byte {
@@ -60,6 +61,22 @@ func PropertyIndexPrefix(tenant, schema, property string) []byte {
 
 func PropertyIndexValuePrefix(tenant, schema, property string, encodedValue []byte) []byte {
 	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexPrefix, tenant, schema, property, encodedValue))
+}
+
+func PropertyIndexNumericPrefix(tenant, schema, property string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexNumPrefix, tenant, schema, property))
+}
+
+func PropertyIndexNumericKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/%s", indexNumPrefix, tenant, schema, property, orderedValue, entityID))
+}
+
+func PropertyIndexNumericValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexNumPrefix, tenant, schema, property, orderedValue))
+}
+
+func PropertyIndexNumericValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/\xff", indexNumPrefix, tenant, schema, property, orderedValue))
 }
 
 func StatsVertexTotalKey(tenant string) []byte {

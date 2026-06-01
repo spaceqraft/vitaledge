@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -459,6 +460,68 @@ func TestPropertyIndexRoundTrip(t *testing.T) {
 
 	if got := countByPrefix(t, store, prefix); got != 0 {
 		t.Fatalf("expected zero index keys, got %d", got)
+	}
+}
+
+func TestPropertyIndexNumericRangeScan(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	entries := []*graph.PropertyIndexEntry{
+		{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("3.5"), EntityID: "e35", EntityClass: "edge"},
+		{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("4.0"), EntityID: "e40", EntityClass: "edge"},
+		{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("5.0"), EntityID: "e50", EntityClass: "edge"},
+		{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("top"), EntityID: "es", EntityClass: "edge"},
+	}
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		for _, entry := range entries {
+			if err := tx.PutPropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("put index entries failed: %v", err)
+	}
+
+	var got []string
+	err = store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexNumericRange(ctx, "acme", "RATED", "rating", 4.0, true, true, 0, false, false, 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				got = append(got, entry.EntityID)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("numeric range scan failed: %v", err)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "e40,e50" {
+		t.Fatalf("unexpected numeric range entity ids: %#v", got)
+	}
+
+	numericPrefix := keyspace.PropertyIndexNumericPrefix("acme", "RATED", "rating")
+	if gotCount := countByPrefix(t, store, numericPrefix); gotCount != 3 {
+		t.Fatalf("expected three numeric shadow index keys, got %d", gotCount)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		for _, entry := range entries {
+			if err := tx.DeletePropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("delete index entries failed: %v", err)
+	}
+	if gotCount := countByPrefix(t, store, numericPrefix); gotCount != 0 {
+		t.Fatalf("expected numeric shadow index keys to be deleted, got %d", gotCount)
 	}
 }
 

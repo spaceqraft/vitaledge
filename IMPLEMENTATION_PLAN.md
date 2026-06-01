@@ -519,6 +519,91 @@ Quality gates:
 
 - Benchmark threshold checks in CI (non-blocking initially, then blocking).
 
+#### Stage2 recommendation fanout reduction: KPI checklist
+
+Baseline anchor (latest recommendation EXPLAIN):
+
+1. Stage2 expansion currently reads `rowsIn=30` and emits `rowsOut=3334` at the stage2 edge scan.
+2. Stage2 residual filter is bookkeeping-only on this workload (`rowsOut` unchanged across stage2 filter).
+3. Stage1 top-k pushdown is healthy and should remain enabled unless adaptive feedback proves otherwise.
+
+Primary KPIs (must be tracked per A/B run):
+
+1. Stage2 fanout ratio:
+   - Definition: `stage2_rows_out / stage2_rows_in` from EXPLAIN cardinality (`N9` style scan node).
+   - Target direction: down.
+2. Stage2 candidate volume:
+   - Definition: runtime counter `fast_path.stage2.edges_visited` per query op.
+   - Target direction: down.
+3. End-to-end latency:
+   - Definition: recommendation benchmark `ns/op` for baseline vs enabled mode.
+   - Target direction: down or neutral.
+4. Result parity:
+   - Definition: exact row-equivalence versus baseline execution (same query + tenant snapshot).
+   - Requirement: identical rows.
+5. Pushdown diagnostics quality:
+   - Definition: counters for applied/skip reasons remain interpretable (`index_pushdown_applied`, `index_pushdown_skipped_*`, probe diagnostics).
+   - Requirement: no observability regression.
+
+Secondary KPIs (nice-to-have for this stage):
+
+1. Stage2 candidate group count before final top-k.
+2. Stage2 index candidates total when index path is eligible.
+3. Memory pressure proxy via allocations/op in benchmark output.
+
+Acceptance threshold for this fanout-reduction track:
+
+1. `fast_path.stage2.edges_visited/op` decreases by a meaningful margin on the target recommendation workload.
+2. Benchmark `ns/op` does not regress (prefer improvement).
+3. Result parity tests remain green.
+4. EXPLAIN continues to report coherent execution strategy + runtime feedback fields.
+
+#### Stage2 recommendation fanout reduction: first slice (S2-F1)
+
+Slice objective:
+
+1. Reduce broad stage2 expansion work by introducing a bounded exact-safe candidate accumulation path that can stop processing additional edges once no unseen candidate can enter the current top-k frontier.
+
+Scope (narrow by design):
+
+1. Apply only to the recognized stage2 recommendation fast path (`MATCH+RETURN` peer/candidate aggregation).
+2. Guard behind existing eligibility checks and preserve current fallback behavior.
+3. Keep semantics exact; no approximate ranking/truncation in this slice.
+
+Implementation tasks:
+
+1. Add per-query accounting for candidate frontier state in stage2 accumulation.
+2. Add an exact-safe early-stop condition tied to current top-k boundary and remaining per-peer edge contribution bounds.
+3. Emit dedicated runtime counters for:
+   - early-stop checks,
+   - early-stop triggers,
+   - edges skipped due to early-stop.
+4. Keep existing stage2 index pushdown diagnostics unchanged.
+
+Validation tasks:
+
+1. Add focused parity test comparing S2-F1 enabled path vs baseline result rows.
+2. Extend benchmark reporting with new early-stop counters per op.
+3. Run recommendation A/B benchmark pair and capture KPI deltas.
+4. Re-run EXPLAIN coherence tests and verify no payload-shape drift.
+
+Exit criteria for S2-F1:
+
+1. Result parity test passes.
+2. Full executor test suite is green.
+3. Recommendation benchmark shows reduced stage2 edge visits/op.
+4. EXPLAIN remains coherent and includes unchanged/compatible strategy diagnostics.
+
+S2-F1 implementation status:
+
+1. Completed: exact-safe stage2 early-stop boundary check in recommendation fast path when stage2 top-k pushdown is active (`ORDER BY total_sim DESC LIMIT ...`).
+2. Completed: runtime counters added and wired through existing diagnostics:
+   - `fast_path.stage2.early_stop_checks`
+   - `fast_path.stage2.early_stop_triggers`
+   - `fast_path.stage2.early_stop_edges_skipped`
+3. Completed: parity test coverage added (`TestRecommendationStage2TopKEarlyStopMatchesBaseline`).
+4. Completed: benchmark output now includes early-stop per-op metrics.
+
 ### WS4: Reliability and Operations
 
 Primary outputs:

@@ -219,6 +219,22 @@ func (e *Executor) resolveBuiltinProcedure(name string) (resolvedProcedure, bool
 			},
 			handler: e.builtinCreatePropertyIndexProcedure,
 		}, true
+	case "db.index.dropproperty":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.dropProperty",
+				Inputs: []ProcedureArg{
+					{Name: "schema", Type: "STRING", Nullable: false},
+					{Name: "property", Type: "STRING", Nullable: false},
+					{Name: "ifExists", Type: "BOOLEAN", Nullable: true},
+				},
+				Outputs: []ProcedureArg{
+					{Name: "dropped", Type: "BOOLEAN", Nullable: false},
+					{Name: "deletedEntities", Type: "INTEGER", Nullable: false},
+				},
+			},
+			handler: e.builtinDropPropertyIndexProcedure,
+		}, true
 	case "db.index.createedgeproperty":
 		return resolvedProcedure{
 			decl: ProcedureDecl{
@@ -234,6 +250,22 @@ func (e *Executor) resolveBuiltinProcedure(name string) (resolvedProcedure, bool
 				},
 			},
 			handler: e.builtinCreateEdgePropertyIndexProcedure,
+		}, true
+	case "db.index.dropedgeproperty":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.dropEdgeProperty",
+				Inputs: []ProcedureArg{
+					{Name: "edgeType", Type: "STRING", Nullable: false},
+					{Name: "property", Type: "STRING", Nullable: false},
+					{Name: "ifExists", Type: "BOOLEAN", Nullable: true},
+				},
+				Outputs: []ProcedureArg{
+					{Name: "dropped", Type: "BOOLEAN", Nullable: false},
+					{Name: "deletedEntities", Type: "INTEGER", Nullable: false},
+				},
+			},
+			handler: e.builtinDropEdgePropertyIndexProcedure,
 		}, true
 	case "db.index.edgebuildjobs":
 		return resolvedProcedure{
@@ -313,6 +345,22 @@ func (e *Executor) builtinCreatePropertyIndexProcedure(ctx context.Context, args
 	return []Row{{"created": created, "indexedEntities": indexedEntities}}, nil
 }
 
+func (e *Executor) builtinDropPropertyIndexProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+	schema, property, ifExists, err := parseDropPropertyIndexArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	dropped, deletedEntities, err := e.DropPropertyIndex(ctx, tenant, schema, property, ifExists)
+	if err != nil {
+		return nil, err
+	}
+	return []Row{{"dropped": dropped, "deletedEntities": deletedEntities}}, nil
+}
+
 func (e *Executor) builtinCreateEdgePropertyIndexProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
@@ -327,6 +375,22 @@ func (e *Executor) builtinCreateEdgePropertyIndexProcedure(ctx context.Context, 
 		return nil, err
 	}
 	return []Row{{"created": created, "indexedEntities": indexedEntities}}, nil
+}
+
+func (e *Executor) builtinDropEdgePropertyIndexProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+	edgeType, property, ifExists, err := parseDropEdgePropertyIndexArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	dropped, deletedEntities, err := e.DropEdgePropertyIndex(ctx, tenant, edgeType, property, ifExists)
+	if err != nil {
+		return nil, err
+	}
+	return []Row{{"dropped": dropped, "deletedEntities": deletedEntities}}, nil
 }
 
 func (e *Executor) builtinEdgeBuildJobsProcedure(ctx context.Context, _ []any, _ Params) ([]Row, error) {
@@ -595,6 +659,31 @@ func parseCreatePropertyIndexArgs(args []any) (schema, property string, ifNotExi
 	return strings.TrimSpace(schemaValue), strings.TrimSpace(propertyValue), ifNotExists, nil
 }
 
+func parseDropPropertyIndexArgs(args []any) (schema, property string, ifExists bool, err error) {
+	if len(args) < 2 || len(args) > 3 {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid number of arguments", nil)
+	}
+
+	schemaValue, ok := args[0].(string)
+	if !ok {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"schema\"", nil)
+	}
+	propertyValue, ok := args[1].(string)
+	if !ok {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"property\"", nil)
+	}
+
+	if len(args) == 3 && args[2] != nil {
+		parsed, ok := args[2].(bool)
+		if !ok {
+			return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"ifExists\"", nil)
+		}
+		ifExists = parsed
+	}
+
+	return strings.TrimSpace(schemaValue), strings.TrimSpace(propertyValue), ifExists, nil
+}
+
 func parseCreateEdgePropertyIndexArgs(args []any) (edgeType, property string, ifNotExists bool, err error) {
 	if len(args) < 2 || len(args) > 3 {
 		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid number of arguments", nil)
@@ -618,6 +707,31 @@ func parseCreateEdgePropertyIndexArgs(args []any) (edgeType, property string, if
 	}
 
 	return strings.TrimSpace(edgeTypeValue), strings.TrimSpace(propertyValue), ifNotExists, nil
+}
+
+func parseDropEdgePropertyIndexArgs(args []any) (edgeType, property string, ifExists bool, err error) {
+	if len(args) < 2 || len(args) > 3 {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid number of arguments", nil)
+	}
+
+	edgeTypeValue, ok := args[0].(string)
+	if !ok {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"edgeType\"", nil)
+	}
+	propertyValue, ok := args[1].(string)
+	if !ok {
+		return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"property\"", nil)
+	}
+
+	if len(args) == 3 && args[2] != nil {
+		parsed, ok := args[2].(bool)
+		if !ok {
+			return "", "", false, graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"ifExists\"", nil)
+		}
+		ifExists = parsed
+	}
+
+	return strings.TrimSpace(edgeTypeValue), strings.TrimSpace(propertyValue), ifExists, nil
 }
 
 func parseRestartEdgePropertyBuildArgs(args []any) (edgeType, property string, err error) {

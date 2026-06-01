@@ -313,6 +313,16 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 
 	for idx := 0; idx < len(part.Clauses); idx++ {
 		clause := part.Clauses[idx]
+		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindWith {
+			if fastRows, fastColumns, ok, fastErr := e.tryFastTargetSharedPeerAggregationWithTopKClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns); fastErr != nil {
+				return nil, nil, false, fastErr
+			} else if ok {
+				rows = fastRows
+				resultColumns = fastColumns
+				idx += 2
+				continue
+			}
+		}
 		if idx+1 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith {
 			if fastRows, fastColumns, ok, fastErr := e.tryFastTargetSharedPeerAggregationClausePair(ctx, tx, rows, clause, part.Clauses[idx+1], params, resultColumns); fastErr != nil {
 				return nil, nil, false, fastErr
@@ -392,74 +402,131 @@ type fastTargetSharedPeerProjection struct {
 	secondEdgeProperty string
 }
 
+type fastTargetSharedPeerTopKProjection struct {
+	targetExpr     string
+	targetKey      string
+	peerExpr       string
+	peerKey        string
+	similarityExpr string
+	similarityKey  string
+}
+
+type fastTargetSharedPeerTopKSpec struct {
+	descending bool
+	skip       int
+	limit      int
+}
+
+type fastTargetSharedPeerAggregate struct {
+	target     *graph.Vertex
+	peer       *graph.Vertex
+	shared     int
+	sumAbsDiff float64
+}
+
+type firstHopSeed struct {
+	target                    *graph.Vertex
+	firstValue                float64
+	midRow                    Row
+	secondWhereConstraints    map[string]edgeNumericRangeConstraint
+	hasSecondWhereConstraints bool
+}
+
 type stage1WhereShortcutPlan struct {
 	enabled                bool
 	requirePeerNotTarget   bool
 	requireSecondEdgeCover bool
 }
 
-func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
-	if len(rows) != 1 || len(rows[0]) != 0 {
+type fastTargetSharedPeerRankedRow struct {
+	row        Row
+	score      float64
+	inputIndex int
+}
+
+func (e *Executor) tryFastTargetSharedPeerAggregationWithTopKClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, topKWithClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
+	if !e.stage1TopKPushdownEnabled {
 		return nil, nil, false, nil
 	}
-	if tx == nil {
+	if feedback, ok := e.fastPathFeedbackSnapshot(stage1TopKPushdownImplementation); ok && stage1TopKPushdownShouldDisableFromFeedback(feedback) {
+		e.observeRuntimeCounter(params, "fast_path.stage1.topk_pushdown_skipped_adaptive", 1)
 		return nil, nil, false, nil
+	}
+	aggs, projection, withSpec, ok, err := e.collectFastTargetSharedPeerAggregates(ctx, tx, rows, matchClause, withClause, params)
+	if err != nil || !ok {
+		return nil, nil, false, err
+	}
+	if !withSpecHasWhereRaw(withSpec) && len(aggs) == 0 {
+		return []Row{}, []string{projection.targetKey, projection.peerKey, projection.sharedCountKey, projection.avgDiffKey}, true, nil
+	}
+	topKProjection, topKSpec, ok, err := parseFastTargetSharedPeerTopKWithClause(topKWithClause, projection, params)
+	if err != nil || !ok {
+		return nil, nil, false, err
+	}
+	out, err := fastTargetSharedPeerTopKRows(aggs, projection, withSpec, topKProjection, topKSpec, ctx, tx, params, e)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage1.topk_pushdown_applied", 1)
+	e.observeRuntimeCounter(params, "fast_path.stage1.rows_output", int64(len(out)))
+	columns := []string{topKProjection.targetKey, topKProjection.peerKey, topKProjection.similarityKey}
+	if len(columns) == 0 && len(priorColumns) > 0 {
+		columns = append([]string(nil), priorColumns...)
+	}
+	e.recordFastPathFeedback(stage1TopKPushdownImplementation, int64(len(aggs)), int64(len(out)))
+	return out, columns, true, nil
+}
+
+func withSpecHasWhereRaw(withSpec projectionClauseSpec) bool {
+	return strings.TrimSpace(withSpec.WhereRaw) != ""
+}
+
+func (e *Executor) collectFastTargetSharedPeerAggregates(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, params Params) (map[string]*fastTargetSharedPeerAggregate, fastTargetSharedPeerProjection, projectionClauseSpec, bool, error) {
+	if len(rows) != 1 || len(rows[0]) != 0 {
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
+	}
+	if tx == nil {
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
 	}
 
 	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
 	if err != nil || matchSpec.Optional {
-		return nil, nil, false, nil
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
 	}
 
 	chain, err := parseTwoHopDirectedChainPattern(matchSpec.Pattern)
-	if err != nil {
-		return nil, nil, false, nil
-	}
-	if chain.SecondForward {
-		return nil, nil, false, nil
+	if err != nil || chain.SecondForward {
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
 	}
 
 	withSpec, err := projectionClauseSpecFromClause(withClause)
 	if err != nil {
-		return nil, nil, false, nil
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
 	}
 	if withSpec.Distinct || len(withSpec.OrderBy) != 0 || strings.TrimSpace(withSpec.SkipRaw) != "" || strings.TrimSpace(withSpec.LimitRaw) != "" {
-		return nil, nil, false, nil
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
 	}
 	items, err := parseProjectionItems(withSpec.ProjectionRaw)
 	if err != nil {
-		return nil, nil, false, nil
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
 	}
 	projection, ok := parseFastTargetSharedPeerProjection(items, chain)
 	if !ok {
-		return nil, nil, false, nil
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
 	}
 
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
-		return nil, nil, false, err
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
 	}
 
 	targetCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, rows[0], chain.Left, params)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
 	}
 	e.observeRuntimeCounter(params, "fast_path.stage1.target_candidates", int64(len(targetCandidates)))
 
-	type peerAggregate struct {
-		target     *graph.Vertex
-		peer       *graph.Vertex
-		shared     int
-		sumAbsDiff float64
-	}
-	type firstHopSeed struct {
-		target                    *graph.Vertex
-		firstValue                float64
-		midRow                    Row
-		secondWhereConstraints    map[string]edgeNumericRangeConstraint
-		hasSecondWhereConstraints bool
-	}
-	aggs := map[string]*peerAggregate{}
+	aggs := map[string]*fastTargetSharedPeerAggregate{}
 	whereShortcut := buildStage1WhereShortcutPlan(matchSpec.Where, chain)
 	accumulate := func(target *graph.Vertex, peer *graph.Vertex, firstValue, secondValue float64) {
 		if target == nil || peer == nil {
@@ -468,7 +535,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 		key := target.ID + "|" + peer.ID
 		agg, exists := aggs[key]
 		if !exists {
-			agg = &peerAggregate{target: target, peer: peer}
+			agg = &fastTargetSharedPeerAggregate{target: target, peer: peer}
 			aggs[key] = agg
 		}
 		agg.shared++
@@ -539,10 +606,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 					if err != nil {
 						return err
 					}
-					if peer == nil {
-						return nil
-					}
-					if !vertexBindingMatches(midRow, chain.Right.Var, peer) {
+					if peer == nil || !vertexBindingMatches(midRow, chain.Right.Var, peer) {
 						return nil
 					}
 
@@ -587,7 +651,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 					return nil
 				})
 			}); err != nil {
-				return nil, nil, false, err
+				return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
 			}
 		}
 	} else {
@@ -610,7 +674,6 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 			if chain.Left.Var != "" {
 				baseRow[chain.Left.Var] = target
 			}
-
 			firstScanType := chain.FirstEdgeType
 			if len(chain.FirstEdgeAnyOf) > 0 {
 				firstScanType = ""
@@ -623,7 +686,6 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 				if !edgePatternMatches(edge1, chain.FirstEdgeProps, params, baseRow) {
 					return nil
 				}
-
 				shared, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
 				if err != nil {
 					return err
@@ -631,7 +693,6 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 				if shared == nil {
 					return nil
 				}
-
 				midRow := cloneRow(baseRow)
 				if chain.FirstEdgeVar != "" {
 					midRow[chain.FirstEdgeVar] = edge1
@@ -646,21 +707,13 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 				if !firstOK {
 					return nil
 				}
-
 				secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, chain.SecondEdgeVar, midRow, params)
-				seed := firstHopSeed{
-					target:                    target,
-					firstValue:                firstValue,
-					midRow:                    midRow,
-					secondWhereConstraints:    secondWhereConstraints,
-					hasSecondWhereConstraints: hasSecondWhereConstraints,
-				}
+				seed := firstHopSeed{target: target, firstValue: firstValue, midRow: midRow, secondWhereConstraints: secondWhereConstraints, hasSecondWhereConstraints: hasSecondWhereConstraints}
 				sharedID := strings.TrimSpace(shared.ID)
 				if sharedID == "" {
 					return nil
 				}
 				sharedSeeds[sharedID] = append(sharedSeeds[sharedID], seed)
-
 				buckets := sharedSeedBucketsByID[sharedID]
 				targetConstraint, hasTargetConstraint := seed.secondWhereConstraints[projection.secondEdgeProperty]
 				switch {
@@ -680,7 +733,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 				e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.shared_seed_rows", 1)
 				return nil
 			}); err != nil {
-				return nil, nil, false, err
+				return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
 			}
 		}
 
@@ -689,10 +742,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 		if len(chain.SecondEdgeAnyOf) > 0 {
 			secondScanType = ""
 		}
-		for sharedID, seeds := range sharedSeeds {
-			if len(seeds) == 0 {
-				continue
-			}
+		for sharedID := range sharedSeeds {
 			buckets := sharedSeedBucketsByID[sharedID]
 			e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.shared_vertices_expanded", 1)
 			if err := scanInEdgesQueryCached(ctx, tx, tenant, sharedID, secondScanType, params, func(edge2 *graph.Edge) error {
@@ -700,7 +750,6 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 				if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
 					return nil
 				}
-
 				peer, err := getVertexQueryCached(ctx, tx, tenant, edge2.SrcID, params)
 				if err != nil {
 					return err
@@ -708,12 +757,10 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 				if peer == nil {
 					return nil
 				}
-
 				secondValue, secondOK := edgeNumericProperty(edge2, projection.secondEdgeProperty)
 				if !secondOK {
 					return nil
 				}
-
 				applySeed := func(seed firstHopSeed) error {
 					e.observeRuntimeCounter(params, "fast_path.stage1.seed_rows_considered", 1)
 					if seed.target == nil {
@@ -729,7 +776,6 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 					if !vertexBindingMatches(seed.midRow, chain.Right.Var, peer) {
 						return nil
 					}
-
 					merged := cloneRow(seed.midRow)
 					if chain.Right.Var != "" {
 						merged[chain.Right.Var] = peer
@@ -760,11 +806,9 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 							}
 						}
 					}
-
 					accumulate(seed.target, peer, seed.firstValue, secondValue)
 					return nil
 				}
-
 				for _, seed := range buckets.unconstrained {
 					if err := applySeed(seed); err != nil {
 						return err
@@ -788,15 +832,23 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 				}
 				return nil
 			}); err != nil {
-				return nil, nil, false, err
+				return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
 			}
 		}
 	}
 
+	return aggs, projection, withSpec, true, nil
+}
+
+func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
+	aggs, projection, withSpec, ok, err := e.collectFastTargetSharedPeerAggregates(ctx, tx, rows, matchClause, withClause, params)
+	if err != nil || !ok {
+		return nil, nil, false, err
+	}
 	out := make([]Row, 0, len(aggs))
 	e.observeRuntimeCounter(params, "fast_path.stage1.peer_groups_before_with_filter", int64(len(aggs)))
-	for _, agg := range aggs {
-		if agg.shared <= 0 {
+	for _, agg := range sortedFastTargetSharedPeerAggregates(aggs) {
+		if agg == nil || agg.shared <= 0 {
 			continue
 		}
 		row := Row{}
@@ -1757,6 +1809,218 @@ func compareFastPeerCandidateRank(left, right fastPeerCandidateRankedRow, descen
 		return 1
 	}
 	return 0
+}
+
+func parseFastTargetSharedPeerTopKWithClause(clause ast.Clause, prior fastTargetSharedPeerProjection, params Params) (fastTargetSharedPeerTopKProjection, fastTargetSharedPeerTopKSpec, bool, error) {
+	withSpec, err := projectionClauseSpecFromClause(clause)
+	if err != nil {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+	if withSpec.Distinct || strings.TrimSpace(withSpec.WhereRaw) != "" || len(withSpec.OrderBy) != 1 || strings.TrimSpace(withSpec.LimitRaw) == "" {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+
+	items, err := parseProjectionItems(withSpec.ProjectionRaw)
+	if err != nil {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+	if len(items) != 3 {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+
+	projection := fastTargetSharedPeerTopKProjection{}
+	for _, item := range items {
+		if item.Expression == "*" || item.CollectArg != "" || item.CountArg != "" || item.AggFunc != "" {
+			return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+		}
+		key := item.Expression
+		if item.Alias != "" {
+			key = item.Alias
+		}
+		expr := strings.TrimSpace(item.Expression)
+		switch expr {
+		case prior.targetKey, prior.targetExpr:
+			projection.targetExpr = expr
+			projection.targetKey = key
+		case prior.peerKey, prior.peerExpr:
+			projection.peerExpr = expr
+			projection.peerKey = key
+		default:
+			if projection.similarityExpr != "" {
+				return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+			}
+			projection.similarityExpr = expr
+			projection.similarityKey = key
+		}
+	}
+	if projection.targetKey == "" || projection.peerKey == "" || projection.similarityKey == "" || projection.similarityExpr == "" {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+
+	orderExpr := strings.TrimSpace(withSpec.OrderBy[0].Expression)
+	if !strings.EqualFold(orderExpr, projection.similarityKey) && !strings.EqualFold(orderExpr, projection.similarityExpr) {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+	skip, err := evalOptionalInt(rawExpression(withSpec.SkipRaw), params)
+	if err != nil {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, err
+	}
+	limit, err := evalOptionalInt(rawExpression(withSpec.LimitRaw), params)
+	if err != nil {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, err
+	}
+	return projection, fastTargetSharedPeerTopKSpec{descending: withSpec.OrderBy[0].Descending, skip: skip, limit: limit}, true, nil
+}
+
+func fastTargetSharedPeerTopKRows(aggs map[string]*fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection, withSpec projectionClauseSpec, topKProjection fastTargetSharedPeerTopKProjection, spec fastTargetSharedPeerTopKSpec, ctx context.Context, tx graph.Tx, params Params, exec *Executor) ([]Row, error) {
+	if spec.limit <= 0 {
+		return []Row{}, nil
+	}
+
+	params = withProjectionEvalRuntime(ctx, tx, params, exec)
+	keep := spec.skip + spec.limit
+	if keep <= 0 {
+		keep = spec.limit
+	}
+	top := &fastTargetSharedPeerTopKHeap{descending: spec.descending, rows: make([]fastTargetSharedPeerRankedRow, 0, keep)}
+	inputIndex := 0
+	for _, agg := range sortedFastTargetSharedPeerAggregates(aggs) {
+		if agg == nil || agg.shared <= 0 {
+			continue
+		}
+		row := Row{}
+		row[projection.targetKey] = agg.target
+		row[projection.peerKey] = agg.peer
+		row[projection.sharedCountKey] = agg.shared
+		row[projection.avgDiffKey] = agg.sumAbsDiff / float64(agg.shared)
+		if withSpec.WhereRaw != "" {
+			ok, err := exec.evalWhereExpression(ctx, tx, withSpec.WhereRaw, row, params)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+		}
+		similarityValue, err := evalExpressionWithScope(topKProjection.similarityExpr, row, params)
+		if err != nil {
+			return nil, err
+		}
+		score, ok := comparableNumericValue(similarityValue)
+		if !ok {
+			continue
+		}
+		trimmed := Row{}
+		trimmed[topKProjection.targetKey] = row[projection.targetKey]
+		trimmed[topKProjection.peerKey] = row[projection.peerKey]
+		trimmed[topKProjection.similarityKey] = similarityValue
+		candidate := fastTargetSharedPeerRankedRow{row: trimmed, score: score, inputIndex: inputIndex}
+		inputIndex++
+		if top.Len() < keep {
+			heap.Push(top, candidate)
+			continue
+		}
+		if compareFastTargetSharedPeerRank(candidate, top.rows[0], spec.descending) < 0 {
+			top.rows[0] = candidate
+			heap.Fix(top, 0)
+		}
+	}
+
+	ranked := top.rows
+	sort.Slice(ranked, func(i, j int) bool {
+		return compareFastTargetSharedPeerRank(ranked[i], ranked[j], spec.descending) < 0
+	})
+	if spec.skip >= len(ranked) {
+		return []Row{}, nil
+	}
+	end := len(ranked)
+	if max := spec.skip + spec.limit; max < end {
+		end = max
+	}
+	out := make([]Row, 0, end-spec.skip)
+	for _, rankedRow := range ranked[spec.skip:end] {
+		out = append(out, rankedRow.row)
+	}
+	return out, nil
+}
+
+type fastTargetSharedPeerTopKHeap struct {
+	rows       []fastTargetSharedPeerRankedRow
+	descending bool
+}
+
+func (h fastTargetSharedPeerTopKHeap) Len() int { return len(h.rows) }
+
+func (h fastTargetSharedPeerTopKHeap) Less(i, j int) bool {
+	return compareFastTargetSharedPeerRank(h.rows[i], h.rows[j], h.descending) > 0
+}
+
+func (h fastTargetSharedPeerTopKHeap) Swap(i, j int) { h.rows[i], h.rows[j] = h.rows[j], h.rows[i] }
+
+func (h *fastTargetSharedPeerTopKHeap) Push(x any) {
+	h.rows = append(h.rows, x.(fastTargetSharedPeerRankedRow))
+}
+
+func (h *fastTargetSharedPeerTopKHeap) Pop() any {
+	last := len(h.rows) - 1
+	item := h.rows[last]
+	h.rows = h.rows[:last]
+	return item
+}
+
+func compareFastTargetSharedPeerRank(left, right fastTargetSharedPeerRankedRow, descending bool) int {
+	if left.score != right.score {
+		if descending {
+			if left.score > right.score {
+				return -1
+			}
+			return 1
+		}
+		if left.score < right.score {
+			return -1
+		}
+		return 1
+	}
+	if left.inputIndex < right.inputIndex {
+		return -1
+	}
+	if left.inputIndex > right.inputIndex {
+		return 1
+	}
+	return 0
+}
+
+func sortedFastTargetSharedPeerAggregates(aggs map[string]*fastTargetSharedPeerAggregate) []*fastTargetSharedPeerAggregate {
+	out := make([]*fastTargetSharedPeerAggregate, 0, len(aggs))
+	for _, agg := range aggs {
+		if agg == nil {
+			continue
+		}
+		out = append(out, agg)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		leftTarget := ""
+		if out[i].target != nil {
+			leftTarget = strings.TrimSpace(out[i].target.ID)
+		}
+		rightTarget := ""
+		if out[j].target != nil {
+			rightTarget = strings.TrimSpace(out[j].target.ID)
+		}
+		if leftTarget != rightTarget {
+			return leftTarget < rightTarget
+		}
+		leftPeer := ""
+		if out[i].peer != nil {
+			leftPeer = strings.TrimSpace(out[i].peer.ID)
+		}
+		rightPeer := ""
+		if out[j].peer != nil {
+			rightPeer = strings.TrimSpace(out[j].peer.ID)
+		}
+		return leftPeer < rightPeer
+	})
+	return out
 }
 
 func validateUnionKinds(kinds []ast.UnionKind) error {

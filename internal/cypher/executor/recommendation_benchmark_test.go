@@ -44,6 +44,10 @@ func BenchmarkRecommendationQueryStep1TopKPushdown(b *testing.B) {
 	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep1TopK, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
 }
 
+func BenchmarkRecommendationQueryStep1TopKPushdownEnabled(b *testing.B) {
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
+}
+
 func BenchmarkRecommendationQueryStep2LateMaterialization(b *testing.B) {
 	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
 }
@@ -101,7 +105,7 @@ func benchmarkRecommendationQueryWithQuery(b *testing.B, mode recommendationBenc
 	catalog := indexschema.NewCatalog()
 	opts := Options{Metrics: collector, IndexCatalog: catalog}
 	if mode == recommendationBenchmarkModeStep1TopK {
-		opts.DisableStage2LateMaterialization = true
+		opts.DisableStage1TopKPushdown = true
 	}
 	if mode == recommendationBenchmarkModeStep2IndexPushdownBaseline {
 		opts.DisableStage2EdgeIndexPushdown = true

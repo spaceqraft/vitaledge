@@ -1400,6 +1400,7 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 	prefilterBypassCandidates := 0
 	whereShortcutCandidates := 0
 	topKPushdownCandidates := 0
+	topKAdaptiveDisabledCandidates := 0
 	lateMaterializationCandidates := 0
 	fastPathFeedbackCandidates := 0
 	for _, path := range fastPaths {
@@ -1415,6 +1416,9 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 		}
 		if eligible, _ := path["topKPushdown"].(bool); eligible {
 			topKPushdownCandidates++
+		}
+		if disabled, _ := path["adaptiveTopKDisabled"].(bool); disabled {
+			topKAdaptiveDisabledCandidates++
 		}
 		if eligible, _ := path["lateMaterialization"].(bool); eligible {
 			lateMaterializationCandidates++
@@ -1450,13 +1454,14 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 			"quality":    cardinalityQuality,
 		},
 		"execution": map[string]any{
-			"fastPathCandidates":            len(fastPaths),
-			"implementations":               implementations,
-			"prefilterBypassCandidates":     prefilterBypassCandidates,
-			"whereShortcutCandidates":       whereShortcutCandidates,
-			"topKPushdownCandidates":        topKPushdownCandidates,
-			"lateMaterializationCandidates": lateMaterializationCandidates,
-			"fastPathFeedbackCandidates":    fastPathFeedbackCandidates,
+			"fastPathCandidates":             len(fastPaths),
+			"implementations":                implementations,
+			"prefilterBypassCandidates":      prefilterBypassCandidates,
+			"whereShortcutCandidates":        whereShortcutCandidates,
+			"topKPushdownCandidates":         topKPushdownCandidates,
+			"topKAdaptiveDisabledCandidates": topKAdaptiveDisabledCandidates,
+			"lateMaterializationCandidates":  lateMaterializationCandidates,
+			"fastPathFeedbackCandidates":     fastPathFeedbackCandidates,
 		},
 	}
 }
@@ -1567,10 +1572,19 @@ func collectExplainFastPaths(stmt ast.Statement, params Params, feedbackFn func(
 	}
 
 	collectFromClauses := func(clauses []ast.Clause) {
-		for idx := 0; idx+1 < len(clauses); idx++ {
-			signal, ok := explainFastPathClausePairSignal(clauses[idx], clauses[idx+1], params, feedbackFn)
-			if ok {
-				addSignal(signal)
+		for idx := 0; idx < len(clauses); idx++ {
+			if idx+2 < len(clauses) {
+				if signal, ok := explainFastPathClauseTripletSignal(clauses[idx], clauses[idx+1], clauses[idx+2], params, feedbackFn); ok {
+					addSignal(signal)
+					idx += 2
+					continue
+				}
+			}
+			if idx+1 < len(clauses) {
+				signal, ok := explainFastPathClausePairSignal(clauses[idx], clauses[idx+1], params, feedbackFn)
+				if ok {
+					addSignal(signal)
+				}
 			}
 		}
 	}
@@ -1598,6 +1612,87 @@ func collectExplainFastPaths(stmt ast.Statement, params Params, feedbackFn func(
 	}
 
 	return signals
+}
+
+func explainFastPathClauseTripletSignal(matchClause, withClause, topKWithClause ast.Clause, params Params, feedbackFn func(string) (map[string]any, bool)) (map[string]any, bool) {
+	if matchClause.Kind != ast.ClauseKindMatch || withClause.Kind != ast.ClauseKindWith || topKWithClause.Kind != ast.ClauseKindWith {
+		return nil, false
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
+	if err != nil || matchSpec.Optional {
+		return nil, false
+	}
+	chain, err := parseTwoHopDirectedChainPattern(matchSpec.Pattern)
+	if err != nil || chain.SecondForward {
+		return nil, false
+	}
+
+	withSpec, err := projectionClauseSpecFromClause(withClause)
+	if err != nil || withSpec.Distinct || len(withSpec.OrderBy) != 0 || strings.TrimSpace(withSpec.SkipRaw) != "" || strings.TrimSpace(withSpec.LimitRaw) != "" {
+		return nil, false
+	}
+	items, err := parseProjectionItems(withSpec.ProjectionRaw)
+	if err != nil {
+		return nil, false
+	}
+	projection, ok := parseFastTargetSharedPeerProjection(items, chain)
+	if !ok {
+		return nil, false
+	}
+
+	_, topKSpec, ok, err := parseFastTargetSharedPeerTopKWithClause(topKWithClause, projection, params)
+	if err != nil || !ok {
+		return nil, false
+	}
+	adaptiveTopKDisabled := false
+	if feedbackFn != nil {
+		if feedback, ok := feedbackFn(stage1TopKPushdownImplementation); ok {
+			adaptiveTopKDisabled = stage1TopKPushdownShouldDisableFromFeedback(feedback)
+		}
+	}
+	status := "eligible"
+	if adaptiveTopKDisabled {
+		status = "adaptive-disabled"
+	}
+
+	whereShortcut := buildStage1WhereShortcutPlan(matchSpec.Where, chain)
+	signal := map[string]any{
+		"name":                   "target_shared_peer_aggregation",
+		"implementation":         stage1TopKPushdownImplementation,
+		"clausePair":             "MATCH+WITH+WITH",
+		"status":                 status,
+		"whereShortcutCoverage":  whereShortcut.enabled,
+		"peerInequalityShortcut": whereShortcut.requirePeerNotTarget,
+		"topKPushdown":           true,
+		"topKLimit":              topKSpec.limit,
+		"topKSkip":               topKSpec.skip,
+		"adaptiveTopKDisabled":   adaptiveTopKDisabled,
+		"assessment": map[string]any{
+			"name":                   "target_shared_peer_aggregation",
+			"implementation":         stage1TopKPushdownImplementation,
+			"clausePair":             "MATCH+WITH+WITH",
+			"status":                 status,
+			"whereShortcutCoverage":  whereShortcut.enabled,
+			"peerInequalityShortcut": whereShortcut.requirePeerNotTarget,
+			"topKPushdown":           true,
+			"topKLimit":              topKSpec.limit,
+			"topKSkip":               topKSpec.skip,
+			"adaptiveTopKDisabled":   adaptiveTopKDisabled,
+		},
+	}
+	if feedbackFn != nil {
+		if feedback, ok := feedbackFn(stage1TopKPushdownImplementation); ok {
+			normalizedFeedback := map[string]any{}
+			for key, value := range feedback {
+				signal[key] = value
+				normalizedFeedback[key] = value
+			}
+			signal["feedback"] = normalizedFeedback
+			signal["feedbackObserved"] = true
+		}
+	}
+	return signal, true
 }
 
 func explainDirectedWhereHasRightExclusionPattern(whereRaw, rightVar string) bool {
@@ -1951,6 +2046,10 @@ func (b *explainPlanBuilder) build(stmt ast.Statement) {
 	case *ast.QueryStatement:
 		for _, part := range s.Parts {
 			for idx := 0; idx < len(part.Clauses); idx++ {
+				if idx+2 < len(part.Clauses) && b.addFastPathClauseTriplet(part.Clauses[idx], part.Clauses[idx+1], part.Clauses[idx+2]) {
+					idx += 2
+					continue
+				}
 				if idx+1 < len(part.Clauses) && b.addFastPathClausePair(part.Clauses[idx], part.Clauses[idx+1]) {
 					idx++
 					continue
@@ -2094,8 +2193,67 @@ func (b *explainPlanBuilder) annotateMatchRangeWithFastPath(start, end int, sign
 					node["peerInequalityShortcut"] = value
 				}
 			}
+		case "MATCH+WITH+WITH":
+			if op == "PROJECT" || op == "AGGREGATE" || op == "SORT" || op == "PAGINATION" {
+				if implementation, _ := signal["implementation"].(string); strings.TrimSpace(implementation) != "" {
+					if existing, _ := node["implementation"].(string); strings.TrimSpace(existing) == "" {
+						node["implementation"] = implementation
+					} else {
+						node["executionStrategy"] = implementation
+					}
+				}
+				if name, _ := signal["name"].(string); strings.TrimSpace(name) != "" {
+					node["strategyName"] = name
+				}
+				if status, _ := signal["status"].(string); strings.TrimSpace(status) != "" {
+					node["strategyStatus"] = status
+				}
+				if value, ok := signal["topKPushdown"].(bool); ok {
+					node["topKPushdown"] = value
+				}
+				if value, ok := signal["topKLimit"].(int); ok {
+					node["topKLimit"] = value
+				}
+				if value, ok := signal["topKSkip"].(int); ok {
+					node["topKSkip"] = value
+				}
+				if value, ok := signal["adaptiveTopKDisabled"].(bool); ok {
+					node["adaptiveTopKDisabled"] = value
+				}
+				if value, ok := signal["adaptiveTopKDisabled"].(bool); ok {
+					node["adaptiveTopKDisabled"] = value
+				}
+			}
 		}
 	}
+}
+
+func (b *explainPlanBuilder) addFastPathClauseTriplet(matchClause, withClause, topKWithClause ast.Clause) bool {
+	if matchClause.Kind != ast.ClauseKindMatch || withClause.Kind != ast.ClauseKindWith || topKWithClause.Kind != ast.ClauseKindWith {
+		return false
+	}
+
+	signal, ok := explainFastPathClauseTripletSignal(matchClause, withClause, topKWithClause, b.params, nil)
+	if !ok {
+		return false
+	}
+	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
+	if err != nil {
+		return false
+	}
+
+	matchStart := len(b.nodes)
+	whereExpr := matchClause.Where
+	if whereExpr == nil && strings.TrimSpace(matchSpec.Where) != "" {
+		whereExpr = &ast.Expression{Raw: strings.TrimSpace(matchSpec.Where)}
+	}
+	b.addMatchClause(matchSpec.Optional, "MATCH "+matchSpec.Pattern, whereExpr)
+	projectionStart := len(b.nodes)
+	b.annotateMatchRangeWithFastPath(matchStart, projectionStart, signal)
+	b.addClause(withClause)
+	b.addClause(topKWithClause)
+	b.annotateProjectionRangeWithFastPath(projectionStart, signal)
+	return true
 }
 
 func (b *explainPlanBuilder) annotateProjectionRangeWithFastPath(start int, signal map[string]any) {

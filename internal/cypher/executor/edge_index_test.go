@@ -1141,6 +1141,211 @@ func TestRecommendationStage2EdgeIndexPushdownMatchesBaseline(t *testing.T) {
 	}
 }
 
+func TestRecommendationStage1TopKPushdownMatchesBaseline(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := seedRecommendationBenchmarkGraph(ctx, store); err != nil {
+		t.Fatalf("seed benchmark graph failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement(recommendationBenchmarkQuery)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	baselineCollector := NewCollector()
+	baselineExec := New(store, Options{Metrics: baselineCollector, DisableStage1TopKPushdown: true})
+	baselineRes, err := baselineExec.ExecuteStatement(ctx, stmt, Params{"tenant": "bench-rec"})
+	if err != nil {
+		t.Fatalf("baseline execute failed: %v", err)
+	}
+
+	enabledCollector := NewCollector()
+	enabledExec := New(store, Options{Metrics: enabledCollector})
+	enabledRes, err := enabledExec.ExecuteStatement(ctx, stmt, Params{"tenant": "bench-rec"})
+	if err != nil {
+		t.Fatalf("enabled execute failed: %v", err)
+	}
+
+	baselineRows := append([]Row(nil), baselineRes.Rows...)
+	enabledRows := append([]Row(nil), enabledRes.Rows...)
+	sortRowsByMovieID(baselineRows)
+	sortRowsByMovieID(enabledRows)
+
+	baselineJSON, err := json.Marshal(baselineRows)
+	if err != nil {
+		t.Fatalf("marshal baseline rows failed: %v", err)
+	}
+	enabledJSON, err := json.Marshal(enabledRows)
+	if err != nil {
+		t.Fatalf("marshal enabled rows failed: %v", err)
+	}
+	if string(baselineJSON) != string(enabledJSON) {
+		t.Fatalf("expected identical rows, baseline=%s enabled=%s", string(baselineJSON), string(enabledJSON))
+	}
+
+	baselineCounters, err := runtimeCountersFromWarnings(baselineRes.Warnings)
+	if err != nil {
+		t.Fatalf("baseline runtime counters parse failed: %v", err)
+	}
+	enabledCounters, err := runtimeCountersFromWarnings(enabledRes.Warnings)
+	if err != nil {
+		t.Fatalf("enabled runtime counters parse failed: %v", err)
+	}
+	if baselineCounters["fast_path.stage1.topk_pushdown_applied"] != 0 {
+		t.Fatalf("expected baseline without stage1 top-k pushdown, got %#v", baselineCounters)
+	}
+	if enabledCounters["fast_path.stage1.topk_pushdown_applied"] <= 0 {
+		t.Fatalf("expected enabled run to apply stage1 top-k pushdown, got %#v", enabledCounters)
+	}
+	if enabledCounters["fast_path.stage1.rows_output"] > 30 {
+		t.Fatalf("expected stage1 top-k output to respect LIMIT 30, got %#v", enabledCounters)
+	}
+}
+
+func TestRecommendationStage1TopKPushdownAdaptiveDisablesHighSelectivityWorkload(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-target", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1)}}); err != nil {
+			return err
+		}
+		for _, id := range []string{"u-peer-1", "u-peer-2"} {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: id, Labels: []string{"User"}}); err != nil {
+				return err
+			}
+		}
+		for i := 1; i <= 3; i++ {
+			movieID := fmt.Sprintf("m-shared-%d", i)
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: movieID, Labels: []string{"Movie"}}); err != nil {
+				return err
+			}
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-candidate", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-t-1", Type: "RATED", SrcID: "u-target", DstID: "m-shared-1", Properties: map[string][]byte{"rating": valueToBytes(5.0)}},
+			{Tenant: "acme", ID: "e-t-2", Type: "RATED", SrcID: "u-target", DstID: "m-shared-2", Properties: map[string][]byte{"rating": valueToBytes(4.0)}},
+			{Tenant: "acme", ID: "e-t-3", Type: "RATED", SrcID: "u-target", DstID: "m-shared-3", Properties: map[string][]byte{"rating": valueToBytes(5.0)}},
+			{Tenant: "acme", ID: "e-p1-1", Type: "RATED", SrcID: "u-peer-1", DstID: "m-shared-1", Properties: map[string][]byte{"rating": valueToBytes(5.0)}},
+			{Tenant: "acme", ID: "e-p1-2", Type: "RATED", SrcID: "u-peer-1", DstID: "m-shared-2", Properties: map[string][]byte{"rating": valueToBytes(4.0)}},
+			{Tenant: "acme", ID: "e-p1-3", Type: "RATED", SrcID: "u-peer-1", DstID: "m-shared-3", Properties: map[string][]byte{"rating": valueToBytes(5.0)}},
+			{Tenant: "acme", ID: "e-p1-c", Type: "RATED", SrcID: "u-peer-1", DstID: "m-candidate", Properties: map[string][]byte{"rating": valueToBytes(5.0)}},
+			{Tenant: "acme", ID: "e-p2-1", Type: "RATED", SrcID: "u-peer-2", DstID: "m-shared-1", Properties: map[string][]byte{"rating": valueToBytes(5.0)}},
+			{Tenant: "acme", ID: "e-p2-2", Type: "RATED", SrcID: "u-peer-2", DstID: "m-shared-2", Properties: map[string][]byte{"rating": valueToBytes(4.0)}},
+			{Tenant: "acme", ID: "e-p2-3", Type: "RATED", SrcID: "u-peer-2", DstID: "m-shared-3", Properties: map[string][]byte{"rating": valueToBytes(5.0)}},
+			{Tenant: "acme", ID: "e-p2-c", Type: "RATED", SrcID: "u-peer-2", DstID: "m-candidate", Properties: map[string][]byte{"rating": valueToBytes(5.0)}},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	query := "MATCH (target:User {user_id: 1})-[r1:RATED]->(shared:Movie)<-[r2:RATED]-(peer:User) WHERE peer <> target AND abs(r1.rating - r2.rating) <= 1.5 WITH target, peer, count(shared) AS shared_count, avg(abs(r1.rating - r2.rating)) AS avg_diff WHERE shared_count >= 1 WITH target, peer, shared_count * (1.0 / (1.0 + avg_diff)) AS similarity ORDER BY similarity DESC LIMIT 30 MATCH (peer)-[rp:RATED]->(candidate:Movie) WHERE rp.rating = 5.0 AND NOT (target)-[:RATED]->(candidate) RETURN candidate.movie_id AS movie_id, avg(rp.rating) AS peer_avg, count(rp) AS peer_count, sum(similarity) AS total_sim ORDER BY total_sim DESC LIMIT 10"
+	stmt, err := parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	baselineCollector := NewCollector()
+	baselineExec := New(store, Options{Metrics: baselineCollector, DisableStage1TopKPushdown: true})
+	baselineRes, err := baselineExec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("baseline execute failed: %v", err)
+	}
+
+	adaptiveCollector := NewCollector()
+	adaptiveExec := New(store, Options{Metrics: adaptiveCollector})
+	for i := 0; i < stage1TopKPushdownAdaptiveDisableMinSamples; i++ {
+		if _, err := adaptiveExec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+			t.Fatalf("warmup execute failed: %v", err)
+		}
+	}
+	adaptiveRes, err := adaptiveExec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("adaptive execute failed: %v", err)
+	}
+
+	baselineRows := append([]Row(nil), baselineRes.Rows...)
+	adaptiveRows := append([]Row(nil), adaptiveRes.Rows...)
+	sortRowsByMovieID(baselineRows)
+	sortRowsByMovieID(adaptiveRows)
+	baselineJSON, err := json.Marshal(baselineRows)
+	if err != nil {
+		t.Fatalf("marshal baseline rows failed: %v", err)
+	}
+	adaptiveJSON, err := json.Marshal(adaptiveRows)
+	if err != nil {
+		t.Fatalf("marshal adaptive rows failed: %v", err)
+	}
+	if string(baselineJSON) != string(adaptiveJSON) {
+		t.Fatalf("expected identical rows after adaptive disable, baseline=%s adaptive=%s", string(baselineJSON), string(adaptiveJSON))
+	}
+
+	adaptiveCounters, err := runtimeCountersFromWarnings(adaptiveRes.Warnings)
+	if err != nil {
+		t.Fatalf("adaptive runtime counters parse failed: %v", err)
+	}
+	if adaptiveCounters["fast_path.stage1.topk_pushdown_skipped_adaptive"] <= 0 {
+		t.Fatalf("expected adaptive top-k skip counter > 0, got %#v", adaptiveCounters)
+	}
+	if adaptiveCounters["fast_path.stage1.topk_pushdown_applied"] != 0 {
+		t.Fatalf("expected adaptive run to skip top-k pushdown, got %#v", adaptiveCounters)
+	}
+
+	explainStmt, err := parser.ParseStatement("EXPLAIN " + query)
+	if err != nil {
+		t.Fatalf("explain parse failed: %v", err)
+	}
+	explainRes, err := adaptiveExec.ExecuteStatement(ctx, explainStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("explain execute failed: %v", err)
+	}
+	explainPayload, ok := explainRes.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", explainRes.Rows[0]["explain"])
+	}
+	fastPaths, ok := explainPayload["executionStrategies"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected executionStrategies []map[string]any, got %T", explainPayload["executionStrategies"])
+	}
+	foundAdaptive := false
+	for _, path := range fastPaths {
+		if impl, _ := path["implementation"].(string); impl != stage1TopKPushdownImplementation {
+			continue
+		}
+		if disabled, _ := path["adaptiveTopKDisabled"].(bool); !disabled {
+			t.Fatalf("expected adaptiveTopKDisabled=true, got %#v", path)
+		}
+		foundAdaptive = true
+	}
+	if !foundAdaptive {
+		t.Fatalf("expected stage1 top-k strategy entry in EXPLAIN, got %#v", fastPaths)
+	}
+	runtimeStats, ok := explainPayload["runtimeStats"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats map, got %T", explainPayload["runtimeStats"])
+	}
+	execution, ok := runtimeStats["execution"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.execution map, got %T", runtimeStats["execution"])
+	}
+	if disabledCandidates, _ := execution["topKAdaptiveDisabledCandidates"].(int); disabledCandidates < 1 {
+		t.Fatalf("expected topKAdaptiveDisabledCandidates >= 1, got %#v", execution["topKAdaptiveDisabledCandidates"])
+	}
+}
+
 func TestRecommendationStage2EdgeIndexPushdownAdaptiveSkipsUnselectiveWorkload(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()

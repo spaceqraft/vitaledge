@@ -18,6 +18,12 @@ import (
 	"github.com/paegun/vitaledge/internal/graph"
 )
 
+const stage1TopKPushdownImplementation = "fast_target_shared_peer_topk_pushdown_clause_triplet"
+
+const stage1TopKPushdownAdaptiveDisableSelectivityThreshold = 0.85
+
+const stage1TopKPushdownAdaptiveDisableMinSamples = 2
+
 type Params map[string]any
 
 var (
@@ -80,6 +86,10 @@ type IndexCatalog interface {
 type Options struct {
 	Metrics      Metrics
 	IndexCatalog IndexCatalog
+	// DisableStage1TopKPushdown forces the stage-1 recommendation fast path to
+	// materialize the full peer aggregate set instead of applying the immediate
+	// follow-on WITH similarity ORDER BY/LIMIT pushdown.
+	DisableStage1TopKPushdown bool
 	// DisableStage1SharedSeedExpansion forces the stage-1 recommendation fast
 	// path to use direct nested expansion instead of shared-seed expansion.
 	DisableStage1SharedSeedExpansion bool
@@ -98,6 +108,7 @@ type Executor struct {
 	store                            graph.GraphStore
 	metrics                          Metrics
 	indexCatalog                     IndexCatalog
+	stage1TopKPushdownEnabled        bool
 	stage1SharedSeedExpansionEnabled bool
 	stage2TopKPushdownEnabled        bool
 	stage2LateMaterializationEnabled bool
@@ -141,6 +152,7 @@ func New(store graph.GraphStore, opts Options) *Executor {
 		store:                            store,
 		metrics:                          metrics,
 		indexCatalog:                     opts.IndexCatalog,
+		stage1TopKPushdownEnabled:        !opts.DisableStage1TopKPushdown,
 		stage1SharedSeedExpansionEnabled: !opts.DisableStage1SharedSeedExpansion,
 		stage2TopKPushdownEnabled:        !opts.DisableStage2TopKPushdown,
 		stage2LateMaterializationEnabled: !opts.DisableStage2LateMaterialization,
@@ -194,6 +206,50 @@ func (e *Executor) fastPathFeedbackSnapshot(implementation string) (map[string]a
 		"source":         "runtime",
 		"implementation": implementation,
 	}, true
+}
+
+func stage1TopKPushdownShouldDisableFromFeedback(feedback map[string]any) bool {
+	if len(feedback) == 0 {
+		return false
+	}
+	samples := feedbackInt64Value(feedback, "samples")
+	if samples < stage1TopKPushdownAdaptiveDisableMinSamples {
+		return false
+	}
+	selectivity := feedbackFloat64Value(feedback, "selectivity")
+	return selectivity >= stage1TopKPushdownAdaptiveDisableSelectivityThreshold
+}
+
+func feedbackInt64Value(values map[string]any, key string) int64 {
+	if values == nil {
+		return 0
+	}
+	switch typed := values[key].(type) {
+	case int:
+		return int64(typed)
+	case int64:
+		return typed
+	case float64:
+		return int64(typed)
+	default:
+		return 0
+	}
+}
+
+func feedbackFloat64Value(values map[string]any, key string) float64 {
+	if values == nil {
+		return 0
+	}
+	switch typed := values[key].(type) {
+	case float64:
+		return typed
+	case int:
+		return float64(typed)
+	case int64:
+		return float64(typed)
+	default:
+		return 0
+	}
 }
 
 func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, params Params) (res *Result, err error) {

@@ -96,6 +96,43 @@ Operational note:
 
 1. Edge property indexes are catalog-driven and backfilled automatically at startup from index schema configuration.
 
+### Adaptive Pushdown Policy (Stage2 Recommendation Path)
+
+The stage2 recommendation expansion path uses an adaptive pushdown policy rather than unconditional index use.
+
+Current decision flow:
+
+1. Predicate-shape pre-gate: broad one-sided numeric ranges are treated as non-selective for this path and skip index probing.
+2. Bounded probe: when the shape is eligible, index probing is capped by a probe candidate limit.
+3. Selectivity gate: probed candidates are accepted only when candidate volume and average candidates per source are below configured thresholds.
+4. Fallback: if any gate fails, execution falls back to adjacency expansion.
+
+Current default constants:
+
+1. `stage2IndexPushdownProbeCandidateLimit = 1536`
+2. `stage2IndexPushdownMaxIndexedCandidates = 512`
+3. `stage2IndexPushdownMaxAverageEdgesPerSource = 16`
+
+Correctness invariant:
+
+1. Adaptive pushdown only selects an access path and must never alter query semantics.
+2. Residual predicate evaluation remains authoritative for correctness.
+
+Observability contract for adaptive behavior:
+
+1. `fast_path.stage2.index_pushdown_applied`
+2. `fast_path.stage2.index_pushdown_rows`
+3. `fast_path.stage2.index_candidates_total`
+4. `fast_path.stage2.index_pushdown_skipped_predicate_shape`
+5. `fast_path.stage2.index_pushdown_skipped_unselective`
+
+General optimization technique used by VitalEdge:
+
+1. Do not treat index pushdown as universally beneficial for graph traversals.
+2. Use bounded probing to estimate selectivity before committing to index-first expansion.
+3. Keep fast-path decisions observable through runtime counters and benchmark A/B variants.
+4. Re-tune thresholds with representative broad and selective workload shapes as data distributions change.
+
 ## EXPLAIN Specification Decision
 
 ### Decision
@@ -187,6 +224,7 @@ Backfill expectations:
 1. Runtime transport direction is gRPC/protobuf.
 2. During current query-engine iteration, EXPLAIN request/response will continue to use Cypher text input and JSON output for faster iteration.
 3. The JSON structure is treated as the canonical short-term contract and will be mapped to protobuf messages when the gRPC layer is wired.
+4. Clients are encouraged to send parameterized queries; parameter binding is applied server-side using typed request parameters.
 
 Reference schema: [EXPLAIN_OUTPUT_SCHEMA.json](EXPLAIN_OUTPUT_SCHEMA.json).
 

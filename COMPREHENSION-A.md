@@ -153,6 +153,70 @@ Back link: [Q-026](COMPREHENSION-Q.md#q-026)
 Reviewers should check for: design intent alignment, keyspace and transaction impact, observability and security boundary changes, and migration/rollback strategy.
 Back link: [Q-027](COMPREHENSION-Q.md#q-027)
 
+## Topic 9: Query Pipeline and EXPLAIN
+
+<a id="a-032"></a>
+### A-032
+Parse: input is query text/params, output is typed AST and clause metadata.  
+Semantic validation: input is AST + catalog + params, output is semantic model (scopes, symbols, typed expressions, projection/pagination intent).  
+Logical planning: input is semantic model + stats/indexes, output is logical operator graph (scan/match/expand/filter/project/aggregate/sort/limit/update).  
+Physical execution: input is logical plan + runtime context, output is result stream/set and diagnostics; must not reinterpret raw text for semantics.
+Back link: [Q-032](COMPREHENSION-Q.md#q-032)
+
+<a id="a-033"></a>
+### A-033
+EXPLAIN runs parse, semantic validation, logical and physical planning, but does not execute or mutate state. Output includes logical/physical plan nodes, plan-influencing details (cardinality, index selection, cost), per-node cardinality quality, and warnings for missing stats or fallbacks.
+Back link: [Q-033](COMPREHENSION-Q.md#q-033)
+
+<a id="a-034"></a>
+### A-034
+EXPLAIN executes all planning stages but never applies writes or mutates graph state; integration tests and dry-run guards ensure this for all query shapes, including write-shaped statements.
+Back link: [Q-034](COMPREHENSION-Q.md#q-034)
+
+<a id="a-035"></a>
+### A-035
+EXPLAIN surfaces operator-shaped plan nodes, access-path annotations, index decisions (recommendation, impact, selectivity), query-level cost estimates, runtime planning counters, and warning diagnostics for fallback or missing stats.
+Back link: [Q-035](COMPREHENSION-Q.md#q-035)
+
+<a id="a-036"></a>
+### A-036
+Cardinality values in EXPLAIN are classified as `exact` (from maintained stats), `estimate` (heuristics), or `sample` (probed), with sampling context when available; EXPLAIN output marks each accordingly.
+Back link: [Q-036](COMPREHENSION-Q.md#q-036)
+
+## Topic 10: Edge Property Index Pushdown
+
+<a id="a-037"></a>
+### A-037
+Edge property index pushdown applies equality or numeric range predicates to edge property indexes for relationship traversal; fallback occurs for unsupported predicates, and residual filtering always runs to ensure correctness.
+Back link: [Q-037](COMPREHENSION-Q.md#q-037)
+
+<a id="a-038"></a>
+### A-038
+Adaptive pushdown for stage2 recommendations uses predicate-shape gating, bounded probe caps, selectivity thresholds, and falls back to adjacency expansion if any guardrail is tripped; correctness is invariant.
+Back link: [Q-038](COMPREHENSION-Q.md#q-038)
+
+<a id="a-039"></a>
+### A-039
+Index pushdown observability is achieved via runtime counters (per-query diagnostics and Prometheus metrics) for index usage, candidate counts, fallback reasons, and selectivity, all surfaced in EXPLAIN and operational dashboards.
+Back link: [Q-039](COMPREHENSION-Q.md#q-039)
+
+## Topic 11: Programmatic Interface and CLI
+
+<a id="a-040"></a>
+### A-040
+gRPC/protobuf interface principles: support raw Cypher and prepared queries, enable client-side parse/completeness checks while keeping parameter binding on the server, keep server as semantic/planning authority, and provide explicit version negotiation and fallback.
+Back link: [Q-040](COMPREHENSION-Q.md#q-040)
+
+<a id="a-041"></a>
+### A-041
+Clients send parameterized Cypher or prepared payloads with typed parameters, and the server applies/binds them during query handling; this preserves type correctness without requiring client-side string interpolation.
+Back link: [Q-041](COMPREHENSION-Q.md#q-041)
+
+<a id="a-042"></a>
+### A-042
+CLI uses gRPC/protobuf transport, determines statement completeness locally (parser checks), and only sends complete statements; incomplete statements remain buffered until ready.
+Back link: [Q-042](COMPREHENSION-Q.md#q-042)
+
 ## Optional Add-on Prompts
 
 <a id="a-028"></a>

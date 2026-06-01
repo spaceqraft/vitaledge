@@ -89,6 +89,9 @@ type Options struct {
 	// DisableStage2LateMaterialization forces eager per-update projection
 	// materialization in the stage-2 recommendation fast path.
 	DisableStage2LateMaterialization bool
+	// DisableStage2EdgeIndexPushdown forces stage-2 recommendation candidate
+	// expansion to use adjacency scans instead of edge-property index pushdown.
+	DisableStage2EdgeIndexPushdown bool
 }
 
 type Executor struct {
@@ -98,6 +101,7 @@ type Executor struct {
 	stage1SharedSeedExpansionEnabled bool
 	stage2TopKPushdownEnabled        bool
 	stage2LateMaterializationEnabled bool
+	stage2EdgeIndexPushdownEnabled   bool
 
 	indexJobWorkerOnce   sync.Once
 	indexJobWorkerMu     sync.Mutex
@@ -130,6 +134,7 @@ func New(store graph.GraphStore, opts Options) *Executor {
 		stage1SharedSeedExpansionEnabled: !opts.DisableStage1SharedSeedExpansion,
 		stage2TopKPushdownEnabled:        !opts.DisableStage2TopKPushdown,
 		stage2LateMaterializationEnabled: !opts.DisableStage2LateMaterialization,
+		stage2EdgeIndexPushdownEnabled:   !opts.DisableStage2EdgeIndexPushdown,
 	}
 }
 

@@ -131,6 +131,56 @@ Answer link: [A-026](COMPREHENSION-A.md#a-026)
 ### Q-027: What practical review questions should be answered before approving major architecture changes?
 Answer link: [A-027](COMPREHENSION-A.md#a-027)
 
+## Topic 9: Query Pipeline and EXPLAIN
+
+<a id="q-032"></a>
+### Q-032: What are the explicit contracts and responsibilities for each stage in the query pipeline (parse, semantic validation, logical planning, physical execution)?
+Answer link: [A-032](COMPREHENSION-A.md#a-032)
+
+<a id="q-033"></a>
+### Q-033: How does the EXPLAIN command behave, and what must its output include?
+Answer link: [A-033](COMPREHENSION-A.md#a-033)
+
+<a id="q-034"></a>
+### Q-034: How does the system ensure that EXPLAIN is read-only, even for write-shaped queries?
+Answer link: [A-034](COMPREHENSION-A.md#a-034)
+
+<a id="q-035"></a>
+### Q-035: What diagnostics and statistics are surfaced by EXPLAIN for operator tuning?
+Answer link: [A-035](COMPREHENSION-A.md#a-035)
+
+<a id="q-036"></a>
+### Q-036: What is the policy for cardinality quality in EXPLAIN output, and how are values classified?
+Answer link: [A-036](COMPREHENSION-A.md#a-036)
+
+## Topic 10: Edge Property Index Pushdown
+
+<a id="q-037"></a>
+### Q-037: How does edge property index pushdown work, and what are the fallback and correctness policies?
+Answer link: [A-037](COMPREHENSION-A.md#a-037)
+
+<a id="q-038"></a>
+### Q-038: What is the adaptive pushdown policy for stage2 recommendation queries, and what are its guardrails?
+Answer link: [A-038](COMPREHENSION-A.md#a-038)
+
+<a id="q-039"></a>
+### Q-039: How is index pushdown observability achieved in the system?
+Answer link: [A-039](COMPREHENSION-A.md#a-039)
+
+## Topic 11: Programmatic Interface and CLI
+
+<a id="q-040"></a>
+### Q-040: What are the key design principles for the gRPC/protobuf programmatic interface?
+Answer link: [A-040](COMPREHENSION-A.md#a-040)
+
+<a id="q-041"></a>
+### Q-041: How do parameterized queries and server-side parameter binding work, and why are they required?
+Answer link: [A-041](COMPREHENSION-A.md#a-041)
+
+<a id="q-042"></a>
+### Q-042: What is the CLI's contract for statement completeness and transport?
+Answer link: [A-042](COMPREHENSION-A.md#a-042)
+
 ## Optional Add-on Prompts
 
 <a id="q-028"></a>

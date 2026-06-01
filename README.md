@@ -41,6 +41,7 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - Graph store benchmark baseline: `make bench-graph-store`
 - Cypher ingest benchmark (indexed vs non-indexed UNWIND..MERGE): `make bench-merge-index`
 - Recommendation query optimization benchmark hooks: `go test ./internal/cypher/executor -run '^$' -bench 'BenchmarkRecommendationQueryStep1TopKPushdown|BenchmarkRecommendationQueryStep2LateMaterialization' -benchtime=1x`
+- Recommendation stage2 adaptive pushdown A/B hooks (broad + selective): `go test ./internal/cypher/executor -run '^$' -bench 'BenchmarkRecommendationQueryStep2IndexPushdown(Baseline|Enabled)|BenchmarkRecommendationQuerySelectiveStep2IndexPushdown(Baseline|Enabled)$' -benchtime=1x`
 - Milestone benchmark baseline (local JSONL snapshot): `make bench-milestone`
 - Mixed CLI soak profile (concurrent write/noop-write/read): `make soak-mixed`
 
@@ -49,6 +50,28 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - `-iterations N`: operation count for the scenario loop.
 - `-seed-size N`: explicit seed graph size override for seeded scenarios (`research`, `rebac`).
 - `-json`: machine-readable output for baseline capture.
+
+### Adaptive Pushdown Tuning Workflow
+
+VitalEdge uses adaptive pushdown for stage2 recommendation expansion to avoid index paths that are not selective enough.
+
+Current defaults are intentionally conservative and may evolve:
+
+- `stage2IndexPushdownProbeCandidateLimit = 1536`
+- `stage2IndexPushdownMaxIndexedCandidates = 512`
+- `stage2IndexPushdownMaxAverageEdgesPerSource = 16`
+
+When tuning these values, use the broad and selective A/B benchmarks above and compare:
+
+1. Broad predicate shape: should stay at or near baseline when adaptive pushdown is enabled.
+2. Selective predicate shape: should not regress materially, and may improve when pushdown is applied.
+3. Runtime counters: inspect `fast_path.stage2.index_pushdown_applied`, `fast_path.stage2.index_pushdown_rows`, `fast_path.stage2.index_pushdown_skipped_predicate_shape`, `fast_path.stage2.index_pushdown_skipped_unselective`, and `fast_path.stage2.index_candidates_total`.
+
+Technique guideline:
+
+1. Prefer bounded probe + fallback over unconditional global index scans.
+2. Keep correctness invariant: adaptive decisions only change access path, never result semantics.
+3. Tune by benchmark evidence across at least one broad and one selective workload shape before changing defaults.
 
 ## Startup Index Schema Config
 
@@ -426,7 +449,7 @@ make build
 
 Interactive commands:
 
-- `SET name=<scalar>`: set or update a client-side variable (`null`, booleans, numbers, or quoted strings).
+- `SET name=<scalar>`: set or update a session variable (`null`, booleans, numbers, or quoted strings).
 - `SET` (or `LIST`/`VARS`): list all variables.
 - `UNSET name`: remove one variable.
 - `:quit` / `:exit`: leave the CLI.
@@ -434,7 +457,7 @@ Interactive commands:
 Execution behavior:
 
 - Statements are sent only after local parse-completeness checks pass.
-- Variable bindings are applied client-side from `$name` placeholders.
+- Variables are sent as query parameters and bound server-side from `$name` placeholders.
 - Multiline statements are buffered until complete (for example `MATCH` + `WHERE` + `RETURN`).
 - Result sets are rendered in a capped-width table:
 	- column width is computed from the column header and scanned row values,

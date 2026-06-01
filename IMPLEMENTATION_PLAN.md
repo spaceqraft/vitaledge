@@ -99,6 +99,8 @@ Current implementation status:
 - Implemented: stats snapshot read API consumed by EXPLAIN and statistics procedures, including EXPLAIN diagnostics for snapshot coverage completeness and backfill-required status.
 - Implemented: startup schema migration (`no-stats` -> `stats`) that backfills persisted statistics for legacy stores and records schema version metadata.
 - Implemented: recommendation-query benchmark hooks for step-wise optimization reflection (`BenchmarkRecommendationQueryStep1TopKPushdown`, `BenchmarkRecommendationQueryStep2LateMaterialization`).
+- Implemented: stage2 recommendation adaptive edge-index pushdown guardrails (predicate-shape gate, bounded probe cap, selectivity thresholds, and scan fallback) with runtime diagnostics.
+- Implemented: recommendation stage2 adaptive pushdown A/B benchmark coverage for both broad and selective predicate shapes (`BenchmarkRecommendationQueryStep2IndexPushdownBaseline/Enabled`, `BenchmarkRecommendationQuerySelectiveStep2IndexPushdownBaseline/Enabled`).
 
 Phase 1 deliverable status:
 
@@ -605,7 +607,7 @@ Sprint deliverables:
    - statement output includes clear execution statistics,
    - CLI sends requests only after local parse-completeness checks.
    - load-generation support exists for soak execution with deterministic modes (`write`, `noop-write`, `read`) and tunable operation/seed/hop/limit/report parameters.
-   - status: complete (gRPC CLI implements variable commands, client-side binding, adaptive table width capping, graph/path rendering, stats output, completeness gating before RPC, and deterministic soak-load generation modes).
+   - status: complete (gRPC CLI implements variable commands, server-side parameter binding via request parameters, adaptive table width capping, graph/path rendering, stats output, completeness gating before RPC, and deterministic soak-load generation modes).
 5. SDK phase-1 delivery:
    - Python and Go clients support raw Cypher and prepared-query request paths,
    - client-side parse-completeness validation for interactive/scripted usage,
@@ -641,7 +643,7 @@ Objective: make gRPC/protobuf the canonical programmatic surface for CLI and SDK
 Design principles:
 
 1. Support both raw Cypher requests and prepared-query requests.
-2. Allow client-side parse/completeness and parameter binding work to reduce server CPU/RAM.
+2. Allow client-side parse/completeness checks while keeping parameter binding on the server.
 3. Keep server as semantic/planning source of truth (schema/index/runtime-aware checks).
 4. Include explicit version negotiation and compatibility fallback behavior.
 
@@ -663,11 +665,12 @@ message QueryRequest {
    QueryInput input = 2;
    RequestOptions options = 3;
    ClientContext client = 4;
+   map<string, Value> parameters = 5;
 }
 
 message QueryInput {
    oneof kind {
-      string cypher = 1; // client-submitted fully bound statement
+      string cypher = 1; // client-submitted parameterized statement text
       PreparedQuery prepared = 2;
    }
 }
@@ -758,12 +761,12 @@ Server-side behavior rules:
 3. On incompatible prepared input, return capability mismatch and support fallback to raw Cypher mode.
 4. Server may reject or downgrade prepared payloads if validation fails.
 
-Client-side parameter binding contract:
+Server-side parameter binding contract:
 
-1. Programmatic clients and CLI bind parameters client-side before RPC submission.
-2. Requests sent to gRPC contain the fully bound statement text or prepared payload; there is no separate parameter map in the wire request.
-3. Binding should be structured/typed (AST or token-aware literal insertion), not naive string replacement.
-4. SDKs must preserve Cypher literal correctness when binding strings, numerics, booleans, nulls, lists, and maps.
+1. Programmatic clients and CLI submit parameterized Cypher (or prepared payload) plus a typed parameter map.
+2. The server applies parameter binding during semantic/planning/execution and preserves type correctness.
+3. Clients should not perform naive string interpolation for Cypher literals.
+4. SDKs must preserve typed parameter fidelity for strings, numerics, booleans, nulls, lists, and maps.
 
 ### Phased Client SDK Plan (Priority Order)
 
@@ -773,7 +776,7 @@ Phase SDK-1: Python client
 
 1. gRPC channel/client scaffolding and auth/tenant request metadata.
 2. Raw Cypher execute/explain methods.
-3. Client-side parameter binding + parse-completeness check and prepared-query request mode.
+3. Parameterized query submission + parse-completeness check and prepared-query request mode.
 4. Capability negotiation + fallback path from prepared-query to raw Cypher.
 
 Exit evidence:
@@ -786,7 +789,7 @@ Phase SDK-2: Go client
 
 1. Same contract as Python, idiomatic Go API surface.
 2. Strong typed helpers for values/rows/stats/diagnostics.
-3. Prepared-query, client-side binding, and fallback behavior parity with Python.
+3. Prepared-query, server-side-bound parameter submission, and fallback behavior parity with Python.
 
 Exit evidence:
 

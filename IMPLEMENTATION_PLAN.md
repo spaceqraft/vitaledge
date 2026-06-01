@@ -101,6 +101,9 @@ Current implementation status:
 - Implemented: recommendation-query benchmark hooks for step-wise optimization reflection (`BenchmarkRecommendationQueryStep1TopKPushdown`, `BenchmarkRecommendationQueryStep2LateMaterialization`).
 - Implemented: stage2 recommendation adaptive edge-index pushdown guardrails (predicate-shape gate, bounded probe cap, selectivity thresholds, and scan fallback) with runtime diagnostics.
 - Implemented: recommendation stage2 adaptive pushdown A/B benchmark coverage for both broad and selective predicate shapes (`BenchmarkRecommendationQueryStep2IndexPushdownBaseline/Enabled`, `BenchmarkRecommendationQuerySelectiveStep2IndexPushdownBaseline/Enabled`).
+- Implemented: fast-path dynamic selectivity feedback loop that records observed stage2 runtime selectivity and surfaces it back through EXPLAIN planning/runtime metadata.
+- Implemented: feedback-aware EXPLAIN cost refinement that reuses observed fast-path selectivity from the same executor instance to make `costEstimate` sample-aware.
+- Implemented: EXPLAIN payload normalization across list-shaped sections, with nested `assessment` blocks for influencer counts, predicate signals, index decisions, cardinality, cost estimates, warnings, and execution strategies.
 
 Phase 1 deliverable status:
 

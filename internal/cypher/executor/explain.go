@@ -92,9 +92,9 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	analysis.predicateSignals = buildExplainPredicateSignals(stmt, params, tenant, stats)
 	planNodes := buildExplainPlanNodes(stmt, e.indexCatalog, tenant, params)
 	analysis.indexDecisions = buildExplainIndexDecisions(stmt, params, e.indexCatalog, tenant, stats, planNodes)
-	analysis.fastPaths = collectExplainFastPaths(stmt, params)
+	analysis.fastPaths = collectExplainFastPaths(stmt, params, e.fastPathFeedbackSnapshot)
 	analysis.cardinality = buildExplainCardinalityFromPlanNodes(planNodes, params, stats)
-	analysis.costEstimate = buildExplainCostEstimate(planNodes, analysis.cardinality, analysis.indexDecisions)
+	analysis.costEstimate = buildExplainCostEstimate(planNodes, analysis.cardinality, analysis.indexDecisions, e.fastPathFeedbackSnapshot)
 	analysis.warnings = buildExplainWarnings(stmt, analysis, planNodes, tenant)
 	analysis.runtimeStats = buildExplainRuntimeStats(planNodes, analysis.cardinality, analysis.indexDecisions, analysis.fastPaths, analysis.warnings, stats)
 	return analysis, nil
@@ -240,11 +240,17 @@ func buildExplainVertexCounts(stats explainStoreStats, refs explainPatternRefs) 
 
 	out := make([]map[string]any, 0, len(labels))
 	for _, label := range labels {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"label":   label,
 			"count":   stats.labelCounts[label],
 			"quality": "exact",
-		})
+		}
+		entry["assessment"] = map[string]any{
+			"label":   label,
+			"count":   stats.labelCounts[label],
+			"quality": "exact",
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -455,12 +461,19 @@ func buildExplainEdgeCounts(stats explainStoreStats, refs explainPatternRefs) []
 
 	out := make([]map[string]any, 0, len(types))
 	for _, edgeType := range types {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"type":      edgeType,
 			"direction": "out",
 			"count":     stats.edgeCounts[edgeType],
 			"quality":   "exact",
-		})
+		}
+		entry["assessment"] = map[string]any{
+			"type":      edgeType,
+			"direction": "out",
+			"count":     stats.edgeCounts[edgeType],
+			"quality":   "exact",
+		}
+		out = append(out, entry)
 	}
 	return out
 }
@@ -469,11 +482,17 @@ func buildExplainPredicateSignals(stmt ast.Statement, params Params, tenant stri
 	signals := make([]map[string]any, 0)
 	appendFromClause := func(pattern vertexPattern, expression string) {
 		matched := countMatchingVertices(stats, pattern, params)
-		signals = append(signals, map[string]any{
+		entry := map[string]any{
 			"expression":   expression,
 			"matchedCount": matched,
 			"quality":      "exact",
-		})
+		}
+		entry["assessment"] = map[string]any{
+			"expression":   expression,
+			"matchedCount": matched,
+			"quality":      "exact",
+		}
+		signals = append(signals, entry)
 	}
 
 	switch s := stmt.(type) {
@@ -608,6 +627,21 @@ func buildExplainIndexDecisions(stmt ast.Statement, params Params, catalog Index
 		if !selected {
 			decision["suggestedIndex"] = fmt.Sprintf("%s.%s", schema, property)
 		}
+		assessment := map[string]any{
+			"selected":             selected,
+			"reason":               reason,
+			"recommendation":       recommendation,
+			"tuningImpact":         tuningImpact,
+			"estimatedSelectivity": estimatedSelectivity,
+			"scanPopulation":       scanPopulation,
+			"matchedCount":         matchedCount,
+			"estimatedRowsSaved":   estimatedRowsSaved,
+			"quality":              quality,
+		}
+		if !selected {
+			assessment["suggestedIndex"] = fmt.Sprintf("%s.%s", schema, property)
+		}
+		decision["assessment"] = assessment
 		decisions = append(decisions, decision)
 	}
 
@@ -1054,6 +1088,13 @@ func buildExplainCardinalityFromPlanNodes(vertexes []map[string]any, params Para
 			"quality":  quality,
 			"op":       op,
 		}
+		entry["assessment"] = map[string]any{
+			"vertexId": vertexID,
+			"rowsIn":   rowsIn,
+			"rowsOut":  rowsOut,
+			"quality":  quality,
+			"op":       op,
+		}
 		if bindings := explainQueryBindingsForPlanVertex(vertex); len(bindings) == 1 {
 			entry["queryBinding"] = bindings[0]
 		} else if len(bindings) > 1 {
@@ -1107,7 +1148,7 @@ func explainQueryBindingsForPlanVertex(vertex map[string]any) []string {
 	return bindings
 }
 
-func buildExplainCostEstimate(planVertexes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any) map[string]any {
+func buildExplainCostEstimate(planVertexes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any, feedbackFn func(string) (map[string]any, bool)) map[string]any {
 	rowsOutByVertex := map[string]int{}
 	exactCardinality := len(cardinality) > 0
 	for _, entry := range cardinality {
@@ -1124,6 +1165,12 @@ func buildExplainCostEstimate(planVertexes []map[string]any, cardinality []map[s
 
 	scanRows := 0
 	outputRows := 0
+	feedbackObserved := false
+	feedbackImplementation := ""
+	feedbackSamples := int64(0)
+	feedbackSelectivity := 0.0
+	feedbackInputRows := int64(0)
+	feedbackOutputRows := int64(0)
 	for _, vertex := range planVertexes {
 		vertexID, _ := vertex["id"].(string)
 		op, _ := vertex["op"].(string)
@@ -1132,6 +1179,37 @@ func buildExplainCostEstimate(planVertexes []map[string]any, cardinality []map[s
 			scanRows += rowsOut
 		}
 		outputRows = rowsOut
+		if feedbackObserved || feedbackFn == nil {
+			continue
+		}
+		implementation, _ := vertex["implementation"].(string)
+		implementation = strings.TrimSpace(implementation)
+		if implementation == "" {
+			continue
+		}
+		feedback, ok := feedbackFn(implementation)
+		if !ok {
+			continue
+		}
+		if samples, ok := feedback["samples"].(int64); ok && samples > 0 {
+			feedbackSamples = samples
+		}
+		if inputRows, ok := feedback["inputRows"].(int64); ok && inputRows > 0 {
+			feedbackInputRows = inputRows
+		}
+		if outputRowsObserved, ok := feedback["outputRows"].(int64); ok && outputRowsObserved >= 0 {
+			feedbackOutputRows = outputRowsObserved
+			outputRows = int(outputRowsObserved)
+		}
+		if selectivity, ok := feedback["selectivity"].(float64); ok && selectivity >= 0 {
+			feedbackSelectivity = selectivity
+			if feedbackOutputRows == 0 && feedbackInputRows > 0 {
+				feedbackOutputRows = int64(math.Round(float64(feedbackInputRows) * selectivity))
+				outputRows = int(feedbackOutputRows)
+			}
+		}
+		feedbackImplementation = implementation
+		feedbackObserved = true
 	}
 
 	missingIndexPenalty := 0
@@ -1154,6 +1232,16 @@ func buildExplainCostEstimate(planVertexes []map[string]any, cardinality []map[s
 	}
 
 	total := scanRows + outputRows + missingIndexPenalty
+	if feedbackObserved {
+		feedbackAdjustment := 0
+		if feedbackOutputRows > 0 {
+			feedbackAdjustment = int(feedbackOutputRows) - rowsOutByVertex[lastScanVertexID(planVertexes)]
+		}
+		total = scanRows + outputRows + missingIndexPenalty
+		if feedbackAdjustment != 0 {
+			total += feedbackAdjustment
+		}
+	}
 	if total < 1 {
 		total = 1
 	}
@@ -1161,18 +1249,58 @@ func buildExplainCostEstimate(planVertexes []map[string]any, cardinality []map[s
 	if exactCardinality {
 		quality = "exact"
 	}
+	if feedbackObserved {
+		quality = "sample"
+	}
+
+	components := map[string]any{
+		"scanRows":            scanRows,
+		"outputRows":          outputRows,
+		"missingIndexPenalty": missingIndexPenalty,
+	}
+	assessment := map[string]any{
+		"quality":             quality,
+		"value":               total,
+		"unit":                "work_units",
+		"scanRows":            scanRows,
+		"outputRows":          outputRows,
+		"missingIndexPenalty": missingIndexPenalty,
+	}
+	if feedbackObserved {
+		components["fastPathObservedImplementation"] = feedbackImplementation
+		components["fastPathObservedSelectivity"] = feedbackSelectivity
+		components["fastPathObservedSamples"] = feedbackSamples
+		components["fastPathObservedInputRows"] = feedbackInputRows
+		components["fastPathObservedOutputRows"] = feedbackOutputRows
+		assessment["feedback"] = map[string]any{
+			"implementation": feedbackImplementation,
+			"samples":        feedbackSamples,
+			"inputRows":      feedbackInputRows,
+			"outputRows":     feedbackOutputRows,
+			"selectivity":    feedbackSelectivity,
+			"quality":        quality,
+			"source":         "runtime",
+		}
+	}
 
 	return map[string]any{
-		"model":   "heuristic-v1",
-		"value":   total,
-		"unit":    "work_units",
-		"quality": quality,
-		"components": map[string]any{
-			"scanRows":            scanRows,
-			"outputRows":          outputRows,
-			"missingIndexPenalty": missingIndexPenalty,
-		},
+		"model":      "heuristic-v1",
+		"value":      total,
+		"unit":       "work_units",
+		"quality":    quality,
+		"components": components,
+		"assessment": assessment,
 	}
+}
+
+func lastScanVertexID(planVertexes []map[string]any) string {
+	for i := len(planVertexes) - 1; i >= 0; i-- {
+		vertexID, _ := planVertexes[i]["id"].(string)
+		if strings.TrimSpace(vertexID) != "" {
+			return vertexID
+		}
+	}
+	return ""
 }
 
 func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[string]any, indexDecisions []map[string]any, fastPaths []map[string]any, warnings []map[string]any, stats explainStoreStats) map[string]any {
@@ -1273,6 +1401,7 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 	whereShortcutCandidates := 0
 	topKPushdownCandidates := 0
 	lateMaterializationCandidates := 0
+	fastPathFeedbackCandidates := 0
 	for _, path := range fastPaths {
 		implementation, _ := path["implementation"].(string)
 		if strings.TrimSpace(implementation) != "" {
@@ -1289,6 +1418,9 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 		}
 		if eligible, _ := path["lateMaterialization"].(bool); eligible {
 			lateMaterializationCandidates++
+		}
+		if quality, _ := path["quality"].(string); quality == "sample" {
+			fastPathFeedbackCandidates++
 		}
 	}
 
@@ -1324,6 +1456,7 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 			"whereShortcutCandidates":       whereShortcutCandidates,
 			"topKPushdownCandidates":        topKPushdownCandidates,
 			"lateMaterializationCandidates": lateMaterializationCandidates,
+			"fastPathFeedbackCandidates":    fastPathFeedbackCandidates,
 		},
 	}
 }
@@ -1339,6 +1472,11 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planVer
 			return
 		}
 		seen[key] = struct{}{}
+		assessment := map[string]any{}
+		for k, v := range w {
+			assessment[k] = v
+		}
+		w["assessment"] = assessment
 		warnings = append(warnings, w)
 	}
 
@@ -1410,7 +1548,7 @@ func buildExplainWarnings(stmt ast.Statement, analysis *explainAnalysis, planVer
 	return warnings
 }
 
-func collectExplainFastPaths(stmt ast.Statement, params Params) []map[string]any {
+func collectExplainFastPaths(stmt ast.Statement, params Params, feedbackFn func(string) (map[string]any, bool)) []map[string]any {
 	signals := make([]map[string]any, 0)
 	seen := map[string]struct{}{}
 	addSignal := func(signal map[string]any) {
@@ -1430,7 +1568,7 @@ func collectExplainFastPaths(stmt ast.Statement, params Params) []map[string]any
 
 	collectFromClauses := func(clauses []ast.Clause) {
 		for idx := 0; idx+1 < len(clauses); idx++ {
-			signal, ok := explainFastPathClausePairSignal(clauses[idx], clauses[idx+1], params)
+			signal, ok := explainFastPathClausePairSignal(clauses[idx], clauses[idx+1], params, feedbackFn)
 			if ok {
 				addSignal(signal)
 			}
@@ -1439,7 +1577,7 @@ func collectExplainFastPaths(stmt ast.Statement, params Params) []map[string]any
 
 	switch s := stmt.(type) {
 	case *ast.ExplainStatement:
-		return collectExplainFastPaths(s.Statement, params)
+		return collectExplainFastPaths(s.Statement, params, feedbackFn)
 	case *ast.QueryStatement:
 		for _, part := range s.Parts {
 			collectFromClauses(part.Clauses)
@@ -1525,7 +1663,7 @@ func explainAllNodesScanBackedByFastVertexCount(planVertexes []map[string]any, v
 	return false
 }
 
-func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params Params) (map[string]any, bool) {
+func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params Params, feedbackFn func(string) (map[string]any, bool)) (map[string]any, bool) {
 	if matchClause.Kind != ast.ClauseKindMatch {
 		return nil, false
 	}
@@ -1563,6 +1701,14 @@ func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params 
 			"status":                 "eligible",
 			"whereShortcutCoverage":  whereShortcut.enabled,
 			"peerInequalityShortcut": whereShortcut.requirePeerNotTarget,
+			"assessment": map[string]any{
+				"name":                   "target_shared_peer_aggregation",
+				"implementation":         "fast_target_shared_peer_aggregation_clause_pair",
+				"clausePair":             "MATCH+WITH",
+				"status":                 "eligible",
+				"whereShortcutCoverage":  whereShortcut.enabled,
+				"peerInequalityShortcut": whereShortcut.requirePeerNotTarget,
+			},
 		}, true
 
 	case ast.ClauseKindReturn:
@@ -1594,7 +1740,7 @@ func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params 
 		hasRightExclusion := explainDirectedWhereHasRightExclusionPattern(matchSpec.Where, pattern.Right.Var)
 		wherePrefilterCoverage := directedWhereCoveredByExtractedPrefilters(matchSpec.Where, pattern.EdgeVar, pattern.Right.Var, Row{}, params, hasNumericConstraints, hasRightExclusion)
 
-		return map[string]any{
+		signal := map[string]any{
 			"name":                   "peer_candidate_return_aggregation",
 			"implementation":         "fast_peer_candidate_return_aggregation_clause_pair",
 			"clausePair":             "MATCH+RETURN",
@@ -1604,7 +1750,30 @@ func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params 
 			"wherePrefilterCoverage": wherePrefilterCoverage,
 			"topKPushdown":           topKPushdown,
 			"lateMaterialization":    projection.lateMaterializeNonAggregates,
-		}, true
+			"assessment": map[string]any{
+				"name":                   "peer_candidate_return_aggregation",
+				"implementation":         "fast_peer_candidate_return_aggregation_clause_pair",
+				"clausePair":             "MATCH+RETURN",
+				"status":                 "eligible",
+				"numericPrefilter":       hasNumericConstraints,
+				"antiJoinPrefilter":      hasRightExclusion,
+				"wherePrefilterCoverage": wherePrefilterCoverage,
+				"topKPushdown":           topKPushdown,
+				"lateMaterialization":    projection.lateMaterializeNonAggregates,
+			},
+		}
+		if feedbackFn != nil {
+			if feedback, ok := feedbackFn("fast_peer_candidate_return_aggregation_clause_pair"); ok {
+				normalizedFeedback := map[string]any{}
+				for key, value := range feedback {
+					signal[key] = value
+					normalizedFeedback[key] = value
+				}
+				signal["feedback"] = normalizedFeedback
+				signal["feedbackObserved"] = true
+			}
+		}
+		return signal, true
 	}
 
 	return nil, false
@@ -1830,7 +1999,7 @@ func (b *explainPlanBuilder) addFastPathClausePair(matchClause, nextClause ast.C
 		return false
 	}
 
-	signal, ok := explainFastPathClausePairSignal(matchClause, nextClause, b.params)
+	signal, ok := explainFastPathClausePairSignal(matchClause, nextClause, b.params, nil)
 	if !ok {
 		return false
 	}

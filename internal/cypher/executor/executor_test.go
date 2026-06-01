@@ -265,6 +265,13 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if len(vertexCounts) == 0 {
 		t.Fatalf("expected non-empty vertexCounts")
 	}
+	vertexCountAssessment, ok := vertexCounts[0]["assessment"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected vertexCount assessment map, got %T", vertexCounts[0]["assessment"])
+	}
+	if quality, _ := vertexCountAssessment["quality"].(string); quality != "exact" {
+		t.Fatalf("expected vertexCount assessment quality exact, got %#v", vertexCountAssessment["quality"])
+	}
 	edgeCounts, ok := influencers["edgeCounts"].([]map[string]any)
 	if !ok {
 		t.Fatalf("expected edgeCounts []map[string]any, got %T", influencers["edgeCounts"])
@@ -288,6 +295,13 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	}
 	if len(predicateSignals) == 0 {
 		t.Fatalf("expected non-empty predicateSignals")
+	}
+	predicateAssessment, ok := predicateSignals[0]["assessment"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected predicateSignal assessment map, got %T", predicateSignals[0]["assessment"])
+	}
+	if quality, _ := predicateAssessment["quality"].(string); quality != "exact" {
+		t.Fatalf("expected predicateSignal assessment quality exact, got %#v", predicateAssessment["quality"])
 	}
 	indexDecisions, ok := explainPayload["indexDecisions"].([]map[string]any)
 	if !ok {
@@ -314,6 +328,19 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if scanPopulation, _ := indexDecisions[0]["scanPopulation"].(int); scanPopulation < 1 {
 		t.Fatalf("expected scanPopulation >= 1, got %#v", indexDecisions[0]["scanPopulation"])
 	}
+	assessment, ok := indexDecisions[0]["assessment"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected normalized assessment map, got %T", indexDecisions[0]["assessment"])
+	}
+	if selected, _ := assessment["selected"].(bool); !selected {
+		t.Fatalf("expected assessment.selected=true, got %#v", assessment["selected"])
+	}
+	if recommendation, _ := assessment["recommendation"].(string); recommendation != "keep-index" {
+		t.Fatalf("expected assessment recommendation keep-index, got %#v", assessment["recommendation"])
+	}
+	if quality, _ := assessment["quality"].(string); quality != "exact" {
+		t.Fatalf("expected assessment quality exact, got %#v", assessment["quality"])
+	}
 	cardinality, ok := explainPayload["cardinality"].([]map[string]any)
 	if !ok {
 		t.Fatalf("expected cardinality []map[string]any, got %T", explainPayload["cardinality"])
@@ -323,6 +350,16 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	}
 	if rowsOut, _ := cardinality[0]["rowsOut"].(int); rowsOut != 1 {
 		t.Fatalf("expected first cardinality rowsOut=1, got %#v", cardinality[0]["rowsOut"])
+	}
+	cardinalityAssessment, ok := cardinality[0]["assessment"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected cardinality assessment map, got %T", cardinality[0]["assessment"])
+	}
+	if quality, _ := cardinalityAssessment["quality"].(string); quality != "exact" {
+		t.Fatalf("expected cardinality assessment quality exact, got %#v", cardinalityAssessment["quality"])
+	}
+	if rowsOut, _ := cardinalityAssessment["rowsOut"].(int); rowsOut != 1 {
+		t.Fatalf("expected cardinality assessment rowsOut=1, got %#v", cardinalityAssessment["rowsOut"])
 	}
 	costEstimate, ok := explainPayload["costEstimate"].(map[string]any)
 	if !ok {
@@ -349,6 +386,19 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	}
 	if _, ok := components["missingIndexPenalty"].(int); !ok {
 		t.Fatalf("expected missingIndexPenalty component, got %#v", components["missingIndexPenalty"])
+	}
+	costAssessment, ok := costEstimate["assessment"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected costEstimate assessment map, got %T", costEstimate["assessment"])
+	}
+	if unit, _ := costAssessment["unit"].(string); unit != "work_units" {
+		t.Fatalf("expected costEstimate assessment unit work_units, got %#v", costAssessment["unit"])
+	}
+	if quality, _ := costAssessment["quality"].(string); quality != "estimate" {
+		t.Fatalf("expected costEstimate assessment quality estimate, got %#v", costAssessment["quality"])
+	}
+	if _, ok := costAssessment["scanRows"].(int); !ok {
+		t.Fatalf("expected costEstimate assessment scanRows int, got %#v", costAssessment["scanRows"])
 	}
 	runtimeStats, ok := explainPayload["runtimeStats"].(map[string]any)
 	if !ok {
@@ -553,6 +603,135 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 		if code, _ := warning["code"].(string); code == "PLAN_ANALYSIS_PARTIAL" {
 			t.Fatalf("did not expect PLAN_ANALYSIS_PARTIAL when fast paths are recognized: %#v", warnings)
 		}
+	}
+}
+
+func TestExecuteExplainSurfacesFastPathSelectivityFeedbackAfterExecution(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-target", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-peer", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-shared", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-candidate", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-1", Type: "RATED", SrcID: "u-target", DstID: "m-shared", Properties: graph.PropertyMap{"rating": []byte("4")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-2", Type: "RATED", SrcID: "u-peer", DstID: "m-shared", Properties: graph.PropertyMap{"rating": []byte("5")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-3", Type: "RATED", SrcID: "u-peer", DstID: "m-candidate", Properties: graph.PropertyMap{"rating": []byte("5")}}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	query := `MATCH (target:User)-[rt:RATED]->(shared:Movie)<-[rp:RATED]-(peer:User)
+WHERE abs(rp.rating - rt.rating) <= 1
+WITH target, peer, count(shared) AS shared_count, avg(abs(rt.rating-rp.rating)) AS avg_diff
+MATCH (peer)-[rp2:RATED]->(candidate:Movie)
+WHERE rp2.rating >= 4 AND NOT (target)-[:RATED]->(candidate)
+RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS support, sum(shared_count) AS total_sim`
+
+	exec := New(store, Options{})
+	executeStmt, err := parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, executeStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected non-empty execution results")
+	}
+
+	explainStmt, err := parser.ParseStatement("EXPLAIN " + query)
+	if err != nil {
+		t.Fatalf("explain parse failed: %v", err)
+	}
+	explainRes, err := exec.ExecuteStatement(ctx, explainStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("explain execute failed: %v", err)
+	}
+	explainPayload, ok := explainRes.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", explainRes.Rows[0]["explain"])
+	}
+	fastPaths, ok := explainPayload["executionStrategies"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected executionStrategies []map[string]any, got %T", explainPayload["executionStrategies"])
+	}
+	foundFeedback := false
+	for _, path := range fastPaths {
+		if impl, _ := path["implementation"].(string); impl != "fast_peer_candidate_return_aggregation_clause_pair" {
+			continue
+		}
+		assessment, ok := path["assessment"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected fast-path assessment map, got %T", path["assessment"])
+		}
+		if clausePair, _ := assessment["clausePair"].(string); clausePair != "MATCH+RETURN" {
+			t.Fatalf("expected fast-path assessment clausePair MATCH+RETURN, got %#v", assessment["clausePair"])
+		}
+		if observed, _ := path["feedbackObserved"].(bool); !observed {
+			t.Fatalf("expected feedbackObserved=true, got %#v", path["feedbackObserved"])
+		}
+		feedback, ok := path["feedback"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected structured feedback map, got %T", path["feedback"])
+		}
+		if quality, _ := path["quality"].(string); quality != "sample" {
+			t.Fatalf("expected feedback quality sample, got %#v", path["quality"])
+		}
+		if selectivity, ok := path["selectivity"].(float64); !ok || selectivity <= 0 || selectivity > 1 {
+			t.Fatalf("expected observed selectivity in (0,1], got %#v", path["selectivity"])
+		}
+		if feedbackSelectivity, ok := feedback["selectivity"].(float64); !ok || feedbackSelectivity <= 0 || feedbackSelectivity > 1 {
+			t.Fatalf("expected structured feedback selectivity in (0,1], got %#v", feedback["selectivity"])
+		}
+		if feedbackQuality, _ := feedback["quality"].(string); feedbackQuality != "sample" {
+			t.Fatalf("expected structured feedback quality sample, got %#v", feedback["quality"])
+		}
+		if inputRows, ok := path["inputRows"].(int64); !ok || inputRows <= 0 {
+			t.Fatalf("expected positive inputRows feedback, got %#v", path["inputRows"])
+		}
+		if feedbackInputRows, ok := feedback["inputRows"].(int64); !ok || feedbackInputRows <= 0 {
+			t.Fatalf("expected structured feedback inputRows > 0, got %#v", feedback["inputRows"])
+		}
+		if outputRows, ok := path["outputRows"].(int64); !ok || outputRows <= 0 {
+			t.Fatalf("expected positive outputRows feedback, got %#v", path["outputRows"])
+		}
+		if feedbackOutputRows, ok := feedback["outputRows"].(int64); !ok || feedbackOutputRows <= 0 {
+			t.Fatalf("expected structured feedback outputRows > 0, got %#v", feedback["outputRows"])
+		}
+		foundFeedback = true
+	}
+	if !foundFeedback {
+		t.Fatalf("expected fast-path feedback to be surfaced in EXPLAIN, got %#v", fastPaths)
+	}
+	runtimeStats, ok := explainPayload["runtimeStats"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats map, got %T", explainPayload["runtimeStats"])
+	}
+	execution, ok := runtimeStats["execution"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.execution map, got %T", runtimeStats["execution"])
+	}
+	if feedbackCandidates, _ := execution["fastPathFeedbackCandidates"].(int); feedbackCandidates < 1 {
+		t.Fatalf("expected at least one fastPathFeedbackCandidates entry, got %#v", execution["fastPathFeedbackCandidates"])
 	}
 }
 

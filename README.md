@@ -229,6 +229,8 @@ These counters are monotonic process-level totals and complement per-query `RUNT
 
 Use `EXPLAIN` when you want to inspect how VitalEdge would plan a query without mutating data. The output is returned as JSON in the `explain` column, and it includes the query shape, `query.options`, logical and physical plans, influencer counts, cardinality estimates, and index decisions.
 
+The EXPLAIN payload now uses a consistent shape across its list-like sections: each major entry keeps the existing flat fields for compatibility, and also exposes a nested `assessment` object with the same evidence grouped together. That applies to influencer counts, predicate signals, index decisions, cardinality, cost estimates, warnings, and execution strategies.
+
 Example:
 
 ```cypher
@@ -245,6 +247,8 @@ What to look at:
 - `indexDecisions`: reports candidate indexes, whether one was selected, chosen access path, estimated scan savings/selectivity, and recommendation (`keep-index`, `create-index`, or `consider-index`).
 - `cardinality`: shows per-plan-vertex row estimates and their quality (`exact`, `estimate`, or `sample`).
 - `warnings`: emits fallback diagnostics (for example missing index, full-scan fallback, and estimate-only tuning signals) to highlight when planning signals are partial.
+
+For each of those sections, the nested `assessment` block mirrors the same values in a more readable, grouped form for tooling and documentation consumers.
 
 Warning codes currently emitted:
 

@@ -103,9 +103,19 @@ type Executor struct {
 	stage2LateMaterializationEnabled bool
 	stage2EdgeIndexPushdownEnabled   bool
 
+	fastPathFeedbackMu sync.RWMutex
+	fastPathFeedback   map[string]fastPathFeedbackSummary
+
 	indexJobWorkerOnce   sync.Once
 	indexJobWorkerMu     sync.Mutex
 	indexJobWorkerCancel context.CancelFunc
+}
+
+type fastPathFeedbackSummary struct {
+	Samples     int64
+	InputRows   int64
+	OutputRows  int64
+	Selectivity float64
 }
 
 type noopMetrics struct{}
@@ -135,7 +145,55 @@ func New(store graph.GraphStore, opts Options) *Executor {
 		stage2TopKPushdownEnabled:        !opts.DisableStage2TopKPushdown,
 		stage2LateMaterializationEnabled: !opts.DisableStage2LateMaterialization,
 		stage2EdgeIndexPushdownEnabled:   !opts.DisableStage2EdgeIndexPushdown,
+		fastPathFeedback:                 map[string]fastPathFeedbackSummary{},
 	}
+}
+
+func (e *Executor) recordFastPathFeedback(implementation string, inputRows, outputRows int64) {
+	implementation = strings.TrimSpace(implementation)
+	if e == nil || implementation == "" || inputRows <= 0 {
+		return
+	}
+	if outputRows < 0 {
+		outputRows = 0
+	}
+	summary := fastPathFeedbackSummary{Samples: 1, InputRows: inputRows, OutputRows: outputRows}
+	summary.Selectivity = float64(outputRows) / float64(inputRows)
+	e.fastPathFeedbackMu.Lock()
+	defer e.fastPathFeedbackMu.Unlock()
+	if e.fastPathFeedback == nil {
+		e.fastPathFeedback = map[string]fastPathFeedbackSummary{}
+	}
+	current := e.fastPathFeedback[implementation]
+	current.Samples += summary.Samples
+	current.InputRows += summary.InputRows
+	current.OutputRows += summary.OutputRows
+	if current.InputRows > 0 {
+		current.Selectivity = float64(current.OutputRows) / float64(current.InputRows)
+	}
+	e.fastPathFeedback[implementation] = current
+}
+
+func (e *Executor) fastPathFeedbackSnapshot(implementation string) (map[string]any, bool) {
+	implementation = strings.TrimSpace(implementation)
+	if e == nil || implementation == "" {
+		return nil, false
+	}
+	e.fastPathFeedbackMu.RLock()
+	defer e.fastPathFeedbackMu.RUnlock()
+	current, ok := e.fastPathFeedback[implementation]
+	if !ok || current.Samples == 0 {
+		return nil, false
+	}
+	return map[string]any{
+		"samples":        current.Samples,
+		"inputRows":      current.InputRows,
+		"outputRows":     current.OutputRows,
+		"selectivity":    current.Selectivity,
+		"quality":        "sample",
+		"source":         "runtime",
+		"implementation": implementation,
+	}, true
 }
 
 func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, params Params) (res *Result, err error) {

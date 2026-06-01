@@ -1444,6 +1444,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 			return nil, nil, false, err
 		}
 	}
+	e.recordFastPathFeedback("fast_peer_candidate_return_aggregation_clause_pair", int64(len(rows)), int64(len(out)))
 
 	columns := append([]string(nil), projection.orderedOutputKeys...)
 	if len(columns) == 0 && len(priorColumns) > 0 {

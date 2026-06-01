@@ -132,6 +132,8 @@ General optimization technique used by VitalEdge:
 2. Use bounded probing to estimate selectivity before committing to index-first expansion.
 3. Keep fast-path decisions observable through runtime counters and benchmark A/B variants.
 4. Re-tune thresholds with representative broad and selective workload shapes as data distributions change.
+5. Feed observed fast-path selectivity back into planning metadata so EXPLAIN can surface what the runtime learned.
+6. When runtime feedback is available for the same executor instance, let EXPLAIN cost estimates become sample-aware rather than purely heuristic.
 
 ## EXPLAIN Specification Decision
 
@@ -167,6 +169,13 @@ Treat `EXPLAIN` as a dry-run planning command that executes parse, semantic vali
 4. Per-node cardinality entries with quality metadata: `exact`, `estimate`, or `sample`.
 5. Warnings for missing stats, full scans, unsupported optimization, or fallback decisions.
 6. Query shape/fingerprint metadata.
+
+Payload normalization rule:
+
+1. List-shaped EXPLAIN sections should preserve their existing flat fields for compatibility.
+2. The same entries should also expose a nested `assessment` object that groups the evidence used to form the result.
+3. This applies to influencer counts, predicate signals, index decisions, cardinality, cost estimates, warnings, and execution strategies.
+4. The goal is to keep EXPLAIN readable and internally coherent without breaking existing consumers.
 
 Current concrete diagnostics and tuning signals:
 

@@ -986,6 +986,10 @@ func buildExplainCardinalityFromPlanNodes(vertexes []map[string]any, params Para
 			}
 		case "FILTER":
 			rowsOut = rowsIn
+			if bookkeepingOnly, _ := vertex["bookkeepingOnly"].(bool); bookkeepingOnly {
+				quality = "exact"
+				break
+			}
 			if covered, _ := vertex["wherePrefilterCoverage"].(bool); covered {
 				quality = "exact"
 				break
@@ -1069,11 +1073,13 @@ func explainEdgeScanSourcePopulation(vertex map[string]any, stats explainStoreSt
 	}
 	label, _ := vertex[labelKey].(string)
 	label = strings.TrimSpace(label)
-	if label == "" {
-		return 0
+	if label != "" {
+		if count, ok := stats.labelCounts[label]; ok && count > 0 {
+			return count
+		}
 	}
-	if count, ok := stats.labelCounts[label]; ok && count > 0 {
-		return count
+	if stats.vertexTotal > 0 {
+		return stats.vertexTotal
 	}
 	return 0
 }
@@ -1208,12 +1214,29 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 	rowsRead := 0
 	rowsOutput := 0
 	rowsOutByNode := map[string]int{}
+	bookkeepingOnlyFilterVertexes := map[string]struct{}{}
+	for _, vertex := range planVertexes {
+		op, _ := vertex["op"].(string)
+		if op != "FILTER" {
+			continue
+		}
+		if bookkeepingOnly, _ := vertex["bookkeepingOnly"].(bool); !bookkeepingOnly {
+			continue
+		}
+		vertexID, _ := vertex["id"].(string)
+		if strings.TrimSpace(vertexID) == "" {
+			continue
+		}
+		bookkeepingOnlyFilterVertexes[vertexID] = struct{}{}
+	}
 	allExactCardinality := len(cardinality) > 0
 	for _, entry := range cardinality {
 		vertexID, _ := entry["vertexId"].(string)
 		rowsIn, _ := entry["rowsIn"].(int)
 		rowsOut, _ := entry["rowsOut"].(int)
-		rowsRead += rowsIn
+		if _, skip := bookkeepingOnlyFilterVertexes[vertexID]; !skip {
+			rowsRead += rowsIn
+		}
 		rowsOutput = rowsOut
 		if strings.TrimSpace(vertexID) != "" {
 			rowsOutByNode[vertexID] = rowsOut
@@ -1837,6 +1860,16 @@ func (b *explainPlanBuilder) annotateMatchRangeWithFastPath(start, end int, sign
 		end = len(b.nodes)
 	}
 	clausePair, _ := signal["clausePair"].(string)
+
+	residualFilterIdx := -1
+	for idx := start; idx < end; idx++ {
+		node := b.nodes[idx]
+		op, _ := node["op"].(string)
+		if op == "FILTER" {
+			residualFilterIdx = idx
+		}
+	}
+
 	for idx := start; idx < end; idx++ {
 		node := b.nodes[idx]
 		op, _ := node["op"].(string)
@@ -1870,20 +1903,22 @@ func (b *explainPlanBuilder) annotateMatchRangeWithFastPath(start, end int, sign
 					node["antiJoinPrefilter"] = value
 				}
 			}
-			if op == "FILTER" {
+			if op == "FILTER" && idx == residualFilterIdx {
 				if value, ok := signal["wherePrefilterCoverage"].(bool); ok {
 					node["wherePrefilterCoverage"] = value
 					if value {
 						node["implementation"] = "prefilter_covered_filter"
+						node["bookkeepingOnly"] = true
 					}
 				}
 			}
 		case "MATCH+WITH":
-			if op == "FILTER" {
+			if op == "FILTER" && idx == residualFilterIdx {
 				if value, ok := signal["whereShortcutCoverage"].(bool); ok {
 					node["whereShortcutCoverage"] = value
 					if value {
 						node["implementation"] = "where_shortcut_filter"
+						node["bookkeepingOnly"] = true
 					}
 				}
 				if value, ok := signal["peerInequalityShortcut"].(bool); ok {

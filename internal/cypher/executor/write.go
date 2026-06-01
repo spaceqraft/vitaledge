@@ -1385,7 +1385,7 @@ func fastPeerCandidateTopKRows(aggs map[string]*fastPeerCandidateAggregate, grou
 	if keep <= 0 {
 		keep = spec.limit
 	}
-	ranked := make([]fastPeerCandidateRankedRow, 0, keep)
+	top := &fastPeerCandidateTopKHeap{descending: spec.descending, rows: make([]fastPeerCandidateRankedRow, 0, keep)}
 
 	for idx, groupID := range groupOrder {
 		agg := aggs[groupID]
@@ -1393,21 +1393,16 @@ func fastPeerCandidateTopKRows(aggs map[string]*fastPeerCandidateAggregate, grou
 			continue
 		}
 		candidate := fastPeerCandidateRankedRow{agg: agg, score: agg.similaritySum, inputIndex: idx}
-		if len(ranked) < keep {
-			ranked = append(ranked, candidate)
+		if top.Len() < keep {
+			heap.Push(top, candidate)
 			continue
 		}
-
-		worstIdx := 0
-		for i := 1; i < len(ranked); i++ {
-			if compareFastPeerCandidateRank(ranked[worstIdx], ranked[i], spec.descending) < 0 {
-				worstIdx = i
-			}
-		}
-		if compareFastPeerCandidateRank(candidate, ranked[worstIdx], spec.descending) < 0 {
-			ranked[worstIdx] = candidate
+		if compareFastPeerCandidateRank(candidate, top.rows[0], spec.descending) < 0 {
+			top.rows[0] = candidate
+			heap.Fix(top, 0)
 		}
 	}
+	ranked := top.rows
 
 	sort.Slice(ranked, func(i, j int) bool {
 		return compareFastPeerCandidateRank(ranked[i], ranked[j], spec.descending) < 0
@@ -1429,6 +1424,31 @@ func fastPeerCandidateTopKRows(aggs map[string]*fastPeerCandidateAggregate, grou
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+type fastPeerCandidateTopKHeap struct {
+	rows       []fastPeerCandidateRankedRow
+	descending bool
+}
+
+func (h fastPeerCandidateTopKHeap) Len() int { return len(h.rows) }
+
+func (h fastPeerCandidateTopKHeap) Less(i, j int) bool {
+	// Max-heap by rank quality: root is the worst kept row for replacement checks.
+	return compareFastPeerCandidateRank(h.rows[i], h.rows[j], h.descending) > 0
+}
+
+func (h fastPeerCandidateTopKHeap) Swap(i, j int) { h.rows[i], h.rows[j] = h.rows[j], h.rows[i] }
+
+func (h *fastPeerCandidateTopKHeap) Push(x any) {
+	h.rows = append(h.rows, x.(fastPeerCandidateRankedRow))
+}
+
+func (h *fastPeerCandidateTopKHeap) Pop() any {
+	last := len(h.rows) - 1
+	item := h.rows[last]
+	h.rows = h.rows[:last]
+	return item
 }
 
 func compareFastPeerCandidateRank(left, right fastPeerCandidateRankedRow, descending bool) int {

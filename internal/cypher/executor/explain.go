@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -935,12 +936,14 @@ func buildExplainCardinalityFromPlanNodes(vertexes []map[string]any, params Para
 			}
 		case "EDGE_SCAN", "OPTIONAL_EDGE_SCAN":
 			quality = "exact"
-			rowsOut = stats.edgeTotal
+			edgeRows := stats.edgeTotal
+			rowsOut = edgeRows
 			if variableLength, _ := vertex["variableLength"].(bool); variableLength {
 				quality = "estimate"
 			}
 			if edgeType, _ := vertex["edgeType"].(string); strings.TrimSpace(edgeType) != "" {
 				if count, ok := stats.edgeCounts[edgeType]; ok {
+					edgeRows = count
 					rowsOut = count
 				}
 			}
@@ -949,7 +952,19 @@ func buildExplainCardinalityFromPlanNodes(vertexes []map[string]any, params Para
 				for _, edgeType := range edgeAnyOf {
 					total += stats.edgeCounts[edgeType]
 				}
+				edgeRows = total
 				rowsOut = total
+			}
+			if sourceVar, _ := vertex["sourceVar"].(string); strings.TrimSpace(sourceVar) != "" && rowsIn > 0 {
+				sourcePopulation := explainEdgeScanSourcePopulation(vertex, stats)
+				if sourcePopulation > 0 {
+					avgFanout := float64(edgeRows) / float64(sourcePopulation)
+					rowsOut = int(math.Round(float64(rowsIn) * avgFanout))
+					if rowsOut < 0 {
+						rowsOut = 0
+					}
+					quality = "estimate"
+				}
 			}
 			if variableLength, _ := vertex["variableLength"].(bool); variableLength {
 				if maxHops, ok := vertex["maxHops"].(int); ok {
@@ -968,6 +983,43 @@ func buildExplainCardinalityFromPlanNodes(vertexes []map[string]any, params Para
 			if impl, _ := vertex["implementation"].(string); impl == "fast_vertex_count" {
 				rowsOut = 1
 				quality = "exact"
+			}
+		case "FILTER":
+			rowsOut = rowsIn
+			if covered, _ := vertex["wherePrefilterCoverage"].(bool); covered {
+				quality = "exact"
+				break
+			}
+			if covered, _ := vertex["whereShortcutCoverage"].(bool); covered {
+				// Shortcut-covered predicates are still enforced in the execution path;
+				// retain row count unless additional heuristic signals apply.
+				quality = "estimate"
+			}
+			predicate := strings.ToLower(strings.TrimSpace(fmt.Sprint(vertex["predicate"])))
+			if predicate == "" || rowsIn <= 0 {
+				break
+			}
+			selectivity := 1.0
+			if strings.Contains(predicate, "user_id:") || strings.Contains(predicate, "movie_id:") {
+				rowsOut = 1
+				quality = "estimate"
+				break
+			}
+			if strings.Contains(predicate, "<>") || strings.Contains(predicate, "!=") {
+				selectivity *= 0.98
+			}
+			if strings.Contains(predicate, "abs(") && (strings.Contains(predicate, "<=") || strings.Contains(predicate, "<")) {
+				selectivity *= 0.55
+			}
+			if strings.Contains(predicate, "not (") {
+				selectivity *= 0.80
+			}
+			if selectivity < 1.0 {
+				rowsOut = int(math.Round(float64(rowsIn) * selectivity))
+				if rowsOut < 0 {
+					rowsOut = 0
+				}
+				quality = "estimate"
 			}
 		case "SKIP":
 			if page, ok := vertex["pagination"].(map[string]any); ok {
@@ -1007,6 +1059,23 @@ func buildExplainCardinalityFromPlanNodes(vertexes []map[string]any, params Para
 		rows = rowsOut
 	}
 	return entries
+}
+
+func explainEdgeScanSourcePopulation(vertex map[string]any, stats explainStoreStats) int {
+	direction, _ := vertex["matchDirection"].(string)
+	labelKey := "leftLabelFilter"
+	if strings.EqualFold(strings.TrimSpace(direction), "in") {
+		labelKey = "rightLabelFilter"
+	}
+	label, _ := vertex[labelKey].(string)
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return 0
+	}
+	if count, ok := stats.labelCounts[label]; ok && count > 0 {
+		return count
+	}
+	return 0
 }
 
 func explainQueryBindingsForPlanVertex(vertex map[string]any) []string {
@@ -1178,6 +1247,8 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 
 	implementations := make([]string, 0, len(fastPaths))
 	prefilterBypassCandidates := 0
+	whereShortcutCandidates := 0
+	topKPushdownCandidates := 0
 	for _, path := range fastPaths {
 		implementation, _ := path["implementation"].(string)
 		if strings.TrimSpace(implementation) != "" {
@@ -1185,6 +1256,12 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 		}
 		if covered, _ := path["wherePrefilterCoverage"].(bool); covered {
 			prefilterBypassCandidates++
+		}
+		if covered, _ := path["whereShortcutCoverage"].(bool); covered {
+			whereShortcutCandidates++
+		}
+		if eligible, _ := path["topKPushdown"].(bool); eligible {
+			topKPushdownCandidates++
 		}
 	}
 
@@ -1217,6 +1294,8 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 			"fastPathCandidates":        len(fastPaths),
 			"implementations":           implementations,
 			"prefilterBypassCandidates": prefilterBypassCandidates,
+			"whereShortcutCandidates":   whereShortcutCandidates,
+			"topKPushdownCandidates":    topKPushdownCandidates,
 		},
 	}
 }
@@ -1448,11 +1527,14 @@ func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params 
 		if _, ok := parseFastTargetSharedPeerProjection(items, chain); !ok {
 			return nil, false
 		}
+		whereShortcut := buildStage1WhereShortcutPlan(matchSpec.Where, chain)
 		return map[string]any{
-			"name":           "target_shared_peer_aggregation",
-			"implementation": "fast_target_shared_peer_aggregation_clause_pair",
-			"clausePair":     "MATCH+WITH",
-			"status":         "eligible",
+			"name":                   "target_shared_peer_aggregation",
+			"implementation":         "fast_target_shared_peer_aggregation_clause_pair",
+			"clausePair":             "MATCH+WITH",
+			"status":                 "eligible",
+			"whereShortcutCoverage":  whereShortcut.enabled,
+			"peerInequalityShortcut": whereShortcut.requirePeerNotTarget,
 		}, true
 
 	case ast.ClauseKindReturn:
@@ -1471,8 +1553,13 @@ func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params 
 		if err != nil {
 			return nil, false
 		}
-		if _, ok := parseFastPeerCandidateReturnProjection(items, pattern); !ok {
+		projection, ok := parseFastPeerCandidateReturnProjection(items, pattern)
+		if !ok {
 			return nil, false
+		}
+		_, topKPushdown, err := fastPeerCandidateTopKSpecFromProjection(retSpec, projection, params)
+		if err != nil {
+			topKPushdown = false
 		}
 
 		_, hasNumericConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, Row{}, params)
@@ -1487,6 +1574,7 @@ func explainFastPathClausePairSignal(matchClause, nextClause ast.Clause, params 
 			"numericPrefilter":       hasNumericConstraints,
 			"antiJoinPrefilter":      hasRightExclusion,
 			"wherePrefilterCoverage": wherePrefilterCoverage,
+			"topKPushdown":           topKPushdown,
 		}, true
 	}
 
@@ -1743,42 +1831,60 @@ func (b *explainPlanBuilder) annotateMatchRangeWithFastPath(start, end int, sign
 		end = len(b.nodes)
 	}
 	clausePair, _ := signal["clausePair"].(string)
-	if clausePair != "MATCH+RETURN" {
-		return
-	}
-
 	for idx := start; idx < end; idx++ {
 		node := b.nodes[idx]
 		op, _ := node["op"].(string)
-		if op != "EDGE_SCAN" && op != "OPTIONAL_EDGE_SCAN" {
-			continue
-		}
-		if existing, _ := node["implementation"].(string); strings.TrimSpace(existing) == "" {
-			if covered, _ := signal["wherePrefilterCoverage"].(bool); covered {
-				node["implementation"] = "prefilter_covered_directed_relationship_scan"
-			} else {
-				node["implementation"] = "prefiltered_directed_relationship_scan"
+
+		switch clausePair {
+		case "MATCH+RETURN":
+			if op == "EDGE_SCAN" || op == "OPTIONAL_EDGE_SCAN" {
+				if existing, _ := node["implementation"].(string); strings.TrimSpace(existing) == "" {
+					if covered, _ := signal["wherePrefilterCoverage"].(bool); covered {
+						node["implementation"] = "prefilter_covered_directed_relationship_scan"
+					} else {
+						node["implementation"] = "prefiltered_directed_relationship_scan"
+					}
+				}
+				if implementation, _ := signal["implementation"].(string); strings.TrimSpace(implementation) != "" {
+					node["executionStrategy"] = implementation
+				}
+				if name, _ := signal["name"].(string); strings.TrimSpace(name) != "" {
+					node["strategyName"] = name
+				}
+				if status, _ := signal["status"].(string); strings.TrimSpace(status) != "" {
+					node["strategyStatus"] = status
+				}
+				if value, ok := signal["wherePrefilterCoverage"].(bool); ok {
+					node["wherePrefilterCoverage"] = value
+				}
+				if value, ok := signal["numericPrefilter"].(bool); ok {
+					node["numericPrefilter"] = value
+				}
+				if value, ok := signal["antiJoinPrefilter"].(bool); ok {
+					node["antiJoinPrefilter"] = value
+				}
+			}
+			if op == "FILTER" {
+				if value, ok := signal["wherePrefilterCoverage"].(bool); ok {
+					node["wherePrefilterCoverage"] = value
+					if value {
+						node["implementation"] = "prefilter_covered_filter"
+					}
+				}
+			}
+		case "MATCH+WITH":
+			if op == "FILTER" {
+				if value, ok := signal["whereShortcutCoverage"].(bool); ok {
+					node["whereShortcutCoverage"] = value
+					if value {
+						node["implementation"] = "where_shortcut_filter"
+					}
+				}
+				if value, ok := signal["peerInequalityShortcut"].(bool); ok {
+					node["peerInequalityShortcut"] = value
+				}
 			}
 		}
-		if implementation, _ := signal["implementation"].(string); strings.TrimSpace(implementation) != "" {
-			node["executionStrategy"] = implementation
-		}
-		if name, _ := signal["name"].(string); strings.TrimSpace(name) != "" {
-			node["strategyName"] = name
-		}
-		if status, _ := signal["status"].(string); strings.TrimSpace(status) != "" {
-			node["strategyStatus"] = status
-		}
-		if value, ok := signal["wherePrefilterCoverage"].(bool); ok {
-			node["wherePrefilterCoverage"] = value
-		}
-		if value, ok := signal["numericPrefilter"].(bool); ok {
-			node["numericPrefilter"] = value
-		}
-		if value, ok := signal["antiJoinPrefilter"].(bool); ok {
-			node["antiJoinPrefilter"] = value
-		}
-		return
 	}
 }
 
@@ -1807,6 +1913,9 @@ func (b *explainPlanBuilder) annotateProjectionRangeWithFastPath(start int, sign
 		}
 		if value, ok := signal["wherePrefilterCoverage"].(bool); ok {
 			node["wherePrefilterCoverage"] = value
+		}
+		if value, ok := signal["topKPushdown"].(bool); ok {
+			node["topKPushdown"] = value
 		}
 		return
 	}

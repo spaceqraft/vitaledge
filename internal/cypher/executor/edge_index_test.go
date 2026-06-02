@@ -1973,6 +1973,88 @@ func TestRecommendationStage2TopKEarlyStopMatchesBaseline(t *testing.T) {
 	}
 }
 
+func TestTwoHopAntiJoinShortcutAppliesAndPreservesResults(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "a", Labels: []string{"Person"}, Properties: map[string][]byte{"name": valueToBytes("a")}},
+			{Tenant: "acme", ID: "peer", Labels: []string{"Person"}, Properties: map[string][]byte{"name": valueToBytes("peer")}},
+			{Tenant: "acme", ID: "s1", Labels: []string{"Person"}, Properties: map[string][]byte{"name": valueToBytes("s1")}},
+			{Tenant: "acme", ID: "s2", Labels: []string{"Person"}, Properties: map[string][]byte{"name": valueToBytes("s2")}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "a", DstID: "peer"},
+			{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "peer", DstID: "s1"},
+			{Tenant: "acme", ID: "e3", Type: "KNOWS", SrcID: "peer", DstID: "s2"},
+			{Tenant: "acme", ID: "e4", Type: "KNOWS", SrcID: "a", DstID: "s2"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{Metrics: NewCollector()})
+
+	query := "MATCH (a:Person)-[:KNOWS]->(peer:Person)-[:KNOWS]->(suggested:Person) WHERE suggested <> a AND NOT (a)-[:KNOWS]-(suggested) WITH DISTINCT a, suggested MERGE (a)-[:SUGGESTED_FRIEND]->(suggested)"
+	stmt, err := parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse recommend query failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute recommend query failed: %v", err)
+	}
+
+	counters, err := runtimeCountersFromWarnings(res.Warnings)
+	if err != nil {
+		t.Fatalf("runtime counters parse failed: %v", err)
+	}
+	if counters["runtime.antijoin.shortcut_applied"] <= 0 {
+		t.Fatalf("expected anti-join shortcut to apply, got counters %#v", counters)
+	}
+	if counters["runtime.antijoin.neighbor_sets_built"] <= 0 {
+		t.Fatalf("expected anti-join neighbor sets to be built, got counters %#v", counters)
+	}
+	if counters["runtime.adjacency.out_sources.prefilter_applied"] <= 0 {
+		t.Fatalf("expected out-source prefilter to apply, got counters %#v", counters)
+	}
+	if counters["runtime.adjacency.out_sources.cache_misses"] <= 0 {
+		t.Fatalf("expected out-source prefilter cache miss to be recorded, got counters %#v", counters)
+	}
+
+	verifyStmt, err := parser.ParseStatement("MATCH (a:Person)-[:SUGGESTED_FRIEND]->(s:Person) RETURN a.name AS source, s.name AS suggested ORDER BY suggested")
+	if err != nil {
+		t.Fatalf("parse verify query failed: %v", err)
+	}
+	verifyRes, err := exec.ExecuteStatement(ctx, verifyStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute verify query failed: %v", err)
+	}
+	if len(verifyRes.Rows) != 1 {
+		t.Fatalf("expected exactly one suggested friend edge, got %d rows: %#v", len(verifyRes.Rows), verifyRes.Rows)
+	}
+	if got := verifyRes.Rows[0]["source"]; got != "a" {
+		t.Fatalf("expected source a, got %#v", got)
+	}
+	if got := verifyRes.Rows[0]["suggested"]; got != "s1" {
+		t.Fatalf("expected suggested s1, got %#v", got)
+	}
+}
+
 func runtimeCountersFromWarnings(warnings []Diagnostic) (map[string]int64, error) {
 	payload := map[string]int64{}
 	for _, warning := range warnings {

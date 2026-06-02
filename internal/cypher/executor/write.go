@@ -119,8 +119,9 @@ type queryEntityCache struct {
 }
 
 type queryAdjacencyCache struct {
-	outEdges map[string][]*graph.Edge
-	inEdges  map[string][]*graph.Edge
+	outEdges     map[string][]*graph.Edge
+	inEdges      map[string][]*graph.Edge
+	outSourceIDs map[string][]string
 }
 
 type runtimeCounterState struct {
@@ -449,6 +450,15 @@ type stage1WhereShortcutPlan struct {
 	enabled                bool
 	requirePeerNotTarget   bool
 	requireSecondEdgeCover bool
+}
+
+type twoHopAntiJoinShortcutPlan struct {
+	enabled              bool
+	requireRightNotLeft  bool
+	requireNoDirectEdge  bool
+	directEdgeType       string
+	directEdgeAnyOf      []string
+	directEdgeTypeSigKey string
 }
 
 type fastTargetSharedPeerRankedRow struct {
@@ -983,6 +993,108 @@ func isStage1SecondEdgeConstraintConjunct(conjunct, firstEdgeVar, secondEdgeVar 
 		return true
 	}
 	return false
+}
+
+func buildTwoHopDirectedAntiJoinShortcutPlan(whereRaw string, pattern twoHopDirectedChainPattern) twoHopAntiJoinShortcutPlan {
+	conjuncts, ok := flattenWhereConjuncts(whereRaw)
+	if !ok || len(conjuncts) == 0 {
+		return twoHopAntiJoinShortcutPlan{}
+	}
+
+	leftVar := strings.TrimSpace(pattern.Left.Var)
+	rightVar := strings.TrimSpace(pattern.Right.Var)
+	if leftVar == "" || rightVar == "" {
+		return twoHopAntiJoinShortcutPlan{}
+	}
+
+	plan := twoHopAntiJoinShortcutPlan{}
+	for _, conjunct := range conjuncts {
+		conjunct = strings.TrimSpace(conjunct)
+		if conjunct == "" {
+			continue
+		}
+		if isStage1PeerNotTargetConjunct(conjunct, leftVar, rightVar) {
+			plan.requireRightNotLeft = true
+			continue
+		}
+		edgeType, edgeAnyOf, antiJoinConjunct := parseTwoHopUndirectedAntiJoinConjunct(conjunct, leftVar, rightVar)
+		if antiJoinConjunct {
+			typeSig := normalizeEdgeTypeSignature(edgeType, edgeAnyOf)
+			if plan.requireNoDirectEdge {
+				if plan.directEdgeTypeSigKey != typeSig {
+					return twoHopAntiJoinShortcutPlan{}
+				}
+				continue
+			}
+			plan.requireNoDirectEdge = true
+			plan.directEdgeType = edgeType
+			plan.directEdgeAnyOf = append([]string(nil), edgeAnyOf...)
+			plan.directEdgeTypeSigKey = typeSig
+			continue
+		}
+		return twoHopAntiJoinShortcutPlan{}
+	}
+
+	if !plan.requireRightNotLeft && !plan.requireNoDirectEdge {
+		return twoHopAntiJoinShortcutPlan{}
+	}
+	plan.enabled = true
+	return plan
+}
+
+func parseTwoHopUndirectedAntiJoinConjunct(conjunct, leftVar, rightVar string) (edgeType string, edgeAnyOf []string, ok bool) {
+	raw := strings.TrimSpace(conjunct)
+	if raw == "" {
+		return "", nil, false
+	}
+	for {
+		inner, wrapped := unwrapOuterParentheses(raw)
+		if !wrapped {
+			break
+		}
+		raw = strings.TrimSpace(inner)
+	}
+	if !hasLogicalNotPrefix(raw) {
+		return "", nil, false
+	}
+	raw = strings.TrimSpace(raw[3:])
+	if raw == "" {
+		return "", nil, false
+	}
+	if inner, wrapped := unwrapOuterParentheses(raw); wrapped {
+		raw = strings.TrimSpace(inner)
+	}
+
+	relPattern, err := parseUndirectedRelationshipPattern(raw)
+	if err != nil {
+		return "", nil, false
+	}
+	if strings.TrimSpace(relPattern.EdgeVar) != "" || strings.TrimSpace(relPattern.EdgeProps) != "" {
+		return "", nil, false
+	}
+	left := strings.TrimSpace(relPattern.Left.Var)
+	right := strings.TrimSpace(relPattern.Right.Var)
+	if !((left == leftVar && right == rightVar) || (left == rightVar && right == leftVar)) {
+		return "", nil, false
+	}
+	return strings.TrimSpace(relPattern.EdgeType), append([]string(nil), relPattern.EdgeAnyOf...), true
+}
+
+func normalizeEdgeTypeSignature(edgeType string, edgeAnyOf []string) string {
+	edgeType = strings.TrimSpace(edgeType)
+	if len(edgeAnyOf) == 0 {
+		return edgeType
+	}
+	norm := make([]string, 0, len(edgeAnyOf))
+	for _, item := range edgeAnyOf {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		norm = append(norm, item)
+	}
+	sort.Strings(norm)
+	return strings.Join(norm, "|")
 }
 
 func isEdgeVarReferenced(expr, edgeVar string) bool {
@@ -5116,28 +5228,123 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 	if err != nil {
 		return nil, err
 	}
+	antiJoinShortcut := buildTwoHopDirectedAntiJoinShortcutPlan(spec.Where, pattern)
 
 	if len(rows) == 0 {
 		rows = []Row{{}}
 	}
 
 	type cachedTwoHopCandidate struct {
-		edge  *graph.Edge
-		right *graph.Vertex
+		edge    *graph.Edge
+		rightID string
 	}
 	secondHopCache := map[string][]cachedTwoHopCandidate{}
 
 	out := make([]Row, 0)
 	for _, row := range rows {
-		leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+		leftCandidateIDs, usedSourceAccessPath, err := e.resolveTwoHopLeftCandidatesByFirstEdgeType(ctx, tx, tenant, row, pattern, params)
 		if err != nil {
 			return nil, err
 		}
+		leftPreloaded := map[string]*graph.Vertex{}
+		if !usedSourceAccessPath {
+			leftCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, row, pattern.Left, params)
+			if err != nil {
+				return nil, err
+			}
+			leftCandidateIDs = make([]string, 0, len(leftCandidates))
+			for _, left := range leftCandidates {
+				if left == nil {
+					continue
+				}
+				leftID := strings.TrimSpace(left.ID)
+				if leftID == "" {
+					continue
+				}
+				leftCandidateIDs = append(leftCandidateIDs, leftID)
+				leftPreloaded[leftID] = left
+			}
+		}
 
 		matched := false
-		for _, left := range leftCandidates {
-			if left == nil {
+		for _, leftID := range leftCandidateIDs {
+			leftID = strings.TrimSpace(leftID)
+			if leftID == "" {
 				continue
+			}
+
+			left := leftPreloaded[leftID]
+			leftLoaded := left != nil
+			leftRejected := false
+			ensureLeft := func() (*graph.Vertex, error) {
+				if leftRejected {
+					return nil, nil
+				}
+				if leftLoaded {
+					return left, nil
+				}
+				resolved, err := getVertexQueryCached(ctx, tx, tenant, leftID, params)
+				if err != nil {
+					return nil, err
+				}
+				leftLoaded = true
+				if resolved == nil {
+					leftRejected = true
+					return nil, nil
+				}
+				mergedLeft := cloneRow(row)
+				if pattern.Left.Var != "" {
+					mergedLeft[pattern.Left.Var] = resolved
+				}
+				if !vertexBindingMatches(mergedLeft, pattern.Left.Var, resolved) {
+					leftRejected = true
+					return nil, nil
+				}
+				if !vertexPatternMatches(resolved, pattern.Left, params, mergedLeft) {
+					leftRejected = true
+					return nil, nil
+				}
+				left = resolved
+				e.observeRuntimeCounter(params, "runtime.left.lazy_hydrated", 1)
+				return left, nil
+			}
+
+			var antiJoinNeighbors map[string]struct{}
+			antiJoinNeighborsReady := false
+			ensureAntiJoinNeighbors := func() error {
+				if antiJoinNeighborsReady {
+					return nil
+				}
+				antiJoinNeighborsReady = true
+				if !antiJoinShortcut.enabled || !antiJoinShortcut.requireNoDirectEdge {
+					return nil
+				}
+				antiJoinNeighbors = map[string]struct{}{}
+				scanType := antiJoinShortcut.directEdgeType
+				if len(antiJoinShortcut.directEdgeAnyOf) > 0 {
+					scanType = ""
+				}
+				if err := scanOutEdgesQueryCached(ctx, tx, tenant, leftID, scanType, params, func(edge *graph.Edge) error {
+					if edge == nil || !edgeTypeMatches(edge, antiJoinShortcut.directEdgeType, antiJoinShortcut.directEdgeAnyOf) {
+						return nil
+					}
+					antiJoinNeighbors[edge.DstID] = struct{}{}
+					return nil
+				}); err != nil {
+					return err
+				}
+				if err := scanInEdgesQueryCached(ctx, tx, tenant, leftID, scanType, params, func(edge *graph.Edge) error {
+					if edge == nil || !edgeTypeMatches(edge, antiJoinShortcut.directEdgeType, antiJoinShortcut.directEdgeAnyOf) {
+						return nil
+					}
+					antiJoinNeighbors[edge.SrcID] = struct{}{}
+					return nil
+				}); err != nil {
+					return err
+				}
+				e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", 1)
+				e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", int64(len(antiJoinNeighbors)))
+				return nil
 			}
 
 			firstScanType := pattern.FirstEdgeType
@@ -5145,7 +5352,11 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 				firstScanType = ""
 			}
 
-			if err := scanOutEdgesQueryCached(ctx, tx, tenant, left.ID, firstScanType, params, func(edge1 *graph.Edge) error {
+			errSkipLeft := errors.New("skip two-hop left candidate")
+			if err := scanOutEdgesQueryCached(ctx, tx, tenant, leftID, firstScanType, params, func(edge1 *graph.Edge) error {
+				if leftRejected {
+					return errSkipLeft
+				}
 				if !edgeTypeMatches(edge1, pattern.FirstEdgeType, pattern.FirstEdgeAnyOf) {
 					return nil
 				}
@@ -5161,9 +5372,17 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 					return nil
 				}
 
+				leftVertex, err := ensureLeft()
+				if err != nil {
+					return err
+				}
+				if leftVertex == nil {
+					return errSkipLeft
+				}
+
 				mergedMid := cloneRow(row)
 				if pattern.Left.Var != "" {
-					mergedMid[pattern.Left.Var] = left
+					mergedMid[pattern.Left.Var] = leftVertex
 				}
 				if pattern.FirstEdgeVar != "" {
 					mergedMid[pattern.FirstEdgeVar] = edge1
@@ -5196,14 +5415,10 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 				if !cacheHit {
 					candidates = make([]cachedTwoHopCandidate, 0)
 					collectCandidate := func(edge2 *graph.Edge, rightID string) error {
-						right, err := getVertexQueryCached(ctx, tx, tenant, rightID, params)
-						if err != nil {
-							return err
-						}
-						if right == nil {
+						if strings.TrimSpace(rightID) == "" {
 							return nil
 						}
-						candidates = append(candidates, cachedTwoHopCandidate{edge: edge2, right: right})
+						candidates = append(candidates, cachedTwoHopCandidate{edge: edge2, rightID: rightID})
 						return nil
 					}
 					if pattern.SecondForward {
@@ -5222,8 +5437,12 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 					secondHopCache[cacheKey] = candidates
 				}
 
-				collectRight := func(edge2 *graph.Edge, right *graph.Vertex) error {
+				collectRight := func(edge2 *graph.Edge, rightID string) error {
 					if edge2 == nil || edge1 == nil || strings.TrimSpace(edge2.ID) == strings.TrimSpace(edge1.ID) {
+						return nil
+					}
+					rightID = strings.TrimSpace(rightID)
+					if rightID == "" {
 						return nil
 					}
 					if !edgeTypeMatches(edge2, pattern.SecondEdgeType, pattern.SecondEdgeAnyOf) {
@@ -5235,12 +5454,38 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 					if hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, secondWhereConstraints) {
 						return nil
 					}
+					bypassWhereEval := false
+					if antiJoinShortcut.enabled {
+						if antiJoinShortcut.requireRightNotLeft {
+							if strings.TrimSpace(leftID) == "" || leftID == rightID {
+								e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+								return nil
+							}
+						}
+						if antiJoinShortcut.requireNoDirectEdge {
+							if err := ensureAntiJoinNeighbors(); err != nil {
+								return err
+							}
+							if _, connected := antiJoinNeighbors[rightID]; connected {
+								e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+								return nil
+							}
+						}
+						bypassWhereEval = true
+						e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_applied", 1)
+					}
+
+					if !vertexBindingMatchesID(mergedMid, pattern.Right.Var, rightID) {
+						return nil
+					}
+					right, err := getVertexQueryCached(ctx, tx, tenant, rightID, params)
+					if err != nil {
+						return err
+					}
 					if right == nil {
 						return nil
 					}
-					if !vertexBindingMatches(mergedMid, pattern.Right.Var, right) {
-						return nil
-					}
+					e.observeRuntimeCounter(params, "runtime.right.lazy_hydrated", 1)
 
 					merged := cloneRow(mergedMid)
 					if pattern.Right.Var != "" {
@@ -5256,13 +5501,14 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 						} else {
 							directions = append(directions, "reverse")
 						}
-						merged[pathVar] = multiHopPathValue([]*graph.Vertex{left, mid, right}, []*graph.Edge{edge1, edge2}, directions)
+						merged[pathVar] = multiHopPathValue([]*graph.Vertex{leftVertex, mid, right}, []*graph.Edge{edge1, edge2}, directions)
 					}
 					if !vertexPatternMatches(right, pattern.Right, params, merged) {
 						return nil
 					}
 
-					if spec.Where != "" {
+					if spec.Where != "" && !bypassWhereEval {
+						e.observeRuntimeCounter(params, "runtime.antijoin.where_eval_fallback", 1)
 						ok, err := e.evalWhereExpression(ctx, tx, spec.Where, merged, params)
 						if err != nil {
 							return err
@@ -5278,13 +5524,19 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 				}
 
 				for _, candidate := range candidates {
-					if err := collectRight(candidate.edge, candidate.right); err != nil {
+					if err := collectRight(candidate.edge, candidate.rightID); err != nil {
 						return err
 					}
 				}
 				return nil
 			}); err != nil {
-				return nil, err
+				if !errors.Is(err, errSkipLeft) {
+					return nil, err
+				}
+			}
+
+			if leftRejected {
+				continue
 			}
 		}
 
@@ -6470,6 +6722,30 @@ func vertexBindingMatches(row Row, varName string, candidate *graph.Vertex) bool
 		return candidate != nil && typed.ID == candidate.ID
 	case string:
 		return candidate != nil && typed == candidate.ID
+	default:
+		return false
+	}
+}
+
+func vertexBindingMatchesID(row Row, varName, candidateID string) bool {
+	if strings.TrimSpace(varName) == "" {
+		return true
+	}
+	binding, ok := row[varName]
+	if !ok {
+		return true
+	}
+	candidateID = strings.TrimSpace(candidateID)
+	if candidateID == "" {
+		return binding == nil
+	}
+	switch typed := binding.(type) {
+	case nil:
+		return false
+	case *graph.Vertex:
+		return typed != nil && typed.ID == candidateID
+	case string:
+		return typed == candidateID
 	default:
 		return false
 	}
@@ -17344,7 +17620,7 @@ func resetQueryEntityCache(params Params) {
 
 func ensureQueryAdjacencyCache(params Params) *queryAdjacencyCache {
 	if params == nil {
-		return &queryAdjacencyCache{outEdges: map[string][]*graph.Edge{}, inEdges: map[string][]*graph.Edge{}}
+		return &queryAdjacencyCache{outEdges: map[string][]*graph.Edge{}, inEdges: map[string][]*graph.Edge{}, outSourceIDs: map[string][]string{}}
 	}
 	if existing, ok := params[queryAdjacencyCacheParam].(*queryAdjacencyCache); ok && existing != nil {
 		if existing.outEdges == nil {
@@ -17353,9 +17629,12 @@ func ensureQueryAdjacencyCache(params Params) *queryAdjacencyCache {
 		if existing.inEdges == nil {
 			existing.inEdges = map[string][]*graph.Edge{}
 		}
+		if existing.outSourceIDs == nil {
+			existing.outSourceIDs = map[string][]string{}
+		}
 		return existing
 	}
-	cache := &queryAdjacencyCache{outEdges: map[string][]*graph.Edge{}, inEdges: map[string][]*graph.Edge{}}
+	cache := &queryAdjacencyCache{outEdges: map[string][]*graph.Edge{}, inEdges: map[string][]*graph.Edge{}, outSourceIDs: map[string][]string{}}
 	params[queryAdjacencyCacheParam] = cache
 	return cache
 }
@@ -17369,6 +17648,10 @@ func resetQueryAdjacencyCache(params Params) {
 
 func queryAdjacencyCacheKey(tenant, vertexID, edgeType string) string {
 	return strings.TrimSpace(tenant) + "\x00" + strings.TrimSpace(vertexID) + "\x00" + strings.TrimSpace(edgeType)
+}
+
+func queryAdjacencySourceCacheKey(tenant, edgeType string) string {
+	return strings.TrimSpace(tenant) + "\x00" + strings.TrimSpace(edgeType)
 }
 
 func cloneEdgeForCache(edge *graph.Edge) *graph.Edge {
@@ -17453,6 +17736,63 @@ func scanInEdgesQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID, 
 		}
 	}
 	return nil
+}
+
+func scanOutEdgeSourceIDsQueryCached(ctx context.Context, tx graph.Tx, tenant, edgeType string, params Params) ([]string, error) {
+	if params == nil {
+		out := make([]string, 0)
+		if err := tx.ScanOutEdgeSourceIDs(ctx, tenant, edgeType, 0, func(sourceID string) error {
+			out = append(out, sourceID)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+	cache := ensureQueryAdjacencyCache(params)
+	key := queryAdjacencySourceCacheKey(tenant, edgeType)
+	sourceIDs, ok := cache.outSourceIDs[key]
+	if !ok {
+		observeRuntimeCounterLocal(params, "runtime.adjacency.out_sources.cache_misses", 1)
+		sourceIDs = make([]string, 0)
+		if err := tx.ScanOutEdgeSourceIDs(ctx, tenant, edgeType, 0, func(sourceID string) error {
+			sourceIDs = append(sourceIDs, sourceID)
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		cache.outSourceIDs[key] = sourceIDs
+	} else {
+		observeRuntimeCounterLocal(params, "runtime.adjacency.out_sources.cache_hits", 1)
+	}
+	observeRuntimeCounterLocal(params, "runtime.adjacency.out_sources.items_yielded", int64(len(sourceIDs)))
+	return sourceIDs, nil
+}
+
+func (e *Executor) resolveTwoHopLeftCandidatesByFirstEdgeType(ctx context.Context, tx graph.Tx, tenant string, row Row, pattern twoHopDirectedChainPattern, params Params) ([]string, bool, error) {
+	if tx == nil {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(pattern.FirstEdgeType) == "" || len(pattern.FirstEdgeAnyOf) > 0 {
+		return nil, false, nil
+	}
+	if idValue, ok := propertyIDString(pattern.Left.PropertiesRaw, params, row); ok && strings.TrimSpace(idValue) != "" {
+		return nil, false, nil
+	}
+	leftVar := strings.TrimSpace(pattern.Left.Var)
+	if leftVar != "" {
+		if bound, exists := row[leftVar]; exists && bound != nil {
+			return nil, false, nil
+		}
+	}
+
+	sourceIDs, err := scanOutEdgeSourceIDsQueryCached(ctx, tx, tenant, pattern.FirstEdgeType, params)
+	if err != nil {
+		return nil, false, err
+	}
+	e.observeRuntimeCounter(params, "runtime.adjacency.out_sources.prefilter_applied", 1)
+	e.observeRuntimeCounter(params, "runtime.adjacency.out_sources.prefilter_candidates", int64(len(sourceIDs)))
+	return sourceIDs, true, nil
 }
 
 func queryEntityCacheKey(tenant, vertexID string) string {

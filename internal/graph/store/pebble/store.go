@@ -623,6 +623,58 @@ func (t *tx) ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, l
 	return t.scanAdjacency(ctx, keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType), limit, tenant, fn)
 }
 
+func (t *tx) ScanOutEdgeSourceIDs(ctx context.Context, tenant, edgeType string, limit int, fn func(string) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_out_edge_sources", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant and callback are required", nil)
+	}
+
+	prefix := keyspace.OutAdjacencyTenantPrefix(tenant)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create out source iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	lastSource := ""
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		sourceID, keyEdgeType, ok := outAdjSourceAndTypeFromKey(iter.Key())
+		if !ok {
+			return graph.NewError(graph.ErrKindStorage, "malformed out adjacency key", nil)
+		}
+		if edgeType != "" && keyEdgeType != edgeType {
+			continue
+		}
+		if sourceID == lastSource {
+			continue
+		}
+		lastSource = sourceID
+		if err := fn(sourceID); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan out edge sources", err)
+	}
+	return nil
+}
+
 // ScanOutEdgeIDs scans outgoing adjacency keys and yields edge IDs without loading edge records.
 func (t *tx) ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) (err error) {
 	started := time.Now()
@@ -1512,6 +1564,20 @@ func edgeIDFromAdjKey(key []byte) string {
 		return ""
 	}
 	return string(key[i+1:])
+}
+
+func outAdjSourceAndTypeFromKey(key []byte) (sourceID string, edgeType string, ok bool) {
+	parts := bytes.Split(key, []byte{'/'})
+	if len(parts) != 6 {
+		return "", "", false
+	}
+	if !bytes.Equal(parts[0], []byte("a")) || !bytes.Equal(parts[1], []byte("out")) {
+		return "", "", false
+	}
+	if len(parts[3]) == 0 || len(parts[4]) == 0 {
+		return "", "", false
+	}
+	return string(parts[3]), string(parts[4]), true
 }
 
 func vertexIDFromKey(key []byte) string {

@@ -108,6 +108,82 @@ func TestVertexEdgeCRUDAndAdjacency(t *testing.T) {
 	}
 }
 
+func TestScanOutEdgeSourceIDsByType(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u4", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u1", DstID: "u3"},
+			{Tenant: "acme", ID: "e3", Type: "LIKES", SrcID: "u1", DstID: "u4"},
+			{Tenant: "acme", ID: "e4", Type: "KNOWS", SrcID: "u2", DstID: "u3"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		knowSources := make([]string, 0)
+		if err := tx.ScanOutEdgeSourceIDs(ctx, "acme", "KNOWS", 0, func(sourceID string) error {
+			knowSources = append(knowSources, sourceID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(knowSources)
+		if got := strings.Join(knowSources, ","); got != "u1,u2" {
+			return fmt.Errorf("unexpected KNOWS sources: %s", got)
+		}
+
+		allSources := make([]string, 0)
+		if err := tx.ScanOutEdgeSourceIDs(ctx, "acme", "", 0, func(sourceID string) error {
+			allSources = append(allSources, sourceID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(allSources)
+		if got := strings.Join(allSources, ","); got != "u1,u2" {
+			return fmt.Errorf("unexpected all-type sources: %s", got)
+		}
+
+		limited := make([]string, 0)
+		if err := tx.ScanOutEdgeSourceIDs(ctx, "acme", "KNOWS", 1, func(sourceID string) error {
+			limited = append(limited, sourceID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(limited) != 1 {
+			return fmt.Errorf("expected one limited source, got %d", len(limited))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
 func TestScanVertices(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)

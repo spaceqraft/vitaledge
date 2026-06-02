@@ -40,6 +40,10 @@ func OutAdjacencyPrefix(tenant, srcID, edgeType string) []byte {
 	return []byte(fmt.Sprintf("%s/%s/%s/%s/", outPrefix, tenant, srcID, edgeType))
 }
 
+func OutAdjacencyTenantPrefix(tenant string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/", outPrefix, tenant))
+}
+
 func InAdjacencyKey(tenant, dstID, edgeType, edgeID string) []byte {
 	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s", inPrefix, tenant, dstID, edgeType, edgeID))
 }

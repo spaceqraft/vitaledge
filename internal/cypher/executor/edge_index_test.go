@@ -2038,6 +2038,15 @@ func TestTwoHopAntiJoinShortcutAppliesAndPreservesResults(t *testing.T) {
 	if counters["runtime.id_first.fastpath_applied"] <= 0 {
 		t.Fatalf("expected id-first fast path to apply, got counters %#v", counters)
 	}
+	if counters["runtime.antijoin.prefetch_applied"] <= 0 {
+		t.Fatalf("expected anti-join prefetch path to apply, got counters %#v", counters)
+	}
+	if counters["runtime.left.lazy_hydrated"] <= 0 {
+		t.Fatalf("expected deferred left hydration to occur, got counters %#v", counters)
+	}
+	if counters["runtime.mid.lazy_hydrated"] <= 0 {
+		t.Fatalf("expected deferred mid hydration to occur, got counters %#v", counters)
+	}
 
 	verifyStmt, err := parser.ParseStatement("MATCH (a:Person)-[:SUGGESTED_FRIEND]->(s:Person) RETURN a.name AS source, s.name AS suggested ORDER BY suggested")
 	if err != nil {

@@ -515,6 +515,29 @@ func (t *tx) GetEdge(ctx context.Context, tenant, edgeID string) (edge *graph.Ed
 	return edge, nil
 }
 
+func (t *tx) getEdgeLink(ctx context.Context, tenant, edgeID string) (dstID string, err error) {
+	if err := t.ensureActive(ctx); err != nil {
+		return "", err
+	}
+	if tenant == "" || edgeID == "" {
+		return "", graph.NewError(graph.ErrKindInvalidInput, "tenant and edge id are required", nil)
+	}
+	buf, err := t.get(keyspace.EdgeKey(tenant, edgeID))
+	if err != nil {
+		return "", err
+	}
+	var e struct {
+		DstID string
+	}
+	if err := json.Unmarshal(buf, &e); err != nil {
+		return "", graph.NewError(graph.ErrKindStorage, "decode edge link", err)
+	}
+	if strings.TrimSpace(e.DstID) == "" {
+		return "", graph.NewError(graph.ErrKindStorage, "edge missing dst id", nil)
+	}
+	return e.DstID, nil
+}
+
 func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 	started := time.Now()
 	defer func() { t.observeOperation("put_edge", err, started) }()
@@ -621,6 +644,109 @@ func (t *tx) ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, l
 		return graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, and callback are required", nil)
 	}
 	return t.scanAdjacency(ctx, keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType), limit, tenant, fn)
+}
+
+func (t *tx) ScanOutEdgeLinks(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(edgeID, dstID string) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_out_edge_links", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || srcID == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, and callback are required", nil)
+	}
+
+	prefix := keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create out edge link iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		edgeID := edgeIDFromAdjKey(iter.Key())
+		if edgeID == "" {
+			return graph.NewError(graph.ErrKindStorage, "malformed adjacency key", nil)
+		}
+		dstID, err := t.getEdgeLink(ctx, tenant, edgeID)
+		if err != nil {
+			return err
+		}
+		if err := fn(edgeID, dstID); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan out edge links", err)
+	}
+	return nil
+}
+
+func (t *tx) ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string, limit int, fn func(srcID, edgeID, dstID string) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_out_edge_links_by_type", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || strings.TrimSpace(edgeType) == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, edge type, and callback are required", nil)
+	}
+
+	prefix := keyspace.OutAdjacencyTenantPrefix(tenant)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create out edge link by-type iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		sourceID, keyEdgeType, ok := outAdjSourceAndTypeFromKey(iter.Key())
+		if !ok {
+			return graph.NewError(graph.ErrKindStorage, "malformed out adjacency key", nil)
+		}
+		if keyEdgeType != edgeType {
+			continue
+		}
+		edgeID := edgeIDFromAdjKey(iter.Key())
+		if edgeID == "" {
+			return graph.NewError(graph.ErrKindStorage, "malformed adjacency key", nil)
+		}
+		dstID, err := t.getEdgeLink(ctx, tenant, edgeID)
+		if err != nil {
+			return err
+		}
+		if err := fn(sourceID, edgeID, dstID); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan out edge links by type", err)
+	}
+	return nil
 }
 
 func (t *tx) ScanOutEdgeSourceIDs(ctx context.Context, tenant, edgeType string, limit int, fn func(string) error) (err error) {

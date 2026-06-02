@@ -184,6 +184,144 @@ func TestScanOutEdgeSourceIDsByType(t *testing.T) {
 	}
 }
 
+func TestScanOutEdgeLinksByType(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u4", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u1", DstID: "u3"},
+			{Tenant: "acme", ID: "e3", Type: "LIKES", SrcID: "u1", DstID: "u4"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		knowLinks := make([]string, 0)
+		if err := tx.ScanOutEdgeLinks(ctx, "acme", "u1", "KNOWS", 0, func(edgeID, dstID string) error {
+			knowLinks = append(knowLinks, edgeID+"->"+dstID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(knowLinks)
+		if got := strings.Join(knowLinks, ","); got != "e1->u2,e2->u3" {
+			return fmt.Errorf("unexpected KNOWS links: %s", got)
+		}
+
+		allLinks := make([]string, 0)
+		if err := tx.ScanOutEdgeLinks(ctx, "acme", "u1", "", 0, func(edgeID, dstID string) error {
+			allLinks = append(allLinks, edgeID+"->"+dstID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(allLinks)
+		if got := strings.Join(allLinks, ","); got != "e1->u2,e2->u3,e3->u4" {
+			return fmt.Errorf("unexpected all-type links: %s", got)
+		}
+
+		limited := make([]string, 0)
+		if err := tx.ScanOutEdgeLinks(ctx, "acme", "u1", "KNOWS", 1, func(edgeID, dstID string) error {
+			limited = append(limited, edgeID+"->"+dstID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(limited) != 1 {
+			return fmt.Errorf("expected one limited link, got %d", len(limited))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
+func TestScanOutEdgeLinksByTypeBulk(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u4", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u2", DstID: "u3"},
+			{Tenant: "acme", ID: "e3", Type: "LIKES", SrcID: "u3", DstID: "u4"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		knowLinks := make([]string, 0)
+		if err := tx.ScanOutEdgeLinksByType(ctx, "acme", "KNOWS", 0, func(srcID, edgeID, dstID string) error {
+			knowLinks = append(knowLinks, srcID+":"+edgeID+"->"+dstID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(knowLinks)
+		if got := strings.Join(knowLinks, ","); got != "u1:e1->u2,u2:e2->u3" {
+			return fmt.Errorf("unexpected KNOWS bulk links: %s", got)
+		}
+
+		limited := make([]string, 0)
+		if err := tx.ScanOutEdgeLinksByType(ctx, "acme", "KNOWS", 1, func(srcID, edgeID, dstID string) error {
+			limited = append(limited, srcID+":"+edgeID+"->"+dstID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(limited) != 1 {
+			return fmt.Errorf("expected one limited bulk link, got %d", len(limited))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
 func TestScanVertices(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)

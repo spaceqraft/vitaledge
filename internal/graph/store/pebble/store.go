@@ -841,24 +841,24 @@ func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEnt
 		return err
 	}
 	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID)
-	if err := t.set(key, []byte(entry.EntityClass), "write property index"); err != nil {
+	if err := t.set(key, propertyIndexPayload(entry), "write property index"); err != nil {
 		return err
 	}
 	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
 		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
-		if err := t.set(numericKey, numericPropertyIndexPayload(entry.EntityClass, entry.Value), "write numeric property index"); err != nil {
+		if err := t.set(numericKey, numericPropertyIndexPayload(entry), "write numeric property index"); err != nil {
 			return err
 		}
 	}
 	if orderedValue, ok := booleanOrderedValueFromEncoded(entry.Value); ok {
 		booleanKey := keyspace.PropertyIndexBooleanKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
-		if err := t.set(booleanKey, numericPropertyIndexPayload(entry.EntityClass, entry.Value), "write boolean property index"); err != nil {
+		if err := t.set(booleanKey, numericPropertyIndexPayload(entry), "write boolean property index"); err != nil {
 			return err
 		}
 	}
 	if orderedValue, ok := datetimeOrderedValueFromEncoded(entry.Value); ok {
 		datetimeKey := keyspace.PropertyIndexDateTimeKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
-		if err := t.set(datetimeKey, numericPropertyIndexPayload(entry.EntityClass, entry.Value), "write datetime property index"); err != nil {
+		if err := t.set(datetimeKey, numericPropertyIndexPayload(entry), "write datetime property index"); err != nil {
 			return err
 		}
 	}
@@ -1533,13 +1533,19 @@ func propertyIndexEntryFromKey(key, value []byte, tenant, schema, property strin
 	if err != nil {
 		return nil, graph.NewError(graph.ErrKindStorage, "decode property index value", err)
 	}
+	entityClass, edgeSrcID, edgeDstID, err := parsePropertyIndexPayload(value)
+	if err != nil {
+		return nil, err
+	}
 	return &graph.PropertyIndexEntry{
 		Tenant:      tenant,
 		Schema:      schema,
 		Property:    property,
 		Value:       decodedValue,
 		EntityID:    entityID,
-		EntityClass: string(value),
+		EntityClass: entityClass,
+		EdgeSrcID:   edgeSrcID,
+		EdgeDstID:   edgeDstID,
 	}, nil
 }
 
@@ -1549,7 +1555,7 @@ func numericPropertyIndexEntryFromKey(key, payload []byte, tenant, schema, prope
 		return nil, graph.NewError(graph.ErrKindStorage, "malformed numeric property index key", nil)
 	}
 	entityID := string(parts[len(parts)-1])
-	entityClass, rawValue, err := parseNumericPropertyIndexPayload(payload)
+	entityClass, edgeSrcID, edgeDstID, rawValue, err := parseNumericPropertyIndexPayload(payload)
 	if err != nil {
 		return nil, err
 	}
@@ -1560,28 +1566,89 @@ func numericPropertyIndexEntryFromKey(key, payload []byte, tenant, schema, prope
 		Value:       rawValue,
 		EntityID:    entityID,
 		EntityClass: entityClass,
+		EdgeSrcID:   edgeSrcID,
+		EdgeDstID:   edgeDstID,
 	}, nil
 }
 
-func numericPropertyIndexPayload(entityClass string, rawValue []byte) []byte {
-	payload := make([]byte, 0, len(entityClass)+1+len(rawValue))
-	payload = append(payload, []byte(entityClass)...)
+func propertyIndexPayload(entry *graph.PropertyIndexEntry) []byte {
+	if entry == nil {
+		return nil
+	}
+	if strings.TrimSpace(entry.EdgeSrcID) == "" && strings.TrimSpace(entry.EdgeDstID) == "" {
+		return []byte(entry.EntityClass)
+	}
+	payload := make([]byte, 0, len(entry.EntityClass)+len(entry.EdgeSrcID)+len(entry.EdgeDstID)+3)
+	payload = append(payload, []byte(entry.EntityClass)...)
 	payload = append(payload, 0)
-	payload = append(payload, rawValue...)
+	payload = append(payload, []byte(entry.EdgeSrcID)...)
+	payload = append(payload, 0)
+	payload = append(payload, []byte(entry.EdgeDstID)...)
 	return payload
 }
 
-func parseNumericPropertyIndexPayload(payload []byte) (string, []byte, error) {
+func numericPropertyIndexPayload(entry *graph.PropertyIndexEntry) []byte {
+	if entry == nil {
+		return nil
+	}
+	prefix := propertyIndexPayload(entry)
+	payload := make([]byte, 0, len(prefix)+1+len(entry.Value))
+	payload = append(payload, prefix...)
+	payload = append(payload, 0)
+	payload = append(payload, entry.Value...)
+	return payload
+}
+
+func parsePropertyIndexPayload(payload []byte) (string, string, string, error) {
+	if len(payload) == 0 {
+		return "", "", "", graph.NewError(graph.ErrKindStorage, "malformed property index payload", nil)
+	}
+	parts := bytes.Split(payload, []byte{0})
+	entityClass := ""
+	edgeSrcID := ""
+	edgeDstID := ""
+	if len(parts) > 0 {
+		entityClass = string(parts[0])
+	}
+	if len(parts) > 1 {
+		edgeSrcID = string(parts[1])
+	}
+	if len(parts) > 2 {
+		edgeDstID = string(parts[2])
+	}
+	if strings.TrimSpace(entityClass) == "" {
+		return "", "", "", graph.NewError(graph.ErrKindStorage, "property index payload missing entity class", nil)
+	}
+	return entityClass, edgeSrcID, edgeDstID, nil
+}
+
+func parseNumericPropertyIndexPayload(payload []byte) (string, string, string, []byte, error) {
+	if len(payload) == 0 {
+		return "", "", "", nil, graph.NewError(graph.ErrKindStorage, "malformed numeric property index payload", nil)
+	}
+
+	parts := bytes.Split(payload, []byte{0})
+	if len(parts) >= 4 {
+		entityClass := string(parts[0])
+		edgeSrcID := string(parts[1])
+		edgeDstID := string(parts[2])
+		rawValue := append([]byte(nil), parts[3]...)
+		if strings.TrimSpace(entityClass) == "" {
+			return "", "", "", nil, graph.NewError(graph.ErrKindStorage, "numeric property index payload missing entity class", nil)
+		}
+		return entityClass, edgeSrcID, edgeDstID, rawValue, nil
+	}
+
 	sep := bytes.IndexByte(payload, 0)
 	if sep < 0 {
-		return "", nil, graph.NewError(graph.ErrKindStorage, "malformed numeric property index payload", nil)
+		return "", "", "", nil, graph.NewError(graph.ErrKindStorage, "malformed numeric property index payload", nil)
 	}
 	entityClass := string(payload[:sep])
 	rawValue := append([]byte(nil), payload[sep+1:]...)
 	if strings.TrimSpace(entityClass) == "" {
-		return "", nil, graph.NewError(graph.ErrKindStorage, "numeric property index payload missing entity class", nil)
+		return "", "", "", nil, graph.NewError(graph.ErrKindStorage, "numeric property index payload missing entity class", nil)
 	}
-	return entityClass, rawValue, nil
+	return entityClass, "", "", rawValue, nil
 }
 
 func numericOrderedValueFromEncoded(raw []byte) ([]byte, bool) {

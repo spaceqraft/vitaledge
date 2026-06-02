@@ -400,6 +400,129 @@ func TestCallDropEdgePropertyIndexRemovesEntriesAndNumericShadow(t *testing.T) {
 	}
 }
 
+func TestDeleteVertexRemovesPropertyIndexEntries(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{
+			Tenant: "acme",
+			ID:     "u1",
+			Labels: []string{"User"},
+			Properties: map[string][]byte{
+				"email": valueToBytes("alice@example.com"),
+			},
+		})
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	createStmt, err := parser.ParseStatement("CALL db.index.createProperty('User', 'email') YIELD created, indexedEntities")
+	if err != nil {
+		t.Fatalf("parse create failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, createStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute create failed: %v", err)
+	}
+
+	deleteStmt, err := parser.ParseStatement("MATCH (u:User {email: 'alice@example.com'}) DELETE u")
+	if err != nil {
+		t.Fatalf("parse delete failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, deleteStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute delete failed: %v", err)
+	}
+
+	remaining := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexAll(ctx, "acme", "User", "email", 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				remaining++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("scan property index all failed: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected no remaining vertex property index entries after delete, got %d", remaining)
+	}
+}
+
+func TestDeleteEdgeRemovesPropertyIndexEntries(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1", Properties: map[string][]byte{"rating": valueToBytes(5.0)}})
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	createStmt, err := parser.ParseStatement("CALL db.index.createEdgeProperty('RATED', 'rating') YIELD created, indexedEntities")
+	if err != nil {
+		t.Fatalf("parse create failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, createStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute create failed: %v", err)
+	}
+	if _, err := exec.processPendingEdgeIndexBuildJobs(ctx); err != nil {
+		t.Fatalf("process jobs failed: %v", err)
+	}
+
+	deleteStmt, err := parser.ParseStatement("MATCH ()-[r:RATED]->() DELETE r")
+	if err != nil {
+		t.Fatalf("parse delete failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, deleteStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute delete failed: %v", err)
+	}
+
+	remaining := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexAll(ctx, "acme", "RATED", "rating", 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				remaining++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("scan property index all failed: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected no remaining edge property index entries after delete, got %d", remaining)
+	}
+
+	numericShadow := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexNumericRange(ctx, "acme", "RATED", "rating", 5.0, true, true, 5.0, true, true, 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry != nil {
+				numericShadow++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("scan numeric property index range failed: %v", err)
+	}
+	if numericShadow != 0 {
+		t.Fatalf("expected no remaining edge numeric shadow entries after delete, got %d", numericShadow)
+	}
+}
+
 func TestEdgeIndexBuildJobResumesAcrossExecutorRestart(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()

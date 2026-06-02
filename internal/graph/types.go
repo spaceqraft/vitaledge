@@ -29,4 +29,6 @@ type PropertyIndexEntry struct {
 	Value       []byte
 	EntityID    string
 	EntityClass string // vertex|edge
+	EdgeSrcID   string
+	EdgeDstID   string
 }

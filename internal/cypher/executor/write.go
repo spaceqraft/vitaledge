@@ -176,6 +176,17 @@ func (e *Executor) observeRuntimeCounter(params Params, name string, delta int64
 	}
 }
 
+func (e *Executor) observeRuntimeDurationMicros(params Params, name string, started time.Time) {
+	if started.IsZero() || strings.TrimSpace(name) == "" {
+		return
+	}
+	elapsed := time.Since(started).Microseconds()
+	if elapsed <= 0 {
+		elapsed = 1
+	}
+	e.observeRuntimeCounter(params, name, elapsed)
+}
+
 type edgeIDScannerTx interface {
 	ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
 	ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
@@ -1340,6 +1351,8 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 		if peer == nil || strings.TrimSpace(peer.ID) == "" {
 			return nil, false, nil
 		}
+		collectStarted := time.Now()
+		defer e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_collect_peer_edges_micros", collectStarted)
 
 		if e.stage2EdgeIndexPushdownEnabled {
 			predicateShapeEligible := stage2PredicateShapeEligible
@@ -1579,6 +1592,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 		}
 
 		if item.indexedEdges {
+			phaseStarted := time.Now()
 			for _, edge := range item.edges {
 				if edge == nil {
 					continue
@@ -1588,7 +1602,9 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 					return nil, nil, false, err
 				}
 			}
+			e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_process_indexed_edges_micros", phaseStarted)
 		} else {
+			phaseStarted := time.Now()
 			scanType := pattern.EdgeType
 			if len(pattern.EdgeAnyOf) > 0 {
 				scanType = ""
@@ -1596,6 +1612,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 			if err := scanOutEdgesQueryCached(ctx, tx, tenant, peer.ID, scanType, params, processCandidateEdge); err != nil {
 				return nil, nil, false, err
 			}
+			e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_scan_adjacency_micros", phaseStarted)
 		}
 
 		if earlyStopEnabled {
@@ -1621,6 +1638,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 		}
 	}
 
+	finalizeStarted := time.Now()
 	out := make([]Row, 0, len(groupOrder))
 	e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_total", int64(len(groupOrder)))
 	if useTopK {
@@ -1646,6 +1664,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 			return nil, nil, false, err
 		}
 	}
+	e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_finalize_output_micros", finalizeStarted)
 	e.recordFastPathFeedback("fast_peer_candidate_return_aggregation_clause_pair", int64(len(rows)), int64(len(out)))
 
 	columns := append([]string(nil), projection.orderedOutputKeys...)
@@ -6556,6 +6575,17 @@ func (e *Executor) resolveVertexPatternCandidates(ctx context.Context, tx graph.
 		}
 	}
 
+	if idValue, ok := propertyIDString(pattern.PropertiesRaw, params, row); ok {
+		vertex, err := tx.GetVertex(ctx, tenant, idValue)
+		if err != nil {
+			if !graph.IsKind(err, graph.ErrKindNotFound) {
+				return nil, err
+			}
+		} else if vertexPatternMatches(vertex, pattern, params, row) {
+			return []*graph.Vertex{vertex}, nil
+		}
+	}
+
 	if plan, ok, err := e.planVertexPatternPropertyIndexLookup(tenant, pattern, params, row); err != nil {
 		return nil, err
 	} else if ok {
@@ -7324,6 +7354,64 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 	ids := map[string]struct{}{}
 	preloadedEdges := map[string]*graph.Edge{}
 	errEdgeIndexCapReached := errors.New("edge index candidate limit reached")
+	referencesOnlyIndexedProp := func(indexedProp string) bool {
+		if strings.TrimSpace(whereRaw) == "" || strings.TrimSpace(edgeVar) == "" {
+			return true
+		}
+		refRE := regexp.MustCompile(`\b` + regexp.QuoteMeta(edgeVar) + `\.([A-Za-z_][A-Za-z0-9_]*)`)
+		matches := refRE.FindAllStringSubmatch(whereRaw, -1)
+		if len(matches) == 0 {
+			return true
+		}
+		for _, match := range matches {
+			if len(match) < 2 || match[1] != indexedProp {
+				return false
+			}
+		}
+		return true
+	}
+
+	canUseEdgeStub := func(entry *graph.PropertyIndexEntry, indexedProp string) bool {
+		if entry == nil {
+			return false
+		}
+		if strings.TrimSpace(entry.EntityID) == "" || strings.TrimSpace(entry.Schema) == "" {
+			return false
+		}
+		if strings.TrimSpace(entry.EdgeSrcID) == "" || strings.TrimSpace(entry.EdgeDstID) == "" {
+			return false
+		}
+		if strings.TrimSpace(indexedProp) == "" {
+			return false
+		}
+		if !referencesOnlyIndexedProp(indexedProp) {
+			return false
+		}
+		if strings.TrimSpace(edgeProps) == "" {
+			return true
+		}
+		if prop, _, ok := edgePropertyEquality(edgeProps, params, row); ok {
+			return prop == indexedProp
+		}
+		return false
+	}
+
+	buildEdgeStubFromIndexEntry := func(entry *graph.PropertyIndexEntry, indexedProp string) *graph.Edge {
+		if !canUseEdgeStub(entry, indexedProp) {
+			return nil
+		}
+		stub := &graph.Edge{
+			Tenant: entry.Tenant,
+			ID:     entry.EntityID,
+			Type:   entry.Schema,
+			SrcID:  entry.EdgeSrcID,
+			DstID:  entry.EdgeDstID,
+		}
+		if len(entry.Value) > 0 {
+			stub.Properties = map[string][]byte{indexedProp: append([]byte(nil), entry.Value...)}
+		}
+		return stub
+	}
 
 	if prop, value, ok := edgePropertyEquality(edgeProps, params, row); ok {
 		for _, candidateType := range types {
@@ -7340,21 +7428,31 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 				if entry == nil || entry.EntityClass != "edge" {
 					return nil
 				}
-				if hasSourceFilter {
-					edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
-					if err != nil {
-						if graph.IsKind(err, graph.ErrKindNotFound) {
+				if stub := buildEdgeStubFromIndexEntry(entry, prop); stub != nil {
+					if hasSourceFilter {
+						if _, ok := sourceVertexIDs[strings.TrimSpace(stub.SrcID)]; !ok {
 							return nil
 						}
-						return err
 					}
-					if edge == nil {
-						return nil
+					preloadedEdges[entry.EntityID] = stub
+				}
+				if hasSourceFilter {
+					if _, ok := preloadedEdges[entry.EntityID]; !ok {
+						edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
+						if err != nil {
+							if graph.IsKind(err, graph.ErrKindNotFound) {
+								return nil
+							}
+							return err
+						}
+						if edge == nil {
+							return nil
+						}
+						if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
+							return nil
+						}
+						preloadedEdges[entry.EntityID] = edge
 					}
-					if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
-						return nil
-					}
-					preloadedEdges[entry.EntityID] = edge
 				}
 				ids[entry.EntityID] = struct{}{}
 				if len(ids) > candidateLimit {
@@ -7425,21 +7523,31 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 				if !selectedConstraint.matchesValue(decodeStoredPropertyValue(entry.Value)) {
 					return nil
 				}
-				if hasSourceFilter {
-					edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
-					if err != nil {
-						if graph.IsKind(err, graph.ErrKindNotFound) {
+				if stub := buildEdgeStubFromIndexEntry(entry, selectedProp); stub != nil {
+					if hasSourceFilter {
+						if _, ok := sourceVertexIDs[strings.TrimSpace(stub.SrcID)]; !ok {
 							return nil
 						}
-						return err
 					}
-					if edge == nil {
-						return nil
+					preloadedEdges[entry.EntityID] = stub
+				}
+				if hasSourceFilter {
+					if _, ok := preloadedEdges[entry.EntityID]; !ok {
+						edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
+						if err != nil {
+							if graph.IsKind(err, graph.ErrKindNotFound) {
+								return nil
+							}
+							return err
+						}
+						if edge == nil {
+							return nil
+						}
+						if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
+							return nil
+						}
+						preloadedEdges[entry.EntityID] = edge
 					}
-					if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
-						return nil
-					}
-					preloadedEdges[entry.EntityID] = edge
 				}
 				ids[entry.EntityID] = struct{}{}
 				if len(ids) > candidateLimit {
@@ -8005,6 +8113,17 @@ func hasNilPropertyValue(props map[string]any) bool {
 }
 
 func (e *Executor) findMergeVerticesByPattern(ctx context.Context, tx graph.Tx, tenant string, labels []string, props map[string]any) ([]*graph.Vertex, error) {
+	if idValue, ok := vertexIDFromPatternProperties(props); ok {
+		vertex, err := tx.GetVertex(ctx, tenant, idValue)
+		if err != nil {
+			if !graph.IsKind(err, graph.ErrKindNotFound) {
+				return nil, err
+			}
+		} else if vertexMatchesMergePattern(vertex, labels, props) {
+			return []*graph.Vertex{vertex}, nil
+		}
+	}
+
 	type lookupPlan struct {
 		schema   string
 		property string
@@ -8160,6 +8279,8 @@ func (e *Executor) putEdgeWithIndexes(ctx context.Context, tx graph.Tx, edge *gr
 			Value:       valueCopy,
 			EntityID:    edge.ID,
 			EntityClass: "edge",
+			EdgeSrcID:   edge.SrcID,
+			EdgeDstID:   edge.DstID,
 		}); err != nil {
 			return err
 		}
@@ -9166,7 +9287,7 @@ func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, deta
 	case *graph.Vertex:
 		e.metrics.ObserveDeleteCounter("vertex_targets", 1)
 		if detach {
-			if err := deleteVertexWithEdges(ctx, tx, typed.Tenant, typed.ID, e.metrics); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+			if err := e.deleteVertexWithEdges(ctx, tx, typed.Tenant, typed.ID, e.metrics); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 				return nil, err
 			}
 		} else {
@@ -9177,7 +9298,7 @@ func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, deta
 			if hasEdges {
 				return nil, graph.NewError(graph.ErrKindConflict, "DeleteConnectedVertex", nil)
 			}
-			if err := tx.DeleteVertex(ctx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+			if err := e.deleteVertexWithIndexes(ctx, tx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 				return nil, err
 			}
 			e.metrics.ObserveDeleteCounter("vertices_deleted", 1)
@@ -9185,7 +9306,7 @@ func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, deta
 		return deletedVertexBinding{Tenant: typed.Tenant, ID: typed.ID, Labels: append([]string(nil), typed.Labels...)}, nil
 	case *graph.Edge:
 		e.metrics.ObserveDeleteCounter("edge_targets", 1)
-		if err := tx.DeleteEdge(ctx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+		if err := e.deleteEdgeWithIndexes(ctx, tx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 			return nil, err
 		}
 		e.metrics.ObserveDeleteCounter("edges_deleted", 1)
@@ -9222,7 +9343,7 @@ func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any) 
 		if edge == nil {
 			return nil
 		}
-		if err := tx.DeleteEdge(ctx, edge.Tenant, edge.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+		if err := e.deleteEdgeWithIndexes(ctx, tx, edge.Tenant, edge.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 			return err
 		}
 		return nil
@@ -9233,7 +9354,7 @@ func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any) 
 			return nil
 		}
 		// Deleting a path should remove entities reachable by that path.
-		if err := deleteVertexWithEdges(ctx, tx, vertex.Tenant, vertex.ID, e.metrics); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+		if err := e.deleteVertexWithEdges(ctx, tx, vertex.Tenant, vertex.ID, e.metrics); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 			return err
 		}
 		return nil
@@ -17269,23 +17390,31 @@ func cloneEdgeForCache(edge *graph.Edge) *graph.Edge {
 
 func scanOutEdgesQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID, edgeType string, params Params, fn func(*graph.Edge) error) error {
 	if params == nil {
+		// No per-query cache available in this path.
+		// Keep a counter so callers can compare cache-on vs cache-off behavior.
+		// The counter remains scoped to the statement when params is non-nil.
 		return tx.ScanOutEdges(ctx, tenant, vertexID, edgeType, 0, fn)
 	}
 	cache := ensureQueryAdjacencyCache(params)
 	key := queryAdjacencyCacheKey(tenant, vertexID, edgeType)
 	edges, ok := cache.outEdges[key]
 	if !ok {
+		observeRuntimeCounterLocal(params, "runtime.adjacency.out.cache_misses", 1)
 		edges = make([]*graph.Edge, 0)
 		if err := tx.ScanOutEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
 			if edge != nil {
 				edges = append(edges, cloneEdgeForCache(edge))
+				observeRuntimeCounterLocal(params, "runtime.edge.materialized.out", 1)
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
 		cache.outEdges[key] = edges
+	} else {
+		observeRuntimeCounterLocal(params, "runtime.adjacency.out.cache_hits", 1)
 	}
+	observeRuntimeCounterLocal(params, "runtime.adjacency.out.items_yielded", int64(len(edges)))
 	for _, edge := range edges {
 		if err := fn(edge); err != nil {
 			return err
@@ -17302,17 +17431,22 @@ func scanInEdgesQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID, 
 	key := queryAdjacencyCacheKey(tenant, vertexID, edgeType)
 	edges, ok := cache.inEdges[key]
 	if !ok {
+		observeRuntimeCounterLocal(params, "runtime.adjacency.in.cache_misses", 1)
 		edges = make([]*graph.Edge, 0)
 		if err := tx.ScanInEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
 			if edge != nil {
 				edges = append(edges, cloneEdgeForCache(edge))
+				observeRuntimeCounterLocal(params, "runtime.edge.materialized.in", 1)
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
 		cache.inEdges[key] = edges
+	} else {
+		observeRuntimeCounterLocal(params, "runtime.adjacency.in.cache_hits", 1)
 	}
+	observeRuntimeCounterLocal(params, "runtime.adjacency.in.items_yielded", int64(len(edges)))
 	for _, edge := range edges {
 		if err := fn(edge); err != nil {
 			return err
@@ -17328,38 +17462,58 @@ func queryEntityCacheKey(tenant, vertexID string) string {
 func getVertexQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID string, params Params) (*graph.Vertex, error) {
 	vertexID = strings.TrimSpace(vertexID)
 	if vertexID == "" {
+		observeRuntimeCounterLocal(params, "runtime.vertex.lookup.empty_id", 1)
 		return nil, nil
 	}
 	if params == nil {
+		observeRuntimeCounterLocal(params, "runtime.vertex.lookup.direct", 1)
 		vertex, err := tx.GetVertex(ctx, tenant, vertexID)
 		if err != nil {
 			if graph.IsKind(err, graph.ErrKindNotFound) {
+				observeRuntimeCounterLocal(params, "runtime.vertex.lookup.not_found", 1)
 				return nil, nil
 			}
+			observeRuntimeCounterLocal(params, "runtime.vertex.lookup.errors", 1)
 			return nil, err
 		}
+		observeRuntimeCounterLocal(params, "runtime.vertex.materialized.direct", 1)
 		return vertex, nil
 	}
 
 	cache := ensureQueryEntityCache(params)
 	key := queryEntityCacheKey(tenant, vertexID)
 	if vertex, ok := cache.vertexes[key]; ok {
+		observeRuntimeCounterLocal(params, "runtime.vertex.cache_hits", 1)
 		return vertex, nil
 	}
 	if _, missing := cache.missing[key]; missing {
+		observeRuntimeCounterLocal(params, "runtime.vertex.cache_negative_hits", 1)
 		return nil, nil
 	}
+	observeRuntimeCounterLocal(params, "runtime.vertex.cache_misses", 1)
 
 	vertex, err := tx.GetVertex(ctx, tenant, vertexID)
 	if err != nil {
 		if graph.IsKind(err, graph.ErrKindNotFound) {
 			cache.missing[key] = struct{}{}
+			observeRuntimeCounterLocal(params, "runtime.vertex.lookup.not_found", 1)
 			return nil, nil
 		}
+		observeRuntimeCounterLocal(params, "runtime.vertex.lookup.errors", 1)
 		return nil, err
 	}
 	cache.vertexes[key] = vertex
+	observeRuntimeCounterLocal(params, "runtime.vertex.materialized.cache_fill", 1)
 	return vertex, nil
+}
+
+func observeRuntimeCounterLocal(params Params, name string, delta int64) {
+	if delta <= 0 || strings.TrimSpace(name) == "" {
+		return
+	}
+	if state := ensureRuntimeCounterState(params); state != nil {
+		state.counters[name] += delta
+	}
 }
 
 func wherePatternPredicateCacheKey(tenant, vertexID, edgeType string) string {
@@ -18591,7 +18745,7 @@ func flattenListValue(value any) ([]any, error) {
 	return []any{value}, nil
 }
 
-func deleteVertexWithEdges(ctx context.Context, tx graph.Tx, tenant, vertexID string, metrics Metrics) error {
+func (e *Executor) deleteVertexWithEdges(ctx context.Context, tx graph.Tx, tenant, vertexID string, metrics Metrics) error {
 	if metrics != nil {
 		metrics.ObserveDeleteCounter("vertex_detach_targets", 1)
 	}
@@ -18640,20 +18794,87 @@ func deleteVertexWithEdges(ctx context.Context, tx graph.Tx, tenant, vertexID st
 		}
 	}
 	for edgeID := range edgeIDs {
-		if err := tx.DeleteEdge(ctx, tenant, edgeID); err != nil {
+		if err := e.deleteEdgeWithIndexes(ctx, tx, tenant, edgeID); err != nil {
 			return err
 		}
 		if metrics != nil {
 			metrics.ObserveDeleteCounter("edges_deleted", 1)
 		}
 	}
-	if err := tx.DeleteVertex(ctx, tenant, vertexID); err != nil {
+	if err := e.deleteVertexWithIndexes(ctx, tx, tenant, vertexID); err != nil {
 		return err
 	}
 	if metrics != nil {
 		metrics.ObserveDeleteCounter("vertices_deleted", 1)
 	}
 	return nil
+}
+
+func (e *Executor) deleteVertexWithIndexes(ctx context.Context, tx graph.Tx, tenant, vertexID string) error {
+	vertex, err := tx.GetVertex(ctx, tenant, vertexID)
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	if e != nil && e.indexCatalog != nil && vertex != nil {
+		for _, label := range vertex.Labels {
+			for property, encoded := range vertex.Properties {
+				if !e.indexCatalog.HasPropertyIndex(tenant, label, property) {
+					continue
+				}
+				if err := tx.DeletePropertyIndex(ctx, &graph.PropertyIndexEntry{
+					Tenant:      tenant,
+					Schema:      label,
+					Property:    property,
+					Value:       append([]byte(nil), encoded...),
+					EntityID:    vertex.ID,
+					EntityClass: "vertex",
+				}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return tx.DeleteVertex(ctx, tenant, vertexID)
+}
+
+func (e *Executor) deleteEdgeWithIndexes(ctx context.Context, tx graph.Tx, tenant, edgeID string) error {
+	edge, err := tx.GetEdge(ctx, tenant, edgeID)
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	if e != nil && e.indexCatalog != nil && edge != nil {
+		edgeType := strings.TrimSpace(edge.Type)
+		if edgeType != "" {
+			for property, encoded := range edge.Properties {
+				if !e.indexCatalog.HasEdgePropertyIndex(tenant, edgeType, property) {
+					continue
+				}
+				if err := tx.DeletePropertyIndex(ctx, &graph.PropertyIndexEntry{
+					Tenant:      tenant,
+					Schema:      edgeType,
+					Property:    property,
+					Value:       append([]byte(nil), encoded...),
+					EntityID:    edge.ID,
+					EntityClass: "edge",
+					EdgeSrcID:   edge.SrcID,
+					EdgeDstID:   edge.DstID,
+				}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return tx.DeleteEdge(ctx, tenant, edgeID)
 }
 
 func resolvePatternSourceID(row Row, params Params, varName, paramName string) (string, error) {
@@ -18733,6 +18954,14 @@ func vertexIDFromPatternProperties(props map[string]any) (string, bool) {
 		return id, true
 	}
 	return "", false
+}
+
+func propertyIDString(rawProps string, params Params, row Row) (string, bool) {
+	props, err := parsePropertyMap(rawProps, params, row)
+	if err != nil {
+		return "", false
+	}
+	return vertexIDFromPatternProperties(props)
 }
 
 func nextAutoVertexID(varName string) string {

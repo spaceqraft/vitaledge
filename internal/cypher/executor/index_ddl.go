@@ -313,6 +313,8 @@ func (e *Executor) backfillEdgePropertyIndexForVertex(ctx context.Context, tenan
 				Value:       append([]byte(nil), stored...),
 				EntityID:    edge.ID,
 				EntityClass: "edge",
+				EdgeSrcID:   edge.SrcID,
+				EdgeDstID:   edge.DstID,
 			}
 			if err := tx.PutPropertyIndex(ctx, entry); err != nil {
 				return err
@@ -333,6 +335,8 @@ func (e *Executor) backfillEdgePropertyIndexForVertex(ctx context.Context, tenan
 func (e *Executor) backfillEdgePropertyIndexForVertexSingleEntryWrites(ctx context.Context, tenant, vertexID, edgeType, property string) (int, error) {
 	type edgeIndexRecord struct {
 		edgeID string
+		srcID  string
+		dstID  string
 		value  []byte
 	}
 	records := []edgeIndexRecord{}
@@ -345,7 +349,7 @@ func (e *Executor) backfillEdgePropertyIndexForVertexSingleEntryWrites(ctx conte
 			if !ok {
 				return nil
 			}
-			records = append(records, edgeIndexRecord{edgeID: edge.ID, value: append([]byte(nil), stored...)})
+			records = append(records, edgeIndexRecord{edgeID: edge.ID, srcID: edge.SrcID, dstID: edge.DstID, value: append([]byte(nil), stored...)})
 			return nil
 		})
 	})
@@ -362,6 +366,8 @@ func (e *Executor) backfillEdgePropertyIndexForVertexSingleEntryWrites(ctx conte
 			Value:       record.value,
 			EntityID:    record.edgeID,
 			EntityClass: "edge",
+			EdgeSrcID:   record.srcID,
+			EdgeDstID:   record.dstID,
 		}
 		if err := e.store.Update(ctx, func(tx graph.Tx) error {
 			return tx.PutPropertyIndex(ctx, entry)

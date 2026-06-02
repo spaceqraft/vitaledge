@@ -134,6 +134,44 @@ func TestRunExplainIncludesWarningsWhenPresent(t *testing.T) {
 	}
 }
 
+func TestExtractRuntimeCountersAggregatesWarnings(t *testing.T) {
+	warnings := []*v1.Diagnostic{
+		{Code: "RUNTIME_COUNTERS", Message: `{"runtime.vertex.cache_hits": 3, "runtime.vertex.cache_misses": 2}`},
+		{Code: "RUNTIME_COUNTERS", Message: `{"runtime.vertex.cache_hits": 4}`},
+		{Code: "OTHER_WARNING", Message: "ignored"},
+	}
+
+	counters := extractRuntimeCounters(warnings)
+	if got, want := counters["runtime.vertex.cache_hits"], 7.0; got != want {
+		t.Fatalf("runtime.vertex.cache_hits=%v want %v", got, want)
+	}
+	if got, want := counters["runtime.vertex.cache_misses"], 2.0; got != want {
+		t.Fatalf("runtime.vertex.cache_misses=%v want %v", got, want)
+	}
+}
+
+func TestRenderRuntimeCountersSorted(t *testing.T) {
+	counters := map[string]float64{
+		"runtime.vertex.cache_hits":          12,
+		"runtime.adjacency.out.cache_misses": 3,
+	}
+
+	var out bytes.Buffer
+	renderRuntimeCounters(&out, counters)
+	rendered := out.String()
+	if !strings.Contains(rendered, "runtime counters:") {
+		t.Fatalf("expected runtime counters header, got: %s", rendered)
+	}
+	first := strings.Index(rendered, "runtime.adjacency.out.cache_misses=3")
+	second := strings.Index(rendered, "runtime.vertex.cache_hits=12")
+	if first < 0 || second < 0 {
+		t.Fatalf("expected rendered counters, got: %s", rendered)
+	}
+	if first > second {
+		t.Fatalf("expected sorted counter output, got: %s", rendered)
+	}
+}
+
 func (s *stubQueryServiceClient) GetCapabilities(ctx context.Context, in *v1.CapabilitiesRequest, opts ...grpc.CallOption) (*v1.CapabilitiesResponse, error) {
 	return &v1.CapabilitiesResponse{}, nil
 }

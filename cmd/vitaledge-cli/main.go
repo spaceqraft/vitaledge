@@ -328,16 +328,68 @@ func runExecute(ctx context.Context, client v1.QueryServiceClient, tenant string
 	}
 
 	renderTable(out, resp.GetColumns(), resp.GetRows(), maxColumnWidth)
+	runtimeCounters := extractRuntimeCounters(resp.GetWarnings())
 	if len(resp.GetWarnings()) > 0 {
 		for _, warning := range resp.GetWarnings() {
+			if warning.GetCode() == "RUNTIME_COUNTERS" {
+				continue
+			}
 			fmt.Fprintf(stderr, "warning [%s]: %s\n", warning.GetCode(), warning.GetMessage())
 		}
+	}
+	if len(runtimeCounters) > 0 {
+		renderRuntimeCounters(out, runtimeCounters)
 	}
 	stats := resp.GetStats()
 	if stats != nil {
 		fmt.Fprintf(out, "stats: rows=%d durationMs=%d\n", stats.GetRowsReturned(), stats.GetDurationMs())
 	}
 	return nil
+}
+
+func extractRuntimeCounters(warnings []*v1.Diagnostic) map[string]float64 {
+	out := map[string]float64{}
+	for _, warning := range warnings {
+		if warning == nil || warning.GetCode() != "RUNTIME_COUNTERS" {
+			continue
+		}
+		decoded := map[string]any{}
+		if err := json.Unmarshal([]byte(warning.GetMessage()), &decoded); err != nil {
+			continue
+		}
+		for key, value := range decoded {
+			switch typed := value.(type) {
+			case float64:
+				out[key] += typed
+			case json.Number:
+				if parsed, err := typed.Float64(); err == nil {
+					out[key] += parsed
+				}
+			}
+		}
+	}
+	return out
+}
+
+func renderRuntimeCounters(out io.Writer, counters map[string]float64) {
+	if len(counters) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(counters))
+	for key := range counters {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	fmt.Fprintln(out, "runtime counters:")
+	for _, key := range keys {
+		value := counters[key]
+		if value == float64(int64(value)) {
+			fmt.Fprintf(out, "  %s=%d\n", key, int64(value))
+			continue
+		}
+		fmt.Fprintf(out, "  %s=%.3f\n", key, value)
+	}
 }
 
 func executeCypher(ctx context.Context, client v1.QueryServiceClient, tenant string, query string) (*v1.QueryResponse, error) {

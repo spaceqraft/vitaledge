@@ -647,6 +647,60 @@ func TestPropertyIndexDateTimeRangeScan(t *testing.T) {
 	}
 }
 
+func TestEdgePropertyIndexPayloadCarriesEndpoints(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	entry := &graph.PropertyIndexEntry{
+		Tenant:      "acme",
+		Schema:      "RATED",
+		Property:    "rating",
+		Value:       []byte("4.5"),
+		EntityID:    "e45",
+		EntityClass: "edge",
+		EdgeSrcID:   "u1",
+		EdgeDstID:   "m1",
+	}
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutPropertyIndex(ctx, entry)
+	})
+	if err != nil {
+		t.Fatalf("put edge index entry failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndex(ctx, "acme", "RATED", "rating", []byte("4.5"), 0, func(found *graph.PropertyIndexEntry) error {
+			if found == nil {
+				t.Fatalf("expected edge property index entry")
+			}
+			if found.EdgeSrcID != "u1" || found.EdgeDstID != "m1" {
+				t.Fatalf("expected src/dst metadata u1->m1, got %q->%q", found.EdgeSrcID, found.EdgeDstID)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("scan property index failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanPropertyIndexNumericRange(ctx, "acme", "RATED", "rating", 4.5, true, true, 4.5, true, true, 0, func(found *graph.PropertyIndexEntry) error {
+			if found == nil {
+				t.Fatalf("expected edge numeric shadow entry")
+			}
+			if found.EdgeSrcID != "u1" || found.EdgeDstID != "m1" {
+				t.Fatalf("expected numeric shadow src/dst metadata u1->m1, got %q->%q", found.EdgeSrcID, found.EdgeDstID)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("scan numeric property index failed: %v", err)
+	}
+}
+
 func TestReadOnlyTxRejectsWrites(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)

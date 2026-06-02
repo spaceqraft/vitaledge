@@ -2035,6 +2035,9 @@ func TestTwoHopAntiJoinShortcutAppliesAndPreservesResults(t *testing.T) {
 	if counters["runtime.adjacency.out_sources.cache_misses"] <= 0 {
 		t.Fatalf("expected out-source prefilter cache miss to be recorded, got counters %#v", counters)
 	}
+	if counters["runtime.id_first.fastpath_applied"] <= 0 {
+		t.Fatalf("expected id-first fast path to apply, got counters %#v", counters)
+	}
 
 	verifyStmt, err := parser.ParseStatement("MATCH (a:Person)-[:SUGGESTED_FRIEND]->(s:Person) RETURN a.name AS source, s.name AS suggested ORDER BY suggested")
 	if err != nil {

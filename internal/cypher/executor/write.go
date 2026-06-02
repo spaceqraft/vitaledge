@@ -327,6 +327,16 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 
 	for idx := 0; idx < len(part.Clauses); idx++ {
 		clause := part.Clauses[idx]
+		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindMerge {
+			if fastRows, fastColumns, ok, fastErr := e.tryFastTwoHopDistinctMergeClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns); fastErr != nil {
+				return nil, nil, false, fastErr
+			} else if ok {
+				rows = fastRows
+				resultColumns = fastColumns
+				idx += 2
+				continue
+			}
+		}
 		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindWith {
 			if fastRows, fastColumns, ok, fastErr := e.tryFastTargetSharedPeerAggregationWithTopKClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns); fastErr != nil {
 				return nil, nil, false, fastErr
@@ -904,6 +914,307 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 		columns = append([]string(nil), priorColumns...)
 	}
 	return out, columns, true, nil
+}
+
+func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, mergeClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
+	if len(rows) != 1 || len(rows[0]) != 0 {
+		return nil, nil, false, nil
+	}
+	if tx == nil {
+		return nil, nil, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
+	if err != nil || matchSpec.Optional {
+		return nil, nil, false, nil
+	}
+	chain, err := parseTwoHopDirectedChainPattern(matchSpec.Pattern)
+	if err != nil {
+		return nil, nil, false, nil
+	}
+	if strings.TrimSpace(chain.Left.Var) == "" || strings.TrimSpace(chain.Right.Var) == "" || strings.TrimSpace(chain.Mid.Var) == "" {
+		return nil, nil, false, nil
+	}
+	if strings.TrimSpace(chain.Left.PropertiesRaw) != "" || strings.TrimSpace(chain.Mid.PropertiesRaw) != "" || strings.TrimSpace(chain.Right.PropertiesRaw) != "" {
+		return nil, nil, false, nil
+	}
+	if strings.TrimSpace(chain.FirstEdgeProps) != "" || strings.TrimSpace(chain.SecondEdgeProps) != "" {
+		return nil, nil, false, nil
+	}
+	if strings.TrimSpace(chain.FirstEdgeType) == "" || len(chain.FirstEdgeAnyOf) > 0 {
+		return nil, nil, false, nil
+	}
+
+	withSpec, err := projectionClauseSpecFromClause(withClause)
+	if err != nil {
+		return nil, nil, false, nil
+	}
+	if !withSpec.Distinct || strings.TrimSpace(withSpec.WhereRaw) != "" || len(withSpec.OrderBy) != 0 || strings.TrimSpace(withSpec.SkipRaw) != "" || strings.TrimSpace(withSpec.LimitRaw) != "" {
+		return nil, nil, false, nil
+	}
+	items, err := parseProjectionItems(withSpec.ProjectionRaw)
+	if err != nil || len(items) != 2 {
+		return nil, nil, false, nil
+	}
+
+	mergeRaw := normalizeClauseBody(stripCypherLineComments(mergeClause.MergePattern))
+	if mergeRaw == "" {
+		mergeRaw = normalizeClauseBody(stripCypherLineComments(stripLeadingClauseKeyword(mergeClause.Raw, string(mergeClause.Kind))))
+	}
+	mergeLeftVar, _, mergeRightVar, ok := parseFastDirectedMergeEdgePattern(mergeRaw)
+	if !ok {
+		return nil, nil, false, nil
+	}
+	if !projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Left.Var), mergeLeftVar) || !projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Right.Var), mergeRightVar) {
+		return nil, nil, false, nil
+	}
+
+	shortcut := buildTwoHopDirectedAntiJoinShortcutPlan(matchSpec.Where, chain)
+	if !shortcut.enabled {
+		return nil, nil, false, nil
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	sourceIDs, usedSourceAccessPath, err := e.resolveTwoHopLeftCandidatesByFirstEdgeType(ctx, tx, tenant, rows[0], chain, params)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !usedSourceAccessPath {
+		return nil, nil, false, nil
+	}
+
+	type cachedFastCandidate struct {
+		edge    *graph.Edge
+		rightID string
+	}
+	secondHopCache := map[string][]cachedFastCandidate{}
+	pairSeen := map[string]struct{}{}
+	pairRows := make([]Row, 0)
+
+	for _, leftID := range sourceIDs {
+		leftID = strings.TrimSpace(leftID)
+		if leftID == "" {
+			continue
+		}
+
+		leftVertex, err := getVertexQueryCached(ctx, tx, tenant, leftID, params)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if leftVertex == nil {
+			continue
+		}
+		leftScope := Row{}
+		if chain.Left.Var != "" {
+			leftScope[chain.Left.Var] = leftVertex
+		}
+		if !vertexPatternMatches(leftVertex, chain.Left, params, leftScope) {
+			continue
+		}
+
+		antiJoinNeighbors := map[string]struct{}{}
+		antiJoinNeighborsReady := false
+		ensureAntiJoinNeighbors := func() error {
+			if antiJoinNeighborsReady {
+				return nil
+			}
+			antiJoinNeighborsReady = true
+			if !shortcut.requireNoDirectEdge {
+				return nil
+			}
+			scanType := shortcut.directEdgeType
+			if len(shortcut.directEdgeAnyOf) > 0 {
+				scanType = ""
+			}
+			if err := scanOutEdgesQueryCached(ctx, tx, tenant, leftID, scanType, params, func(edge *graph.Edge) error {
+				if edge == nil || !edgeTypeMatches(edge, shortcut.directEdgeType, shortcut.directEdgeAnyOf) {
+					return nil
+				}
+				antiJoinNeighbors[edge.DstID] = struct{}{}
+				return nil
+			}); err != nil {
+				return err
+			}
+			if err := scanInEdgesQueryCached(ctx, tx, tenant, leftID, scanType, params, func(edge *graph.Edge) error {
+				if edge == nil || !edgeTypeMatches(edge, shortcut.directEdgeType, shortcut.directEdgeAnyOf) {
+					return nil
+				}
+				antiJoinNeighbors[edge.SrcID] = struct{}{}
+				return nil
+			}); err != nil {
+				return err
+			}
+			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", 1)
+			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", int64(len(antiJoinNeighbors)))
+			return nil
+		}
+
+		if err := scanOutEdgesQueryCached(ctx, tx, tenant, leftID, chain.FirstEdgeType, params, func(edge1 *graph.Edge) error {
+			if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
+				return nil
+			}
+			mid, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
+			if err != nil {
+				return err
+			}
+			if mid == nil {
+				return nil
+			}
+			midScope := Row{}
+			if chain.Mid.Var != "" {
+				midScope[chain.Mid.Var] = mid
+			}
+			if !vertexPatternMatches(mid, chain.Mid, params, midScope) {
+				return nil
+			}
+
+			secondScanType := chain.SecondEdgeType
+			if len(chain.SecondEdgeAnyOf) > 0 {
+				secondScanType = ""
+			}
+			cacheKey := tenant + "|" + mid.ID + "|"
+			if chain.SecondForward {
+				cacheKey += "out|"
+			} else {
+				cacheKey += "in|"
+			}
+			cacheKey += secondScanType
+
+			candidates, cacheHit := secondHopCache[cacheKey]
+			if !cacheHit {
+				candidates = make([]cachedFastCandidate, 0)
+				collect := func(edge2 *graph.Edge, rightID string) error {
+					rightID = strings.TrimSpace(rightID)
+					if rightID == "" {
+						return nil
+					}
+					candidates = append(candidates, cachedFastCandidate{edge: edge2, rightID: rightID})
+					return nil
+				}
+				if chain.SecondForward {
+					if err := scanOutEdgesQueryCached(ctx, tx, tenant, mid.ID, secondScanType, params, func(edge2 *graph.Edge) error {
+						return collect(edge2, edge2.DstID)
+					}); err != nil {
+						return err
+					}
+				} else {
+					if err := scanInEdgesQueryCached(ctx, tx, tenant, mid.ID, secondScanType, params, func(edge2 *graph.Edge) error {
+						return collect(edge2, edge2.SrcID)
+					}); err != nil {
+						return err
+					}
+				}
+				secondHopCache[cacheKey] = candidates
+			}
+
+			for _, candidate := range candidates {
+				edge2 := candidate.edge
+				rightID := candidate.rightID
+				if edge2 == nil || strings.TrimSpace(edge2.ID) == strings.TrimSpace(edge1.ID) {
+					continue
+				}
+				if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
+					continue
+				}
+				if shortcut.requireRightNotLeft && leftID == rightID {
+					e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+					continue
+				}
+				if shortcut.requireNoDirectEdge {
+					if err := ensureAntiJoinNeighbors(); err != nil {
+						return err
+					}
+					if _, connected := antiJoinNeighbors[rightID]; connected {
+						e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+						continue
+					}
+				}
+				e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_applied", 1)
+
+				rightVertex, err := getVertexQueryCached(ctx, tx, tenant, rightID, params)
+				if err != nil {
+					return err
+				}
+				if rightVertex == nil {
+					continue
+				}
+				e.observeRuntimeCounter(params, "runtime.right.lazy_hydrated", 1)
+				rightScope := Row{}
+				if chain.Right.Var != "" {
+					rightScope[chain.Right.Var] = rightVertex
+				}
+				if !vertexPatternMatches(rightVertex, chain.Right, params, rightScope) {
+					continue
+				}
+
+				pairKey := leftID + "|" + rightID
+				if _, exists := pairSeen[pairKey]; exists {
+					continue
+				}
+				pairSeen[pairKey] = struct{}{}
+				e.observeRuntimeCounter(params, "runtime.id_first.pairs_emitted", 1)
+				pairRows = append(pairRows, Row{mergeLeftVar: leftID, mergeRightVar: rightID})
+			}
+			return nil
+		}); err != nil {
+			return nil, nil, false, err
+		}
+	}
+
+	e.observeRuntimeCounter(params, "runtime.id_first.fastpath_applied", 1)
+	e.observeRuntimeCounter(params, "runtime.id_first.pairs_distinct", int64(len(pairRows)))
+
+	mergedRows, err := e.applyCreateClause(ctx, tx, pairRows, mergeClause, params, true)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	columns := []string{mergeLeftVar, mergeRightVar}
+	if len(columns) == 0 && len(priorColumns) > 0 {
+		columns = append([]string(nil), priorColumns...)
+	}
+	return mergedRows, columns, true, nil
+}
+
+func parseFastDirectedMergeEdgePattern(raw string) (leftVar string, edgeType string, rightVar string, ok bool) {
+	m := createEdgePatternRE.FindStringSubmatch(strings.TrimSpace(raw))
+	if len(m) != 10 {
+		return "", "", "", false
+	}
+	leftVar = strings.TrimSpace(m[1])
+	rightVar = strings.TrimSpace(m[7])
+	edgeType = strings.TrimSpace(m[5])
+	if leftVar == "" || rightVar == "" || edgeType == "" {
+		return "", "", "", false
+	}
+	if strings.TrimSpace(m[2]) != "" || strings.TrimSpace(m[3]) != "" || strings.TrimSpace(m[4]) != "" || strings.TrimSpace(m[6]) != "" || strings.TrimSpace(m[8]) != "" || strings.TrimSpace(m[9]) != "" {
+		return "", "", "", false
+	}
+	return leftVar, edgeType, rightVar, true
+}
+
+func projectionContainsExactVarWithKey(items []projectionSpec, sourceVar string, requiredKey string) bool {
+	sourceVar = strings.TrimSpace(sourceVar)
+	requiredKey = strings.TrimSpace(requiredKey)
+	if sourceVar == "" || requiredKey == "" {
+		return false
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item.AggFunc) != "" || strings.TrimSpace(item.Expression) != sourceVar {
+			continue
+		}
+		key := strings.TrimSpace(item.Alias)
+		if key == "" {
+			key = strings.TrimSpace(item.Expression)
+		}
+		if key == requiredKey {
+			return true
+		}
+	}
+	return false
 }
 
 func stage1WhereShortcutDecision(plan stage1WhereShortcutPlan, target *graph.Vertex, peer *graph.Vertex, hasSecondWhereConstraints bool) (bypassWhereEval bool, dropRow bool) {

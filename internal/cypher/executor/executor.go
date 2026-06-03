@@ -170,7 +170,6 @@ func (e *Executor) recordFastPathFeedback(implementation string, inputRows, outp
 		outputRows = 0
 	}
 	summary := fastPathFeedbackSummary{Samples: 1, InputRows: inputRows, OutputRows: outputRows}
-	summary.Selectivity = float64(outputRows) / float64(inputRows)
 	e.fastPathFeedbackMu.Lock()
 	defer e.fastPathFeedbackMu.Unlock()
 	if e.fastPathFeedback == nil {

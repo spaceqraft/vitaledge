@@ -3,14 +3,17 @@ package keyspace
 import "fmt"
 
 const (
-	vertexPrefix   = "v"
-	edgePrefix     = "e"
-	outPrefix      = "a/out"
-	inPrefix       = "a/in"
-	indexPrefix    = "i"
-	indexNumPrefix = "in"
-	statsPrefix    = "s"
-	metaPrefix     = "m"
+	vertexPrefix           = "v"
+	edgePrefix             = "e"
+	outPrefix              = "a/out"
+	outEndpointPrefix      = "a/out_ep"
+	outEndpointCountPrefix = "a/out_epc"
+	undEndpointCountPrefix = "a/und_epc"
+	inPrefix               = "a/in"
+	indexPrefix            = "i"
+	indexNumPrefix         = "in"
+	statsPrefix            = "s"
+	metaPrefix             = "m"
 )
 
 func VertexKey(tenant, vertexID string) []byte {
@@ -19,6 +22,10 @@ func VertexKey(tenant, vertexID string) []byte {
 
 func VertexPrefix(tenant string) []byte {
 	return []byte(fmt.Sprintf("%s/%s/", vertexPrefix, tenant))
+}
+
+func VertexLabelMembershipKey(tenant, label, vertexID string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s", vertexPrefix+"l", tenant, label, vertexID))
 }
 
 func EdgeKey(tenant, edgeID string) []byte {
@@ -42,6 +49,22 @@ func OutAdjacencyPrefix(tenant, srcID, edgeType string) []byte {
 
 func OutAdjacencyTenantPrefix(tenant string) []byte {
 	return []byte(fmt.Sprintf("%s/%s/", outPrefix, tenant))
+}
+
+func OutEndpointKey(tenant, srcID, edgeType, dstID, edgeID string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s/%s", outEndpointPrefix, tenant, srcID, edgeType, dstID, edgeID))
+}
+
+func OutEndpointPrefix(tenant, srcID, edgeType, dstID string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s/", outEndpointPrefix, tenant, srcID, edgeType, dstID))
+}
+
+func OutEndpointPairCountKey(tenant, srcID, edgeType, dstID string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s", outEndpointCountPrefix, tenant, srcID, edgeType, dstID))
+}
+
+func UndirectedEndpointPairCountKey(tenant, leftID, edgeType, rightID string) []byte {
+	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s", undEndpointCountPrefix, tenant, leftID, edgeType, rightID))
 }
 
 func InAdjacencyKey(tenant, dstID, edgeType, edgeID string) []byte {

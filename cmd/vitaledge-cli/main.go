@@ -1693,7 +1693,7 @@ func isValidCypherIdentifier(s string) bool {
 // after each batch.  It uses countQuery round-trips to determine when all vertices
 // have been removed, so it always terminates correctly regardless of whether
 // concurrent writers are active.
-func runPurge(parent context.Context, client v1.QueryServiceClient, cfg cliConfig, labelExpr string, batchSize int, out io.Writer, stderr io.Writer) error {
+func runPurge(parent context.Context, client v1.QueryServiceClient, cfg cliConfig, labelExpr string, batchSize int, out io.Writer, _ io.Writer) error {
 	if batchSize <= 0 {
 		batchSize = 1000
 	}

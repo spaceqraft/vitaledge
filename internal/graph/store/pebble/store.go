@@ -57,6 +57,8 @@ type tx struct {
 	maxWriteBatchBytes int
 }
 
+const outAdjDstValuePrefix = "d:"
+
 var _ graph.GraphStore = (*Store)(nil)
 var _ graph.Tx = (*tx)(nil)
 
@@ -401,12 +403,18 @@ func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 		if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(vertex.Tenant, label), -1); err != nil {
 			return err
 		}
+		if err := t.delete(keyspace.VertexLabelMembershipKey(vertex.Tenant, label, vertex.ID), "delete vertex label membership"); err != nil {
+			return err
+		}
 	}
 	for label := range nextLabels {
 		if _, ok := prevLabels[label]; ok {
 			continue
 		}
 		if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(vertex.Tenant, label), 1); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.VertexLabelMembershipKey(vertex.Tenant, label, vertex.ID), []byte(vertex.ID), "write vertex label membership"); err != nil {
 			return err
 		}
 	}
@@ -450,7 +458,36 @@ func (t *tx) DeleteVertex(ctx context.Context, tenant, vertexID string) (err err
 	if err := t.delete(keyspace.VertexKey(tenant, vertexID), "delete vertex"); err != nil {
 		return err
 	}
+	if vertex != nil {
+		for label := range normalizedLabelSet(vertex.Labels) {
+			if err := t.delete(keyspace.VertexLabelMembershipKey(tenant, label, vertexID), "delete vertex label membership"); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+func (t *tx) HasVertexLabel(ctx context.Context, tenant, vertexID, label string) (has bool, err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("has_vertex_label", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return false, err
+	}
+	tenant = strings.TrimSpace(tenant)
+	vertexID = strings.TrimSpace(vertexID)
+	label = strings.TrimSpace(label)
+	if tenant == "" || vertexID == "" || label == "" {
+		return false, graph.NewError(graph.ErrKindInvalidInput, "tenant, vertex id, and label are required", nil)
+	}
+	if _, err := t.get(keyspace.VertexLabelMembershipKey(tenant, label, vertexID)); err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (t *tx) GetStatsSnapshot(ctx context.Context, tenant string) (snapshot *graph.StatsSnapshot, err error) {
@@ -581,6 +618,15 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 		if err := t.delete(keyspace.InAdjacencyKey(previous.Tenant, previous.DstID, previous.Type, previous.ID), "delete stale in adjacency"); err != nil {
 			return err
 		}
+		if err := t.delete(keyspace.OutEndpointKey(previous.Tenant, previous.SrcID, previous.Type, previous.DstID, previous.ID), "delete stale out endpoint"); err != nil {
+			return err
+		}
+		if err := t.adjustOutEndpointPairCount(previous.Tenant, previous.SrcID, previous.Type, previous.DstID, -1); err != nil {
+			return err
+		}
+		if err := t.adjustUndirectedEndpointPairCount(previous.Tenant, previous.SrcID, previous.Type, previous.DstID, -1); err != nil {
+			return err
+		}
 	}
 
 	buf, err := json.Marshal(edge)
@@ -590,10 +636,19 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 	if err := t.set(keyspace.EdgeKey(edge.Tenant, edge.ID), buf, "write edge"); err != nil {
 		return err
 	}
-	if err := t.set(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), []byte(edge.ID), "write out adjacency"); err != nil {
+	if err := t.set(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), []byte(outAdjDstValuePrefix+edge.DstID), "write out adjacency"); err != nil {
 		return err
 	}
 	if err := t.set(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), []byte(edge.ID), "write in adjacency"); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.OutEndpointKey(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, edge.ID), []byte(edge.ID), "write out endpoint"); err != nil {
+		return err
+	}
+	if err := t.adjustOutEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, 1); err != nil {
+		return err
+	}
+	if err := t.adjustUndirectedEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, 1); err != nil {
 		return err
 	}
 	return nil
@@ -630,7 +685,76 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 	if err := t.delete(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), "delete in adjacency"); err != nil {
 		return err
 	}
+	if err := t.delete(keyspace.OutEndpointKey(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, edge.ID), "delete out endpoint"); err != nil {
+		return err
+	}
+	if err := t.adjustOutEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, -1); err != nil {
+		return err
+	}
+	if err := t.adjustUndirectedEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, -1); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (t *tx) adjustOutEndpointPairCount(tenant, srcID, edgeType, dstID string, delta int) error {
+	if delta == 0 {
+		return nil
+	}
+	tenant = strings.TrimSpace(tenant)
+	srcID = strings.TrimSpace(srcID)
+	edgeType = strings.TrimSpace(edgeType)
+	dstID = strings.TrimSpace(dstID)
+	if tenant == "" || srcID == "" || edgeType == "" || dstID == "" {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, edge type, and dst id are required", nil)
+	}
+	key := keyspace.OutEndpointPairCountKey(tenant, srcID, edgeType, dstID)
+	current, _, err := t.readCounterMaybeMissing(key)
+	if err != nil {
+		return err
+	}
+	next := current + delta
+	if next <= 0 {
+		if err := t.delete(key, "delete out endpoint pair count"); err != nil {
+			return err
+		}
+		return nil
+	}
+	return t.set(key, []byte(strconv.Itoa(next)), "write out endpoint pair count")
+}
+
+func (t *tx) adjustUndirectedEndpointPairCount(tenant, leftID, edgeType, rightID string, delta int) error {
+	if delta == 0 {
+		return nil
+	}
+	tenant = strings.TrimSpace(tenant)
+	leftID = strings.TrimSpace(leftID)
+	edgeType = strings.TrimSpace(edgeType)
+	rightID = strings.TrimSpace(rightID)
+	if tenant == "" || leftID == "" || edgeType == "" || rightID == "" {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, left id, edge type, and right id are required", nil)
+	}
+	leftID, rightID = canonicalEndpointPair(leftID, rightID)
+	key := keyspace.UndirectedEndpointPairCountKey(tenant, leftID, edgeType, rightID)
+	current, _, err := t.readCounterMaybeMissing(key)
+	if err != nil {
+		return err
+	}
+	next := current + delta
+	if next <= 0 {
+		if err := t.delete(key, "delete undirected endpoint pair count"); err != nil {
+			return err
+		}
+		return nil
+	}
+	return t.set(key, []byte(strconv.Itoa(next)), "write undirected endpoint pair count")
+}
+
+func canonicalEndpointPair(leftID, rightID string) (string, string) {
+	if strings.Compare(leftID, rightID) <= 0 {
+		return leftID, rightID
+	}
+	return rightID, leftID
 }
 
 func (t *tx) ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(*graph.Edge) error) (err error) {
@@ -676,9 +800,16 @@ func (t *tx) ScanOutEdgeLinks(ctx context.Context, tenant, srcID, edgeType strin
 		if edgeID == "" {
 			return graph.NewError(graph.ErrKindStorage, "malformed adjacency key", nil)
 		}
-		dstID, err := t.getEdgeLink(ctx, tenant, edgeID)
-		if err != nil {
-			return err
+		dstID := ""
+		if value := string(iter.Value()); strings.HasPrefix(value, outAdjDstValuePrefix) {
+			dstID = strings.TrimSpace(strings.TrimPrefix(value, outAdjDstValuePrefix))
+		}
+		if dstID == "" {
+			var err error
+			dstID, err = t.getEdgeLink(ctx, tenant, edgeID)
+			if err != nil {
+				return err
+			}
 		}
 		if err := fn(edgeID, dstID); err != nil {
 			return err
@@ -731,9 +862,16 @@ func (t *tx) ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string
 		if edgeID == "" {
 			return graph.NewError(graph.ErrKindStorage, "malformed adjacency key", nil)
 		}
-		dstID, err := t.getEdgeLink(ctx, tenant, edgeID)
-		if err != nil {
-			return err
+		dstID := ""
+		if value := string(iter.Value()); strings.HasPrefix(value, outAdjDstValuePrefix) {
+			dstID = strings.TrimSpace(strings.TrimPrefix(value, outAdjDstValuePrefix))
+		}
+		if dstID == "" {
+			var err error
+			dstID, err = t.getEdgeLink(ctx, tenant, edgeID)
+			if err != nil {
+				return err
+			}
 		}
 		if err := fn(sourceID, edgeID, dstID); err != nil {
 			return err
@@ -747,6 +885,136 @@ func (t *tx) ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string
 		return graph.NewError(graph.ErrKindStorage, "scan out edge links by type", err)
 	}
 	return nil
+}
+
+func (t *tx) hasTypedOutEdgeBetweenLegacy(ctx context.Context, tenant, srcID, dstID, edgeType string) (bool, error) {
+	prefix := keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return false, graph.NewError(graph.ErrKindStorage, "create typed out-edge iterator", err)
+	}
+	defer iter.Close()
+
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return false, err
+		}
+		edgeID := edgeIDFromAdjKey(iter.Key())
+		if edgeID == "" {
+			return false, graph.NewError(graph.ErrKindStorage, "malformed adjacency key", nil)
+		}
+		edgeDstID := ""
+		if value := string(iter.Value()); strings.HasPrefix(value, outAdjDstValuePrefix) {
+			edgeDstID = strings.TrimSpace(strings.TrimPrefix(value, outAdjDstValuePrefix))
+		}
+		if edgeDstID == "" {
+			var err error
+			edgeDstID, err = t.getEdgeLink(ctx, tenant, edgeID)
+			if err != nil {
+				return false, err
+			}
+		}
+		if edgeDstID == dstID {
+			return true, nil
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return false, graph.NewError(graph.ErrKindStorage, "scan typed out-edge", err)
+	}
+	return false, nil
+}
+
+func (t *tx) hasTypedOutEdgeBetween(ctx context.Context, tenant, srcID, dstID, edgeType string) (bool, error) {
+	prefix := keyspace.OutEndpointPrefix(tenant, srcID, edgeType, dstID)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return false, graph.NewError(graph.ErrKindStorage, "create typed out-endpoint iterator", err)
+	}
+	defer iter.Close()
+
+	if ok := iter.First(); ok {
+		if err := checkCtx(ctx); err != nil {
+			return false, err
+		}
+		if err := iter.Error(); err != nil {
+			return false, graph.NewError(graph.ErrKindStorage, "scan typed out-endpoint", err)
+		}
+		return true, nil
+	}
+	if err := iter.Error(); err != nil {
+		return false, graph.NewError(graph.ErrKindStorage, "scan typed out-endpoint", err)
+	}
+
+	// Fallback keeps directed existence checks correct for legacy edges written
+	// before out-endpoint keys were introduced.
+	return t.hasTypedOutEdgeBetweenLegacy(ctx, tenant, srcID, dstID, edgeType)
+}
+
+func (t *tx) HasDirectedEdgeBetween(ctx context.Context, tenant, srcID, dstID, edgeType string) (exists bool, err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("has_directed_edge_between", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return false, err
+	}
+	tenant = strings.TrimSpace(tenant)
+	srcID = strings.TrimSpace(srcID)
+	dstID = strings.TrimSpace(dstID)
+	edgeType = strings.TrimSpace(edgeType)
+	if tenant == "" || srcID == "" || dstID == "" || edgeType == "" {
+		return false, graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, dst id, and edge type are required", nil)
+	}
+	return t.HasDirectedEdgeBetweenFast(ctx, tenant, srcID, dstID, edgeType)
+}
+
+func (t *tx) HasDirectedEdgeBetweenFast(ctx context.Context, tenant, srcID, dstID, edgeType string) (bool, error) {
+	buf, err := t.get(keyspace.OutEndpointPairCountKey(tenant, srcID, edgeType, dstID))
+	if err == nil {
+		// Count keys are deleted at zero, so key presence implies edge existence.
+		if len(buf) > 0 {
+			return true, nil
+		}
+		// Empty value should not occur in normal operation, but treat it as absent.
+		return false, nil
+	}
+	if !graph.IsKind(err, graph.ErrKindNotFound) {
+		return false, err
+	}
+	return t.hasTypedOutEdgeBetween(ctx, tenant, srcID, dstID, edgeType)
+}
+
+func (t *tx) HasUndirectedEdgeBetween(ctx context.Context, tenant, leftID, rightID, edgeType string) (exists bool, err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("has_undirected_edge_between", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return false, err
+	}
+	tenant = strings.TrimSpace(tenant)
+	leftID = strings.TrimSpace(leftID)
+	rightID = strings.TrimSpace(rightID)
+	edgeType = strings.TrimSpace(edgeType)
+	if tenant == "" || leftID == "" || rightID == "" || edgeType == "" {
+		return false, graph.NewError(graph.ErrKindInvalidInput, "tenant, left id, right id, and edge type are required", nil)
+	}
+	return t.HasUndirectedEdgeBetweenFast(ctx, tenant, leftID, rightID, edgeType)
+}
+
+func (t *tx) HasUndirectedEdgeBetweenFast(ctx context.Context, tenant, leftID, rightID, edgeType string) (bool, error) {
+	exists, err := t.HasDirectedEdgeBetweenFast(ctx, tenant, leftID, rightID, edgeType)
+	if err != nil || exists {
+		return exists, err
+	}
+	if leftID == rightID {
+		return false, nil
+	}
+	return t.HasDirectedEdgeBetweenFast(ctx, tenant, rightID, leftID, edgeType)
 }
 
 func (t *tx) ScanOutEdgeSourceIDs(ctx context.Context, tenant, edgeType string, limit int, fn func(string) error) (err error) {

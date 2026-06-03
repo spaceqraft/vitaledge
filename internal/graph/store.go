@@ -21,6 +21,7 @@ type TxOptions struct {
 // Tx defines graph operations within a transactional boundary.
 type Tx interface {
 	GetVertex(ctx context.Context, tenant, vertexID string) (*Vertex, error)
+	HasVertexLabel(ctx context.Context, tenant, vertexID, label string) (bool, error)
 	ScanVertices(ctx context.Context, tenant string, limit int, fn func(*Vertex) error) error
 	ScanVerticesFrom(ctx context.Context, tenant, startAfterVertexID string, limit int, fn func(*Vertex) error) error
 	PutVertex(ctx context.Context, vertex *Vertex) error
@@ -34,6 +35,8 @@ type Tx interface {
 	ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(*Edge) error) error
 	ScanOutEdgeLinks(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(edgeID, dstID string) error) error
 	ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string, limit int, fn func(srcID, edgeID, dstID string) error) error
+	HasDirectedEdgeBetween(ctx context.Context, tenant, srcID, dstID, edgeType string) (bool, error)
+	HasUndirectedEdgeBetween(ctx context.Context, tenant, leftID, rightID, edgeType string) (bool, error)
 	ScanOutEdgeSourceIDs(ctx context.Context, tenant, edgeType string, limit int, fn func(string) error) error
 	ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(*Edge) error) error
 	ScanPropertyIndex(ctx context.Context, tenant, schema, property string, encodedValue []byte, limit int, fn func(*PropertyIndexEntry) error) error

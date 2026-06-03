@@ -135,26 +135,30 @@ type runtimeCounterState struct {
 }
 
 type deferredHydrationPolicy struct {
-	e       *Executor
-	ctx     context.Context
-	tx      graph.Tx
-	tenant  string
-	params  Params
-	checked map[string]struct{}
-	matched map[string]bool
-	vertex  map[string]*graph.Vertex
+	e         *Executor
+	ctx       context.Context
+	tx        graph.Tx
+	tenant    string
+	params    Params
+	checked   map[string]struct{}
+	matched   map[string]bool
+	vertex    map[string]*graph.Vertex
+	idChecked map[string]struct{}
+	idMatched map[string]bool
 }
 
 func newDeferredHydrationPolicy(e *Executor, ctx context.Context, tx graph.Tx, tenant string, params Params) *deferredHydrationPolicy {
 	return &deferredHydrationPolicy{
-		e:       e,
-		ctx:     ctx,
-		tx:      tx,
-		tenant:  strings.TrimSpace(tenant),
-		params:  params,
-		checked: map[string]struct{}{},
-		matched: map[string]bool{},
-		vertex:  map[string]*graph.Vertex{},
+		e:         e,
+		ctx:       ctx,
+		tx:        tx,
+		tenant:    strings.TrimSpace(tenant),
+		params:    params,
+		checked:   map[string]struct{}{},
+		matched:   map[string]bool{},
+		vertex:    map[string]*graph.Vertex{},
+		idChecked: map[string]struct{}{},
+		idMatched: map[string]bool{},
 	}
 }
 
@@ -238,6 +242,83 @@ func (p *deferredHydrationPolicy) resolveAndMatch(vertexID string, pattern verte
 	return v, true, nil
 }
 
+func (p *deferredHydrationPolicy) resolveAndMatchIDLabelProbe(vertexID string, pattern vertexPattern, baseRow Row, hydrationCounter string) (bool, error) {
+	if p == nil {
+		return false, nil
+	}
+	vertexID = strings.TrimSpace(vertexID)
+	if vertexID == "" {
+		return false, nil
+	}
+	if strings.TrimSpace(pattern.PropertiesRaw) != "" {
+		_, matched, err := p.resolveAndMatch(vertexID, pattern, baseRow, hydrationCounter)
+		return matched, err
+	}
+	key := deferredHydrationCacheKey(vertexID, pattern)
+	if _, ok := p.idChecked[key]; ok {
+		return p.idMatched[key], nil
+	}
+	p.idChecked[key] = struct{}{}
+
+	if !vertexBindingMatchesID(baseRow, pattern.Var, vertexID) {
+		p.idMatched[key] = false
+		return false, nil
+	}
+
+	checkLabel := func(label string) (bool, error) {
+		return p.tx.HasVertexLabel(p.ctx, p.tenant, vertexID, strings.TrimSpace(label))
+	}
+
+	if len(pattern.AnyOfLabels) > 0 {
+		anyMatched := false
+		for _, want := range pattern.AnyOfLabels {
+			hasLabel, err := checkLabel(want)
+			if err != nil {
+				_, matched, fallbackErr := p.resolveAndMatch(vertexID, pattern, baseRow, hydrationCounter)
+				return matched, fallbackErr
+			}
+			if hasLabel {
+				anyMatched = true
+				break
+			}
+		}
+		if !anyMatched {
+			p.idMatched[key] = false
+			return false, nil
+		}
+	}
+
+	for _, want := range pattern.AllOfLabels {
+		hasLabel, err := checkLabel(want)
+		if err != nil {
+			_, matched, fallbackErr := p.resolveAndMatch(vertexID, pattern, baseRow, hydrationCounter)
+			return matched, fallbackErr
+		}
+		if !hasLabel {
+			p.idMatched[key] = false
+			return false, nil
+		}
+	}
+
+	for _, want := range pattern.ExcludedLabels {
+		hasLabel, err := checkLabel(want)
+		if err != nil {
+			_, matched, fallbackErr := p.resolveAndMatch(vertexID, pattern, baseRow, hydrationCounter)
+			return matched, fallbackErr
+		}
+		if hasLabel {
+			p.idMatched[key] = false
+			return false, nil
+		}
+	}
+
+	p.idMatched[key] = true
+	if p.e != nil {
+		p.e.observeRuntimeCounter(p.params, "runtime.vertex.label_probe_shortcut_applied", 1)
+	}
+	return true, nil
+}
+
 func ensureRuntimeCounterState(params Params) *runtimeCounterState {
 	if params == nil {
 		return nil
@@ -298,9 +379,26 @@ func (e *Executor) observeRuntimeDurationMicros(params Params, name string, star
 	e.observeRuntimeCounter(params, name, elapsed)
 }
 
-type edgeIDScannerTx interface {
-	ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
-	ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
+type fastDirectedEndpointProbeTx interface {
+	HasDirectedEdgeBetweenFast(ctx context.Context, tenant, srcID, dstID, edgeType string) (bool, error)
+}
+
+type fastUndirectedEndpointProbeTx interface {
+	HasUndirectedEdgeBetweenFast(ctx context.Context, tenant, leftID, rightID, edgeType string) (bool, error)
+}
+
+func hasDirectedEdgeBetweenProbe(ctx context.Context, tx graph.Tx, tenant, srcID, dstID, edgeType string) (bool, error) {
+	if fastTx, ok := tx.(fastDirectedEndpointProbeTx); ok {
+		return fastTx.HasDirectedEdgeBetweenFast(ctx, tenant, srcID, dstID, edgeType)
+	}
+	return tx.HasDirectedEdgeBetween(ctx, tenant, srcID, dstID, edgeType)
+}
+
+func hasUndirectedEdgeBetweenProbe(ctx context.Context, tx graph.Tx, tenant, leftID, rightID, edgeType string) (bool, error) {
+	if fastTx, ok := tx.(fastUndirectedEndpointProbeTx); ok {
+		return fastTx.HasUndirectedEdgeBetweenFast(ctx, tenant, leftID, rightID, edgeType)
+	}
+	return tx.HasUndirectedEdgeBetween(ctx, tenant, leftID, rightID, edgeType)
 }
 
 func withProjectionEvalRuntime(ctx context.Context, tx graph.Tx, params Params, exec *Executor) Params {
@@ -438,7 +536,8 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 	for idx := 0; idx < len(part.Clauses); idx++ {
 		clause := part.Clauses[idx]
 		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindMerge {
-			if fastRows, fastColumns, ok, fastErr := e.tryFastTwoHopDistinctMergeClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns); fastErr != nil {
+			hasDownstreamClauses := idx+3 < len(part.Clauses)
+			if fastRows, fastColumns, ok, fastErr := e.tryFastTwoHopDistinctMergeClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns, hasDownstreamClauses); fastErr != nil {
 				return nil, nil, false, fastErr
 			} else if ok {
 				rows = fastRows
@@ -1026,7 +1125,7 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 	return out, columns, true, nil
 }
 
-func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, mergeClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
+func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, mergeClause ast.Clause, params Params, priorColumns []string, emitMergedRows bool) ([]Row, []string, bool, error) {
 	if len(rows) != 1 || len(rows[0]) != 0 {
 		return nil, nil, false, nil
 	}
@@ -1071,8 +1170,11 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 	if mergeRaw == "" {
 		mergeRaw = normalizeClauseBody(stripCypherLineComments(stripLeadingClauseKeyword(mergeClause.Raw, string(mergeClause.Kind))))
 	}
-	mergeLeftVar, _, mergeRightVar, ok := parseFastDirectedMergeEdgePattern(mergeRaw)
+	mergeLeftVar, mergeEdgeType, mergeRightVar, ok := parseFastDirectedMergeEdgePattern(mergeRaw)
 	if !ok {
+		return nil, nil, false, nil
+	}
+	if strings.TrimSpace(mergeClause.MergeOnCreate) != "" || strings.TrimSpace(mergeClause.MergeOnMatch) != "" {
 		return nil, nil, false, nil
 	}
 	if !projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Left.Var), mergeLeftVar) || !projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Right.Var), mergeRightVar) {
@@ -1118,22 +1220,45 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 	}
 	var prebuiltAntiJoinNeighbors map[string]map[string]struct{}
 	prebuiltAntiJoinNeighborsReady := false
-	canPrebuildAntiJoinNeighbors := shortcut.requireNoDirectEdge && strings.TrimSpace(shortcut.directEdgeType) != "" && len(shortcut.directEdgeAnyOf) == 0
-	canReusePrefetchedFirstHop := canPrebuildAntiJoinNeighbors && strings.TrimSpace(shortcut.directEdgeType) == strings.TrimSpace(chain.FirstEdgeType) && len(chain.FirstEdgeAnyOf) == 0
+	prebuiltAntiJoinNeighborCountersObserved := false
+	probeEdgeType, canUseTypedEndpointProbe := concreteEdgeTypeForEndpointProbe(shortcut.directEdgeType, shortcut.directEdgeAnyOf)
+	canPrebuildAntiJoinNeighbors := shortcut.requireNoDirectEdge && !canUseTypedEndpointProbe
+	canReusePrefetchedFirstHop := shortcut.requireNoDirectEdge && strings.TrimSpace(shortcut.directEdgeType) == strings.TrimSpace(chain.FirstEdgeType) && len(chain.FirstEdgeAnyOf) == 0
+	usePrefetchedAntiJoinNeighborSets := shortcut.requireNoDirectEdge && canReusePrefetchedFirstHop
 	prefetchedFirstHopLinks := map[string][]queryOutEdgeLink{}
 	prefetchOutLinkItems := int64(0)
 	prefetchOutLinkScans := int64(0)
+	directProbeCache := map[string]bool{}
+	directProbe := func(leftID, rightID string) (bool, error) {
+		if !canUseTypedEndpointProbe {
+			return false, nil
+		}
+		key := undirectedTypedPairCacheKey(leftID, rightID, probeEdgeType)
+		if connected, ok := directProbeCache[key]; ok {
+			e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_cache_hits", 1)
+			return connected, nil
+		}
+		e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_checks", 1)
+		connected, err := hasUndirectedEdgeBetweenProbe(ctx, tx, tenant, leftID, rightID, probeEdgeType)
+		if err != nil {
+			return false, err
+		}
+		directProbeCache[key] = connected
+		return connected, nil
+	}
 	ensurePrebuiltAntiJoinNeighbors := func() error {
-		if !canPrebuildAntiJoinNeighbors {
+		if !canPrebuildAntiJoinNeighbors && !canReusePrefetchedFirstHop {
 			return nil
 		}
 		if prebuiltAntiJoinNeighborsReady {
 			return nil
 		}
 		prebuiltAntiJoinNeighborsReady = true
-		prebuiltAntiJoinNeighbors = map[string]map[string]struct{}{}
-		for leftID := range leftCandidateSet {
-			prebuiltAntiJoinNeighbors[leftID] = map[string]struct{}{}
+		if canPrebuildAntiJoinNeighbors || usePrefetchedAntiJoinNeighborSets {
+			prebuiltAntiJoinNeighbors = map[string]map[string]struct{}{}
+			for leftID := range leftCandidateSet {
+				prebuiltAntiJoinNeighbors[leftID] = map[string]struct{}{}
+			}
 		}
 
 		prefetchOutLinkScans = 1
@@ -1145,12 +1270,20 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 				return nil
 			}
 			srcTracked := false
-			if _, ok := prebuiltAntiJoinNeighbors[srcID]; ok {
-				srcTracked = true
+			if prebuiltAntiJoinNeighbors != nil {
+				if _, ok := prebuiltAntiJoinNeighbors[srcID]; ok {
+					srcTracked = true
+				}
+			} else {
+				if _, ok := leftCandidateSet[srcID]; ok {
+					srcTracked = true
+				}
 			}
 			dstTracked := false
-			if _, ok := prebuiltAntiJoinNeighbors[dstID]; ok {
-				dstTracked = true
+			if prebuiltAntiJoinNeighbors != nil {
+				if _, ok := prebuiltAntiJoinNeighbors[dstID]; ok {
+					dstTracked = true
+				}
 			}
 			if !srcTracked && !dstTracked {
 				return nil
@@ -1159,10 +1292,10 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 			if canReusePrefetchedFirstHop && srcTracked {
 				prefetchedFirstHopLinks[srcID] = append(prefetchedFirstHopLinks[srcID], queryOutEdgeLink{edgeID: edgeID, dstID: dstID})
 			}
-			if srcTracked {
+			if srcTracked && prebuiltAntiJoinNeighbors != nil {
 				prebuiltAntiJoinNeighbors[srcID][dstID] = struct{}{}
 			}
-			if dstTracked {
+			if dstTracked && prebuiltAntiJoinNeighbors != nil {
 				prebuiltAntiJoinNeighbors[dstID][srcID] = struct{}{}
 			}
 			return nil
@@ -1173,6 +1306,15 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 		e.observeRuntimeCounter(params, "runtime.adjacency.out_links.prefetch_items_yielded", prefetchOutLinkItems)
 		e.observeRuntimeCounter(params, "runtime.antijoin.prefetch_applied", 1)
 		e.observeRuntimeCounter(params, "runtime.antijoin.prefetch_left_candidates", int64(len(leftCandidateSet)))
+		if prebuiltAntiJoinNeighbors != nil && !prebuiltAntiJoinNeighborCountersObserved {
+			prebuiltAntiJoinNeighborCountersObserved = true
+			neighborSetSizeTotal := int64(0)
+			for _, neighbors := range prebuiltAntiJoinNeighbors {
+				neighborSetSizeTotal += int64(len(neighbors))
+			}
+			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", int64(len(prebuiltAntiJoinNeighbors)))
+			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", neighborSetSizeTotal)
+		}
 		return nil
 	}
 	if canReusePrefetchedFirstHop {
@@ -1181,11 +1323,11 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 		}
 	}
 	ensureLeftPatternMatches := func(leftID string) (bool, error) {
-		_, matched, err := hydrationPolicy.resolveAndMatch(leftID, chain.Left, Row{}, "runtime.left.lazy_hydrated")
+		matched, err := hydrationPolicy.resolveAndMatchIDLabelProbe(leftID, chain.Left, Row{}, "runtime.left.lazy_hydrated")
 		return matched, err
 	}
 	ensureMidPatternMatches := func(midID string) (bool, error) {
-		_, matched, err := hydrationPolicy.resolveAndMatch(midID, chain.Mid, Row{}, "runtime.mid.lazy_hydrated")
+		matched, err := hydrationPolicy.resolveAndMatchIDLabelProbe(midID, chain.Mid, Row{}, "runtime.mid.lazy_hydrated")
 		return matched, err
 	}
 	secondHopSourceSet := map[string]struct{}{}
@@ -1226,6 +1368,15 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 			continue
 		}
 		firstHopMidSeen := map[string]struct{}{}
+		var prefetchedAntiJoinNeighbors map[string]struct{}
+		if usePrefetchedAntiJoinNeighborSets {
+			if err := ensurePrebuiltAntiJoinNeighbors(); err != nil {
+				return nil, nil, false, err
+			}
+			if prebuiltAntiJoinNeighbors != nil {
+				prefetchedAntiJoinNeighbors = prebuiltAntiJoinNeighbors[leftID]
+			}
+		}
 
 		antiJoinNeighbors := map[string]struct{}{}
 		antiJoinNeighborsReady := false
@@ -1235,6 +1386,9 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 			}
 			antiJoinNeighborsReady = true
 			if !shortcut.requireNoDirectEdge {
+				return nil
+			}
+			if canUseTypedEndpointProbe {
 				return nil
 			}
 			if canPrebuildAntiJoinNeighbors {
@@ -1367,12 +1521,29 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 					continue
 				}
 				if shortcut.requireNoDirectEdge {
-					if err := ensureAntiJoinNeighbors(); err != nil {
-						return err
-					}
-					if _, connected := antiJoinNeighbors[rightID]; connected {
-						e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
-						continue
+					if usePrefetchedAntiJoinNeighborSets {
+						if _, connected := prefetchedAntiJoinNeighbors[rightID]; connected {
+							e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+							continue
+						}
+					} else if canUseTypedEndpointProbe {
+						connected, err := directProbe(leftID, rightID)
+						if err != nil {
+							return err
+						}
+						if connected {
+							e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+							continue
+						}
+						e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_applied", 1)
+					} else {
+						if err := ensureAntiJoinNeighbors(); err != nil {
+							return err
+						}
+						if _, connected := antiJoinNeighbors[rightID]; connected {
+							e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+							continue
+						}
 					}
 				}
 				leftMatches, err := ensureLeftPatternMatches(leftID)
@@ -1384,7 +1555,7 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 				}
 				e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_applied", 1)
 
-				_, rightMatches, err := hydrationPolicy.resolveAndMatch(rightID, chain.Right, Row{}, "runtime.right.lazy_hydrated")
+				rightMatches, err := hydrationPolicy.resolveAndMatchIDLabelProbe(rightID, chain.Right, Row{}, "runtime.right.lazy_hydrated")
 				if err != nil {
 					return err
 				}
@@ -1425,9 +1596,169 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 	e.observeRuntimeCounter(params, "runtime.id_first.fastpath_applied", 1)
 	e.observeRuntimeCounter(params, "runtime.id_first.pairs_distinct", int64(len(pairRows)))
 
-	mergedRows, err := e.applyCreateClause(ctx, tx, pairRows, mergeClause, params, true)
-	if err != nil {
-		return nil, nil, false, err
+	existingPairs := map[string]struct{}{}
+	remainingRows := make([]Row, 0, len(pairRows))
+	sourceTargets := map[string]map[string]struct{}{}
+	for _, row := range pairRows {
+		leftID, _ := row[mergeLeftVar].(string)
+		rightID, _ := row[mergeRightVar].(string)
+		leftID = strings.TrimSpace(leftID)
+		rightID = strings.TrimSpace(rightID)
+		if leftID == "" || rightID == "" {
+			continue
+		}
+		remainingRows = append(remainingRows, row)
+		targets := sourceTargets[leftID]
+		if targets == nil {
+			targets = map[string]struct{}{}
+			sourceTargets[leftID] = targets
+		}
+		targets[rightID] = struct{}{}
+	}
+	bulkScanApplied := int64(0)
+	bulkScanItems := int64(0)
+	bulkScanShortCircuitHit := int64(0)
+	bulkScanCapped := int64(0)
+	if len(remainingRows) >= 512 {
+		bulkScanApplied = 1
+		candidateCount := len(remainingRows)
+		maxBulkScanItems := candidateCount * 3
+		if maxBulkScanItems < 4096 {
+			maxBulkScanItems = 4096
+		}
+		stopBulkScan := errors.New("merge bulk scan stop")
+		err := tx.ScanOutEdgeLinksByType(ctx, tenant, mergeEdgeType, 0, func(srcID, edgeID, dstID string) error {
+			srcID = strings.TrimSpace(srcID)
+			dstID = strings.TrimSpace(dstID)
+			if srcID == "" || dstID == "" {
+				return nil
+			}
+			bulkScanItems++
+			if bulkScanItems > int64(maxBulkScanItems) {
+				bulkScanCapped = 1
+				return stopBulkScan
+			}
+			targets, ok := sourceTargets[srcID]
+			if !ok {
+				return nil
+			}
+			if _, ok := targets[dstID]; !ok {
+				return nil
+			}
+			key := directedTypedPairCacheKey(srcID, dstID, mergeEdgeType)
+			if _, seen := existingPairs[key]; seen {
+				return nil
+			}
+			existingPairs[key] = struct{}{}
+			if len(existingPairs) == candidateCount {
+				bulkScanShortCircuitHit = 1
+				return stopBulkScan
+			}
+			return nil
+		})
+		if err != nil && err != stopBulkScan {
+			return nil, nil, false, err
+		}
+	}
+
+	mergeEndpointProbeChecks := int64(0)
+	mergeEndpointProbeHits := int64(0)
+	for _, row := range remainingRows {
+		leftID, _ := row[mergeLeftVar].(string)
+		rightID, _ := row[mergeRightVar].(string)
+		leftID = strings.TrimSpace(leftID)
+		rightID = strings.TrimSpace(rightID)
+		if leftID == "" || rightID == "" {
+			continue
+		}
+		key := directedTypedPairCacheKey(leftID, rightID, mergeEdgeType)
+		if _, ok := existingPairs[key]; ok {
+			continue
+		}
+		mergeEndpointProbeChecks++
+		exists, err := hasDirectedEdgeBetweenProbe(ctx, tx, tenant, leftID, rightID, mergeEdgeType)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if !exists {
+			continue
+		}
+		mergeEndpointProbeHits++
+		existingPairs[key] = struct{}{}
+	}
+	e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_applied", bulkScanApplied)
+	e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_items_yielded", bulkScanItems)
+	e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_short_circuit_hit", bulkScanShortCircuitHit)
+	e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_capped", bulkScanCapped)
+	e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_applied", 1)
+	e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_checks", mergeEndpointProbeChecks)
+	e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_hits", mergeEndpointProbeHits)
+	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_applied", 1)
+	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_candidates", int64(len(pairRows)))
+	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_source_scans", 0)
+	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_items_yielded", 0)
+	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_existing_hits", int64(len(existingPairs)))
+
+	createRows := make([]Row, 0, len(pairRows))
+	for _, row := range pairRows {
+		leftID, _ := row[mergeLeftVar].(string)
+		rightID, _ := row[mergeRightVar].(string)
+		leftID = strings.TrimSpace(leftID)
+		rightID = strings.TrimSpace(rightID)
+		if leftID == "" || rightID == "" {
+			continue
+		}
+		key := directedTypedPairCacheKey(leftID, rightID, mergeEdgeType)
+		if _, exists := existingPairs[key]; exists {
+			continue
+		}
+		createRows = append(createRows, row)
+	}
+	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_pairs_to_create", int64(len(createRows)))
+
+	for _, row := range createRows {
+		leftID, _ := row[mergeLeftVar].(string)
+		rightID, _ := row[mergeRightVar].(string)
+		leftID = strings.TrimSpace(leftID)
+		rightID = strings.TrimSpace(rightID)
+		if leftID == "" || rightID == "" {
+			continue
+		}
+		edge := &graph.Edge{
+			Tenant: tenant,
+			ID:     nextAutoEdgeID(tenant, leftID, mergeEdgeType, rightID),
+			Type:   mergeEdgeType,
+			SrcID:  leftID,
+			DstID:  rightID,
+		}
+		if err := e.putEdgeWithIndexes(ctx, tx, edge); err != nil {
+			return nil, nil, false, err
+		}
+	}
+
+	if !emitMergedRows {
+		e.observeRuntimeCounter(params, "runtime.merge.post_hydration_skipped", 1)
+		return nil, nil, true, nil
+	}
+
+	mergedRows := make([]Row, 0, len(pairRows))
+	for _, row := range pairRows {
+		leftID, _ := row[mergeLeftVar].(string)
+		rightID, _ := row[mergeRightVar].(string)
+		leftID = strings.TrimSpace(leftID)
+		rightID = strings.TrimSpace(rightID)
+		if leftID == "" || rightID == "" {
+			continue
+		}
+		leftVertex, err := getVertexQueryCached(ctx, tx, tenant, leftID, params)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		rightVertex, err := getVertexQueryCached(ctx, tx, tenant, rightID, params)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		mergedRows = append(mergedRows, Row{mergeLeftVar: leftVertex, mergeRightVar: rightVertex})
 	}
 	columns := []string{mergeLeftVar, mergeRightVar}
 	if len(columns) == 0 && len(priorColumns) > 0 {
@@ -1663,6 +1994,34 @@ func normalizeEdgeTypeSignature(edgeType string, edgeAnyOf []string) string {
 	}
 	sort.Strings(norm)
 	return strings.Join(norm, "|")
+}
+
+func concreteEdgeTypeForEndpointProbe(edgeType string, edgeAnyOf []string) (string, bool) {
+	edgeType = strings.TrimSpace(edgeType)
+	if edgeType != "" {
+		return edgeType, true
+	}
+	if len(edgeAnyOf) == 1 {
+		typeName := strings.TrimSpace(edgeAnyOf[0])
+		if typeName != "" {
+			return typeName, true
+		}
+	}
+	return "", false
+}
+
+func undirectedTypedPairCacheKey(leftID, rightID, edgeType string) string {
+	leftID = strings.TrimSpace(leftID)
+	rightID = strings.TrimSpace(rightID)
+	edgeType = strings.TrimSpace(edgeType)
+	if leftID <= rightID {
+		return leftID + "\x00" + rightID + "\x00" + edgeType
+	}
+	return rightID + "\x00" + leftID + "\x00" + edgeType
+}
+
+func directedTypedPairCacheKey(srcID, dstID, edgeType string) string {
+	return strings.TrimSpace(srcID) + "\x00" + strings.TrimSpace(dstID) + "\x00" + strings.TrimSpace(edgeType)
 }
 
 func isEdgeVarReferenced(expr, edgeVar string) bool {
@@ -5806,6 +6165,25 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 		rightID string
 	}
 	secondHopCache := map[string][]cachedTwoHopCandidate{}
+	probeEdgeType, canUseTypedEndpointProbe := concreteEdgeTypeForEndpointProbe(antiJoinShortcut.directEdgeType, antiJoinShortcut.directEdgeAnyOf)
+	directProbeCache := map[string]bool{}
+	directProbe := func(leftID, rightID string) (bool, error) {
+		if !canUseTypedEndpointProbe {
+			return false, nil
+		}
+		key := undirectedTypedPairCacheKey(leftID, rightID, probeEdgeType)
+		if connected, ok := directProbeCache[key]; ok {
+			e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_cache_hits", 1)
+			return connected, nil
+		}
+		e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_checks", 1)
+		connected, err := hasUndirectedEdgeBetweenProbe(ctx, tx, tenant, leftID, rightID, probeEdgeType)
+		if err != nil {
+			return false, err
+		}
+		directProbeCache[key] = connected
+		return connected, nil
+	}
 
 	out := make([]Row, 0)
 	for _, row := range rows {
@@ -5883,7 +6261,7 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 					return nil
 				}
 				antiJoinNeighborsReady = true
-				if !antiJoinShortcut.enabled || !antiJoinShortcut.requireNoDirectEdge {
+				if !antiJoinShortcut.enabled || !antiJoinShortcut.requireNoDirectEdge || canUseTypedEndpointProbe {
 					return nil
 				}
 				antiJoinNeighbors = map[string]struct{}{}
@@ -6030,12 +6408,24 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 							}
 						}
 						if antiJoinShortcut.requireNoDirectEdge {
-							if err := ensureAntiJoinNeighbors(); err != nil {
-								return err
-							}
-							if _, connected := antiJoinNeighbors[rightID]; connected {
-								e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
-								return nil
+							if canUseTypedEndpointProbe {
+								connected, err := directProbe(leftID, rightID)
+								if err != nil {
+									return err
+								}
+								if connected {
+									e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+									return nil
+								}
+								e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_applied", 1)
+							} else {
+								if err := ensureAntiJoinNeighbors(); err != nil {
+									return err
+								}
+								if _, connected := antiJoinNeighbors[rightID]; connected {
+									e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+									return nil
+								}
 							}
 						}
 						bypassWhereEval = true
@@ -18270,38 +18660,6 @@ func scanOutEdgesQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID,
 	observeRuntimeCounterLocal(params, "runtime.adjacency.out.items_yielded", int64(len(edges)))
 	for _, edge := range edges {
 		if err := fn(edge); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func scanOutEdgeLinksQueryCached(ctx context.Context, tx graph.Tx, tenant, vertexID, edgeType string, params Params, fn func(queryOutEdgeLink) error) error {
-	if params == nil {
-		return tx.ScanOutEdgeLinks(ctx, tenant, vertexID, edgeType, 0, func(edgeID, dstID string) error {
-			return fn(queryOutEdgeLink{edgeID: edgeID, dstID: dstID})
-		})
-	}
-	cache := ensureQueryAdjacencyCache(params)
-	key := queryAdjacencyCacheKey(tenant, vertexID, edgeType)
-	links, ok := cache.outEdgeLinks[key]
-	if !ok {
-		observeRuntimeCounterLocal(params, "runtime.adjacency.out_links.cache_misses", 1)
-		links = make([]queryOutEdgeLink, 0)
-		if err := tx.ScanOutEdgeLinks(ctx, tenant, vertexID, edgeType, 0, func(edgeID, dstID string) error {
-			links = append(links, queryOutEdgeLink{edgeID: edgeID, dstID: dstID})
-			return nil
-		}); err != nil {
-			return err
-		}
-		observeRuntimeCounterLocal(params, "runtime.edge.link_scanned.out", int64(len(links)))
-		cache.outEdgeLinks[key] = links
-	} else {
-		observeRuntimeCounterLocal(params, "runtime.adjacency.out_links.cache_hits", 1)
-	}
-	observeRuntimeCounterLocal(params, "runtime.adjacency.out_links.items_yielded", int64(len(links)))
-	for _, link := range links {
-		if err := fn(link); err != nil {
 			return err
 		}
 	}

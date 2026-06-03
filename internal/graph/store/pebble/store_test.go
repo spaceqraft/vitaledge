@@ -322,6 +322,307 @@ func TestScanOutEdgeLinksByTypeBulk(t *testing.T) {
 	}
 }
 
+func TestHasUndirectedEdgeBetween(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e2", Type: "LIKES", SrcID: "u3", DstID: "u1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		connected, err := tx.HasUndirectedEdgeBetween(ctx, "acme", "u1", "u2", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !connected {
+			return fmt.Errorf("expected u1 and u2 to be connected by KNOWS")
+		}
+
+		reverseConnected, err := tx.HasUndirectedEdgeBetween(ctx, "acme", "u2", "u1", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !reverseConnected {
+			return fmt.Errorf("expected reverse check to be connected by KNOWS")
+		}
+
+		notConnected, err := tx.HasUndirectedEdgeBetween(ctx, "acme", "u1", "u3", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if notConnected {
+			return fmt.Errorf("expected u1 and u3 to be disconnected by KNOWS")
+		}
+
+		wrongTypeConnected, err := tx.HasUndirectedEdgeBetween(ctx, "acme", "u1", "u2", "LIKES")
+		if err != nil {
+			return err
+		}
+		if wrongTypeConnected {
+			return fmt.Errorf("expected u1 and u2 to be disconnected by LIKES")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
+func TestHasDirectedEdgeBetween(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u2", DstID: "u1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		exists, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u1", "u2", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("expected directed u1->u2 KNOWS edge")
+		}
+		reverseExists, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u2", "u1", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !reverseExists {
+			return fmt.Errorf("expected directed u2->u1 KNOWS edge")
+		}
+		missing, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u1", "u3", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if missing {
+			return fmt.Errorf("expected no directed u1->u3 KNOWS edge")
+		}
+		wrongType, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u1", "u2", "LIKES")
+		if err != nil {
+			return err
+		}
+		if wrongType {
+			return fmt.Errorf("expected no directed u1->u2 LIKES edge")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
+func TestHasDirectedEdgeBetweenTracksEdgeUpdatesAndDeletes(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u3"})
+	})
+	if err != nil {
+		t.Fatalf("update edge failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		existsOld, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u1", "u2", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if existsOld {
+			return fmt.Errorf("expected no directed u1->u2 KNOWS edge after update")
+		}
+		existsNew, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u1", "u3", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !existsNew {
+			return fmt.Errorf("expected directed u1->u3 KNOWS edge after update")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-update view failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.DeleteEdge(ctx, "acme", "e1")
+	})
+	if err != nil {
+		t.Fatalf("delete edge failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		existsNew, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u1", "u3", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if existsNew {
+			return fmt.Errorf("expected no directed u1->u3 KNOWS edge after delete")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-delete view failed: %v", err)
+	}
+}
+
+func TestHasDirectedEdgeBetweenWithParallelEdges(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u1", DstID: "u2"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.DeleteEdge(ctx, "acme", "e1")
+	})
+	if err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		exists, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u1", "u2", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("expected directed u1->u2 KNOWS edge to remain after deleting one of parallel edges")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
+func TestHasUndirectedEdgeBetweenTracksDirectionDeletes(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u2", DstID: "u1"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.DeleteEdge(ctx, "acme", "e1")
+	})
+	if err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		exists, err := tx.HasUndirectedEdgeBetween(ctx, "acme", "u1", "u2", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("expected undirected u1-u2 KNOWS edge to remain after deleting one direction")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
 func TestScanVertices(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)
@@ -358,6 +659,89 @@ func TestScanVertices(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("scan vertices failed: %v", err)
+	}
+}
+
+func TestHasVertexLabelTracksUpdatesAndDeletes(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Person", "User"}})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		hasPerson, err := tx.HasVertexLabel(ctx, "acme", "u1", "Person")
+		if err != nil {
+			return err
+		}
+		if !hasPerson {
+			return fmt.Errorf("expected u1 to have label Person")
+		}
+		hasAdmin, err := tx.HasVertexLabel(ctx, "acme", "u1", "Admin")
+		if err != nil {
+			return err
+		}
+		if hasAdmin {
+			return fmt.Errorf("expected u1 to not have label Admin")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("initial view failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Person", "Admin"}})
+	})
+	if err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		hasUser, err := tx.HasVertexLabel(ctx, "acme", "u1", "User")
+		if err != nil {
+			return err
+		}
+		if hasUser {
+			return fmt.Errorf("expected u1 to not have label User after update")
+		}
+		hasAdmin, err := tx.HasVertexLabel(ctx, "acme", "u1", "Admin")
+		if err != nil {
+			return err
+		}
+		if !hasAdmin {
+			return fmt.Errorf("expected u1 to have label Admin after update")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-update view failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.DeleteVertex(ctx, "acme", "u1")
+	})
+	if err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		hasPerson, err := tx.HasVertexLabel(ctx, "acme", "u1", "Person")
+		if err != nil {
+			return err
+		}
+		if hasPerson {
+			return fmt.Errorf("expected deleted u1 to have no label membership")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-delete view failed: %v", err)
 	}
 }
 

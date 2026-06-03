@@ -6,6 +6,9 @@ func TestVertexAndEdgeKeys(t *testing.T) {
 	if got := string(VertexKey("t1", "v1")); got != "v/t1/v1" {
 		t.Fatalf("unexpected vertex key: %s", got)
 	}
+	if got := string(VertexLabelMembershipKey("t1", "Person", "v1")); got != "vl/t1/Person/v1" {
+		t.Fatalf("unexpected vertex label membership key: %s", got)
+	}
 	if got := string(EdgeKey("t1", "e1")); got != "e/t1/e1" {
 		t.Fatalf("unexpected edge key: %s", got)
 	}
@@ -17,6 +20,18 @@ func TestAdjacencyPrefixes(t *testing.T) {
 	}
 	if got := string(InAdjacencyPrefix("t1", "dst", "LIKES")); got != "a/in/t1/dst/LIKES/" {
 		t.Fatalf("unexpected in adjacency prefix: %s", got)
+	}
+	if got := string(OutEndpointPrefix("t1", "src", "KNOWS", "dst")); got != "a/out_ep/t1/src/KNOWS/dst/" {
+		t.Fatalf("unexpected out endpoint prefix: %s", got)
+	}
+	if got := string(OutEndpointKey("t1", "src", "KNOWS", "dst", "e1")); got != "a/out_ep/t1/src/KNOWS/dst/e1" {
+		t.Fatalf("unexpected out endpoint key: %s", got)
+	}
+	if got := string(OutEndpointPairCountKey("t1", "src", "KNOWS", "dst")); got != "a/out_epc/t1/src/KNOWS/dst" {
+		t.Fatalf("unexpected out endpoint pair count key: %s", got)
+	}
+	if got := string(UndirectedEndpointPairCountKey("t1", "left", "KNOWS", "right")); got != "a/und_epc/t1/left/KNOWS/right" {
+		t.Fatalf("unexpected undirected endpoint pair count key: %s", got)
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,6 +122,80 @@ func TestGRPCAnyToProtoValueJSONNumberInvalid(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error for invalid json.Number")
 	}
+}
+
+func TestGRPCProtoParamsToExecutorParamsBoundaryIDValidation(t *testing.T) {
+	t.Run("rejects empty edgeId", func(t *testing.T) {
+		_, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
+			"edgeId": {Kind: &v1.Value_StringValue{StringValue: ""}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "edgeId") {
+			t.Fatalf("expected edgeId validation error, got %v", err)
+		}
+	})
+
+	t.Run("rejects whitespace padded edgeId", func(t *testing.T) {
+		_, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
+			"edgeId": {Kind: &v1.Value_StringValue{StringValue: " e-1 "}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "surrounding whitespace") {
+			t.Fatalf("expected surrounding whitespace validation error, got %v", err)
+		}
+	})
+
+	t.Run("rejects non-string edgeId", func(t *testing.T) {
+		_, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
+			"edgeId": {Kind: &v1.Value_IntValue{IntValue: 7}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "string identifier") {
+			t.Fatalf("expected string identifier validation error, got %v", err)
+		}
+	})
+
+	t.Run("accepts nested id field under non-id top-level param", func(t *testing.T) {
+		_, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
+			"people": {
+				Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{
+					{
+						Kind: &v1.Value_MapValue{MapValue: &v1.MapValue{Values: map[string]*v1.Value{
+							"id":   {Kind: &v1.Value_IntValue{IntValue: 1}},
+							"name": {Kind: &v1.Value_StringValue{StringValue: "alice"}},
+						}}},
+					},
+				}}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+	})
+
+	t.Run("rejects top-level ids list containing non-string value", func(t *testing.T) {
+		_, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
+			"edgeIds": {
+				Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{
+					{Kind: &v1.Value_StringValue{StringValue: "e-1"}},
+					{Kind: &v1.Value_IntValue{IntValue: 2}},
+				}}},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "edgeIds[1]") {
+			t.Fatalf("expected edgeIds[1] string identifier validation error, got %v", err)
+		}
+	})
+
+	t.Run("accepts valid edgeId", func(t *testing.T) {
+		params, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
+			"edgeId": {Kind: &v1.Value_StringValue{StringValue: "e-1"}},
+			"limit":  {Kind: &v1.Value_IntValue{IntValue: 10}},
+		})
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if got := params["edgeId"]; got != "e-1" {
+			t.Fatalf("expected edgeId=e-1, got %#v", got)
+		}
+	})
 }
 
 func TestGRPCExecuteIntegrationSerializesNumericAggregatesAndProperties(t *testing.T) {

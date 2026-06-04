@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"sort"
@@ -50,6 +50,7 @@ type tx struct {
 	snapshot           *cpebble.Snapshot
 	batch              *cpebble.Batch
 	locks              map[string]func()
+	vertexCache        map[string]*graph.Vertex
 	counterBase        map[string]int
 	counterBasePresent map[string]bool
 	counterDeltas      map[string]int
@@ -58,6 +59,7 @@ type tx struct {
 }
 
 const outAdjDstValuePrefix = "d:"
+const vertexPropertySchema = "__vertex__"
 
 var _ graph.GraphStore = (*Store)(nil)
 var _ graph.Tx = (*tx)(nil)
@@ -154,7 +156,7 @@ func (s *Store) schemaVersion() (int, error) {
 	}
 	defer closer.Close()
 
-	parsed, parseErr := strconv.Atoi(strings.TrimSpace(string(value)))
+	parsed, parseErr := strconv.Atoi(string(value))
 	if parseErr != nil {
 		return 0, graph.NewError(graph.ErrKindStorage, "decode schema version", parseErr)
 	}
@@ -257,18 +259,21 @@ func (t *tx) GetVertex(ctx context.Context, tenant, vertexID string) (vertex *gr
 	if err := t.ensureActive(ctx); err != nil {
 		return nil, err
 	}
-	if tenant == "" || vertexID == "" {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "tenant and vertex id are required", nil)
+	if cached := t.vertexFromCache(tenant, vertexID); cached != nil {
+		return cached, nil
 	}
 	buf, err := t.get(keyspace.VertexKey(tenant, vertexID))
 	if err != nil {
 		return nil, err
 	}
-	var v graph.Vertex
-	if err := json.Unmarshal(buf, &v); err != nil {
-		return nil, graph.NewError(graph.ErrKindStorage, "decode vertex", err)
+	if len(buf) == 0 {
+		return nil, graph.NewError(graph.ErrKindStorage, "decode vertex phash", nil)
 	}
-	vertex = &v
+	vertex, err = t.loadVertexByID(ctx, tenant, vertexID)
+	if err != nil {
+		return nil, err
+	}
+	t.cacheVertex(vertex)
 	return vertex, nil
 }
 
@@ -298,11 +303,12 @@ func (t *tx) ScanVertices(ctx context.Context, tenant string, limit int, fn func
 		if err := checkCtx(ctx); err != nil {
 			return err
 		}
-		var v graph.Vertex
-		if err := json.Unmarshal(iter.Value(), &v); err != nil {
-			return graph.NewError(graph.ErrKindStorage, "decode vertex", err)
+		vertexID := vertexIDFromKey(iter.Key())
+		v, err := t.loadVertexByID(ctx, tenant, vertexID)
+		if err != nil {
+			return err
 		}
-		if err := fn(&v); err != nil {
+		if err := fn(v); err != nil {
 			return err
 		}
 		seen++
@@ -337,7 +343,6 @@ func (t *tx) ScanVerticesFrom(ctx context.Context, tenant, startAfterVertexID st
 	}
 	defer iter.Close()
 
-	startAfterVertexID = strings.TrimSpace(startAfterVertexID)
 	seekKey := prefix
 	if startAfterVertexID != "" {
 		seekKey = keyspace.VertexKey(tenant, startAfterVertexID)
@@ -348,17 +353,14 @@ func (t *tx) ScanVerticesFrom(ctx context.Context, tenant, startAfterVertexID st
 			return err
 		}
 		vertexID := vertexIDFromKey(iter.Key())
-		if vertexID == "" {
-			return graph.NewError(graph.ErrKindStorage, "malformed vertex key", nil)
-		}
 		if startAfterVertexID != "" && vertexID == startAfterVertexID {
 			continue
 		}
-		var v graph.Vertex
-		if err := json.Unmarshal(iter.Value(), &v); err != nil {
-			return graph.NewError(graph.ErrKindStorage, "decode vertex", err)
+		v, err := t.loadVertexByID(ctx, tenant, vertexID)
+		if err != nil {
+			return err
 		}
-		if err := fn(&v); err != nil {
+		if err := fn(v); err != nil {
 			return err
 		}
 		seen++
@@ -372,6 +374,102 @@ func (t *tx) ScanVerticesFrom(ctx context.Context, tenant, startAfterVertexID st
 	return nil
 }
 
+func (t *tx) ScanVerticesByLabel(ctx context.Context, tenant, label string, limit int, fn func(*graph.Vertex) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_vertices_by_label", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || label == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, label, and callback are required", nil)
+	}
+
+	prefix := keyspace.LabelVertexPrefix(tenant, label)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create label vertex iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		vertexID := string(iter.Value())
+		buf, err := t.get(keyspace.VertexKey(tenant, vertexID))
+		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				continue
+			}
+			return err
+		}
+		if len(buf) == 0 {
+			return graph.NewError(graph.ErrKindStorage, "decode vertex phash", nil)
+		}
+		v, err := t.loadVertexByID(ctx, tenant, vertexID)
+		if err != nil {
+			return err
+		}
+		if err := fn(v); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan vertices by label", err)
+	}
+	return nil
+}
+
+func (t *tx) ScanVertexIDsByLabel(ctx context.Context, tenant, label string, limit int, fn func(string) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_vertex_ids_by_label", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if tenant == "" || label == "" || fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "tenant, label, and callback are required", nil)
+	}
+
+	prefix := keyspace.LabelVertexPrefix(tenant, label)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create label vertex id iterator", err)
+	}
+	defer iter.Close()
+
+	seen := 0
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		vertexID := string(iter.Value())
+		if err := fn(vertexID); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan vertex ids by label", err)
+	}
+	return nil
+}
+
 func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 	started := time.Now()
 	defer func() { t.observeOperation("put_vertex", err, started) }()
@@ -379,23 +477,34 @@ func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 	if err := t.ensureWrite(ctx); err != nil {
 		return err
 	}
-	if vertex == nil || vertex.Tenant == "" || vertex.ID == "" {
-		return graph.NewError(graph.ErrKindInvalidInput, "vertex tenant and id are required", nil)
+	if vertex == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "vertex is required", nil)
 	}
-	previous, err := t.GetVertex(ctx, vertex.Tenant, vertex.ID)
+	existingHash, err := t.get(keyspace.VertexKey(vertex.Tenant, vertex.ID))
+	previousExists := err == nil
 	if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 		return err
 	}
-	if previous == nil {
+	nextHash := vertexPHash(vertex)
+	if previousExists && bytes.Equal(existingHash, nextHash) {
+		return nil
+	}
+	if !previousExists {
 		if err := t.addToCounter(keyspace.StatsVertexTotalKey(vertex.Tenant), 1); err != nil {
 			return err
 		}
 	}
-	prevLabels := normalizedLabelSet(nil)
-	if previous != nil {
-		prevLabels = normalizedLabelSet(previous.Labels)
+	prevLabelList := normalizedLabelsOrdered(nil)
+	if previousExists {
+		prevLabelList, err = t.loadVertexLabels(ctx, vertex.Tenant, vertex.ID)
+		if err != nil {
+			return err
+		}
+		prevLabelList = normalizedLabelsOrdered(prevLabelList)
 	}
-	nextLabels := normalizedLabelSet(vertex.Labels)
+	nextLabelList := normalizedLabelsOrdered(vertex.Labels)
+	prevLabels := labelSliceSet(prevLabelList)
+	nextLabels := labelSliceSet(nextLabelList)
 	for label := range prevLabels {
 		if _, ok := nextLabels[label]; ok {
 			continue
@@ -403,28 +512,39 @@ func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 		if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(vertex.Tenant, label), -1); err != nil {
 			return err
 		}
+		if err := t.delete(keyspace.VertexLabelKey(vertex.Tenant, vertex.ID, label), "delete vertex label forward index"); err != nil {
+			return err
+		}
 		if err := t.delete(keyspace.VertexLabelMembershipKey(vertex.Tenant, label, vertex.ID), "delete vertex label membership"); err != nil {
 			return err
 		}
 	}
-	for label := range nextLabels {
+	for idx, label := range nextLabelList {
 		if _, ok := prevLabels[label]; ok {
 			continue
 		}
 		if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(vertex.Tenant, label), 1); err != nil {
 			return err
 		}
+		if err := t.set(keyspace.VertexLabelKey(vertex.Tenant, vertex.ID, label), encodeVertexLabelOrder(idx, label), "write vertex label forward index"); err != nil {
+			return err
+		}
 		if err := t.set(keyspace.VertexLabelMembershipKey(vertex.Tenant, label, vertex.ID), []byte(vertex.ID), "write vertex label membership"); err != nil {
 			return err
 		}
 	}
-	buf, err := json.Marshal(vertex)
-	if err != nil {
-		return graph.NewError(graph.ErrKindStorage, "encode vertex", err)
+	if previousExists {
+		if err := t.deleteVertexPropertiesBySchema(ctx, vertex.Tenant, vertex.ID, vertexPropertySchema); err != nil {
+			return err
+		}
 	}
-	if err := t.set(keyspace.VertexKey(vertex.Tenant, vertex.ID), buf, "write vertex"); err != nil {
+	if err := t.writeVertexProperties(vertex); err != nil {
 		return err
 	}
+	if err := t.set(keyspace.VertexKey(vertex.Tenant, vertex.ID), nextHash, "write vertex"); err != nil {
+		return err
+	}
+	t.cacheVertex(vertex)
 	return nil
 }
 
@@ -434,9 +554,6 @@ func (t *tx) DeleteVertex(ctx context.Context, tenant, vertexID string) (err err
 
 	if err := t.ensureWrite(ctx); err != nil {
 		return err
-	}
-	if tenant == "" || vertexID == "" {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant and vertex id are required", nil)
 	}
 	vertex, err := t.GetVertex(ctx, tenant, vertexID)
 	if err != nil {
@@ -458,14 +575,509 @@ func (t *tx) DeleteVertex(ctx context.Context, tenant, vertexID string) (err err
 	if err := t.delete(keyspace.VertexKey(tenant, vertexID), "delete vertex"); err != nil {
 		return err
 	}
+	t.dropVertexCache(tenant, vertexID)
 	if vertex != nil {
+		if err := t.deleteVertexPropertiesBySchema(ctx, tenant, vertexID, ""); err != nil {
+			return err
+		}
 		for label := range normalizedLabelSet(vertex.Labels) {
+			if err := t.delete(keyspace.VertexLabelKey(tenant, vertexID, label), "delete vertex label forward index"); err != nil {
+				return err
+			}
 			if err := t.delete(keyspace.VertexLabelMembershipKey(tenant, label, vertexID), "delete vertex label membership"); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func (t *tx) vertexCacheKey(tenant, vertexID string) string {
+	return tenant + "\x00" + vertexID
+}
+
+func (t *tx) vertexFromCache(tenant, vertexID string) *graph.Vertex {
+	if t == nil || len(t.vertexCache) == 0 {
+		return nil
+	}
+	vertex := t.vertexCache[t.vertexCacheKey(tenant, vertexID)]
+	return cloneVertex(vertex)
+}
+
+func (t *tx) cacheVertex(vertex *graph.Vertex) {
+	if t == nil || vertex == nil {
+		return
+	}
+	if t.vertexCache == nil {
+		t.vertexCache = map[string]*graph.Vertex{}
+	}
+	t.vertexCache[t.vertexCacheKey(vertex.Tenant, vertex.ID)] = cloneVertex(vertex)
+}
+
+func (t *tx) dropVertexCache(tenant, vertexID string) {
+	if t == nil || t.vertexCache == nil {
+		return
+	}
+	delete(t.vertexCache, t.vertexCacheKey(tenant, vertexID))
+}
+
+func cloneVertex(vertex *graph.Vertex) *graph.Vertex {
+	if vertex == nil {
+		return nil
+	}
+	clone := &graph.Vertex{
+		Tenant: vertex.Tenant,
+		ID:     vertex.ID,
+	}
+	if len(vertex.Labels) > 0 {
+		clone.Labels = append([]string(nil), vertex.Labels...)
+	}
+	if len(vertex.Properties) > 0 {
+		clone.Properties = make(graph.PropertyMap, len(vertex.Properties))
+		for key, value := range vertex.Properties {
+			clone.Properties[key] = append([]byte(nil), value...)
+		}
+	}
+	return clone
+}
+
+func (t *tx) loadVertexByID(ctx context.Context, tenant, vertexID string) (*graph.Vertex, error) {
+	labels, err := t.loadVertexLabels(ctx, tenant, vertexID)
+	if err != nil {
+		return nil, err
+	}
+	properties, err := t.loadVertexProperties(ctx, tenant, vertexID)
+	if err != nil {
+		return nil, err
+	}
+	return &graph.Vertex{Tenant: tenant, ID: vertexID, Labels: labels, Properties: properties}, nil
+}
+
+func (t *tx) loadEdgeByID(ctx context.Context, tenant, edgeID string) (*graph.Edge, error) {
+	edgeType, srcID, dstID, err := t.loadEdgeTypeAndEndpoints(ctx, tenant, edgeID)
+	if err != nil {
+		return nil, err
+	}
+	properties, err := t.loadEdgeProperties(ctx, tenant, edgeID)
+	if err != nil {
+		return nil, err
+	}
+	return &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID, Properties: properties}, nil
+}
+
+func (t *tx) loadEdgeTypeAndEndpoints(ctx context.Context, tenant, edgeID string) (edgeType, srcID, dstID string, err error) {
+	prefix := keyspace.EdgeTypePrefix(tenant, edgeID)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return "", "", "", graph.NewError(graph.ErrKindStorage, "create edge type iterator", err)
+	}
+	defer iter.Close()
+
+	if ok := iter.First(); !ok {
+		if err := iter.Error(); err != nil {
+			return "", "", "", graph.NewError(graph.ErrKindStorage, "scan edge type", err)
+		}
+		return "", "", "", graph.NewError(graph.ErrKindNotFound, "edge type not found", nil)
+	}
+	if err := checkCtx(ctx); err != nil {
+		return "", "", "", err
+	}
+	parts := bytes.Split(iter.Key(), []byte{'/'})
+	if len(parts) < 4 {
+		return "", "", "", graph.NewError(graph.ErrKindStorage, "malformed edge type key", nil)
+	}
+	edgeType = string(parts[len(parts)-1])
+	payload, err := t.get(keyspace.TypeEdgeKey(tenant, edgeType, edgeID))
+	if err != nil {
+		return "", "", "", err
+	}
+	srcID, dstID, ok := parseEdgeEndpointsPayload(payload)
+	if !ok {
+		return "", "", "", graph.NewError(graph.ErrKindStorage, "decode type edge endpoints", nil)
+	}
+	return edgeType, srcID, dstID, nil
+}
+
+func (t *tx) loadVertexLabels(ctx context.Context, tenant, vertexID string) ([]string, error) {
+	prefix := keyspace.VertexLabelPrefix(tenant, vertexID)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "create vertex label iterator", err)
+	}
+	defer iter.Close()
+
+	type orderedLabel struct {
+		order int
+		label string
+	}
+	labels := make([]orderedLabel, 0)
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
+		}
+		parts := bytes.Split(iter.Key(), []byte{'/'})
+		if len(parts) < 4 {
+			return nil, graph.NewError(graph.ErrKindStorage, "malformed vertex label key", nil)
+		}
+		label := string(parts[len(parts)-1])
+		if label == "" || label == "UNLABELED" {
+			continue
+		}
+		order := decodeVertexLabelOrder(iter.Value(), label)
+		labels = append(labels, orderedLabel{order: order, label: label})
+	}
+	if err := iter.Error(); err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "scan vertex labels", err)
+	}
+	sort.SliceStable(labels, func(i, j int) bool {
+		if labels[i].order == labels[j].order {
+			return labels[i].label < labels[j].label
+		}
+		return labels[i].order < labels[j].order
+	})
+	out := make([]string, 0, len(labels))
+	for _, item := range labels {
+		out = append(out, item.label)
+	}
+	return out, nil
+}
+
+func (t *tx) loadVertexProperties(ctx context.Context, tenant, vertexID string) (graph.PropertyMap, error) {
+	prefix := []byte("vp/" + tenant + "/" + vertexID + "/" + vertexPropertySchema + "/")
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "create vertex property iterator", err)
+	}
+	defer iter.Close()
+
+	properties := graph.PropertyMap{}
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
+		}
+		schema, property, encodedValue, ok := vertexPropertyPartsFromKey(iter.Key())
+		if !ok {
+			continue
+		}
+		if property == "" {
+			continue
+		}
+		if _, exists := properties[property]; exists {
+			continue
+		}
+		if schema == vertexPropertySchema {
+			stored := append([]byte(nil), iter.Value()...)
+			if len(stored) > 0 {
+				properties[property] = stored
+				continue
+			}
+		}
+		properties[property] = encodedValue
+	}
+	if err := iter.Error(); err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "scan vertex properties", err)
+	}
+	if len(properties) == 0 {
+		return nil, nil
+	}
+	return properties, nil
+}
+
+func (t *tx) deleteVertexPropertiesBySchema(ctx context.Context, tenant, vertexID, schema string) error {
+	prefix := []byte("vp/" + tenant + "/" + vertexID + "/")
+	if schema != "" {
+		prefix = []byte("vp/" + tenant + "/" + vertexID + "/" + schema + "/")
+	}
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create vertex property delete iterator", err)
+	}
+	defer iter.Close()
+
+	type keyValue struct {
+		key   []byte
+		value []byte
+	}
+	items := make([]keyValue, 0)
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		items = append(items, keyValue{key: append([]byte(nil), iter.Key()...), value: append([]byte(nil), iter.Value()...)})
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan vertex properties for delete", err)
+	}
+
+	for _, item := range items {
+		schema, property, encodedValue, ok := vertexPropertyPartsFromKey(item.key)
+		if !ok {
+			continue
+		}
+		if schema == vertexPropertySchema && len(item.value) > 0 {
+			encodedValue = append([]byte(nil), item.value...)
+		}
+		if err := t.delete(item.key, "delete vertex property forward index"); err != nil {
+			return err
+		}
+		if err := t.delete(keyspace.PropertyVertexKey(tenant, schema, property, encodedValue, vertexID), "delete property vertex reverse index"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *tx) writeVertexProperties(vertex *graph.Vertex) error {
+	if vertex == nil || len(vertex.Properties) == 0 {
+		return nil
+	}
+	for property, encodedValue := range vertex.Properties {
+		if property == "" {
+			continue
+		}
+		valueCopy := append([]byte(nil), encodedValue...)
+		if err := t.set(keyspace.VertexPropertyKey(vertex.Tenant, vertex.ID, vertexPropertySchema, property, valueCopy), valueCopy, "write vertex property forward index"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.PropertyVertexKey(vertex.Tenant, vertexPropertySchema, property, valueCopy, vertex.ID), []byte(vertex.ID), "write property vertex reverse index"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *tx) loadEdgeProperties(ctx context.Context, tenant, edgeID string) (graph.PropertyMap, error) {
+	prefix := keyspace.EdgePropertyEntityPrefix(tenant, edgeID)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "create edge property iterator", err)
+	}
+	defer iter.Close()
+
+	properties := graph.PropertyMap{}
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return nil, err
+		}
+		_, property, encodedValue, ok := edgePropertyPartsFromKey(iter.Key())
+		if !ok || property == "" {
+			continue
+		}
+		if _, exists := properties[property]; exists {
+			continue
+		}
+		properties[property] = encodedValue
+	}
+	if err := iter.Error(); err != nil {
+		return nil, graph.NewError(graph.ErrKindStorage, "scan edge properties", err)
+	}
+	if len(properties) == 0 {
+		return nil, nil
+	}
+	return properties, nil
+}
+
+func (t *tx) deleteEdgePropertiesBySchema(ctx context.Context, tenant, edgeID, schema string) error {
+	prefix := keyspace.EdgePropertyEntityPrefix(tenant, edgeID)
+	if schema != "" {
+		prefix = []byte("ep/" + tenant + "/" + edgeID + "/" + schema + "/")
+	}
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return graph.NewError(graph.ErrKindStorage, "create edge property delete iterator", err)
+	}
+	defer iter.Close()
+
+	type keyValue struct {
+		key []byte
+	}
+	items := make([]keyValue, 0)
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return err
+		}
+		items = append(items, keyValue{key: append([]byte(nil), iter.Key()...)})
+	}
+	if err := iter.Error(); err != nil {
+		return graph.NewError(graph.ErrKindStorage, "scan edge properties for delete", err)
+	}
+
+	for _, item := range items {
+		schema, property, encodedValue, ok := edgePropertyPartsFromKey(item.key)
+		if !ok {
+			continue
+		}
+		if err := t.delete(item.key, "delete edge property forward index"); err != nil {
+			return err
+		}
+		if err := t.delete(keyspace.PropertyEdgeKey(tenant, schema, property, encodedValue, edgeID), "delete property edge reverse index"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *tx) writeEdgeProperties(edge *graph.Edge) error {
+	if edge == nil || len(edge.Properties) == 0 {
+		return nil
+	}
+	for property, encodedValue := range edge.Properties {
+		if property == "" {
+			continue
+		}
+		valueCopy := append([]byte(nil), encodedValue...)
+		if err := t.set(keyspace.EdgePropertyKey(edge.Tenant, edge.ID, edge.Type, property, valueCopy), []byte(edge.ID), "write edge property forward index"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.PropertyEdgeKey(edge.Tenant, edge.Type, property, valueCopy, edge.ID), []byte(edge.ID), "write property edge reverse index"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func vertexPropertyPartsFromKey(key []byte) (schema, property string, encodedValue []byte, ok bool) {
+	parts := bytes.Split(key, []byte{'/'})
+	if len(parts) < 6 {
+		return "", "", nil, false
+	}
+	schema = string(parts[len(parts)-3])
+	property = string(parts[len(parts)-2])
+	valueHex := string(parts[len(parts)-1])
+	if schema == "" || property == "" {
+		return "", "", nil, false
+	}
+	decodedValue, err := hex.DecodeString(valueHex)
+	if err != nil {
+		return "", "", nil, false
+	}
+	return schema, property, decodedValue, true
+}
+
+func vertexPHash(vertex *graph.Vertex) []byte {
+	h := fnv.New64a()
+	if vertex != nil {
+		_, _ = h.Write([]byte(vertex.Tenant))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(vertex.ID))
+		_, _ = h.Write([]byte{0})
+		labels := make([]string, 0, len(vertex.Labels))
+		for _, label := range vertex.Labels {
+			normalized := label
+			if normalized == "" {
+				continue
+			}
+			labels = append(labels, normalized)
+		}
+		sort.Strings(labels)
+		for _, label := range labels {
+			_, _ = h.Write([]byte(label))
+			_, _ = h.Write([]byte{0})
+		}
+		if len(vertex.Properties) > 0 {
+			keys := make([]string, 0, len(vertex.Properties))
+			for key := range vertex.Properties {
+				normalized := key
+				if normalized == "" {
+					continue
+				}
+				keys = append(keys, normalized)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				_, _ = h.Write([]byte(key))
+				_, _ = h.Write([]byte{0})
+				_, _ = h.Write(vertex.Properties[key])
+				_, _ = h.Write([]byte{0})
+			}
+		}
+	}
+	return []byte(strconv.FormatUint(h.Sum64(), 16))
+}
+
+func edgePHash(edge *graph.Edge) []byte {
+	h := fnv.New64a()
+	if edge != nil {
+		_, _ = h.Write([]byte(edge.Tenant))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(edge.ID))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(edge.Type))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(edge.SrcID))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(edge.DstID))
+		_, _ = h.Write([]byte{0})
+		if len(edge.Properties) > 0 {
+			keys := make([]string, 0, len(edge.Properties))
+			for key := range edge.Properties {
+				normalized := key
+				if normalized == "" {
+					continue
+				}
+				keys = append(keys, normalized)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				_, _ = h.Write([]byte(key))
+				_, _ = h.Write([]byte{0})
+				_, _ = h.Write(edge.Properties[key])
+				_, _ = h.Write([]byte{0})
+			}
+		}
+	}
+	return []byte(strconv.FormatUint(h.Sum64(), 16))
+}
+
+func normalizedLabelsOrdered(labels []string) []string {
+	out := make([]string, 0, len(labels))
+	seen := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		normalized := label
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	if len(out) == 0 {
+		return []string{"UNLABELED"}
+	}
+	return out
+}
+
+func labelSliceSet(labels []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		out[label] = struct{}{}
+	}
+	return out
+}
+
+func encodeVertexLabelOrder(order int, label string) []byte {
+	return []byte(fmt.Sprintf("%09d:%s", order, label))
+}
+
+func decodeVertexLabelOrder(raw []byte, label string) int {
+	text := string(raw)
+	if text == "" {
+		return 0
+	}
+	parts := strings.SplitN(text, ":", 2)
+	if len(parts) != 2 {
+		return 0
+	}
+	if parts[1] != label {
+		return 0
+	}
+	parsed, err := strconv.Atoi(parts[0])
+	if err != nil || parsed < 0 {
+		return 0
+	}
+	return parsed
 }
 
 func (t *tx) HasVertexLabel(ctx context.Context, tenant, vertexID, label string) (has bool, err error) {
@@ -475,13 +1087,7 @@ func (t *tx) HasVertexLabel(ctx context.Context, tenant, vertexID, label string)
 	if err := t.ensureActive(ctx); err != nil {
 		return false, err
 	}
-	tenant = strings.TrimSpace(tenant)
-	vertexID = strings.TrimSpace(vertexID)
-	label = strings.TrimSpace(label)
-	if tenant == "" || vertexID == "" || label == "" {
-		return false, graph.NewError(graph.ErrKindInvalidInput, "tenant, vertex id, and label are required", nil)
-	}
-	if _, err := t.get(keyspace.VertexLabelMembershipKey(tenant, label, vertexID)); err != nil {
+	if _, err := t.get(keyspace.VertexLabelKey(tenant, vertexID, label)); err != nil {
 		if graph.IsKind(err, graph.ErrKindNotFound) {
 			return false, nil
 		}
@@ -537,18 +1143,17 @@ func (t *tx) GetEdge(ctx context.Context, tenant, edgeID string) (edge *graph.Ed
 	if err := t.ensureActive(ctx); err != nil {
 		return nil, err
 	}
-	if tenant == "" || edgeID == "" {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "tenant and edge id are required", nil)
-	}
 	buf, err := t.get(keyspace.EdgeKey(tenant, edgeID))
 	if err != nil {
 		return nil, err
 	}
-	var e graph.Edge
-	if err := json.Unmarshal(buf, &e); err != nil {
-		return nil, graph.NewError(graph.ErrKindStorage, "decode edge", err)
+	if len(buf) == 0 {
+		return nil, graph.NewError(graph.ErrKindStorage, "decode edge phash", nil)
 	}
-	edge = &e
+	edge, err = t.loadEdgeByID(ctx, tenant, edgeID)
+	if err != nil {
+		return nil, err
+	}
 	return edge, nil
 }
 
@@ -556,23 +1161,14 @@ func (t *tx) getEdgeLink(ctx context.Context, tenant, edgeID string) (dstID stri
 	if err := t.ensureActive(ctx); err != nil {
 		return "", err
 	}
-	if tenant == "" || edgeID == "" {
-		return "", graph.NewError(graph.ErrKindInvalidInput, "tenant and edge id are required", nil)
-	}
-	buf, err := t.get(keyspace.EdgeKey(tenant, edgeID))
+	_, _, dstID, err = t.loadEdgeTypeAndEndpoints(ctx, tenant, edgeID)
 	if err != nil {
 		return "", err
 	}
-	var e struct {
-		DstID string
-	}
-	if err := json.Unmarshal(buf, &e); err != nil {
-		return "", graph.NewError(graph.ErrKindStorage, "decode edge link", err)
-	}
-	if strings.TrimSpace(e.DstID) == "" {
+	if dstID == "" {
 		return "", graph.NewError(graph.ErrKindStorage, "edge missing dst id", nil)
 	}
-	return e.DstID, nil
+	return dstID, nil
 }
 
 func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
@@ -582,14 +1178,26 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 	if err := t.ensureWrite(ctx); err != nil {
 		return err
 	}
-	if edge == nil || edge.Tenant == "" || edge.ID == "" || edge.SrcID == "" || edge.DstID == "" || edge.Type == "" {
-		return graph.NewError(graph.ErrKindInvalidInput, "edge tenant/id/src/dst/type are required", nil)
+	if edge == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "edge is required", nil)
 	}
 	t.lockEdgeForMutation(edge.Tenant, edge.ID)
 
-	previous, err := t.GetEdge(ctx, edge.Tenant, edge.ID)
+	existingHash, err := t.get(keyspace.EdgeKey(edge.Tenant, edge.ID))
+	previousExists := err == nil
 	if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 		return err
+	}
+	nextHash := edgePHash(edge)
+	if previousExists && bytes.Equal(existingHash, nextHash) {
+		return nil
+	}
+	var previous *graph.Edge
+	if previousExists {
+		previous, err = t.loadEdgeByID(ctx, edge.Tenant, edge.ID)
+		if err != nil {
+			return err
+		}
 	}
 	if previous == nil {
 		if err := t.addToCounter(keyspace.StatsEdgeTotalKey(edge.Tenant), 1); err != nil {
@@ -612,6 +1220,12 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 		}
 	}
 	if previous != nil {
+		if err := t.delete(keyspace.EdgeTypeKey(previous.Tenant, previous.ID, previous.Type), "delete stale edge type"); err != nil {
+			return err
+		}
+		if err := t.delete(keyspace.TypeEdgeKey(previous.Tenant, previous.Type, previous.ID), "delete stale type edge"); err != nil {
+			return err
+		}
 		if err := t.delete(keyspace.OutAdjacencyKey(previous.Tenant, previous.SrcID, previous.Type, previous.ID), "delete stale out adjacency"); err != nil {
 			return err
 		}
@@ -629,11 +1243,21 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 		}
 	}
 
-	buf, err := json.Marshal(edge)
-	if err != nil {
-		return graph.NewError(graph.ErrKindStorage, "encode edge", err)
+	if previousExists {
+		if err := t.deleteEdgePropertiesBySchema(ctx, edge.Tenant, edge.ID, ""); err != nil {
+			return err
+		}
 	}
-	if err := t.set(keyspace.EdgeKey(edge.Tenant, edge.ID), buf, "write edge"); err != nil {
+	if err := t.writeEdgeProperties(edge); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.EdgeKey(edge.Tenant, edge.ID), nextHash, "write edge"); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.EdgeTypeKey(edge.Tenant, edge.ID, edge.Type), []byte(edge.Type), "write edge type"); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.TypeEdgeKey(edge.Tenant, edge.Type, edge.ID), edgeEndpointsPayload(edge.SrcID, edge.DstID), "write type edge"); err != nil {
 		return err
 	}
 	if err := t.set(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), []byte(outAdjDstValuePrefix+edge.DstID), "write out adjacency"); err != nil {
@@ -661,9 +1285,6 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 	if err := t.ensureWrite(ctx); err != nil {
 		return err
 	}
-	if tenant == "" || edgeID == "" {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant and edge id are required", nil)
-	}
 	t.lockEdgeForMutation(tenant, edgeID)
 
 	edge, err := t.GetEdge(ctx, tenant, edgeID)
@@ -677,6 +1298,15 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 		return err
 	}
 	if err := t.delete(keyspace.EdgeKey(tenant, edgeID), "delete edge"); err != nil {
+		return err
+	}
+	if err := t.deleteEdgePropertiesBySchema(ctx, tenant, edgeID, ""); err != nil {
+		return err
+	}
+	if err := t.delete(keyspace.EdgeTypeKey(edge.Tenant, edge.ID, edge.Type), "delete edge type"); err != nil {
+		return err
+	}
+	if err := t.delete(keyspace.TypeEdgeKey(edge.Tenant, edge.Type, edge.ID), "delete type edge"); err != nil {
 		return err
 	}
 	if err := t.delete(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), "delete out adjacency"); err != nil {
@@ -701,13 +1331,6 @@ func (t *tx) adjustOutEndpointPairCount(tenant, srcID, edgeType, dstID string, d
 	if delta == 0 {
 		return nil
 	}
-	tenant = strings.TrimSpace(tenant)
-	srcID = strings.TrimSpace(srcID)
-	edgeType = strings.TrimSpace(edgeType)
-	dstID = strings.TrimSpace(dstID)
-	if tenant == "" || srcID == "" || edgeType == "" || dstID == "" {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, edge type, and dst id are required", nil)
-	}
 	key := keyspace.OutEndpointPairCountKey(tenant, srcID, edgeType, dstID)
 	current, _, err := t.readCounterMaybeMissing(key)
 	if err != nil {
@@ -726,13 +1349,6 @@ func (t *tx) adjustOutEndpointPairCount(tenant, srcID, edgeType, dstID string, d
 func (t *tx) adjustUndirectedEndpointPairCount(tenant, leftID, edgeType, rightID string, delta int) error {
 	if delta == 0 {
 		return nil
-	}
-	tenant = strings.TrimSpace(tenant)
-	leftID = strings.TrimSpace(leftID)
-	edgeType = strings.TrimSpace(edgeType)
-	rightID = strings.TrimSpace(rightID)
-	if tenant == "" || leftID == "" || edgeType == "" || rightID == "" {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant, left id, edge type, and right id are required", nil)
 	}
 	leftID, rightID = canonicalEndpointPair(leftID, rightID)
 	key := keyspace.UndirectedEndpointPairCountKey(tenant, leftID, edgeType, rightID)
@@ -764,8 +1380,8 @@ func (t *tx) ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, l
 	if err := t.ensureActive(ctx); err != nil {
 		return err
 	}
-	if tenant == "" || srcID == "" || fn == nil {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, and callback are required", nil)
+	if fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "callback is required", nil)
 	}
 	return t.scanAdjacency(ctx, keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType), limit, tenant, fn)
 }
@@ -777,8 +1393,8 @@ func (t *tx) ScanOutEdgeLinks(ctx context.Context, tenant, srcID, edgeType strin
 	if err := t.ensureActive(ctx); err != nil {
 		return err
 	}
-	if tenant == "" || srcID == "" || fn == nil {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, and callback are required", nil)
+	if fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "callback is required", nil)
 	}
 
 	prefix := keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType)
@@ -802,7 +1418,7 @@ func (t *tx) ScanOutEdgeLinks(ctx context.Context, tenant, srcID, edgeType strin
 		}
 		dstID := ""
 		if value := string(iter.Value()); strings.HasPrefix(value, outAdjDstValuePrefix) {
-			dstID = strings.TrimSpace(strings.TrimPrefix(value, outAdjDstValuePrefix))
+			dstID = strings.TrimPrefix(value, outAdjDstValuePrefix)
 		}
 		if dstID == "" {
 			var err error
@@ -832,17 +1448,17 @@ func (t *tx) ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string
 	if err := t.ensureActive(ctx); err != nil {
 		return err
 	}
-	if tenant == "" || strings.TrimSpace(edgeType) == "" || fn == nil {
+	if tenant == "" || edgeType == "" || fn == nil {
 		return graph.NewError(graph.ErrKindInvalidInput, "tenant, edge type, and callback are required", nil)
 	}
 
-	prefix := keyspace.OutAdjacencyTenantPrefix(tenant)
+	prefix := keyspace.TypeEdgePrefix(tenant, edgeType)
 	iter, err := t.reader.NewIter(&cpebble.IterOptions{
 		LowerBound: prefix,
 		UpperBound: prefixUpperBound(prefix),
 	})
 	if err != nil {
-		return graph.NewError(graph.ErrKindStorage, "create out edge link by-type iterator", err)
+		return graph.NewError(graph.ErrKindStorage, "create type-edge iterator", err)
 	}
 	defer iter.Close()
 
@@ -851,27 +1467,18 @@ func (t *tx) ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string
 		if err := checkCtx(ctx); err != nil {
 			return err
 		}
-		sourceID, keyEdgeType, ok := outAdjSourceAndTypeFromKey(iter.Key())
-		if !ok {
-			return graph.NewError(graph.ErrKindStorage, "malformed out adjacency key", nil)
-		}
-		if keyEdgeType != edgeType {
-			continue
-		}
 		edgeID := edgeIDFromAdjKey(iter.Key())
 		if edgeID == "" {
-			return graph.NewError(graph.ErrKindStorage, "malformed adjacency key", nil)
+			return graph.NewError(graph.ErrKindStorage, "malformed type-edge key", nil)
 		}
-		dstID := ""
-		if value := string(iter.Value()); strings.HasPrefix(value, outAdjDstValuePrefix) {
-			dstID = strings.TrimSpace(strings.TrimPrefix(value, outAdjDstValuePrefix))
-		}
-		if dstID == "" {
-			var err error
-			dstID, err = t.getEdgeLink(ctx, tenant, edgeID)
+		sourceID, dstID, ok := parseEdgeEndpointsPayload(iter.Value())
+		if !ok {
+			edge, err := t.GetEdge(ctx, tenant, edgeID)
 			if err != nil {
 				return err
 			}
+			sourceID = edge.SrcID
+			dstID = edge.DstID
 		}
 		if err := fn(sourceID, edgeID, dstID); err != nil {
 			return err
@@ -882,7 +1489,107 @@ func (t *tx) ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string
 		}
 	}
 	if err := iter.Error(); err != nil {
-		return graph.NewError(graph.ErrKindStorage, "scan out edge links by type", err)
+		return graph.NewError(graph.ErrKindStorage, "scan type-edge links", err)
+	}
+	return nil
+}
+
+func (t *tx) ScanOutEdgeProperty(ctx context.Context, tenant, srcID, edgeType, property string, encodedValue []byte, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_out_edge_property", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "callback is required", nil)
+	}
+
+	stop := errors.New("scan out edge property limit reached")
+	seen := 0
+	if err := t.ScanOutEdgeLinks(ctx, tenant, srcID, edgeType, 0, func(edgeID, dstID string) error {
+		value, hasValue, err := t.edgePropertyValue(ctx, tenant, edgeID, edgeType, property)
+		if err != nil {
+			return err
+		}
+		if !hasValue || !bytes.Equal(value, encodedValue) {
+			return nil
+		}
+		entry := &graph.PropertyIndexEntry{
+			Tenant:      tenant,
+			Schema:      edgeType,
+			Property:    property,
+			Value:       append([]byte(nil), value...),
+			EntityID:    edgeID,
+			EntityClass: "edge",
+			EdgeSrcID:   srcID,
+			EdgeDstID:   dstID,
+		}
+		if err := fn(entry); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			return stop
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, stop) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (t *tx) ScanOutEdgePropertyNumericRange(ctx context.Context, tenant, srcID, edgeType, property string, lower float64, lowerSet bool, lowerInclusive bool, upper float64, upperSet bool, upperInclusive bool, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("scan_out_edge_property_numeric_range", err, started) }()
+
+	if err := t.ensureActive(ctx); err != nil {
+		return err
+	}
+	if fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "callback is required", nil)
+	}
+
+	stop := errors.New("scan out edge property numeric range limit reached")
+	seen := 0
+	if err := t.ScanOutEdgeLinks(ctx, tenant, srcID, edgeType, 0, func(edgeID, dstID string) error {
+		value, hasValue, err := t.edgePropertyValue(ctx, tenant, edgeID, edgeType, property)
+		if err != nil {
+			return err
+		}
+		if !hasValue {
+			return nil
+		}
+		numeric, ok := parseNumericPropertyValue(value)
+		if !ok || !numericValueInRange(numeric, lower, lowerSet, lowerInclusive, upper, upperSet, upperInclusive) {
+			return nil
+		}
+		entry := &graph.PropertyIndexEntry{
+			Tenant:      tenant,
+			Schema:      edgeType,
+			Property:    property,
+			Value:       append([]byte(nil), value...),
+			EntityID:    edgeID,
+			EntityClass: "edge",
+			EdgeSrcID:   srcID,
+			EdgeDstID:   dstID,
+		}
+		if err := fn(entry); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			return stop
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, stop) {
+			return nil
+		}
+		return err
 	}
 	return nil
 }
@@ -908,7 +1615,7 @@ func (t *tx) hasTypedOutEdgeBetweenLegacy(ctx context.Context, tenant, srcID, ds
 		}
 		edgeDstID := ""
 		if value := string(iter.Value()); strings.HasPrefix(value, outAdjDstValuePrefix) {
-			edgeDstID = strings.TrimSpace(strings.TrimPrefix(value, outAdjDstValuePrefix))
+			edgeDstID = strings.TrimPrefix(value, outAdjDstValuePrefix)
 		}
 		if edgeDstID == "" {
 			var err error
@@ -963,13 +1670,6 @@ func (t *tx) HasDirectedEdgeBetween(ctx context.Context, tenant, srcID, dstID, e
 	if err := t.ensureActive(ctx); err != nil {
 		return false, err
 	}
-	tenant = strings.TrimSpace(tenant)
-	srcID = strings.TrimSpace(srcID)
-	dstID = strings.TrimSpace(dstID)
-	edgeType = strings.TrimSpace(edgeType)
-	if tenant == "" || srcID == "" || dstID == "" || edgeType == "" {
-		return false, graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, dst id, and edge type are required", nil)
-	}
 	return t.HasDirectedEdgeBetweenFast(ctx, tenant, srcID, dstID, edgeType)
 }
 
@@ -996,13 +1696,6 @@ func (t *tx) HasUndirectedEdgeBetween(ctx context.Context, tenant, leftID, right
 	if err := t.ensureActive(ctx); err != nil {
 		return false, err
 	}
-	tenant = strings.TrimSpace(tenant)
-	leftID = strings.TrimSpace(leftID)
-	rightID = strings.TrimSpace(rightID)
-	edgeType = strings.TrimSpace(edgeType)
-	if tenant == "" || leftID == "" || rightID == "" || edgeType == "" {
-		return false, graph.NewError(graph.ErrKindInvalidInput, "tenant, left id, right id, and edge type are required", nil)
-	}
 	return t.HasUndirectedEdgeBetweenFast(ctx, tenant, leftID, rightID, edgeType)
 }
 
@@ -1026,6 +1719,56 @@ func (t *tx) ScanOutEdgeSourceIDs(ctx context.Context, tenant, edgeType string, 
 	}
 	if tenant == "" || fn == nil {
 		return graph.NewError(graph.ErrKindInvalidInput, "tenant and callback are required", nil)
+	}
+
+	if edgeType != "" {
+		prefix := keyspace.TypeEdgePrefix(tenant, edgeType)
+		iter, err := t.reader.NewIter(&cpebble.IterOptions{
+			LowerBound: prefix,
+			UpperBound: prefixUpperBound(prefix),
+		})
+		if err != nil {
+			return graph.NewError(graph.ErrKindStorage, "create type-edge source iterator", err)
+		}
+		defer iter.Close()
+
+		seen := 0
+		emitted := make(map[string]struct{})
+		for ok := iter.First(); ok; ok = iter.Next() {
+			if err := checkCtx(ctx); err != nil {
+				return err
+			}
+			sourceID, _, ok := parseEdgeEndpointsPayload(iter.Value())
+			if !ok {
+				edgeID := edgeIDFromAdjKey(iter.Key())
+				if edgeID == "" {
+					return graph.NewError(graph.ErrKindStorage, "malformed type-edge key", nil)
+				}
+				edge, err := t.GetEdge(ctx, tenant, edgeID)
+				if err != nil {
+					return err
+				}
+				sourceID = edge.SrcID
+			}
+			if sourceID == "" {
+				continue
+			}
+			if _, ok := emitted[sourceID]; ok {
+				continue
+			}
+			emitted[sourceID] = struct{}{}
+			if err := fn(sourceID); err != nil {
+				return err
+			}
+			seen++
+			if limit > 0 && seen >= limit {
+				break
+			}
+		}
+		if err := iter.Error(); err != nil {
+			return graph.NewError(graph.ErrKindStorage, "scan type-edge sources", err)
+		}
+		return nil
 	}
 
 	prefix := keyspace.OutAdjacencyTenantPrefix(tenant)
@@ -1077,8 +1820,8 @@ func (t *tx) ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string,
 	if err := t.ensureActive(ctx); err != nil {
 		return err
 	}
-	if tenant == "" || srcID == "" || fn == nil {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant, src id, and callback are required", nil)
+	if fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "callback is required", nil)
 	}
 	return t.scanAdjacencyEdgeIDs(ctx, keyspace.OutAdjacencyPrefix(tenant, srcID, edgeType), limit, fn)
 }
@@ -1090,8 +1833,8 @@ func (t *tx) ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, li
 	if err := t.ensureActive(ctx); err != nil {
 		return err
 	}
-	if tenant == "" || dstID == "" || fn == nil {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant, dst id, and callback are required", nil)
+	if fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "callback is required", nil)
 	}
 	return t.scanAdjacency(ctx, keyspace.InAdjacencyPrefix(tenant, dstID, edgeType), limit, tenant, fn)
 }
@@ -1104,8 +1847,8 @@ func (t *tx) ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, 
 	if err := t.ensureActive(ctx); err != nil {
 		return err
 	}
-	if tenant == "" || dstID == "" || fn == nil {
-		return graph.NewError(graph.ErrKindInvalidInput, "tenant, dst id, and callback are required", nil)
+	if fn == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "callback is required", nil)
 	}
 	return t.scanAdjacencyEdgeIDs(ctx, keyspace.InAdjacencyPrefix(tenant, dstID, edgeType), limit, fn)
 }
@@ -1290,6 +2033,22 @@ func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEnt
 	if err := t.set(key, propertyIndexPayload(entry), "write property index"); err != nil {
 		return err
 	}
+	if strings.EqualFold(entry.EntityClass, "vertex") {
+		if err := t.set(keyspace.VertexPropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, entry.Value), []byte(entry.EntityID), "write vertex property forward index"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.PropertyVertexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID), []byte(entry.EntityID), "write property vertex reverse index"); err != nil {
+			return err
+		}
+	}
+	if strings.EqualFold(entry.EntityClass, "edge") {
+		if err := t.set(keyspace.EdgePropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, entry.Value), []byte(entry.EntityID), "write edge property forward index"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.PropertyEdgeKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID), []byte(entry.EntityID), "write property edge reverse index"); err != nil {
+			return err
+		}
+	}
 	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
 		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.set(numericKey, numericPropertyIndexPayload(entry), "write numeric property index"); err != nil {
@@ -1324,6 +2083,22 @@ func (t *tx) DeletePropertyIndex(ctx context.Context, entry *graph.PropertyIndex
 	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID)
 	if err := t.delete(key, "delete property index"); err != nil {
 		return err
+	}
+	if strings.EqualFold(entry.EntityClass, "vertex") {
+		if err := t.delete(keyspace.VertexPropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, entry.Value), "delete vertex property forward index"); err != nil {
+			return err
+		}
+		if err := t.delete(keyspace.PropertyVertexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID), "delete property vertex reverse index"); err != nil {
+			return err
+		}
+	}
+	if strings.EqualFold(entry.EntityClass, "edge") {
+		if err := t.delete(keyspace.EdgePropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, entry.Value), "delete edge property forward index"); err != nil {
+			return err
+		}
+		if err := t.delete(keyspace.PropertyEdgeKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID), "delete property edge reverse index"); err != nil {
+			return err
+		}
 	}
 	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
 		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
@@ -1549,7 +2324,7 @@ func (t *tx) readCounterMaybeMissing(key []byte) (value int, found bool, err err
 		}
 		return 0, false, err
 	}
-	parsed, parseErr := strconv.ParseInt(strings.TrimSpace(string(buf)), 10, 64)
+	parsed, parseErr := strconv.ParseInt(string(buf), 10, 64)
 	if parseErr != nil {
 		return 0, false, graph.NewError(graph.ErrKindStorage, "decode counter", parseErr)
 	}
@@ -1662,11 +2437,11 @@ func (t *tx) scanCounterMap(prefix []byte) (map[string]int, error) {
 		if !bytes.HasPrefix(key, prefix) {
 			continue
 		}
-		suffix := strings.TrimSpace(string(key[len(prefix):]))
+		suffix := string(key[len(prefix):])
 		if suffix == "" {
 			continue
 		}
-		value, parseErr := strconv.ParseInt(strings.TrimSpace(string(iter.Value())), 10, 64)
+		value, parseErr := strconv.ParseInt(string(iter.Value()), 10, 64)
 		if parseErr != nil {
 			return nil, graph.NewError(graph.ErrKindStorage, "decode counter", parseErr)
 		}
@@ -1693,7 +2468,7 @@ func (t *tx) collectStatsBackfillTenants() ([]string, error) {
 			if len(parts) < 2 {
 				continue
 			}
-			tenant := strings.TrimSpace(parts[1])
+			tenant := parts[1]
 			if tenant == "" {
 				continue
 			}
@@ -1719,7 +2494,7 @@ func (t *tx) collectStatsBackfillTenants() ([]string, error) {
 }
 
 func (t *tx) backfillTenantStats(ctx context.Context, tenant string) error {
-	if strings.TrimSpace(tenant) == "" {
+	if tenant == "" {
 		return nil
 	}
 	vertexTotal := 0
@@ -1750,12 +2525,16 @@ func (t *tx) backfillTenantStats(ctx context.Context, tenant string) error {
 		if err := checkCtx(ctx); err != nil {
 			return err
 		}
-		var edge graph.Edge
-		if err := json.Unmarshal(iter.Value(), &edge); err != nil {
-			return graph.NewError(graph.ErrKindStorage, "decode edge", err)
+		edgeID := edgeIDFromAdjKey(iter.Key())
+		if edgeID == "" {
+			return graph.NewError(graph.ErrKindStorage, "malformed edge key", nil)
+		}
+		edgeType, _, _, err := t.loadEdgeTypeAndEndpoints(ctx, tenant, edgeID)
+		if err != nil {
+			return err
 		}
 		edgeTotal++
-		edgeCounts[normalizedEdgeType(edge.Type)]++
+		edgeCounts[normalizedEdgeType(edgeType)]++
 	}
 	if err := iter.Error(); err != nil {
 		return graph.NewError(graph.ErrKindStorage, "scan edges", err)
@@ -1826,7 +2605,6 @@ func normalizedLabelSet(labels []string) map[string]struct{} {
 		return set
 	}
 	for _, label := range labels {
-		label = strings.TrimSpace(label)
 		if label == "" {
 			continue
 		}
@@ -1839,7 +2617,6 @@ func normalizedLabelSet(labels []string) map[string]struct{} {
 }
 
 func normalizedEdgeType(edgeType string) string {
-	edgeType = strings.TrimSpace(edgeType)
 	if edgeType == "" {
 		return "UNTYPED"
 	}
@@ -1870,7 +2647,7 @@ func (t *tx) loadCounterBaseMaybeMissing(key []byte) (value int, found bool, err
 		}
 		return 0, false, err
 	}
-	parsed, parseErr := strconv.ParseInt(strings.TrimSpace(string(buf)), 10, 64)
+	parsed, parseErr := strconv.ParseInt(string(buf), 10, 64)
 	if parseErr != nil {
 		return 0, false, graph.NewError(graph.ErrKindStorage, "decode counter", parseErr)
 	}
@@ -1962,16 +2739,34 @@ func edgeIDFromAdjKey(key []byte) string {
 
 func outAdjSourceAndTypeFromKey(key []byte) (sourceID string, edgeType string, ok bool) {
 	parts := bytes.Split(key, []byte{'/'})
-	if len(parts) != 6 {
+	if len(parts) < 5 {
 		return "", "", false
 	}
-	if !bytes.Equal(parts[0], []byte("a")) || !bytes.Equal(parts[1], []byte("out")) {
+	source := parts[len(parts)-3]
+	typ := parts[len(parts)-2]
+	if len(source) == 0 || len(typ) == 0 {
 		return "", "", false
 	}
-	if len(parts[3]) == 0 || len(parts[4]) == 0 {
+	return string(source), string(typ), true
+}
+
+func edgeEndpointsPayload(srcID, dstID string) []byte {
+	payload := make([]byte, 0, len(srcID)+len(dstID)+1)
+	payload = append(payload, srcID...)
+	payload = append(payload, 0)
+	payload = append(payload, dstID...)
+	return payload
+}
+
+func parseEdgeEndpointsPayload(payload []byte) (srcID, dstID string, ok bool) {
+	parts := bytes.Split(payload, []byte{0})
+	if len(parts) != 2 {
 		return "", "", false
 	}
-	return string(parts[3]), string(parts[4]), true
+	if len(parts[0]) == 0 || len(parts[1]) == 0 {
+		return "", "", false
+	}
+	return string(parts[0]), string(parts[1]), true
 }
 
 func vertexIDFromKey(key []byte) string {
@@ -2031,11 +2826,90 @@ func numericPropertyIndexEntryFromKey(key, payload []byte, tenant, schema, prope
 	}, nil
 }
 
+func edgePropertyPartsFromKey(key []byte) (schema, property string, encodedValue []byte, ok bool) {
+	parts := bytes.Split(key, []byte{'/'})
+	if len(parts) < 6 {
+		return "", "", nil, false
+	}
+	schema = string(parts[len(parts)-3])
+	property = string(parts[len(parts)-2])
+	valueHex := string(parts[len(parts)-1])
+	if schema == "" || property == "" {
+		return "", "", nil, false
+	}
+	decodedValue, err := hex.DecodeString(valueHex)
+	if err != nil {
+		return "", "", nil, false
+	}
+	return schema, property, decodedValue, true
+}
+
+func (t *tx) edgePropertyValue(ctx context.Context, tenant, edgeID, schema, property string) ([]byte, bool, error) {
+	prefix := keyspace.EdgePropertyPrefix(tenant, edgeID, schema, property)
+	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
+	if err != nil {
+		return nil, false, graph.NewError(graph.ErrKindStorage, "create edge property iterator", err)
+	}
+	defer iter.Close()
+
+	for ok := iter.First(); ok; ok = iter.Next() {
+		if err := checkCtx(ctx); err != nil {
+			return nil, false, err
+		}
+		keySchema, keyProperty, encodedValue, ok := edgePropertyPartsFromKey(iter.Key())
+		if !ok {
+			return nil, false, graph.NewError(graph.ErrKindStorage, "malformed edge property key", nil)
+		}
+		if keySchema != schema || keyProperty != property {
+			continue
+		}
+		return encodedValue, true, nil
+	}
+	if err := iter.Error(); err != nil {
+		return nil, false, graph.NewError(graph.ErrKindStorage, "scan edge properties", err)
+	}
+	return nil, false, nil
+}
+
+func parseNumericPropertyValue(raw []byte) (float64, bool) {
+	text := string(raw)
+	if text == "" {
+		return 0, false
+	}
+	numeric, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(numeric) {
+		return 0, false
+	}
+	return numeric, true
+}
+
+func numericValueInRange(value, lower float64, lowerSet, lowerInclusive bool, upper float64, upperSet, upperInclusive bool) bool {
+	if lowerSet {
+		if lowerInclusive {
+			if value < lower {
+				return false
+			}
+		} else if value <= lower {
+			return false
+		}
+	}
+	if upperSet {
+		if upperInclusive {
+			if value > upper {
+				return false
+			}
+		} else if value >= upper {
+			return false
+		}
+	}
+	return true
+}
+
 func propertyIndexPayload(entry *graph.PropertyIndexEntry) []byte {
 	if entry == nil {
 		return nil
 	}
-	if strings.TrimSpace(entry.EdgeSrcID) == "" && strings.TrimSpace(entry.EdgeDstID) == "" {
+	if entry.EdgeSrcID == "" && entry.EdgeDstID == "" {
 		return []byte(entry.EntityClass)
 	}
 	payload := make([]byte, 0, len(entry.EntityClass)+len(entry.EdgeSrcID)+len(entry.EdgeDstID)+3)
@@ -2076,7 +2950,7 @@ func parsePropertyIndexPayload(payload []byte) (string, string, string, error) {
 	if len(parts) > 2 {
 		edgeDstID = string(parts[2])
 	}
-	if strings.TrimSpace(entityClass) == "" {
+	if entityClass == "" {
 		return "", "", "", graph.NewError(graph.ErrKindStorage, "property index payload missing entity class", nil)
 	}
 	return entityClass, edgeSrcID, edgeDstID, nil
@@ -2093,7 +2967,7 @@ func parseNumericPropertyIndexPayload(payload []byte) (string, string, string, [
 		edgeSrcID := string(parts[1])
 		edgeDstID := string(parts[2])
 		rawValue := append([]byte(nil), parts[3]...)
-		if strings.TrimSpace(entityClass) == "" {
+		if entityClass == "" {
 			return "", "", "", nil, graph.NewError(graph.ErrKindStorage, "numeric property index payload missing entity class", nil)
 		}
 		return entityClass, edgeSrcID, edgeDstID, rawValue, nil
@@ -2105,14 +2979,14 @@ func parseNumericPropertyIndexPayload(payload []byte) (string, string, string, [
 	}
 	entityClass := string(payload[:sep])
 	rawValue := append([]byte(nil), payload[sep+1:]...)
-	if strings.TrimSpace(entityClass) == "" {
+	if entityClass == "" {
 		return "", "", "", nil, graph.NewError(graph.ErrKindStorage, "numeric property index payload missing entity class", nil)
 	}
 	return entityClass, "", "", rawValue, nil
 }
 
 func numericOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
-	text := strings.TrimSpace(string(raw))
+	text := string(raw)
 	if text == "" {
 		return nil, false
 	}
@@ -2124,7 +2998,7 @@ func numericOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
 }
 
 func booleanOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
-	text := strings.TrimSpace(string(raw))
+	text := string(raw)
 	switch text {
 	case "false":
 		return orderedBoolBytes(false), true
@@ -2140,7 +3014,7 @@ func datetimeOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	if !strings.EqualFold(strings.TrimSpace(fmt.Sprint(temporal["__temporal_type"])), "datetime") {
+	if !strings.EqualFold(fmt.Sprint(temporal["__temporal_type"]), "datetime") {
 		return nil, false
 	}
 	t, ok := storedTemporalDateTime(temporal)
@@ -2207,11 +3081,10 @@ func datetimePropertyIndexEntryFromKey(key, payload []byte, tenant, schema, prop
 }
 
 func parseStoredMapString(raw string) (map[string]any, bool) {
-	raw = strings.TrimSpace(raw)
 	if !strings.HasPrefix(raw, "map[") || !strings.HasSuffix(raw, "]") {
 		return nil, false
 	}
-	body := strings.TrimSpace(raw[len("map[") : len(raw)-1])
+	body := raw[len("map[") : len(raw)-1]
 	if body == "" {
 		return map[string]any{}, true
 	}
@@ -2246,7 +3119,7 @@ func storedTemporalDateTime(src map[string]any) (time.Time, bool) {
 
 	loc := time.UTC
 	if tzRaw, ok := src["timezone"]; ok {
-		tz := strings.TrimSpace(fmt.Sprint(tzRaw))
+		tz := fmt.Sprint(tzRaw)
 		if tz != "" {
 			if offset, err := parseOffsetSeconds(tz); err == nil {
 				loc = time.FixedZone("", offset)
@@ -2269,7 +3142,7 @@ func storedMapInt(value map[string]any, key string) (int, bool) {
 	}
 	switch typed := raw.(type) {
 	case string:
-		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
+		parsed, err := strconv.Atoi(typed)
 		if err != nil {
 			return 0, false
 		}
@@ -2286,7 +3159,6 @@ func storedMapInt(value map[string]any, key string) (int, bool) {
 }
 
 func parseOffsetSeconds(raw string) (int, error) {
-	raw = strings.TrimSpace(raw)
 	if raw == "" || strings.EqualFold(raw, "Z") {
 		return 0, nil
 	}

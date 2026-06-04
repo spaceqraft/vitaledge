@@ -388,9 +388,74 @@ func grpcProtoParamsToExecutorParams(protoParams map[string]*v1.Value) (executor
 		if err != nil {
 			return nil, fmt.Errorf("parameter %q: %w", k, err)
 		}
+		if err := grpcValidateBoundaryParam(k, k, converted); err != nil {
+			return nil, err
+		}
 		params[k] = converted
 	}
 	return params, nil
+}
+
+func grpcValidateBoundaryParam(path, key string, value any) error {
+	if path == "" {
+		path = key
+	}
+	idLike := grpcParamKeyLooksLikeID(key)
+	if value == nil {
+		if idLike {
+			return fmt.Errorf("parameter %q must be a non-empty string identifier", path)
+		}
+		return nil
+	}
+
+	switch typed := value.(type) {
+	case string:
+		if !idLike {
+			return nil
+		}
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return fmt.Errorf("parameter %q must be a non-empty string identifier", path)
+		}
+		if trimmed != typed {
+			return fmt.Errorf("parameter %q must not include surrounding whitespace", path)
+		}
+		return nil
+	case []any:
+		for idx, item := range typed {
+			if err := grpcValidateBoundaryParam(fmt.Sprintf("%s[%d]", path, idx), key, item); err != nil {
+				return err
+			}
+		}
+		return nil
+	case map[string]any:
+		for childKey, item := range typed {
+			childPath := childKey
+			if path != "" {
+				childPath = path + "." + childKey
+			}
+			if err := grpcValidateBoundaryParam(childPath, key, item); err != nil {
+				return err
+			}
+		}
+		if idLike {
+			return fmt.Errorf("parameter %q must be a string identifier", path)
+		}
+		return nil
+	default:
+		if idLike {
+			return fmt.Errorf("parameter %q must be a string identifier, provided typed: %T, value: %v", path, value, value)
+		}
+		return nil
+	}
+}
+
+func grpcParamKeyLooksLikeID(key string) bool {
+	lower := strings.ToLower(key)
+	lower = strings.ReplaceAll(lower, "_", "")
+	lower = strings.ReplaceAll(lower, "-", "")
+	lower = strings.ReplaceAll(lower, ".", "")
+	return lower == "id" || strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "ids")
 }
 
 func grpcProtoValueToAny(v *v1.Value) (any, error) {

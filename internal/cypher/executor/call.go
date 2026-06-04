@@ -479,9 +479,17 @@ func (e *Executor) builtinEdgeCountProcedure(ctx context.Context, args []any, pa
 			ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
 			ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
 		}
+		type labelVertexIDScannerTx interface {
+			ScanVertexIDsByLabel(ctx context.Context, tenant, label string, limit int, fn func(string) error) error
+		}
 
 		if label == "" {
 			if scanner, ok := tx.(edgeIDScannerTx); ok {
+				e.warnScanFallbackOnce(
+					"builtinEdgeCountProcedure:unlabeled:vertex_scan_with_edge_id_scan",
+					"builtinEdgeCountProcedure using ScanVertices for unlabeled edge count with edge-id scan tenant=%s",
+					tenant,
+				)
 				return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 					if vertex == nil {
 						return nil
@@ -492,6 +500,11 @@ func (e *Executor) builtinEdgeCountProcedure(ctx context.Context, args []any, pa
 					})
 				})
 			}
+			e.warnScanFallbackOnce(
+				"builtinEdgeCountProcedure:unlabeled:vertex_scan_with_edge_scan",
+				"builtinEdgeCountProcedure using ScanVertices+ScanOutEdges for unlabeled edge count tenant=%s",
+				tenant,
+			)
 			return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 				if vertex == nil {
 					return nil
@@ -506,6 +519,26 @@ func (e *Executor) builtinEdgeCountProcedure(ctx context.Context, args []any, pa
 		}
 
 		if scanner, ok := tx.(edgeIDScannerTx); ok {
+			if byLabel, byLabelOK := tx.(labelVertexIDScannerTx); byLabelOK {
+				return byLabel.ScanVertexIDsByLabel(ctx, tenant, label, 0, func(vertexID string) error {
+					if err := scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, "", 0, func(edgeID string) error {
+						edgeIDs[edgeID] = struct{}{}
+						return nil
+					}); err != nil {
+						return err
+					}
+					return scanner.ScanInEdgeIDs(ctx, tenant, vertexID, "", 0, func(edgeID string) error {
+						edgeIDs[edgeID] = struct{}{}
+						return nil
+					})
+				})
+			}
+			e.warnScanFallbackOnce(
+				"builtinEdgeCountProcedure:labeled:vertex_scan_with_edge_id_scan",
+				"builtinEdgeCountProcedure using ScanVertices for labeled edge count with edge-id scan tenant=%s label=%s",
+				tenant,
+				label,
+			)
 			return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 				if !vertexHasLabel(vertex, label) {
 					return nil
@@ -523,6 +556,12 @@ func (e *Executor) builtinEdgeCountProcedure(ctx context.Context, args []any, pa
 			})
 		}
 
+		e.warnScanFallbackOnce(
+			"builtinEdgeCountProcedure:labeled:vertex_scan_with_edge_scan",
+			"builtinEdgeCountProcedure using ScanVertices with in/out edge scans tenant=%s label=%s",
+			tenant,
+			label,
+		)
 		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 			if !vertexHasLabel(vertex, label) {
 				return nil
@@ -600,6 +639,23 @@ func (e *Executor) builtinVertexCountProcedure(ctx context.Context, args []any, 
 
 	count := 0
 	err = e.store.View(ctx, func(tx graph.Tx) error {
+		type labelVertexIDScannerTx interface {
+			ScanVertexIDsByLabel(ctx context.Context, tenant, label string, limit int, fn func(string) error) error
+		}
+		if label != "" {
+			if byLabel, ok := tx.(labelVertexIDScannerTx); ok {
+				return byLabel.ScanVertexIDsByLabel(ctx, tenant, label, 0, func(string) error {
+					count++
+					return nil
+				})
+			}
+			e.warnScanFallbackOnce(
+				"builtinVertexCountProcedure:labeled:vertex_scan",
+				"builtinVertexCountProcedure using ScanVertices for labeled vertex count tenant=%s label=%s",
+				tenant,
+				label,
+			)
+		}
 		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 			if vertex == nil {
 				return nil

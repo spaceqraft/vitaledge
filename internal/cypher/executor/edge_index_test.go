@@ -1688,7 +1688,7 @@ func TestRecommendationStage2EdgeIndexPushdownAdaptiveSkipsUnselectiveWorkload(t
 	if err != nil {
 		t.Fatalf("runtime counters parse failed: %v", err)
 	}
-	if counters["fast_path.stage2.index_pushdown_skipped_unselective"] <= 0 && counters["fast_path.stage2.index_pushdown_skipped_predicate_shape"] <= 0 {
+	if counters["fast_path.stage2.index_pushdown_skipped_unselective"] <= 0 && counters["fast_path.stage2.index_pushdown_skipped_predicate_shape"] <= 0 && counters["fast_path.stage2.index_pushdown_skipped_probe_cap"] <= 0 && counters["fast_path.stage2.index_pushdown_skipped_wide_non_range"] <= 0 {
 		t.Fatalf("expected adaptive skip counter > 0, got %#v", counters)
 	}
 	if counters["fast_path.stage2.index_pushdown_applied"] != 0 {

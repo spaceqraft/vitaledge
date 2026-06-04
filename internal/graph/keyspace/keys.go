@@ -1,167 +1,258 @@
 package keyspace
 
-import "fmt"
+import (
+	"encoding/hex"
+	"strings"
+)
 
 const (
 	vertexPrefix           = "v"
 	edgePrefix             = "e"
-	outPrefix              = "a/out"
-	outEndpointPrefix      = "a/out_ep"
-	outEndpointCountPrefix = "a/out_epc"
-	undEndpointCountPrefix = "a/und_epc"
-	inPrefix               = "a/in"
-	indexPrefix            = "i"
-	indexNumPrefix         = "in"
+	vertexLabelPrefix      = "vl"
+	labelVertexPrefix      = "lv"
+	edgeTypePrefix         = "et"
+	typeEdgePrefix         = "te"
+	vertexPropertyPrefix   = "vp"
+	propertyVertexPrefix   = "pv"
+	edgePropertyPrefix     = "ep"
+	propertyEdgePrefix     = "pe"
+	outPrefix              = "rf"
+	outEndpointPrefix      = "od"
+	outEndpointCountPrefix = "odc"
+	undEndpointCountPrefix = "udc"
+	inPrefix               = "rt"
+	indexPrefix            = "pi"
+	indexNumPrefix         = "pn"
 	statsPrefix            = "s"
 	metaPrefix             = "m"
 )
 
 func VertexKey(tenant, vertexID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s", vertexPrefix, tenant, vertexID))
+	return buildKey(vertexPrefix, tenant, vertexID)
 }
 
 func VertexPrefix(tenant string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/", vertexPrefix, tenant))
+	return buildPrefix(vertexPrefix, tenant)
 }
 
 func VertexLabelMembershipKey(tenant, label, vertexID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s", vertexPrefix+"l", tenant, label, vertexID))
+	return LabelVertexKey(tenant, label, vertexID)
+}
+
+func VertexLabelKey(tenant, vertexID, label string) []byte {
+	return buildKey(vertexLabelPrefix, tenant, vertexID, label)
+}
+
+func LabelVertexKey(tenant, label, vertexID string) []byte {
+	return buildKey(labelVertexPrefix, tenant, label, vertexID)
+}
+
+func VertexLabelPrefix(tenant, vertexID string) []byte {
+	return buildPrefix(vertexLabelPrefix, tenant, vertexID)
+}
+
+func LabelVertexPrefix(tenant, label string) []byte {
+	return buildPrefix(labelVertexPrefix, tenant, label)
 }
 
 func EdgeKey(tenant, edgeID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s", edgePrefix, tenant, edgeID))
+	return buildKey(edgePrefix, tenant, edgeID)
 }
 
 func EdgePrefix(tenant string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/", edgePrefix, tenant))
+	return buildPrefix(edgePrefix, tenant)
+}
+
+func EdgeTypeKey(tenant, edgeID, edgeType string) []byte {
+	return buildKey(edgeTypePrefix, tenant, edgeID, edgeType)
+}
+
+func EdgeTypePrefix(tenant, edgeID string) []byte {
+	return buildPrefix(edgeTypePrefix, tenant, edgeID)
+}
+
+func TypeEdgeKey(tenant, edgeType, edgeID string) []byte {
+	return buildKey(typeEdgePrefix, tenant, edgeType, edgeID)
+}
+
+func TypeEdgePrefix(tenant, edgeType string) []byte {
+	return buildPrefix(typeEdgePrefix, tenant, edgeType)
 }
 
 func OutAdjacencyKey(tenant, srcID, edgeType, edgeID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s", outPrefix, tenant, srcID, edgeType, edgeID))
+	return buildKey(outPrefix, tenant, srcID, edgeType, edgeID)
 }
 
 func OutAdjacencyPrefix(tenant, srcID, edgeType string) []byte {
 	if edgeType == "" {
-		return []byte(fmt.Sprintf("%s/%s/%s/", outPrefix, tenant, srcID))
+		return buildPrefix(outPrefix, tenant, srcID)
 	}
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/", outPrefix, tenant, srcID, edgeType))
+	return buildPrefix(outPrefix, tenant, srcID, edgeType)
 }
 
 func OutAdjacencyTenantPrefix(tenant string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/", outPrefix, tenant))
+	return buildPrefix(outPrefix, tenant)
 }
 
 func OutEndpointKey(tenant, srcID, edgeType, dstID, edgeID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s/%s", outEndpointPrefix, tenant, srcID, edgeType, dstID, edgeID))
+	return buildKey(outEndpointPrefix, tenant, srcID, edgeType, dstID, edgeID)
 }
 
 func OutEndpointPrefix(tenant, srcID, edgeType, dstID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s/", outEndpointPrefix, tenant, srcID, edgeType, dstID))
+	return buildPrefix(outEndpointPrefix, tenant, srcID, edgeType, dstID)
 }
 
 func OutEndpointPairCountKey(tenant, srcID, edgeType, dstID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s", outEndpointCountPrefix, tenant, srcID, edgeType, dstID))
+	return buildKey(outEndpointCountPrefix, tenant, srcID, edgeType, dstID)
 }
 
 func UndirectedEndpointPairCountKey(tenant, leftID, edgeType, rightID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s", undEndpointCountPrefix, tenant, leftID, edgeType, rightID))
+	return buildKey(undEndpointCountPrefix, tenant, leftID, edgeType, rightID)
 }
 
 func InAdjacencyKey(tenant, dstID, edgeType, edgeID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%s", inPrefix, tenant, dstID, edgeType, edgeID))
+	return buildKey(inPrefix, tenant, dstID, edgeType, edgeID)
 }
 
 func InAdjacencyPrefix(tenant, dstID, edgeType string) []byte {
 	if edgeType == "" {
-		return []byte(fmt.Sprintf("%s/%s/%s/", inPrefix, tenant, dstID))
+		return buildPrefix(inPrefix, tenant, dstID)
 	}
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/", inPrefix, tenant, dstID, edgeType))
+	return buildPrefix(inPrefix, tenant, dstID, edgeType)
+}
+
+func InAdjacencyTenantPrefix(tenant string) []byte {
+	return buildPrefix(inPrefix, tenant)
+}
+
+func VertexPropertyKey(tenant, vertexID, schema, property string, encodedValue []byte) []byte {
+	return buildKey(vertexPropertyPrefix, tenant, vertexID, schema, property, hex.EncodeToString(encodedValue))
+}
+
+func VertexPropertyPrefix(tenant, vertexID, schema, property string) []byte {
+	return buildPrefix(vertexPropertyPrefix, tenant, vertexID, schema, property)
+}
+
+func PropertyVertexKey(tenant, schema, property string, encodedValue []byte, vertexID string) []byte {
+	return buildKey(propertyVertexPrefix, tenant, schema, property, hex.EncodeToString(encodedValue), vertexID)
+}
+
+func PropertyVertexPrefix(tenant, schema, property string) []byte {
+	return buildPrefix(propertyVertexPrefix, tenant, schema, property)
+}
+
+func EdgePropertyKey(tenant, edgeID, schema, property string, encodedValue []byte) []byte {
+	return buildKey(edgePropertyPrefix, tenant, edgeID, schema, property, hex.EncodeToString(encodedValue))
+}
+
+func EdgePropertyPrefix(tenant, edgeID, schema, property string) []byte {
+	return buildPrefix(edgePropertyPrefix, tenant, edgeID, schema, property)
+}
+
+func EdgePropertyEntityPrefix(tenant, edgeID string) []byte {
+	return buildPrefix(edgePropertyPrefix, tenant, edgeID)
+}
+
+func PropertyEdgeKey(tenant, schema, property string, encodedValue []byte, edgeID string) []byte {
+	return buildKey(propertyEdgePrefix, tenant, schema, property, hex.EncodeToString(encodedValue), edgeID)
+}
+
+func PropertyEdgePrefix(tenant, schema, property string) []byte {
+	return buildPrefix(propertyEdgePrefix, tenant, schema, property)
 }
 
 func PropertyIndexKey(tenant, schema, property string, encodedValue []byte, entityID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/%s", indexPrefix, tenant, schema, property, encodedValue, entityID))
+	return buildKey(indexPrefix, tenant, schema, property, hex.EncodeToString(encodedValue), entityID)
 }
 
 func PropertyIndexPrefix(tenant, schema, property string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexPrefix, tenant, schema, property))
+	return buildPrefix(indexPrefix, tenant, schema, property)
 }
 
 func PropertyIndexValuePrefix(tenant, schema, property string, encodedValue []byte) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexPrefix, tenant, schema, property, encodedValue))
+	return buildPrefix(indexPrefix, tenant, schema, property, hex.EncodeToString(encodedValue))
 }
 
 func PropertyIndexNumericPrefix(tenant, schema, property string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexNumPrefix, tenant, schema, property))
+	return buildPrefix(indexNumPrefix, tenant, schema, property)
 }
 
 func PropertyIndexBooleanPrefix(tenant, schema, property string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexPrefix+"b", tenant, schema, property))
+	return buildPrefix(indexPrefix+"b", tenant, schema, property)
 }
 
 func PropertyIndexBooleanKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/%s", indexPrefix+"b", tenant, schema, property, orderedValue, entityID))
+	return buildKey(indexPrefix+"b", tenant, schema, property, hex.EncodeToString(orderedValue), entityID)
 }
 
 func PropertyIndexBooleanValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexPrefix+"b", tenant, schema, property, orderedValue))
+	return buildPrefix(indexPrefix+"b", tenant, schema, property, hex.EncodeToString(orderedValue))
 }
 
 func PropertyIndexBooleanValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/\xff", indexPrefix+"b", tenant, schema, property, orderedValue))
+	return append(PropertyIndexBooleanValuePrefix(tenant, schema, property, orderedValue), 0xFF)
 }
 
 func PropertyIndexDateTimePrefix(tenant, schema, property string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/", indexPrefix+"t", tenant, schema, property))
+	return buildPrefix(indexPrefix+"t", tenant, schema, property)
 }
 
 func PropertyIndexDateTimeKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/%s", indexPrefix+"t", tenant, schema, property, orderedValue, entityID))
+	return buildKey(indexPrefix+"t", tenant, schema, property, hex.EncodeToString(orderedValue), entityID)
 }
 
 func PropertyIndexDateTimeValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexPrefix+"t", tenant, schema, property, orderedValue))
+	return buildPrefix(indexPrefix+"t", tenant, schema, property, hex.EncodeToString(orderedValue))
 }
 
 func PropertyIndexDateTimeValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/\xff", indexPrefix+"t", tenant, schema, property, orderedValue))
+	return append(PropertyIndexDateTimeValuePrefix(tenant, schema, property, orderedValue), 0xFF)
 }
 
 func PropertyIndexNumericKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/%s", indexNumPrefix, tenant, schema, property, orderedValue, entityID))
+	return buildKey(indexNumPrefix, tenant, schema, property, hex.EncodeToString(orderedValue), entityID)
 }
 
 func PropertyIndexNumericValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/", indexNumPrefix, tenant, schema, property, orderedValue))
+	return buildPrefix(indexNumPrefix, tenant, schema, property, hex.EncodeToString(orderedValue))
 }
 
 func PropertyIndexNumericValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {
-	return []byte(fmt.Sprintf("%s/%s/%s/%s/%x/\xff", indexNumPrefix, tenant, schema, property, orderedValue))
+	return append(PropertyIndexNumericValuePrefix(tenant, schema, property, orderedValue), 0xFF)
 }
 
 func StatsVertexTotalKey(tenant string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/vertex_total", statsPrefix, tenant))
+	return buildKey(statsPrefix, tenant, "vertex_total")
 }
 
 func StatsEdgeTotalKey(tenant string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/edge_total", statsPrefix, tenant))
+	return buildKey(statsPrefix, tenant, "edge_total")
 }
 
 func StatsVertexLabelCountKey(tenant, label string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/label/%s", statsPrefix, tenant, label))
+	return buildKey(statsPrefix, tenant, "label", label)
 }
 
 func StatsVertexLabelPrefix(tenant string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/label/", statsPrefix, tenant))
+	return buildPrefix(statsPrefix, tenant, "label")
 }
 
 func StatsEdgeTypeCountKey(tenant, edgeType string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/edge_type/%s", statsPrefix, tenant, edgeType))
+	return buildKey(statsPrefix, tenant, "edge_type", edgeType)
 }
 
 func StatsEdgeTypePrefix(tenant string) []byte {
-	return []byte(fmt.Sprintf("%s/%s/edge_type/", statsPrefix, tenant))
+	return buildPrefix(statsPrefix, tenant, "edge_type")
 }
 
 func SchemaVersionKey() []byte {
-	return []byte(fmt.Sprintf("%s/schema_version", metaPrefix))
+	return buildKey(metaPrefix, "schema_version")
+}
+
+func buildKey(parts ...string) []byte {
+	return []byte(strings.Join(parts, "/"))
+}
+
+func buildPrefix(parts ...string) []byte {
+	return []byte(strings.Join(parts, "/") + "/")
 }

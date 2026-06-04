@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"reflect"
 	"regexp"
@@ -120,6 +121,8 @@ type Executor struct {
 	indexJobWorkerOnce   sync.Once
 	indexJobWorkerMu     sync.Mutex
 	indexJobWorkerCancel context.CancelFunc
+
+	scanFallbackWarnings sync.Map
 }
 
 type fastPathFeedbackSummary struct {
@@ -249,6 +252,23 @@ func feedbackFloat64Value(values map[string]any, key string) float64 {
 	default:
 		return 0
 	}
+}
+
+func (e *Executor) warnScanFallbackOnce(key, format string, args ...any) {
+	if e == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = strings.TrimSpace(format)
+	}
+	if key == "" {
+		key = "scan_fallback"
+	}
+	if _, loaded := e.scanFallbackWarnings.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	log.Printf("WARN scan fallback: "+format, args...)
 }
 
 func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, params Params) (res *Result, err error) {

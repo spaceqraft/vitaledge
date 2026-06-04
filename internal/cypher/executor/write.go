@@ -104,6 +104,7 @@ const edgeRangeIndexCandidateLimit = 200000
 const stage2IndexPushdownMaxIndexedCandidates = 512
 const stage2IndexPushdownMaxIndexedCandidatesOneSidedRange = 2048
 const stage2IndexPushdownMaxAverageEdgesPerSource = 16
+const stage2IndexPushdownAdaptiveProbeEdgesPerSource = 4
 const stage2IndexPushdownProbeCandidateLimit = 1536
 const stage2IndexPushdownProbeCandidateLimitOneSidedRange = 4096
 const stage2IndexPushdownSourceScopedProbeMaxSources = 8
@@ -2328,7 +2329,8 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	stage2IndexPushdownDecisionCache := map[string]bool{}
 	stage2IndexPushdownUsed := false
 	stage2PredicateShapeSkipNoted := false
-	stage2SourceScopeSkipNoted := false
+	stage2SourceScopedPerPeerProbeNoted := false
+	stage2WideNonRangeProbeSkipNoted := false
 	stage2PredicateShapeEligible, stage2PredicateShapeDecisive := stage2IndexPushdownPredicateShapeDecision(pattern, matchSpec.Where, params)
 	stage2OneSidedNumericRangeEligible := stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, matchSpec.Where, nil, params)
 	stage2IndexProbeLimit := stage2IndexPushdownProbeCandidateLimit
@@ -2384,12 +2386,23 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	if len(stage2SourcePeerIDs) > 0 && len(stage2SourcePeerIDs) <= stage2IndexPushdownSourceScopedProbeMaxSources {
 		stage2ProbeSourceFilter = stage2SourcePeerIDs
 	}
+	if len(stage2SourcePeerIDs) > 0 {
+		adaptiveProbeLimit := len(stage2SourcePeerIDs) * stage2IndexPushdownAdaptiveProbeEdgesPerSource
+		if adaptiveProbeLimit < stage2IndexPushdownSourceScopedProbeMaxSources {
+			adaptiveProbeLimit = stage2IndexPushdownSourceScopedProbeMaxSources
+		}
+		if adaptiveProbeLimit > 0 && adaptiveProbeLimit < stage2IndexProbeLimit {
+			stage2IndexProbeLimit = adaptiveProbeLimit
+			e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_limit_adaptive_tightened", 1)
+		}
+	}
 	e.observeRuntimeCounter(params, "fast_path.stage2.peer_rows_input", int64(len(rows)))
 
 	collectPeerEdges := func(row Row, peer *graph.Vertex) ([]*graph.Edge, bool, error) {
 		if peer == nil || strings.TrimSpace(peer.ID) == "" {
 			return nil, false, nil
 		}
+		peerID := strings.TrimSpace(peer.ID)
 		collectStarted := time.Now()
 		defer e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_collect_peer_edges_micros", collectStarted)
 
@@ -2407,19 +2420,45 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 				if stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, matchSpec.Where, row, params) {
 					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_eligible_one_sided_range", 1)
 				}
+				rowHasNumericRangeShape := false
+				if constraints, ok := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params); ok {
+					for _, constraint := range constraints {
+						if constraint.isContradictory() {
+							rowHasNumericRangeShape = true
+							break
+						}
+						if constraint.lowerSet || constraint.upperSet {
+							rowHasNumericRangeShape = true
+							break
+						}
+					}
+				}
+				if len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources && !rowHasNumericRangeShape {
+					if !stage2WideNonRangeProbeSkipNoted {
+						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_wide_non_range", 1)
+						stage2WideNonRangeProbeSkipNoted = true
+					}
+					return nil, false, nil
+				}
 				cacheKey, cacheable := stage2IndexLookupCacheKey(pattern, matchSpec.Where, row, params)
 				if cacheable {
+					lookupCacheKey := cacheKey
+					probeSourceFilter := stage2ProbeSourceFilter
+					if probeSourceFilter == nil && len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources {
+						if !stage2SourceScopedPerPeerProbeNoted {
+							e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_source_scoped_per_peer", 1)
+							stage2SourceScopedPerPeerProbeNoted = true
+						}
+						lookupCacheKey = cacheKey + "|src=" + peerID
+						probeSourceFilter = map[string]struct{}{peerID: {}}
+					}
 					lookupByIndex := false
-					if cachedLookup, ok := stage2IndexPushdownDecisionCache[cacheKey]; ok {
+					if cachedLookup, ok := stage2IndexPushdownDecisionCache[lookupCacheKey]; ok {
 						lookupByIndex = cachedLookup
 						e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_hits", 1)
 					} else {
 						e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_misses", 1)
-						if stage2ProbeSourceFilter == nil && len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources && !stage2SourceScopeSkipNoted {
-							e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_source_scope_skipped_wide", 1)
-							stage2SourceScopeSkipNoted = true
-						}
-						edges, indexed, probeCapExceeded, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, matchSpec.Where, "", row, params, stage2ProbeSourceFilter, stage2IndexProbeLimit)
+						edges, indexed, probeCapExceeded, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, matchSpec.Where, "", row, params, probeSourceFilter, stage2IndexProbeLimit)
 						if err != nil {
 							return nil, false, err
 						}
@@ -2443,12 +2482,12 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 							e.observeRuntimeCounter(params, "fast_path.stage2.index_candidates_total", int64(totalCandidates))
 							applyPushdown = shouldApplyStage2IndexPushdown(edgesBySource)
 							if applyPushdown {
-								stage2IndexedEdgeCache[cacheKey] = edgesBySource
+								stage2IndexedEdgeCache[lookupCacheKey] = edgesBySource
 							} else {
 								e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_unselective", 1)
 							}
 						}
-						stage2IndexPushdownDecisionCache[cacheKey] = applyPushdown
+						stage2IndexPushdownDecisionCache[lookupCacheKey] = applyPushdown
 						lookupByIndex = applyPushdown
 					}
 					if lookupByIndex {
@@ -2457,7 +2496,7 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 							stage2IndexPushdownUsed = true
 						}
 						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_rows", 1)
-						indexedEdges := stage2IndexedEdgeCache[cacheKey][peer.ID]
+						indexedEdges := stage2IndexedEdgeCache[lookupCacheKey][peerID]
 						return append([]*graph.Edge(nil), indexedEdges...), true, nil
 					}
 				}
@@ -7829,6 +7868,22 @@ func (e *Executor) resolveVertexPatternCandidates(ctx context.Context, tx graph.
 		return matches, nil
 	}
 
+	if matches, ok, err := e.lookupVertexPatternCandidatesByLabelIndex(ctx, tx, tenant, pattern, params, row); err != nil {
+		return nil, err
+	} else if ok {
+		return matches, nil
+	}
+
+	e.warnScanFallbackOnce(
+		fmt.Sprintf("resolveVertexPatternCandidates:scan:%s:%s:%s", tenant, strings.Join(nonEmptyUniqueStrings(pattern.AllOfLabels), ","), strings.Join(nonEmptyUniqueStrings(pattern.AnyOfLabels), ",")),
+		"resolveVertexPatternCandidates using ScanVertices fallback tenant=%s var=%s labels_all=%d labels_any=%d has_props=%t",
+		tenant,
+		pattern.Var,
+		len(pattern.AllOfLabels),
+		len(pattern.AnyOfLabels),
+		strings.TrimSpace(pattern.PropertiesRaw) != "",
+	)
+
 	out := make([]*graph.Vertex, 0)
 	if err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 		if vertexPatternMatches(vertex, pattern, params, row) {
@@ -7839,6 +7894,96 @@ func (e *Executor) resolveVertexPatternCandidates(ctx context.Context, tx graph.
 		return nil, err
 	}
 	return out, nil
+}
+
+func (e *Executor) lookupVertexPatternCandidatesByLabelIndex(ctx context.Context, tx graph.Tx, tenant string, pattern vertexPattern, params Params, row Row) ([]*graph.Vertex, bool, error) {
+	type labelVertexScannerTx interface {
+		ScanVerticesByLabel(ctx context.Context, tenant, label string, limit int, fn func(*graph.Vertex) error) error
+	}
+
+	scanner, ok := tx.(labelVertexScannerTx)
+	if !ok {
+		return nil, false, nil
+	}
+
+	allOf := nonEmptyUniqueStrings(pattern.AllOfLabels)
+	anyOf := nonEmptyUniqueStrings(pattern.AnyOfLabels)
+	if len(allOf) == 0 && len(anyOf) == 0 {
+		return nil, false, nil
+	}
+
+	anchorLabels := make([]string, 0)
+	if len(allOf) > 0 {
+		anchor := chooseAnchorLabel(allOf)
+		if anchor == "" {
+			return nil, false, nil
+		}
+		anchorLabels = append(anchorLabels, anchor)
+	} else {
+		anchorLabels = append(anchorLabels, anyOf...)
+	}
+
+	seen := make(map[string]struct{})
+	matches := make([]*graph.Vertex, 0)
+	for _, label := range anchorLabels {
+		if label == "" {
+			continue
+		}
+		err := scanner.ScanVerticesByLabel(ctx, tenant, label, 0, func(vertex *graph.Vertex) error {
+			if vertex == nil || strings.TrimSpace(vertex.ID) == "" {
+				return nil
+			}
+			if _, ok := seen[vertex.ID]; ok {
+				return nil
+			}
+			if !vertexPatternMatches(vertex, pattern, params, row) {
+				return nil
+			}
+			seen[vertex.ID] = struct{}{}
+			matches = append(matches, vertex)
+			return nil
+		})
+		if err != nil {
+			return nil, true, err
+		}
+	}
+
+	if len(matches) == 0 {
+		return nil, true, nil
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].ID < matches[j].ID
+	})
+	return matches, true, nil
+}
+
+func nonEmptyUniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := strings.TrimSpace(value)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	return result
+}
+
+func chooseAnchorLabel(labels []string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	copyLabels := append([]string(nil), labels...)
+	sort.Strings(copyLabels)
+	return copyLabels[0]
 }
 
 type vertexPropertyIndexLookupPlan struct {
@@ -8582,6 +8727,7 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 		return nil, false, false, nil
 	}
 	hasSourceFilter := len(sourceVertexIDs) > 0
+	useSourceScopedScans := hasSourceFilter && len(sourceVertexIDs) <= 2
 
 	strategy := "edge_property_index"
 	ids := map[string]struct{}{}
@@ -8656,49 +8802,76 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 		}
 
 		encoded := valueToBytes(value)
-		for _, candidateType := range types {
-			err := tx.ScanPropertyIndex(ctx, tenant, candidateType, prop, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
-				if entry == nil || entry.EntityClass != "edge" {
-					return nil
-				}
-				if stub := buildEdgeStubFromIndexEntry(entry, prop); stub != nil {
-					if hasSourceFilter {
-						if _, ok := sourceVertexIDs[strings.TrimSpace(stub.SrcID)]; !ok {
-							return nil
-						}
-					}
-					preloadedEdges[entry.EntityID] = stub
-				}
-				if hasSourceFilter {
-					if _, ok := preloadedEdges[entry.EntityID]; !ok {
-						edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
-						if err != nil {
-							if graph.IsKind(err, graph.ErrKindNotFound) {
-								return nil
-							}
-							return err
-						}
-						if edge == nil {
-							return nil
-						}
-						if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
-							return nil
-						}
-						preloadedEdges[entry.EntityID] = edge
-					}
-				}
-				ids[entry.EntityID] = struct{}{}
-				if len(ids) > candidateLimit {
-					return errEdgeIndexCapReached
-				}
+
+		consumeIndexEntry := func(entry *graph.PropertyIndexEntry) error {
+			if entry == nil || entry.EntityClass != "edge" {
 				return nil
-			})
-			if err != nil {
-				if errors.Is(err, errEdgeIndexCapReached) {
-					return nil, false, true, nil
+			}
+			if stub := buildEdgeStubFromIndexEntry(entry, prop); stub != nil {
+				if hasSourceFilter {
+					if _, ok := sourceVertexIDs[strings.TrimSpace(stub.SrcID)]; !ok {
+						return nil
+					}
 				}
-				e.metrics.ObserveIndexLookup(strategy, "error", 0)
-				return nil, true, false, err
+				preloadedEdges[entry.EntityID] = stub
+			}
+			if hasSourceFilter {
+				if _, ok := preloadedEdges[entry.EntityID]; !ok {
+					edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
+					if err != nil {
+						if graph.IsKind(err, graph.ErrKindNotFound) {
+							return nil
+						}
+						return err
+					}
+					if edge == nil {
+						return nil
+					}
+					if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
+						return nil
+					}
+					preloadedEdges[entry.EntityID] = edge
+				}
+			}
+			ids[entry.EntityID] = struct{}{}
+			if len(ids) > candidateLimit {
+				return errEdgeIndexCapReached
+			}
+			return nil
+		}
+
+		if useSourceScopedScans {
+			strategy = "edge_property_index_source"
+			for sourceID := range sourceVertexIDs {
+				sourceID = strings.TrimSpace(sourceID)
+				if sourceID == "" {
+					continue
+				}
+				for _, candidateType := range types {
+					err := tx.ScanOutEdgeProperty(ctx, tenant, sourceID, candidateType, prop, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
+						return consumeIndexEntry(entry)
+					})
+					if err != nil {
+						if errors.Is(err, errEdgeIndexCapReached) {
+							return nil, false, true, nil
+						}
+						e.metrics.ObserveIndexLookup(strategy, "error", 0)
+						return nil, true, false, err
+					}
+				}
+			}
+		} else {
+			for _, candidateType := range types {
+				err := tx.ScanPropertyIndex(ctx, tenant, candidateType, prop, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
+					return consumeIndexEntry(entry)
+				})
+				if err != nil {
+					if errors.Is(err, errEdgeIndexCapReached) {
+						return nil, false, true, nil
+					}
+					e.metrics.ObserveIndexLookup(strategy, "error", 0)
+					return nil, true, false, err
+				}
 			}
 		}
 	} else {
@@ -8748,52 +8921,78 @@ func (e *Executor) resolveEdgesByIndexedProperty(ctx context.Context, tx graph.T
 		}
 
 		strategy = "edge_property_index_range"
-		for _, candidateType := range types {
-			err := tx.ScanPropertyIndexNumericRange(ctx, tenant, candidateType, selectedProp, selectedConstraint.lower, selectedConstraint.lowerSet, selectedConstraint.lowerInclusive, selectedConstraint.upper, selectedConstraint.upperSet, selectedConstraint.upperInclusive, 0, func(entry *graph.PropertyIndexEntry) error {
-				if entry == nil || entry.EntityClass != "edge" {
-					return nil
-				}
-				if !selectedConstraint.matchesValue(decodeStoredPropertyValue(entry.Value)) {
-					return nil
-				}
-				if stub := buildEdgeStubFromIndexEntry(entry, selectedProp); stub != nil {
-					if hasSourceFilter {
-						if _, ok := sourceVertexIDs[strings.TrimSpace(stub.SrcID)]; !ok {
-							return nil
-						}
-					}
-					preloadedEdges[entry.EntityID] = stub
-				}
-				if hasSourceFilter {
-					if _, ok := preloadedEdges[entry.EntityID]; !ok {
-						edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
-						if err != nil {
-							if graph.IsKind(err, graph.ErrKindNotFound) {
-								return nil
-							}
-							return err
-						}
-						if edge == nil {
-							return nil
-						}
-						if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
-							return nil
-						}
-						preloadedEdges[entry.EntityID] = edge
-					}
-				}
-				ids[entry.EntityID] = struct{}{}
-				if len(ids) > candidateLimit {
-					return errEdgeIndexCapReached
-				}
+		consumeRangeEntry := func(entry *graph.PropertyIndexEntry) error {
+			if entry == nil || entry.EntityClass != "edge" {
 				return nil
-			})
-			if err != nil {
-				if errors.Is(err, errEdgeIndexCapReached) {
-					return nil, false, true, nil
+			}
+			if !selectedConstraint.matchesValue(decodeStoredPropertyValue(entry.Value)) {
+				return nil
+			}
+			if stub := buildEdgeStubFromIndexEntry(entry, selectedProp); stub != nil {
+				if hasSourceFilter {
+					if _, ok := sourceVertexIDs[strings.TrimSpace(stub.SrcID)]; !ok {
+						return nil
+					}
 				}
-				e.metrics.ObserveIndexLookup(strategy, "error", 0)
-				return nil, true, false, err
+				preloadedEdges[entry.EntityID] = stub
+			}
+			if hasSourceFilter {
+				if _, ok := preloadedEdges[entry.EntityID]; !ok {
+					edge, err := tx.GetEdge(ctx, tenant, entry.EntityID)
+					if err != nil {
+						if graph.IsKind(err, graph.ErrKindNotFound) {
+							return nil
+						}
+						return err
+					}
+					if edge == nil {
+						return nil
+					}
+					if _, ok := sourceVertexIDs[strings.TrimSpace(edge.SrcID)]; !ok {
+						return nil
+					}
+					preloadedEdges[entry.EntityID] = edge
+				}
+			}
+			ids[entry.EntityID] = struct{}{}
+			if len(ids) > candidateLimit {
+				return errEdgeIndexCapReached
+			}
+			return nil
+		}
+
+		if useSourceScopedScans {
+			strategy = "edge_property_index_range_source"
+			for sourceID := range sourceVertexIDs {
+				sourceID = strings.TrimSpace(sourceID)
+				if sourceID == "" {
+					continue
+				}
+				for _, candidateType := range types {
+					err := tx.ScanOutEdgePropertyNumericRange(ctx, tenant, sourceID, candidateType, selectedProp, selectedConstraint.lower, selectedConstraint.lowerSet, selectedConstraint.lowerInclusive, selectedConstraint.upper, selectedConstraint.upperSet, selectedConstraint.upperInclusive, 0, func(entry *graph.PropertyIndexEntry) error {
+						return consumeRangeEntry(entry)
+					})
+					if err != nil {
+						if errors.Is(err, errEdgeIndexCapReached) {
+							return nil, false, true, nil
+						}
+						e.metrics.ObserveIndexLookup(strategy, "error", 0)
+						return nil, true, false, err
+					}
+				}
+			}
+		} else {
+			for _, candidateType := range types {
+				err := tx.ScanPropertyIndexNumericRange(ctx, tenant, candidateType, selectedProp, selectedConstraint.lower, selectedConstraint.lowerSet, selectedConstraint.lowerInclusive, selectedConstraint.upper, selectedConstraint.upperSet, selectedConstraint.upperInclusive, 0, func(entry *graph.PropertyIndexEntry) error {
+					return consumeRangeEntry(entry)
+				})
+				if err != nil {
+					if errors.Is(err, errEdgeIndexCapReached) {
+						return nil, false, true, nil
+					}
+					e.metrics.ObserveIndexLookup(strategy, "error", 0)
+					return nil, true, false, err
+				}
 			}
 		}
 	}

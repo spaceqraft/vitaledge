@@ -44,6 +44,13 @@ func TestVertexEdgeCRUDAndAdjacency(t *testing.T) {
 		t.Fatalf("update failed: %v", err)
 	}
 
+	if !dbHasKey(t, store, keyspace.VertexLabelKey("acme", "u1", "User")) {
+		t.Fatalf("expected vertex label forward index for u1/User")
+	}
+	if !dbHasKey(t, store, keyspace.VertexLabelMembershipKey("acme", "User", "u1")) {
+		t.Fatalf("expected label vertex reverse index for User/u1")
+	}
+
 	err = store.View(ctx, func(tx graph.Tx) error {
 		edge, err := tx.GetEdge(ctx, "acme", "e1")
 		if err != nil {
@@ -105,6 +112,115 @@ func TestVertexEdgeCRUDAndAdjacency(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("post-delete verification failed: %v", err)
+	}
+}
+
+func TestEdgePHashStorageAndPropertyHydration(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	initial := &graph.Edge{
+		Tenant: "acme",
+		ID:     "e1",
+		Type:   "RATED",
+		SrcID:  "u1",
+		DstID:  "m1",
+		Properties: graph.PropertyMap{
+			"rating": []byte("4.5"),
+			"note":   []byte("great"),
+		},
+	}
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, initial)
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	raw, closer, err := store.db.Get(keyspace.EdgeKey("acme", "e1"))
+	if err != nil {
+		t.Fatalf("read raw edge failed: %v", err)
+	}
+	defer closer.Close()
+	if got := string(raw); got != string(edgePHash(initial)) {
+		t.Fatalf("unexpected edge phash: got %q want %q", got, string(edgePHash(initial)))
+	}
+	if json.Valid(raw) {
+		t.Fatalf("expected edge value to be phash, got json payload %q", string(raw))
+	}
+	if got := countByPrefix(t, store, keyspace.EdgePropertyPrefix("acme", "e1", "RATED", "rating")); got != 1 {
+		t.Fatalf("expected one edge property forward key, got %d", got)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		edge, err := tx.GetEdge(ctx, "acme", "e1")
+		if err != nil {
+			return err
+		}
+		if edge.Type != "RATED" || edge.SrcID != "u1" || edge.DstID != "m1" {
+			return fmt.Errorf("unexpected hydrated edge: %+v", edge)
+		}
+		if got := string(edge.Properties["rating"]); got != "4.5" {
+			return fmt.Errorf("unexpected rating property: %q", got)
+		}
+		if got := string(edge.Properties["note"]); got != "great" {
+			return fmt.Errorf("unexpected note property: %q", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+
+	updated := &graph.Edge{
+		Tenant: "acme",
+		ID:     "e1",
+		Type:   "LIKED",
+		SrcID:  "u1",
+		DstID:  "m1",
+		Properties: graph.PropertyMap{
+			"weight": []byte("0.9"),
+		},
+	}
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutEdge(ctx, updated)
+	})
+	if err != nil {
+		t.Fatalf("update edge failed: %v", err)
+	}
+	if got := countByPrefix(t, store, keyspace.EdgePropertyPrefix("acme", "e1", "RATED", "rating")); got != 0 {
+		t.Fatalf("expected stale edge property forward keys removed, got %d", got)
+	}
+	if got := countByPrefix(t, store, keyspace.PropertyEdgePrefix("acme", "RATED", "rating")); got != 0 {
+		t.Fatalf("expected stale property edge reverse keys removed, got %d", got)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		edge, err := tx.GetEdge(ctx, "acme", "e1")
+		if err != nil {
+			return err
+		}
+		if edge.Type != "LIKED" {
+			return fmt.Errorf("unexpected updated edge type: %s", edge.Type)
+		}
+		if _, ok := edge.Properties["rating"]; ok {
+			return fmt.Errorf("unexpected stale rating property after update")
+		}
+		if got := string(edge.Properties["weight"]); got != "0.9" {
+			return fmt.Errorf("unexpected weight property: %q", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-update view failed: %v", err)
 	}
 }
 
@@ -251,6 +367,69 @@ func TestScanOutEdgeLinksByType(t *testing.T) {
 		}
 		if len(limited) != 1 {
 			return fmt.Errorf("expected one limited link, got %d", len(limited))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
+func TestScanVerticesByLabelAndIDs(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"User", "Person"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"User"}},
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		typed, ok := tx.(interface {
+			ScanVerticesByLabel(ctx context.Context, tenant, label string, limit int, fn func(*graph.Vertex) error) error
+			ScanVertexIDsByLabel(ctx context.Context, tenant, label string, limit int, fn func(string) error) error
+		})
+		if !ok {
+			return fmt.Errorf("tx does not expose label scan extensions")
+		}
+
+		users := make([]string, 0)
+		if err := typed.ScanVerticesByLabel(ctx, "acme", "User", 0, func(vertex *graph.Vertex) error {
+			if vertex != nil {
+				users = append(users, vertex.ID)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(users)
+		if got := strings.Join(users, ","); got != "u1,u2" {
+			return fmt.Errorf("unexpected user vertex ids: %s", got)
+		}
+
+		userIDs := make([]string, 0)
+		if err := typed.ScanVertexIDsByLabel(ctx, "acme", "User", 0, func(vertexID string) error {
+			userIDs = append(userIDs, vertexID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(userIDs)
+		if got := strings.Join(userIDs, ","); got != "u1,u2" {
+			return fmt.Errorf("unexpected user vertex ids from id scan: %s", got)
 		}
 		return nil
 	})
@@ -1048,6 +1227,12 @@ func TestPropertyIndexRoundTrip(t *testing.T) {
 	if got := countByPrefix(t, store, prefix); got != 1 {
 		t.Fatalf("expected one index key, got %d", got)
 	}
+	if got := countByPrefix(t, store, keyspace.PropertyVertexPrefix("acme", "User", "email")); got != 1 {
+		t.Fatalf("expected one property->vertex reverse key, got %d", got)
+	}
+	if got := countByPrefix(t, store, keyspace.VertexPropertyPrefix("acme", "u1", "User", "email")); got != 1 {
+		t.Fatalf("expected one vertex->property forward key, got %d", got)
+	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
 		return tx.DeletePropertyIndex(ctx, entry)
@@ -1058,6 +1243,12 @@ func TestPropertyIndexRoundTrip(t *testing.T) {
 
 	if got := countByPrefix(t, store, prefix); got != 0 {
 		t.Fatalf("expected zero index keys, got %d", got)
+	}
+	if got := countByPrefix(t, store, keyspace.PropertyVertexPrefix("acme", "User", "email")); got != 0 {
+		t.Fatalf("expected zero property->vertex reverse keys, got %d", got)
+	}
+	if got := countByPrefix(t, store, keyspace.VertexPropertyPrefix("acme", "u1", "User", "email")); got != 0 {
+		t.Fatalf("expected zero vertex->property forward keys, got %d", got)
 	}
 }
 
@@ -1106,6 +1297,9 @@ func TestPropertyIndexNumericRangeScan(t *testing.T) {
 	if gotCount := countByPrefix(t, store, numericPrefix); gotCount != 3 {
 		t.Fatalf("expected three numeric shadow index keys, got %d", gotCount)
 	}
+	if gotCount := countByPrefix(t, store, keyspace.PropertyEdgePrefix("acme", "RATED", "rating")); gotCount != 4 {
+		t.Fatalf("expected four property->edge reverse index keys, got %d", gotCount)
+	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
 		for _, entry := range entries {
@@ -1120,6 +1314,9 @@ func TestPropertyIndexNumericRangeScan(t *testing.T) {
 	}
 	if gotCount := countByPrefix(t, store, numericPrefix); gotCount != 0 {
 		t.Fatalf("expected numeric shadow index keys to be deleted, got %d", gotCount)
+	}
+	if gotCount := countByPrefix(t, store, keyspace.PropertyEdgePrefix("acme", "RATED", "rating")); gotCount != 0 {
+		t.Fatalf("expected property->edge reverse index keys to be deleted, got %d", gotCount)
 	}
 }
 
@@ -1165,6 +1362,9 @@ func TestPropertyIndexBooleanRangeScan(t *testing.T) {
 	if gotCount := countByPrefix(t, store, booleanPrefix); gotCount != 2 {
 		t.Fatalf("expected two boolean shadow index keys, got %d", gotCount)
 	}
+	if gotCount := countByPrefix(t, store, keyspace.PropertyVertexPrefix("acme", "Feature", "enabled")); gotCount != 2 {
+		t.Fatalf("expected two property->vertex reverse index keys, got %d", gotCount)
+	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
 		for _, entry := range entries {
@@ -1179,6 +1379,9 @@ func TestPropertyIndexBooleanRangeScan(t *testing.T) {
 	}
 	if gotCount := countByPrefix(t, store, booleanPrefix); gotCount != 0 {
 		t.Fatalf("expected boolean shadow index keys to be deleted, got %d", gotCount)
+	}
+	if gotCount := countByPrefix(t, store, keyspace.PropertyVertexPrefix("acme", "Feature", "enabled")); gotCount != 0 {
+		t.Fatalf("expected property->vertex reverse index keys to be deleted, got %d", gotCount)
 	}
 }
 
@@ -1228,6 +1431,9 @@ func TestPropertyIndexDateTimeRangeScan(t *testing.T) {
 	if gotCount := countByPrefix(t, store, datetimePrefix); gotCount != 3 {
 		t.Fatalf("expected three datetime shadow index keys, got %d", gotCount)
 	}
+	if gotCount := countByPrefix(t, store, keyspace.PropertyVertexPrefix("acme", "Event", "startedAt")); gotCount != 3 {
+		t.Fatalf("expected three property->vertex reverse index keys, got %d", gotCount)
+	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
 		for _, entry := range entries {
@@ -1242,6 +1448,9 @@ func TestPropertyIndexDateTimeRangeScan(t *testing.T) {
 	}
 	if gotCount := countByPrefix(t, store, datetimePrefix); gotCount != 0 {
 		t.Fatalf("expected datetime shadow index keys to be deleted, got %d", gotCount)
+	}
+	if gotCount := countByPrefix(t, store, keyspace.PropertyVertexPrefix("acme", "Event", "startedAt")); gotCount != 0 {
+		t.Fatalf("expected property->vertex reverse index keys to be deleted, got %d", gotCount)
 	}
 }
 
@@ -1296,6 +1505,152 @@ func TestEdgePropertyIndexPayloadCarriesEndpoints(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("scan numeric property index failed: %v", err)
+	}
+}
+
+func TestScanOutEdgeProperty(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m3", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1"},
+			{Tenant: "acme", ID: "e2", Type: "RATED", SrcID: "u1", DstID: "m2"},
+			{Tenant: "acme", ID: "e3", Type: "RATED", SrcID: "u1", DstID: "m3"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		entries := []*graph.PropertyIndexEntry{
+			{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("5.0"), EntityID: "e1", EntityClass: "edge", EdgeSrcID: "u1", EdgeDstID: "m1"},
+			{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("4.5"), EntityID: "e2", EntityClass: "edge", EdgeSrcID: "u1", EdgeDstID: "m2"},
+			{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("5.0"), EntityID: "e3", EntityClass: "edge", EdgeSrcID: "u1", EdgeDstID: "m3"},
+		}
+		for _, entry := range entries {
+			if err := tx.PutPropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		ids := make([]string, 0)
+		if err := tx.ScanOutEdgeProperty(ctx, "acme", "u1", "RATED", "rating", []byte("5.0"), 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry == nil {
+				t.Fatalf("expected edge property entry")
+			}
+			if entry.EdgeSrcID != "u1" {
+				t.Fatalf("expected source u1, got %q", entry.EdgeSrcID)
+			}
+			ids = append(ids, entry.EntityID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(ids)
+		if len(ids) != 2 || ids[0] != "e1" || ids[1] != "e3" {
+			return fmt.Errorf("unexpected out-edge property scan result: %#v", ids)
+		}
+
+		limited := make([]string, 0)
+		if err := tx.ScanOutEdgeProperty(ctx, "acme", "u1", "RATED", "rating", []byte("5.0"), 1, func(entry *graph.PropertyIndexEntry) error {
+			limited = append(limited, entry.EntityID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(limited) != 1 {
+			return fmt.Errorf("expected one limited result, got %d", len(limited))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan out edge property failed: %v", err)
+	}
+}
+
+func TestScanOutEdgePropertyNumericRange(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m3", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1"},
+			{Tenant: "acme", ID: "e2", Type: "RATED", SrcID: "u1", DstID: "m2"},
+			{Tenant: "acme", ID: "e3", Type: "RATED", SrcID: "u1", DstID: "m3"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		entries := []*graph.PropertyIndexEntry{
+			{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("3.9"), EntityID: "e1", EntityClass: "edge", EdgeSrcID: "u1", EdgeDstID: "m1"},
+			{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("4.6"), EntityID: "e2", EntityClass: "edge", EdgeSrcID: "u1", EdgeDstID: "m2"},
+			{Tenant: "acme", Schema: "RATED", Property: "rating", Value: []byte("5.0"), EntityID: "e3", EntityClass: "edge", EdgeSrcID: "u1", EdgeDstID: "m3"},
+		}
+		for _, entry := range entries {
+			if err := tx.PutPropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		ids := make([]string, 0)
+		if err := tx.ScanOutEdgePropertyNumericRange(ctx, "acme", "u1", "RATED", "rating", 4.5, true, true, 0, false, false, 0, func(entry *graph.PropertyIndexEntry) error {
+			if entry == nil {
+				t.Fatalf("expected edge property entry")
+			}
+			ids = append(ids, entry.EntityID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(ids)
+		if len(ids) != 2 || ids[0] != "e2" || ids[1] != "e3" {
+			return fmt.Errorf("unexpected numeric range result: %#v", ids)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan out edge property numeric range failed: %v", err)
 	}
 }
 
@@ -2133,8 +2488,16 @@ func assertAdjacencyConsistency(t *testing.T, store *Store, tenant string) {
 	edges := readAllEdgesByID(t, store, tenant)
 
 	for edgeID, edge := range edges {
+		edgeTypeKey := keyspace.EdgeTypeKey(tenant, edgeID, edge.Type)
+		typeEdgeKey := keyspace.TypeEdgeKey(tenant, edge.Type, edgeID)
 		outKey := keyspace.OutAdjacencyKey(tenant, edge.SrcID, edge.Type, edgeID)
 		inKey := keyspace.InAdjacencyKey(tenant, edge.DstID, edge.Type, edgeID)
+		if !dbHasKey(t, store, edgeTypeKey) {
+			t.Fatalf("missing edge type index for edge %s", edgeID)
+		}
+		if !dbHasKey(t, store, typeEdgeKey) {
+			t.Fatalf("missing type edge index for edge %s", edgeID)
+		}
 		if !dbHasKey(t, store, outKey) {
 			t.Fatalf("missing out adjacency for edge %s", edgeID)
 		}
@@ -2144,7 +2507,7 @@ func assertAdjacencyConsistency(t *testing.T, store *Store, tenant string) {
 	}
 
 	outAdjCount := 0
-	iteratePrefix(t, store, []byte("a/out/"+tenant+"/"), func(key, _ []byte) {
+	iteratePrefix(t, store, keyspace.OutAdjacencyTenantPrefix(tenant), func(key, _ []byte) {
 		outAdjCount++
 		kTenant, srcID, edgeType, edgeID, ok := parseOutAdjacencyKey(key)
 		if !ok {
@@ -2160,7 +2523,7 @@ func assertAdjacencyConsistency(t *testing.T, store *Store, tenant string) {
 	})
 
 	inAdjCount := 0
-	iteratePrefix(t, store, []byte("a/in/"+tenant+"/"), func(key, _ []byte) {
+	iteratePrefix(t, store, keyspace.InAdjacencyTenantPrefix(tenant), func(key, _ []byte) {
 		inAdjCount++
 		kTenant, dstID, edgeType, edgeID, ok := parseInAdjacencyKey(key)
 		if !ok {
@@ -2189,8 +2552,16 @@ func assertAdjacencyConsistencyB(b *testing.B, store *Store, tenant string) {
 	edges := readAllEdgesByIDB(b, store, tenant)
 
 	for edgeID, edge := range edges {
+		edgeTypeKey := keyspace.EdgeTypeKey(tenant, edgeID, edge.Type)
+		typeEdgeKey := keyspace.TypeEdgeKey(tenant, edge.Type, edgeID)
 		outKey := keyspace.OutAdjacencyKey(tenant, edge.SrcID, edge.Type, edgeID)
 		inKey := keyspace.InAdjacencyKey(tenant, edge.DstID, edge.Type, edgeID)
+		if !dbHasKeyB(b, store, edgeTypeKey) {
+			b.Fatalf("missing edge type index for edge %s", edgeID)
+		}
+		if !dbHasKeyB(b, store, typeEdgeKey) {
+			b.Fatalf("missing type edge index for edge %s", edgeID)
+		}
 		if !dbHasKeyB(b, store, outKey) {
 			b.Fatalf("missing out adjacency for edge %s", edgeID)
 		}
@@ -2200,7 +2571,7 @@ func assertAdjacencyConsistencyB(b *testing.B, store *Store, tenant string) {
 	}
 
 	outAdjCount := 0
-	iteratePrefixB(b, store, []byte("a/out/"+tenant+"/"), func(key, _ []byte) {
+	iteratePrefixB(b, store, keyspace.OutAdjacencyTenantPrefix(tenant), func(key, _ []byte) {
 		outAdjCount++
 		kTenant, srcID, edgeType, edgeID, ok := parseOutAdjacencyKey(key)
 		if !ok {
@@ -2216,7 +2587,7 @@ func assertAdjacencyConsistencyB(b *testing.B, store *Store, tenant string) {
 	})
 
 	inAdjCount := 0
-	iteratePrefixB(b, store, []byte("a/in/"+tenant+"/"), func(key, _ []byte) {
+	iteratePrefixB(b, store, keyspace.InAdjacencyTenantPrefix(tenant), func(key, _ []byte) {
 		inAdjCount++
 		kTenant, dstID, edgeType, edgeID, ok := parseInAdjacencyKey(key)
 		if !ok {
@@ -2243,17 +2614,26 @@ func readAllEdgesByID(t *testing.T, store *Store, tenant string) map[string]*gra
 	t.Helper()
 
 	out := make(map[string]*graph.Edge)
+	edgeIDs := make([]string, 0)
 	iteratePrefix(t, store, keyspace.EdgePrefix(tenant), func(key, value []byte) {
 		edgeID := edgeIDFromAdjKey(key)
 		if edgeID == "" {
 			t.Fatalf("malformed edge key %q", key)
 		}
-		var edge graph.Edge
-		if err := json.Unmarshal(value, &edge); err != nil {
-			t.Fatalf("decode edge failed for key %q: %v", key, err)
-		}
-		out[edgeID] = &edge
+		edgeIDs = append(edgeIDs, edgeID)
 	})
+	if err := store.View(context.Background(), func(tx graph.Tx) error {
+		for _, edgeID := range edgeIDs {
+			edge, err := tx.GetEdge(context.Background(), tenant, edgeID)
+			if err != nil {
+				return err
+			}
+			out[edgeID] = edge
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("hydrate edges failed: %v", err)
+	}
 	return out
 }
 
@@ -2261,17 +2641,26 @@ func readAllEdgesByIDB(b *testing.B, store *Store, tenant string) map[string]*gr
 	b.Helper()
 
 	out := make(map[string]*graph.Edge)
+	edgeIDs := make([]string, 0)
 	iteratePrefixB(b, store, keyspace.EdgePrefix(tenant), func(key, value []byte) {
 		edgeID := edgeIDFromAdjKey(key)
 		if edgeID == "" {
 			b.Fatalf("malformed edge key %q", key)
 		}
-		var edge graph.Edge
-		if err := json.Unmarshal(value, &edge); err != nil {
-			b.Fatalf("decode edge failed for key %q: %v", key, err)
-		}
-		out[edgeID] = &edge
+		edgeIDs = append(edgeIDs, edgeID)
 	})
+	if err := store.View(context.Background(), func(tx graph.Tx) error {
+		for _, edgeID := range edgeIDs {
+			edge, err := tx.GetEdge(context.Background(), tenant, edgeID)
+			if err != nil {
+				return err
+			}
+			out[edgeID] = edge
+		}
+		return nil
+	}); err != nil {
+		b.Fatalf("hydrate edges failed: %v", err)
+	}
 	return out
 }
 
@@ -2349,18 +2738,18 @@ func iteratePrefixB(b *testing.B, store *Store, prefix []byte, fn func(key, valu
 
 func parseOutAdjacencyKey(key []byte) (tenant, srcID, edgeType, edgeID string, ok bool) {
 	parts := strings.Split(string(key), "/")
-	if len(parts) != 6 || parts[0] != "a" || parts[1] != "out" {
+	if len(parts) < 5 {
 		return "", "", "", "", false
 	}
-	return parts[2], parts[3], parts[4], parts[5], true
+	return parts[len(parts)-4], parts[len(parts)-3], parts[len(parts)-2], parts[len(parts)-1], true
 }
 
 func parseInAdjacencyKey(key []byte) (tenant, dstID, edgeType, edgeID string, ok bool) {
 	parts := strings.Split(string(key), "/")
-	if len(parts) != 6 || parts[0] != "a" || parts[1] != "in" {
+	if len(parts) < 5 {
 		return "", "", "", "", false
 	}
-	return parts[2], parts[3], parts[4], parts[5], true
+	return parts[len(parts)-4], parts[len(parts)-3], parts[len(parts)-2], parts[len(parts)-1], true
 }
 
 type recordingMetrics struct {

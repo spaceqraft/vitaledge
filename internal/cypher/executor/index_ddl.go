@@ -226,6 +226,40 @@ func (e *Executor) BackfillPropertyIndex(ctx context.Context, tenant, schema, pr
 
 	count := 0
 	err := e.store.Update(ctx, func(tx graph.Tx) error {
+		type labelVertexScannerTx interface {
+			ScanVerticesByLabel(ctx context.Context, tenant, label string, limit int, fn func(*graph.Vertex) error) error
+		}
+		if scanner, ok := tx.(labelVertexScannerTx); ok {
+			return scanner.ScanVerticesByLabel(ctx, tenant, schema, 0, func(vertex *graph.Vertex) error {
+				if vertex == nil || strings.TrimSpace(vertex.ID) == "" || vertex.Properties == nil {
+					return nil
+				}
+				stored, ok := vertex.Properties[property]
+				if !ok {
+					return nil
+				}
+				entry := &graph.PropertyIndexEntry{
+					Tenant:      tenant,
+					Schema:      schema,
+					Property:    property,
+					Value:       append([]byte(nil), stored...),
+					EntityID:    vertex.ID,
+					EntityClass: "vertex",
+				}
+				if err := tx.PutPropertyIndex(ctx, entry); err != nil {
+					return err
+				}
+				count++
+				return nil
+			})
+		}
+		e.warnScanFallbackOnce(
+			"BackfillPropertyIndex:vertex_scan",
+			"BackfillPropertyIndex using ScanVertices fallback tenant=%s schema=%s property=%s",
+			tenant,
+			schema,
+			property,
+		)
 		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
 			if !vertexHasLabel(vertex, schema) {
 				return nil
@@ -273,11 +307,11 @@ func (e *Executor) BackfillEdgePropertyIndex(ctx context.Context, tenant, edgeTy
 
 	vertexIDs := []string{}
 	if err := e.store.View(ctx, func(tx graph.Tx) error {
-		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
-			if vertex == nil || strings.TrimSpace(vertex.ID) == "" {
+		return tx.ScanOutEdgeSourceIDs(ctx, tenant, edgeType, 0, func(sourceID string) error {
+			if strings.TrimSpace(sourceID) == "" {
 				return nil
 			}
-			vertexIDs = append(vertexIDs, vertex.ID)
+			vertexIDs = append(vertexIDs, sourceID)
 			return nil
 		})
 	}); err != nil {

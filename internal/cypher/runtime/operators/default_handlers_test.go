@@ -215,6 +215,29 @@ func TestWriteHandlerMaterializesReverseEdgeEndpointBindings(t *testing.T) {
 	}
 }
 
+func TestWriteHandlerSkipsMaterializationWhenDisabled(t *testing.T) {
+	h := NewWriteHandler()
+	state := &State{
+		Params:                   map[string]any{"id": "u21"},
+		MaterializeWriteBindings: false,
+	}
+
+	err := h.Execute("p9", map[string]any{
+		"kind":         "CREATE",
+		"raw":          "CREATE (u:User {id:$id})",
+		"mergePattern": "(u:User {id:$id})",
+	}, state)
+	if err != nil {
+		t.Fatalf("write execute failed: %v", err)
+	}
+	if len(state.Rows) != 0 {
+		t.Fatalf("expected no row materialization when disabled, got %#v", state.Rows)
+	}
+	if len(state.WriteEvents) != 1 {
+		t.Fatalf("expected one write event, got %#v", state.WriteEvents)
+	}
+}
+
 func TestWriteHandlerBuildsReverseEdgeMutationPayload(t *testing.T) {
 	h := NewWriteHandler()
 	state := &State{Params: map[string]any{"src": "u10", "dst": "u11"}}

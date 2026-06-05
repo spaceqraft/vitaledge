@@ -24,6 +24,10 @@ type ExecutionStats struct {
 	WritesRecorded    int
 }
 
+// MaterializeWriteBindingsParam toggles whether PHY_WRITE backfills row
+// bindings for downstream projection operators.
+const MaterializeWriteBindingsParam = "__ve_materialize_write_bindings"
+
 // OperatorState is mutable execution state shared across operator handlers.
 type OperatorState = operators.State
 

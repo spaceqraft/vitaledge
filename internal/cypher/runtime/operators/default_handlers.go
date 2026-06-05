@@ -342,6 +342,9 @@ func (h writeHandler) Execute(nodeID string, attrs map[string]any, state *State)
 	event.ResolvedParams = resolveWriteParams(state, raw, mergePattern, onCreate, onMatch)
 	event.ParamKeys = referencedParamKeys(raw, mergePattern, strings.Join(onCreate, " "), strings.Join(onMatch, " "))
 	state.WriteEvents = append(state.WriteEvents, event)
+	if !shouldMaterializeWriteBindings(state) {
+		return nil
+	}
 
 	if len(state.Rows) == 0 {
 		state.Rows = []map[string]any{{}}
@@ -355,6 +358,31 @@ func (h writeHandler) Execute(nodeID string, attrs map[string]any, state *State)
 	}
 
 	return nil
+}
+
+func shouldMaterializeWriteBindings(state *State) bool {
+	if state == nil || state.Params == nil {
+		return true
+	}
+	value, ok := state.Params["__ve_materialize_write_bindings"]
+	if !ok || value == nil {
+		return true
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true", "1", "yes", "on":
+			return true
+		case "false", "0", "no", "off":
+			return false
+		default:
+			return true
+		}
+	default:
+		return true
+	}
 }
 
 func materializeWriteBindings(row map[string]any, event WriteEvent) {

@@ -50,7 +50,7 @@ func (e *Engine) Execute(ctx ExecutionContext) (ExecutionResult, error) {
 	if e == nil {
 		e = New()
 	}
-	state := &OperatorState{ExecutedOps: []string{}, Rows: []map[string]any{}, Params: ctx.Params}
+	state := &OperatorState{ExecutedOps: []string{}, Rows: []map[string]any{}, Params: ctx.Params, MaterializeWriteBindings: boolParam(ctx.Params, MaterializeWriteBindingsParam, true)}
 	result := ExecutionResult{
 		ExecutedOps: []string{},
 		Rows:        []map[string]any{},
@@ -116,6 +116,31 @@ func (e *Engine) Execute(ctx ExecutionContext) (ExecutionResult, error) {
 	result.Stats.WritesRecorded = len(state.WriteEvents)
 
 	return result, nil
+}
+
+func boolParam(params map[string]any, key string, defaultValue bool) bool {
+	if params == nil {
+		return defaultValue
+	}
+	value, ok := params[key]
+	if !ok || value == nil {
+		return defaultValue
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true", "1", "yes", "on":
+			return true
+		case "false", "0", "no", "off":
+			return false
+		default:
+			return defaultValue
+		}
+	default:
+		return defaultValue
+	}
 }
 
 // ExecuteWithTx runs the physical plan and applies surfaced write events

@@ -46,11 +46,12 @@ type EdgeMutation struct {
 
 // State is mutable execution state shared across operator handlers.
 type State struct {
-	ExecutedOps       []string
-	Rows              []map[string]any
-	WriteEvents       []WriteEvent
-	Params            map[string]any
-	OperatorExecCount int
+	ExecutedOps              []string
+	Rows                     []map[string]any
+	WriteEvents              []WriteEvent
+	Params                   map[string]any
+	MaterializeWriteBindings bool
+	OperatorExecCount        int
 }
 
 // Handler executes a physical operator.

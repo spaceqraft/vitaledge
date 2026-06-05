@@ -536,6 +536,17 @@ func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.Q
 
 	for idx := 0; idx < len(part.Clauses); idx++ {
 		clause := part.Clauses[idx]
+		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindCreate {
+			hasDownstreamClauses := idx+3 < len(part.Clauses)
+			if fastRows, fastColumns, ok, fastErr := e.tryFastTwoHopDistinctCreateClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns, hasDownstreamClauses); fastErr != nil {
+				return nil, nil, false, fastErr
+			} else if ok {
+				rows = fastRows
+				resultColumns = fastColumns
+				idx += 2
+				continue
+			}
+		}
 		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindMerge {
 			hasDownstreamClauses := idx+3 < len(part.Clauses)
 			if fastRows, fastColumns, ok, fastErr := e.tryFastTwoHopDistinctMergeClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns, hasDownstreamClauses); fastErr != nil {
@@ -1123,7 +1134,15 @@ func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Cont
 	return out, columns, true, nil
 }
 
+func (e *Executor) tryFastTwoHopDistinctCreateClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, createClause ast.Clause, params Params, priorColumns []string, emitCreatedRows bool) ([]Row, []string, bool, error) {
+	return e.tryFastTwoHopDistinctWriteClauses(ctx, tx, rows, matchClause, withClause, createClause, params, priorColumns, emitCreatedRows, false)
+}
+
 func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, mergeClause ast.Clause, params Params, priorColumns []string, emitMergedRows bool) ([]Row, []string, bool, error) {
+	return e.tryFastTwoHopDistinctWriteClauses(ctx, tx, rows, matchClause, withClause, mergeClause, params, priorColumns, emitMergedRows, true)
+}
+
+func (e *Executor) tryFastTwoHopDistinctWriteClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, writeClause ast.Clause, params Params, priorColumns []string, emitWriteRows bool, mergeSemantics bool) ([]Row, []string, bool, error) {
 	if len(rows) != 1 || len(rows[0]) != 0 {
 		return nil, nil, false, nil
 	}
@@ -1164,15 +1183,15 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 		return nil, nil, false, nil
 	}
 
-	mergeRaw := normalizeClauseBody(stripCypherLineComments(mergeClause.MergePattern))
-	if mergeRaw == "" {
-		mergeRaw = normalizeClauseBody(stripCypherLineComments(stripLeadingClauseKeyword(mergeClause.Raw, string(mergeClause.Kind))))
+	writeRaw := normalizeClauseBody(stripCypherLineComments(writeClause.MergePattern))
+	if writeRaw == "" {
+		writeRaw = normalizeClauseBody(stripCypherLineComments(stripLeadingClauseKeyword(writeClause.Raw, string(writeClause.Kind))))
 	}
-	mergeLeftVar, mergeEdgeType, mergeRightVar, ok := parseFastDirectedMergeEdgePattern(mergeRaw)
+	mergeLeftVar, mergeEdgeType, mergeRightVar, ok := parseFastDirectedWriteEdgePattern(writeRaw)
 	if !ok {
 		return nil, nil, false, nil
 	}
-	if strings.TrimSpace(mergeClause.MergeOnCreate) != "" || strings.TrimSpace(mergeClause.MergeOnMatch) != "" {
+	if mergeSemantics && (strings.TrimSpace(writeClause.MergeOnCreate) != "" || strings.TrimSpace(writeClause.MergeOnMatch) != "") {
 		return nil, nil, false, nil
 	}
 	if !projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Left.Var), mergeLeftVar) || !projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Right.Var), mergeRightVar) {
@@ -1187,6 +1206,22 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 	tenant, err := requireStringParam(params, "tenant")
 	if err != nil {
 		return nil, nil, false, err
+	}
+	performNoDirectEdgeChecks := shortcut.requireNoDirectEdge
+	if performNoDirectEdgeChecks && !mergeSemantics {
+		directType := strings.TrimSpace(shortcut.directEdgeType)
+		if directType != "" && len(shortcut.directEdgeAnyOf) == 0 {
+			snapshot, statsErr := tx.GetStatsSnapshot(ctx, tenant)
+			if statsErr != nil {
+				return nil, nil, false, statsErr
+			}
+			if snapshot != nil {
+				if count := snapshot.EdgeCounts[directType]; count == 0 {
+					performNoDirectEdgeChecks = false
+					e.observeRuntimeCounter(params, "runtime.antijoin.zero_type_shortcut_applied", 1)
+				}
+			}
+		}
 	}
 
 	sourceIDs, usedSourceAccessPath, err := e.resolveTwoHopLeftCandidatesByFirstEdgeType(ctx, tx, tenant, rows[0], chain, params)
@@ -1220,9 +1255,9 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 	prebuiltAntiJoinNeighborsReady := false
 	prebuiltAntiJoinNeighborCountersObserved := false
 	probeEdgeType, canUseTypedEndpointProbe := concreteEdgeTypeForEndpointProbe(shortcut.directEdgeType, shortcut.directEdgeAnyOf)
-	canPrebuildAntiJoinNeighbors := shortcut.requireNoDirectEdge && !canUseTypedEndpointProbe
-	canReusePrefetchedFirstHop := shortcut.requireNoDirectEdge && strings.TrimSpace(shortcut.directEdgeType) == strings.TrimSpace(chain.FirstEdgeType) && len(chain.FirstEdgeAnyOf) == 0
-	usePrefetchedAntiJoinNeighborSets := shortcut.requireNoDirectEdge && canReusePrefetchedFirstHop
+	canPrebuildAntiJoinNeighbors := performNoDirectEdgeChecks && !canUseTypedEndpointProbe
+	canReusePrefetchedFirstHop := performNoDirectEdgeChecks && strings.TrimSpace(shortcut.directEdgeType) == strings.TrimSpace(chain.FirstEdgeType) && len(chain.FirstEdgeAnyOf) == 0
+	usePrefetchedAntiJoinNeighborSets := performNoDirectEdgeChecks && canReusePrefetchedFirstHop
 	prefetchedFirstHopLinks := map[string][]queryOutEdgeLink{}
 	prefetchOutLinkItems := int64(0)
 	prefetchOutLinkScans := int64(0)
@@ -1365,6 +1400,7 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 		if leftID == "" {
 			continue
 		}
+		const antiJoinProbeToNeighborSetThreshold = 64
 		firstHopMidSeen := map[string]struct{}{}
 		var prefetchedAntiJoinNeighbors map[string]struct{}
 		if usePrefetchedAntiJoinNeighborSets {
@@ -1378,15 +1414,17 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 
 		antiJoinNeighbors := map[string]struct{}{}
 		antiJoinNeighborsReady := false
+		preferTypedProbeNeighborSet := false
+		typedProbeChecksForLeft := 0
 		ensureAntiJoinNeighbors := func() error {
 			if antiJoinNeighborsReady {
 				return nil
 			}
-			antiJoinNeighborsReady = true
 			if !shortcut.requireNoDirectEdge {
+				antiJoinNeighborsReady = true
 				return nil
 			}
-			if canUseTypedEndpointProbe {
+			if canUseTypedEndpointProbe && !preferTypedProbeNeighborSet {
 				return nil
 			}
 			if canPrebuildAntiJoinNeighbors {
@@ -1402,6 +1440,7 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 				}
 				e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", 1)
 				e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", int64(len(antiJoinNeighbors)))
+				antiJoinNeighborsReady = true
 				return nil
 			}
 			scanType := shortcut.directEdgeType
@@ -1428,6 +1467,7 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 			}
 			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", 1)
 			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", int64(len(antiJoinNeighbors)))
+			antiJoinNeighborsReady = true
 			return nil
 		}
 
@@ -1518,16 +1558,21 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 					e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
 					continue
 				}
-				if shortcut.requireNoDirectEdge {
+				if performNoDirectEdgeChecks {
 					if usePrefetchedAntiJoinNeighborSets {
 						if _, connected := prefetchedAntiJoinNeighbors[rightID]; connected {
 							e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
 							continue
 						}
-					} else if canUseTypedEndpointProbe {
+					} else if canUseTypedEndpointProbe && !preferTypedProbeNeighborSet {
 						connected, err := directProbe(leftID, rightID)
 						if err != nil {
 							return err
+						}
+						typedProbeChecksForLeft++
+						if !preferTypedProbeNeighborSet && typedProbeChecksForLeft >= antiJoinProbeToNeighborSetThreshold {
+							preferTypedProbeNeighborSet = true
+							e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_neighbor_switches", 1)
 						}
 						if connected {
 							e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
@@ -1594,125 +1639,130 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 	e.observeRuntimeCounter(params, "runtime.id_first.fastpath_applied", 1)
 	e.observeRuntimeCounter(params, "runtime.id_first.pairs_distinct", int64(len(pairRows)))
 
-	existingPairs := map[string]struct{}{}
-	remainingRows := make([]Row, 0, len(pairRows))
-	sourceTargets := map[string]map[string]struct{}{}
-	for _, row := range pairRows {
-		leftID, _ := row[mergeLeftVar].(string)
-		rightID, _ := row[mergeRightVar].(string)
-		leftID = strings.TrimSpace(leftID)
-		rightID = strings.TrimSpace(rightID)
-		if leftID == "" || rightID == "" {
-			continue
-		}
-		remainingRows = append(remainingRows, row)
-		targets := sourceTargets[leftID]
-		if targets == nil {
-			targets = map[string]struct{}{}
-			sourceTargets[leftID] = targets
-		}
-		targets[rightID] = struct{}{}
-	}
-	bulkScanApplied := int64(0)
-	bulkScanItems := int64(0)
-	bulkScanShortCircuitHit := int64(0)
-	bulkScanCapped := int64(0)
-	if len(remainingRows) >= 512 {
-		bulkScanApplied = 1
-		candidateCount := len(remainingRows)
-		maxBulkScanItems := candidateCount * 3
-		if maxBulkScanItems < 4096 {
-			maxBulkScanItems = 4096
-		}
-		stopBulkScan := errors.New("merge bulk scan stop")
-		err := tx.ScanOutEdgeLinksByType(ctx, tenant, mergeEdgeType, 0, func(srcID, edgeID, dstID string) error {
-			srcID = strings.TrimSpace(srcID)
-			dstID = strings.TrimSpace(dstID)
-			if srcID == "" || dstID == "" {
-				return nil
-			}
-			bulkScanItems++
-			if bulkScanItems > int64(maxBulkScanItems) {
-				bulkScanCapped = 1
-				return stopBulkScan
-			}
-			targets, ok := sourceTargets[srcID]
-			if !ok {
-				return nil
-			}
-			if _, ok := targets[dstID]; !ok {
-				return nil
-			}
-			key := directedTypedPairCacheKey(srcID, dstID, mergeEdgeType)
-			if _, seen := existingPairs[key]; seen {
-				return nil
-			}
-			existingPairs[key] = struct{}{}
-			if len(existingPairs) == candidateCount {
-				bulkScanShortCircuitHit = 1
-				return stopBulkScan
-			}
-			return nil
-		})
-		if err != nil && err != stopBulkScan {
-			return nil, nil, false, err
-		}
-	}
-
-	mergeEndpointProbeChecks := int64(0)
-	mergeEndpointProbeHits := int64(0)
-	for _, row := range remainingRows {
-		leftID, _ := row[mergeLeftVar].(string)
-		rightID, _ := row[mergeRightVar].(string)
-		leftID = strings.TrimSpace(leftID)
-		rightID = strings.TrimSpace(rightID)
-		if leftID == "" || rightID == "" {
-			continue
-		}
-		key := directedTypedPairCacheKey(leftID, rightID, mergeEdgeType)
-		if _, ok := existingPairs[key]; ok {
-			continue
-		}
-		mergeEndpointProbeChecks++
-		exists, err := hasDirectedEdgeBetweenProbe(ctx, tx, tenant, leftID, rightID, mergeEdgeType)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		if !exists {
-			continue
-		}
-		mergeEndpointProbeHits++
-		existingPairs[key] = struct{}{}
-	}
-	e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_applied", bulkScanApplied)
-	e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_items_yielded", bulkScanItems)
-	e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_short_circuit_hit", bulkScanShortCircuitHit)
-	e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_capped", bulkScanCapped)
-	e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_applied", 1)
-	e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_checks", mergeEndpointProbeChecks)
-	e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_hits", mergeEndpointProbeHits)
-	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_applied", 1)
-	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_candidates", int64(len(pairRows)))
-	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_source_scans", 0)
-	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_items_yielded", 0)
-	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_existing_hits", int64(len(existingPairs)))
-
 	createRows := make([]Row, 0, len(pairRows))
-	for _, row := range pairRows {
-		leftID, _ := row[mergeLeftVar].(string)
-		rightID, _ := row[mergeRightVar].(string)
-		leftID = strings.TrimSpace(leftID)
-		rightID = strings.TrimSpace(rightID)
-		if leftID == "" || rightID == "" {
-			continue
+	if mergeSemantics {
+		existingPairs := map[string]struct{}{}
+		remainingRows := make([]Row, 0, len(pairRows))
+		sourceTargets := map[string]map[string]struct{}{}
+		for _, row := range pairRows {
+			leftID, _ := row[mergeLeftVar].(string)
+			rightID, _ := row[mergeRightVar].(string)
+			leftID = strings.TrimSpace(leftID)
+			rightID = strings.TrimSpace(rightID)
+			if leftID == "" || rightID == "" {
+				continue
+			}
+			remainingRows = append(remainingRows, row)
+			targets := sourceTargets[leftID]
+			if targets == nil {
+				targets = map[string]struct{}{}
+				sourceTargets[leftID] = targets
+			}
+			targets[rightID] = struct{}{}
 		}
-		key := directedTypedPairCacheKey(leftID, rightID, mergeEdgeType)
-		if _, exists := existingPairs[key]; exists {
-			continue
+		bulkScanApplied := int64(0)
+		bulkScanItems := int64(0)
+		bulkScanShortCircuitHit := int64(0)
+		bulkScanCapped := int64(0)
+		if len(remainingRows) >= 512 {
+			bulkScanApplied = 1
+			candidateCount := len(remainingRows)
+			maxBulkScanItems := candidateCount * 3
+			if maxBulkScanItems < 4096 {
+				maxBulkScanItems = 4096
+			}
+			stopBulkScan := errors.New("merge bulk scan stop")
+			err := tx.ScanOutEdgeLinksByType(ctx, tenant, mergeEdgeType, 0, func(srcID, edgeID, dstID string) error {
+				srcID = strings.TrimSpace(srcID)
+				dstID = strings.TrimSpace(dstID)
+				if srcID == "" || dstID == "" {
+					return nil
+				}
+				bulkScanItems++
+				if bulkScanItems > int64(maxBulkScanItems) {
+					bulkScanCapped = 1
+					return stopBulkScan
+				}
+				targets, ok := sourceTargets[srcID]
+				if !ok {
+					return nil
+				}
+				if _, ok := targets[dstID]; !ok {
+					return nil
+				}
+				key := directedTypedPairCacheKey(srcID, dstID, mergeEdgeType)
+				if _, seen := existingPairs[key]; seen {
+					return nil
+				}
+				existingPairs[key] = struct{}{}
+				if len(existingPairs) == candidateCount {
+					bulkScanShortCircuitHit = 1
+					return stopBulkScan
+				}
+				return nil
+			})
+			if err != nil && err != stopBulkScan {
+				return nil, nil, false, err
+			}
 		}
-		createRows = append(createRows, row)
+
+		mergeEndpointProbeChecks := int64(0)
+		mergeEndpointProbeHits := int64(0)
+		for _, row := range remainingRows {
+			leftID, _ := row[mergeLeftVar].(string)
+			rightID, _ := row[mergeRightVar].(string)
+			leftID = strings.TrimSpace(leftID)
+			rightID = strings.TrimSpace(rightID)
+			if leftID == "" || rightID == "" {
+				continue
+			}
+			key := directedTypedPairCacheKey(leftID, rightID, mergeEdgeType)
+			if _, ok := existingPairs[key]; ok {
+				continue
+			}
+			mergeEndpointProbeChecks++
+			exists, err := hasDirectedEdgeBetweenProbe(ctx, tx, tenant, leftID, rightID, mergeEdgeType)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			if !exists {
+				continue
+			}
+			mergeEndpointProbeHits++
+			existingPairs[key] = struct{}{}
+		}
+		e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_applied", bulkScanApplied)
+		e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_items_yielded", bulkScanItems)
+		e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_short_circuit_hit", bulkScanShortCircuitHit)
+		e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_capped", bulkScanCapped)
+		e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_applied", 1)
+		e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_checks", mergeEndpointProbeChecks)
+		e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_hits", mergeEndpointProbeHits)
+		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_applied", 1)
+		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_candidates", int64(len(pairRows)))
+		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_source_scans", 0)
+		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_items_yielded", 0)
+		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_existing_hits", int64(len(existingPairs)))
+
+		for _, row := range pairRows {
+			leftID, _ := row[mergeLeftVar].(string)
+			rightID, _ := row[mergeRightVar].(string)
+			leftID = strings.TrimSpace(leftID)
+			rightID = strings.TrimSpace(rightID)
+			if leftID == "" || rightID == "" {
+				continue
+			}
+			key := directedTypedPairCacheKey(leftID, rightID, mergeEdgeType)
+			if _, exists := existingPairs[key]; exists {
+				continue
+			}
+			createRows = append(createRows, row)
+		}
+		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_pairs_to_create", int64(len(createRows)))
+	} else {
+		createRows = append(createRows, pairRows...)
+		e.observeRuntimeCounter(params, "runtime.create.fastpath_pairs_to_create", int64(len(createRows)))
 	}
-	e.observeRuntimeCounter(params, "runtime.merge.batch_probe_pairs_to_create", int64(len(createRows)))
 
 	for _, row := range createRows {
 		leftID, _ := row[mergeLeftVar].(string)
@@ -1734,8 +1784,12 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 		}
 	}
 
-	if !emitMergedRows {
-		e.observeRuntimeCounter(params, "runtime.merge.post_hydration_skipped", 1)
+	if !emitWriteRows {
+		if mergeSemantics {
+			e.observeRuntimeCounter(params, "runtime.merge.post_hydration_skipped", 1)
+		} else {
+			e.observeRuntimeCounter(params, "runtime.create.post_hydration_skipped", 1)
+		}
 		return nil, nil, true, nil
 	}
 
@@ -1765,7 +1819,7 @@ func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx gra
 	return mergedRows, columns, true, nil
 }
 
-func parseFastDirectedMergeEdgePattern(raw string) (leftVar string, edgeType string, rightVar string, ok bool) {
+func parseFastDirectedWriteEdgePattern(raw string) (leftVar string, edgeType string, rightVar string, ok bool) {
 	m := createEdgePatternRE.FindStringSubmatch(strings.TrimSpace(raw))
 	if len(m) != 10 {
 		return "", "", "", false
@@ -3349,7 +3403,7 @@ func (e *Executor) tryFastEdgeCountQuery(ctx context.Context, stmt *ast.QuerySta
 	if err != nil {
 		return nil, false, nil
 	}
-	if strings.TrimSpace(relPattern.EdgeVar) == "" || relPattern.EdgeType != "" || len(relPattern.EdgeAnyOf) != 0 || strings.TrimSpace(relPattern.EdgeProps) != "" {
+	if strings.TrimSpace(relPattern.EdgeVar) == "" || len(relPattern.EdgeAnyOf) != 0 || strings.TrimSpace(relPattern.EdgeProps) != "" {
 		return nil, false, nil
 	}
 	if strings.TrimSpace(relPattern.Left.Var) != "" || strings.TrimSpace(relPattern.Right.Var) != "" {
@@ -3702,11 +3756,11 @@ func (e *Executor) tryFastEdgeDeleteQuery(ctx context.Context, stmt *ast.QuerySt
 		return nil, false, nil
 	}
 
-	relPattern, err := parseUndirectedRelationshipPattern(matchSpec.Pattern)
+	relPattern, err := parseFastDeleteRelationshipPattern(matchSpec.Pattern)
 	if err != nil {
 		return nil, false, nil
 	}
-	if strings.TrimSpace(relPattern.EdgeVar) == "" || relPattern.EdgeType != "" || len(relPattern.EdgeAnyOf) != 0 || strings.TrimSpace(relPattern.EdgeProps) != "" {
+	if strings.TrimSpace(relPattern.EdgeVar) == "" || len(relPattern.EdgeAnyOf) != 0 || strings.TrimSpace(relPattern.EdgeProps) != "" {
 		return nil, false, nil
 	}
 	if strings.TrimSpace(relPattern.Left.Var) != "" || strings.TrimSpace(relPattern.Right.Var) != "" {
@@ -3721,10 +3775,6 @@ func (e *Executor) tryFastEdgeDeleteQuery(ctx context.Context, stmt *ast.QuerySt
 	if !ok {
 		return nil, false, nil
 	}
-	if !leftAny && !rightAny {
-		return nil, false, nil
-	}
-
 	deleteTarget, ok := fastDeleteEdgeTarget(part.Clauses[1].Raw)
 	if !ok || deleteTarget != relPattern.EdgeVar {
 		return nil, false, nil
@@ -3736,16 +3786,20 @@ func (e *Executor) tryFastEdgeDeleteQuery(ctx context.Context, stmt *ast.QuerySt
 	}
 
 	err = e.store.Update(ctx, func(tx graph.Tx) error {
-		edgeIDs, err := collectFastEdgeIDsForLabels(ctx, tx, tenant, leftLabel, rightLabel, leftAny, rightAny)
+		edgeIDs, err := collectFastEdgeIDsForLabels(ctx, tx, tenant, relPattern.EdgeType, leftLabel, rightLabel, leftAny, rightAny, relPattern.Undirected)
 		if err != nil {
 			return err
 		}
-		for edgeID := range edgeIDs {
-			if err := tx.DeleteEdge(ctx, tenant, edgeID); err != nil {
-				if graph.IsKind(err, graph.ErrKindNotFound) {
-					continue
+		const deleteChunkSize = 2048
+		for start := 0; start < len(edgeIDs); start += deleteChunkSize {
+			end := start + deleteChunkSize
+			if end > len(edgeIDs) {
+				end = len(edgeIDs)
+			}
+			for _, edgeID := range edgeIDs[start:end] {
+				if err := e.deleteEdgeWithIndexes(ctx, tx, tenant, edgeID); err != nil {
+					return err
 				}
-				return err
 			}
 		}
 		return nil
@@ -3755,6 +3809,55 @@ func (e *Executor) tryFastEdgeDeleteQuery(ctx context.Context, stmt *ast.QuerySt
 	}
 
 	return &Result{Columns: nil, Rows: nil, Stats: Stats{RowsReturned: 0}}, true, nil
+}
+
+type fastDeleteRelationshipPattern struct {
+	Left       vertexPattern
+	Right      vertexPattern
+	EdgeVar    string
+	EdgeType   string
+	EdgeAnyOf  []string
+	EdgeProps  string
+	Undirected bool
+}
+
+func parseFastDeleteRelationshipPattern(raw string) (fastDeleteRelationshipPattern, error) {
+	if directed, err := parseDirectedRelationshipPattern(raw); err == nil {
+		return fastDeleteRelationshipPattern{
+			Left:       directed.Left,
+			Right:      directed.Right,
+			EdgeVar:    directed.EdgeVar,
+			EdgeType:   directed.EdgeType,
+			EdgeAnyOf:  directed.EdgeAnyOf,
+			EdgeProps:  directed.EdgeProps,
+			Undirected: false,
+		}, nil
+	}
+	if reverse, err := parseReverseDirectedRelationshipPattern(raw); err == nil {
+		// Canonicalize to stored edge direction (source->destination).
+		return fastDeleteRelationshipPattern{
+			Left:       reverse.Right,
+			Right:      reverse.Left,
+			EdgeVar:    reverse.EdgeVar,
+			EdgeType:   reverse.EdgeType,
+			EdgeAnyOf:  reverse.EdgeAnyOf,
+			EdgeProps:  reverse.EdgeProps,
+			Undirected: false,
+		}, nil
+	}
+	undirected, err := parseUndirectedRelationshipPattern(raw)
+	if err != nil {
+		return fastDeleteRelationshipPattern{}, err
+	}
+	return fastDeleteRelationshipPattern{
+		Left:       undirected.Left,
+		Right:      undirected.Right,
+		EdgeVar:    undirected.EdgeVar,
+		EdgeType:   undirected.EdgeType,
+		EdgeAnyOf:  undirected.EdgeAnyOf,
+		EdgeProps:  undirected.EdgeProps,
+		Undirected: true,
+	}, nil
 }
 
 func fastDeleteEdgeTarget(raw string) (string, bool) {
@@ -3773,12 +3876,65 @@ func fastDeleteEdgeTarget(raw string) (string, bool) {
 	return body, true
 }
 
-func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, leftLabel, rightLabel string, leftAny, rightAny bool) (map[string]struct{}, error) {
-	edgeIDs := map[string]struct{}{}
+func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, edgeType, leftLabel, rightLabel string, leftAny, rightAny, undirected bool) ([]string, error) {
+	edgeIDs := make([]string, 0)
+	edgeType = strings.TrimSpace(edgeType)
+	if edgeType != "" {
+		labelMatchCache := map[string]bool{}
+		vertexMatchesLabel := func(vertexID, label string, any bool) (bool, error) {
+			if any || strings.TrimSpace(label) == "" {
+				return true, nil
+			}
+			cacheKey := label + "\x00" + vertexID
+			if cached, ok := labelMatchCache[cacheKey]; ok {
+				return cached, nil
+			}
+			hasLabel, err := tx.HasVertexLabel(ctx, tenant, vertexID, label)
+			if err != nil {
+				return false, err
+			}
+			labelMatchCache[cacheKey] = hasLabel
+			return hasLabel, nil
+		}
+
+		err := tx.ScanOutEdgeLinksByType(ctx, tenant, edgeType, 0, func(srcID, edgeID, dstID string) error {
+			leftMatch, err := vertexMatchesLabel(srcID, leftLabel, leftAny)
+			if err != nil {
+				return err
+			}
+			rightMatch, err := vertexMatchesLabel(dstID, rightLabel, rightAny)
+			if err != nil {
+				return err
+			}
+			matched := leftMatch && rightMatch
+			if !matched && undirected {
+				revLeftMatch, err := vertexMatchesLabel(srcID, rightLabel, rightAny)
+				if err != nil {
+					return err
+				}
+				revRightMatch, err := vertexMatchesLabel(dstID, leftLabel, leftAny)
+				if err != nil {
+					return err
+				}
+				matched = revLeftMatch && revRightMatch
+			}
+			if !matched {
+				return nil
+			}
+			edgeIDs = append(edgeIDs, edgeID)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return edgeIDs, nil
+	}
+
 	type edgeIDScannerTx interface {
 		ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
 		ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
 	}
+	seen := map[string]struct{}{}
 
 	collectAllOut := func(scanOut func(vertexID string, fn func(string) error) error) error {
 		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
@@ -3786,7 +3942,11 @@ func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, leftL
 				return nil
 			}
 			return scanOut(vertex.ID, func(edgeID string) error {
-				edgeIDs[edgeID] = struct{}{}
+				if _, ok := seen[edgeID]; ok {
+					return nil
+				}
+				seen[edgeID] = struct{}{}
+				edgeIDs = append(edgeIDs, edgeID)
 				return nil
 			})
 		})
@@ -3798,7 +3958,11 @@ func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, leftL
 				return nil
 			}
 			return scanOutIn(vertex.ID, func(edgeID string) error {
-				edgeIDs[edgeID] = struct{}{}
+				if _, ok := seen[edgeID]; ok {
+					return nil
+				}
+				seen[edgeID] = struct{}{}
+				edgeIDs = append(edgeIDs, edgeID)
 				return nil
 			})
 		})
@@ -3806,13 +3970,13 @@ func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, leftL
 
 	if scanner, ok := tx.(edgeIDScannerTx); ok {
 		scanOut := func(vertexID string, fn func(string) error) error {
-			return scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, "", 0, fn)
+			return scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, edgeType, 0, fn)
 		}
 		scanOutIn := func(vertexID string, fn func(string) error) error {
-			if err := scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, "", 0, fn); err != nil {
+			if err := scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, edgeType, 0, fn); err != nil {
 				return err
 			}
-			return scanner.ScanInEdgeIDs(ctx, tenant, vertexID, "", 0, fn)
+			return scanner.ScanInEdgeIDs(ctx, tenant, vertexID, edgeType, 0, fn)
 		}
 		switch {
 		case leftAny && rightAny:
@@ -3834,7 +3998,7 @@ func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, leftL
 	}
 
 	scanOut := func(vertexID string, fn func(string) error) error {
-		return tx.ScanOutEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
+		return tx.ScanOutEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
 			if edge == nil {
 				return nil
 			}
@@ -3842,7 +4006,7 @@ func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, leftL
 		})
 	}
 	scanOutIn := func(vertexID string, fn func(string) error) error {
-		if err := tx.ScanOutEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
+		if err := tx.ScanOutEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
 			if edge == nil {
 				return nil
 			}
@@ -3850,7 +4014,7 @@ func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, leftL
 		}); err != nil {
 			return err
 		}
-		return tx.ScanInEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
+		return tx.ScanInEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
 			if edge == nil {
 				return nil
 			}

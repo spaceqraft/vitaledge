@@ -54,11 +54,13 @@ func (e *Executor) tryExecuteViaRuntimePipeline(ctx context.Context, stmt *ast.Q
 	physicalPlan := physical.Build(logicalPlan)
 	engine := cypherruntime.New()
 	tenant := tenantFromParams(params)
+	runtimeParams := map[string]any(params)
+	runtimeParams[cypherruntime.MaterializeWriteBindingsParam] = runtimePipelineHasReturnClause(stmt)
 
 	var runtimeRes cypherruntime.ExecutionResult
 	err = e.store.Update(ctx, func(tx graph.Tx) error {
 		var execErr error
-		runtimeRes, execErr = engine.ExecuteWithTx(ctx, cypherruntime.ExecutionContext{Plan: physicalPlan, Tenant: tenant, Params: map[string]any(params)}, tx)
+		runtimeRes, execErr = engine.ExecuteWithTx(ctx, cypherruntime.ExecutionContext{Plan: physicalPlan, Tenant: tenant, Params: runtimeParams}, tx)
 		return execErr
 	})
 	if err != nil {

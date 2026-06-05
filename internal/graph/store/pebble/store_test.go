@@ -965,6 +965,55 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 		t.Fatalf("snapshot verification failed: %v", err)
 	}
 
+	metrics := newRecordingMetrics()
+	storeWithMetrics := openTempStoreWithMetrics(t, metrics)
+	defer func() { _ = storeWithMetrics.Close() }()
+
+	err = storeWithMetrics.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-metric", Labels: []string{"User", "Admin"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-metric", Type: "REL", SrcID: "u-metric", DstID: "v-metric"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("metric seed failed: %v", err)
+	}
+
+	err = storeWithMetrics.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-metric", Labels: []string{"User", "Admin"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-metric", Type: "LINKS", SrcID: "u-metric", DstID: "v-metric"})
+	})
+	if err != nil {
+		t.Fatalf("metric overwrite failed: %v", err)
+	}
+	if got := metrics.opCount("get_vertex", "ok"); got != 0 {
+		t.Fatalf("expected vertex overwrite to avoid get_vertex hydration, got %d", got)
+	}
+	if got := metrics.opCount("get_edge", "ok"); got != 0 {
+		t.Fatalf("expected edge overwrite to avoid get_edge hydration, got %d", got)
+	}
+
+	err = storeWithMetrics.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.DeleteVertex(ctx, "acme", "u-metric"); err != nil {
+			return err
+		}
+		return tx.DeleteEdge(ctx, "acme", "e-metric")
+	})
+	if err != nil {
+		t.Fatalf("metric delete failed: %v", err)
+	}
+	if got := metrics.opCount("get_vertex", "ok"); got != 0 {
+		t.Fatalf("expected delete path to avoid get_vertex hydration, got %d", got)
+	}
+	if got := metrics.opCount("get_edge", "ok"); got != 0 {
+		t.Fatalf("expected delete path to avoid get_edge hydration, got %d", got)
+	}
+
 	err = store.Update(ctx, func(tx graph.Tx) error {
 		if err := tx.DeleteEdge(ctx, "acme", "e2"); err != nil {
 			return err

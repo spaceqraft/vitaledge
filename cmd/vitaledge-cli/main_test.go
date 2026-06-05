@@ -134,6 +134,40 @@ func TestRunExplainIncludesWarningsWhenPresent(t *testing.T) {
 	}
 }
 
+func TestRunExplainRendersNarrativeFromPipelineNodes(t *testing.T) {
+	payload := map[string]any{
+		"query": map[string]any{"text": "UNWIND $people AS person CREATE (p:Person {id: person.id, name: person.name})"},
+		"logicalPlan": map[string]any{
+			"nodes": []map[string]any{
+				{"op": "UNWIND"},
+				{"op": "WRITE", "attrs": map[string]any{"kind": "CREATE"}},
+			},
+		},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload failed: %v", err)
+	}
+
+	client := &stubQueryServiceClient{
+		explainFunc: func(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.ExplainResponse, error) {
+			return &v1.ExplainResponse{ExplainJson: encoded, Stats: &v1.QueryStats{RowsReturned: 0, DurationMs: 3}}, nil
+		},
+	}
+
+	var out bytes.Buffer
+	if err := runExplain(context.Background(), client, "acme", "EXPLAIN UNWIND $people AS person CREATE (p:Person {id: person.id, name: person.name})", &out); err != nil {
+		t.Fatalf("runExplain returned error: %v", err)
+	}
+	rendered := out.String()
+	if !strings.Contains(rendered, "Execution path:") {
+		t.Fatalf("expected execution path section, got: %s", rendered)
+	}
+	if !strings.Contains(rendered, "1. UNWIND") || !strings.Contains(rendered, "2. WRITE (kind=CREATE)") {
+		t.Fatalf("expected pipeline node narrative for UNWIND/WRITE, got: %s", rendered)
+	}
+}
+
 func TestExtractRuntimeCountersAggregatesWarnings(t *testing.T) {
 	warnings := []*v1.Diagnostic{
 		{Code: "RUNTIME_COUNTERS", Message: `{"runtime.vertex.cache_hits": 3, "runtime.vertex.cache_misses": 2}`},

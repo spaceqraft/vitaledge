@@ -480,6 +480,38 @@ func renderExplainNarrative(out io.Writer, explain map[string]any) {
 			fmt.Fprintln(out)
 		}
 	}
+	if len(vertexes) == 0 {
+		nodes := asMapSlice(logicalPlan["nodes"])
+		if len(nodes) > 0 {
+			fmt.Fprintln(out, "Execution path:")
+			for idx, node := range nodes {
+				fmt.Fprintf(out, "%d. %s", idx+1, asString(node["op"]))
+				details := make([]string, 0, 2)
+				if impl := asString(node["implementation"]); impl != "" {
+					details = append(details, "implementation="+impl)
+				}
+				if attrs, ok := node["attrs"].(map[string]any); ok {
+					if kind := asString(attrs["kind"]); kind != "" {
+						details = append(details, "kind="+kind)
+					}
+				}
+				if len(details) > 0 {
+					fmt.Fprintf(out, " (%s)", strings.Join(details, ", "))
+				}
+				fmt.Fprintln(out)
+			}
+		}
+	}
+
+	if writePlan, ok := explain["writePlan"].(map[string]any); ok {
+		steps := asMapSlice(writePlan["steps"])
+		if len(steps) > 0 {
+			fmt.Fprintln(out, "Write plan:")
+			for idx, step := range steps {
+				fmt.Fprintf(out, "%d. %s\n", idx+1, asString(step["op"]))
+			}
+		}
+	}
 
 	fastPaths := asMapSlice(explain["executionStrategies"])
 	if len(fastPaths) > 0 {

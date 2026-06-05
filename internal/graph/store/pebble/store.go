@@ -555,38 +555,37 @@ func (t *tx) DeleteVertex(ctx context.Context, tenant, vertexID string) (err err
 	if err := t.ensureWrite(ctx); err != nil {
 		return err
 	}
-	vertex, err := t.GetVertex(ctx, tenant, vertexID)
-	if err != nil {
+	if _, err := t.get(keyspace.VertexKey(tenant, vertexID)); err != nil {
 		if graph.IsKind(err, graph.ErrKindNotFound) {
 			return nil
 		}
 		return err
 	}
-	if vertex != nil {
-		if err := t.addToCounter(keyspace.StatsVertexTotalKey(tenant), -1); err != nil {
+	labels, err := t.loadVertexLabels(ctx, tenant, vertexID)
+	if err != nil {
+		return err
+	}
+	if err := t.addToCounter(keyspace.StatsVertexTotalKey(tenant), -1); err != nil {
+		return err
+	}
+	for _, label := range normalizedLabelsOrdered(labels) {
+		if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(tenant, label), -1); err != nil {
 			return err
-		}
-		for label := range normalizedLabelSet(vertex.Labels) {
-			if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(tenant, label), -1); err != nil {
-				return err
-			}
 		}
 	}
 	if err := t.delete(keyspace.VertexKey(tenant, vertexID), "delete vertex"); err != nil {
 		return err
 	}
 	t.dropVertexCache(tenant, vertexID)
-	if vertex != nil {
-		if err := t.deleteVertexPropertiesBySchema(ctx, tenant, vertexID, ""); err != nil {
+	if err := t.deleteVertexPropertiesBySchema(ctx, tenant, vertexID, ""); err != nil {
+		return err
+	}
+	for _, label := range normalizedLabelsOrdered(labels) {
+		if err := t.delete(keyspace.VertexLabelKey(tenant, vertexID, label), "delete vertex label forward index"); err != nil {
 			return err
 		}
-		for label := range normalizedLabelSet(vertex.Labels) {
-			if err := t.delete(keyspace.VertexLabelKey(tenant, vertexID, label), "delete vertex label forward index"); err != nil {
-				return err
-			}
-			if err := t.delete(keyspace.VertexLabelMembershipKey(tenant, label, vertexID), "delete vertex label membership"); err != nil {
-				return err
-			}
+		if err := t.delete(keyspace.VertexLabelMembershipKey(tenant, label, vertexID), "delete vertex label membership"); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1192,14 +1191,14 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 	if previousExists && bytes.Equal(existingHash, nextHash) {
 		return nil
 	}
-	var previous *graph.Edge
+	var previousType, previousSrcID, previousDstID string
 	if previousExists {
-		previous, err = t.loadEdgeByID(ctx, edge.Tenant, edge.ID)
+		previousType, previousSrcID, previousDstID, err = t.loadEdgeTypeAndEndpoints(ctx, edge.Tenant, edge.ID)
 		if err != nil {
 			return err
 		}
 	}
-	if previous == nil {
+	if !previousExists {
 		if err := t.addToCounter(keyspace.StatsEdgeTotalKey(edge.Tenant), 1); err != nil {
 			return err
 		}
@@ -1207,8 +1206,8 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 			return err
 		}
 	}
-	if previous != nil {
-		oldType := normalizedEdgeType(previous.Type)
+	if previousExists {
+		oldType := normalizedEdgeType(previousType)
 		newType := normalizedEdgeType(edge.Type)
 		if oldType != newType {
 			if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(edge.Tenant, oldType), -1); err != nil {
@@ -1219,26 +1218,26 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 			}
 		}
 	}
-	if previous != nil {
-		if err := t.delete(keyspace.EdgeTypeKey(previous.Tenant, previous.ID, previous.Type), "delete stale edge type"); err != nil {
+	if previousExists {
+		if err := t.delete(keyspace.EdgeTypeKey(edge.Tenant, edge.ID, previousType), "delete stale edge type"); err != nil {
 			return err
 		}
-		if err := t.delete(keyspace.TypeEdgeKey(previous.Tenant, previous.Type, previous.ID), "delete stale type edge"); err != nil {
+		if err := t.delete(keyspace.TypeEdgeKey(edge.Tenant, previousType, edge.ID), "delete stale type edge"); err != nil {
 			return err
 		}
-		if err := t.delete(keyspace.OutAdjacencyKey(previous.Tenant, previous.SrcID, previous.Type, previous.ID), "delete stale out adjacency"); err != nil {
+		if err := t.delete(keyspace.OutAdjacencyKey(edge.Tenant, previousSrcID, previousType, edge.ID), "delete stale out adjacency"); err != nil {
 			return err
 		}
-		if err := t.delete(keyspace.InAdjacencyKey(previous.Tenant, previous.DstID, previous.Type, previous.ID), "delete stale in adjacency"); err != nil {
+		if err := t.delete(keyspace.InAdjacencyKey(edge.Tenant, previousDstID, previousType, edge.ID), "delete stale in adjacency"); err != nil {
 			return err
 		}
-		if err := t.delete(keyspace.OutEndpointKey(previous.Tenant, previous.SrcID, previous.Type, previous.DstID, previous.ID), "delete stale out endpoint"); err != nil {
+		if err := t.delete(keyspace.OutEndpointKey(edge.Tenant, previousSrcID, previousType, previousDstID, edge.ID), "delete stale out endpoint"); err != nil {
 			return err
 		}
-		if err := t.adjustOutEndpointPairCount(previous.Tenant, previous.SrcID, previous.Type, previous.DstID, -1); err != nil {
+		if err := t.adjustOutEndpointPairCount(edge.Tenant, previousSrcID, previousType, previousDstID, -1); err != nil {
 			return err
 		}
-		if err := t.adjustUndirectedEndpointPairCount(previous.Tenant, previous.SrcID, previous.Type, previous.DstID, -1); err != nil {
+		if err := t.adjustUndirectedEndpointPairCount(edge.Tenant, previousSrcID, previousType, previousDstID, -1); err != nil {
 			return err
 		}
 	}
@@ -1287,14 +1286,23 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 	}
 	t.lockEdgeForMutation(tenant, edgeID)
 
-	edge, err := t.GetEdge(ctx, tenant, edgeID)
+	if _, err := t.get(keyspace.EdgeKey(tenant, edgeID)); err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil
+		}
+		return err
+	}
+	edgeType, srcID, dstID, err := t.loadEdgeTypeAndEndpoints(ctx, tenant, edgeID)
 	if err != nil {
+		if graph.IsKind(err, graph.ErrKindNotFound) {
+			return nil
+		}
 		return err
 	}
 	if err := t.addToCounter(keyspace.StatsEdgeTotalKey(tenant), -1); err != nil {
 		return err
 	}
-	if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(tenant, normalizedEdgeType(edge.Type)), -1); err != nil {
+	if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(tenant, normalizedEdgeType(edgeType)), -1); err != nil {
 		return err
 	}
 	if err := t.delete(keyspace.EdgeKey(tenant, edgeID), "delete edge"); err != nil {
@@ -1303,25 +1311,25 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 	if err := t.deleteEdgePropertiesBySchema(ctx, tenant, edgeID, ""); err != nil {
 		return err
 	}
-	if err := t.delete(keyspace.EdgeTypeKey(edge.Tenant, edge.ID, edge.Type), "delete edge type"); err != nil {
+	if err := t.delete(keyspace.EdgeTypeKey(tenant, edgeID, edgeType), "delete edge type"); err != nil {
 		return err
 	}
-	if err := t.delete(keyspace.TypeEdgeKey(edge.Tenant, edge.Type, edge.ID), "delete type edge"); err != nil {
+	if err := t.delete(keyspace.TypeEdgeKey(tenant, edgeType, edgeID), "delete type edge"); err != nil {
 		return err
 	}
-	if err := t.delete(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), "delete out adjacency"); err != nil {
+	if err := t.delete(keyspace.OutAdjacencyKey(tenant, srcID, edgeType, edgeID), "delete out adjacency"); err != nil {
 		return err
 	}
-	if err := t.delete(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), "delete in adjacency"); err != nil {
+	if err := t.delete(keyspace.InAdjacencyKey(tenant, dstID, edgeType, edgeID), "delete in adjacency"); err != nil {
 		return err
 	}
-	if err := t.delete(keyspace.OutEndpointKey(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, edge.ID), "delete out endpoint"); err != nil {
+	if err := t.delete(keyspace.OutEndpointKey(tenant, srcID, edgeType, dstID, edgeID), "delete out endpoint"); err != nil {
 		return err
 	}
-	if err := t.adjustOutEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, -1); err != nil {
+	if err := t.adjustOutEndpointPairCount(tenant, srcID, edgeType, dstID, -1); err != nil {
 		return err
 	}
-	if err := t.adjustUndirectedEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, -1); err != nil {
+	if err := t.adjustUndirectedEndpointPairCount(tenant, srcID, edgeType, dstID, -1); err != nil {
 		return err
 	}
 	return nil

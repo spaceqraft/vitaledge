@@ -4450,6 +4450,120 @@ func TestExecuteMatchSetRemoveAndDelete(t *testing.T) {
 	}
 }
 
+func TestExecuteDeleteTypedRelationshipOnlyRemovesTargetType(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p2", Labels: []string{"Person"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "sf1", Type: "SUGGESTED_FRIEND", SrcID: "p1", DstID: "p2"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "k1", Type: "KNOWS", SrcID: "p1", DstID: "p2"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (:Person)-[sf:SUGGESTED_FRIEND]->() DELETE sf")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute delete failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		if _, err := tx.GetEdge(ctx, "acme", "sf1"); !graph.IsKind(err, graph.ErrKindNotFound) {
+			return errUnexpected("expected typed edge to be deleted")
+		}
+		edge, err := tx.GetEdge(ctx, "acme", "k1")
+		if err != nil {
+			return err
+		}
+		if edge == nil || edge.Type != "KNOWS" {
+			return errUnexpected("expected non-target edge type to remain")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verification failed: %v", err)
+	}
+}
+
+func TestExecuteTwoHopDistinctCreateRecommendationEdges(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		for _, id := range []string{"p1", "p2", "p3"} {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: id, Labels: []string{"Person"}}); err != nil {
+				return err
+			}
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "k1", Type: "KNOWS", SrcID: "p1", DstID: "p2"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "k2", Type: "KNOWS", SrcID: "p3", DstID: "p2"}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:Person)-[:KNOWS]->(m:Person)<-[:KNOWS]-(b:Person) WHERE a <> b AND NOT (a)-[:SUGGESTED_FRIEND]-(b) WITH DISTINCT a, b CREATE (a)-[:SUGGESTED_FRIEND]->(b)")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute create failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		countP1 := 0
+		if err := tx.ScanOutEdges(ctx, "acme", "p1", "SUGGESTED_FRIEND", 10, func(edge *graph.Edge) error {
+			if edge != nil && edge.DstID == "p3" {
+				countP1++
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		countP3 := 0
+		if err := tx.ScanOutEdges(ctx, "acme", "p3", "SUGGESTED_FRIEND", 10, func(edge *graph.Edge) error {
+			if edge != nil && edge.DstID == "p1" {
+				countP3++
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if countP1 != 1 || countP3 != 1 {
+			return errUnexpected("expected one suggested-friend edge in each direction")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verification failed: %v", err)
+	}
+}
+
 func TestExecuteSetVertexLabels(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

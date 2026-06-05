@@ -445,6 +445,11 @@ func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QuerySta
 	}
 
 	if !writeQuery {
+		if fastResult, ok, fastErr := e.tryFastTypedCollectDistinctReturnQuery(ctx, stmt, params); fastErr != nil {
+			return nil, fastErr
+		} else if ok {
+			return fastResult, nil
+		}
 		if fastResult, ok, fastErr := e.tryFastEdgeCountQuery(ctx, stmt, params); fastErr != nil {
 			return nil, fastErr
 		} else if ok {
@@ -3380,6 +3385,323 @@ func isWriteClauseKind(kind ast.ClauseKind) bool {
 	default:
 		return false
 	}
+}
+
+type fastTypedCollectDistinctEndpointExpr struct {
+	Var      string
+	Property string
+}
+
+type fastTypedCollectDistinctReturnSpec struct {
+	groupExpr             fastTypedCollectDistinctEndpointExpr
+	groupKey              string
+	collectExpr           fastTypedCollectDistinctEndpointExpr
+	collectKey            string
+	orderedOutputKeys     []string
+	groupOrderByDirection *projectionOrderBySpec
+}
+
+func (e *Executor) tryFastTypedCollectDistinctReturnQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
+	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
+		return nil, false, nil
+	}
+	part := stmt.Parts[0]
+	if len(part.Clauses) != 2 {
+		return nil, false, nil
+	}
+	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindReturn {
+		return nil, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
+	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
+		return nil, false, nil
+	}
+	pattern, err := parseDirectedRelationshipPattern(matchSpec.Pattern)
+	if err != nil {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(pattern.EdgeType) == "" || len(pattern.EdgeAnyOf) != 0 || strings.TrimSpace(pattern.EdgeProps) != "" {
+		return nil, false, nil
+	}
+	leftVar := strings.TrimSpace(pattern.Left.Var)
+	rightVar := strings.TrimSpace(pattern.Right.Var)
+	if leftVar == "" || rightVar == "" {
+		return nil, false, nil
+	}
+
+	leftLabel, leftAny, ok := fastEdgeCountVertexLabelFilter(pattern.Left)
+	if !ok {
+		return nil, false, nil
+	}
+	rightLabel, rightAny, ok := fastEdgeCountVertexLabelFilter(pattern.Right)
+	if !ok {
+		return nil, false, nil
+	}
+
+	retSpec, err := projectionClauseSpecFromClause(part.Clauses[1])
+	if err != nil {
+		return nil, false, nil
+	}
+	if retSpec.Distinct || strings.TrimSpace(retSpec.WhereRaw) != "" || strings.TrimSpace(retSpec.SkipRaw) != "" || strings.TrimSpace(retSpec.LimitRaw) != "" {
+		return nil, false, nil
+	}
+	items, err := parseProjectionItems(retSpec.ProjectionRaw)
+	if err != nil || len(items) != 2 {
+		return nil, false, nil
+	}
+
+	parsed, ok := parseFastTypedCollectDistinctReturnProjection(items, retSpec.OrderBy, leftVar, rightVar)
+	if !ok {
+		return nil, false, nil
+	}
+
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, true, err
+	}
+
+	type groupState struct {
+		keyVal      any
+		collectVals []any
+		collectSeen map[string]struct{}
+	}
+
+	vertexCache := map[string]*graph.Vertex{}
+	groups := map[string]*groupState{}
+	groupOrder := make([]string, 0)
+
+	getVertex := func(tx graph.Tx, vertexID string) (*graph.Vertex, error) {
+		if cached, ok := vertexCache[vertexID]; ok {
+			return cached, nil
+		}
+		vertex, err := tx.GetVertex(ctx, tenant, vertexID)
+		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				vertexCache[vertexID] = nil
+				return nil, nil
+			}
+			return nil, err
+		}
+		vertexCache[vertexID] = vertex
+		return vertex, nil
+	}
+
+	resolveExprValue := func(tx graph.Tx, expr fastTypedCollectDistinctEndpointExpr, srcID, dstID string) (any, error) {
+		vertexID := srcID
+		if expr.Var == rightVar {
+			vertexID = dstID
+		}
+		vertex, err := getVertex(tx, strings.TrimSpace(vertexID))
+		if err != nil {
+			return nil, err
+		}
+		if vertex == nil {
+			return nil, nil
+		}
+		if expr.Property == "" {
+			return vertex, nil
+		}
+		raw, ok := vertex.Properties[expr.Property]
+		if !ok {
+			return nil, nil
+		}
+		return decodeStoredPropertyValue(raw), nil
+	}
+
+	err = e.store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanOutEdgeLinksByType(ctx, tenant, pattern.EdgeType, 0, func(srcID, _ string, dstID string) error {
+			srcID = strings.TrimSpace(srcID)
+			dstID = strings.TrimSpace(dstID)
+			if srcID == "" || dstID == "" {
+				return nil
+			}
+
+			srcVertex, err := getVertex(tx, srcID)
+			if err != nil {
+				return err
+			}
+			if srcVertex == nil {
+				return nil
+			}
+			dstVertex, err := getVertex(tx, dstID)
+			if err != nil {
+				return err
+			}
+			if dstVertex == nil {
+				return nil
+			}
+
+			if !leftAny && !vertexHasLabel(srcVertex, leftLabel) {
+				return nil
+			}
+			if !rightAny && !vertexHasLabel(dstVertex, rightLabel) {
+				return nil
+			}
+
+			groupVal, err := resolveExprValue(tx, parsed.groupExpr, srcID, dstID)
+			if err != nil {
+				return err
+			}
+			collectVal, err := resolveExprValue(tx, parsed.collectExpr, srcID, dstID)
+			if err != nil {
+				return err
+			}
+
+			groupKeyRaw, err := json.Marshal(normalizeResultValue(groupVal))
+			if err != nil {
+				return graph.NewError(graph.ErrKindUnsupported, "fast collect group key is not serializable", err)
+			}
+			groupKey := string(groupKeyRaw)
+			group, exists := groups[groupKey]
+			if !exists {
+				group = &groupState{keyVal: groupVal, collectSeen: map[string]struct{}{}}
+				groups[groupKey] = group
+				groupOrder = append(groupOrder, groupKey)
+			}
+
+			collectKeyRaw, err := json.Marshal(normalizeResultValue(collectVal))
+			if err != nil {
+				return graph.NewError(graph.ErrKindUnsupported, "fast collect value is not serializable", err)
+			}
+			collectKey := string(collectKeyRaw)
+			if _, seen := group.collectSeen[collectKey]; seen {
+				return nil
+			}
+			group.collectSeen[collectKey] = struct{}{}
+			group.collectVals = append(group.collectVals, collectVal)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, true, err
+	}
+
+	outRows := make([]Row, 0, len(groups))
+	for _, groupKey := range groupOrder {
+		group := groups[groupKey]
+		if group == nil {
+			continue
+		}
+		row := Row{
+			parsed.groupKey:   group.keyVal,
+			parsed.collectKey: group.collectVals,
+		}
+		outRows = append(outRows, row)
+	}
+
+	if parsed.groupOrderByDirection != nil {
+		sorted, err := sortProjectedRows(outRows, []projectionOrderBySpec{*parsed.groupOrderByDirection}, params, 0)
+		if err != nil {
+			return nil, true, err
+		}
+		outRows = sorted
+	}
+
+	return &Result{
+		Columns: append([]string(nil), parsed.orderedOutputKeys...),
+		Rows:    outRows,
+		Stats:   Stats{RowsReturned: len(outRows)},
+	}, true, nil
+}
+
+func parseFastTypedCollectDistinctReturnProjection(items []projectionSpec, orderBy []projectionOrderBySpec, leftVar, rightVar string) (fastTypedCollectDistinctReturnSpec, bool) {
+	if len(items) != 2 {
+		return fastTypedCollectDistinctReturnSpec{}, false
+	}
+	out := fastTypedCollectDistinctReturnSpec{}
+	groupSeen := false
+	collectSeen := false
+	groupExprRaw := ""
+	collectExprRaw := ""
+
+	for _, item := range items {
+		key := item.Expression
+		if item.Alias != "" {
+			key = item.Alias
+		}
+		out.orderedOutputKeys = append(out.orderedOutputKeys, key)
+
+		if item.CountArg != "" || item.AggFunc != "" {
+			return fastTypedCollectDistinctReturnSpec{}, false
+		}
+
+		if item.CollectArg != "" {
+			collectExpr, distinct := parseCollectDistinctArg(item.CollectArg)
+			if !distinct {
+				return fastTypedCollectDistinctReturnSpec{}, false
+			}
+			parsedExpr, ok := parseFastTypedCollectDistinctEndpointExpr(collectExpr, leftVar, rightVar)
+			if !ok {
+				return fastTypedCollectDistinctReturnSpec{}, false
+			}
+			out.collectExpr = parsedExpr
+			out.collectKey = key
+			collectExprRaw = strings.TrimSpace(collectExpr)
+			collectSeen = true
+			continue
+		}
+
+		parsedExpr, ok := parseFastTypedCollectDistinctEndpointExpr(item.Expression, leftVar, rightVar)
+		if !ok {
+			return fastTypedCollectDistinctReturnSpec{}, false
+		}
+		out.groupExpr = parsedExpr
+		out.groupKey = key
+		groupExprRaw = strings.TrimSpace(item.Expression)
+		groupSeen = true
+	}
+
+	if !groupSeen || !collectSeen || out.groupKey == "" || out.collectKey == "" {
+		return fastTypedCollectDistinctReturnSpec{}, false
+	}
+	if out.groupExpr.Var == out.collectExpr.Var {
+		return fastTypedCollectDistinctReturnSpec{}, false
+	}
+
+	if len(orderBy) > 1 {
+		return fastTypedCollectDistinctReturnSpec{}, false
+	}
+	if len(orderBy) == 1 {
+		orderExpr := strings.TrimSpace(orderBy[0].Expression)
+		if orderExpr != strings.TrimSpace(out.groupKey) && orderExpr != groupExprRaw {
+			return fastTypedCollectDistinctReturnSpec{}, false
+		}
+		if orderExpr == strings.TrimSpace(out.collectKey) || orderExpr == collectExprRaw {
+			return fastTypedCollectDistinctReturnSpec{}, false
+		}
+		spec := orderBy[0]
+		spec.Expression = out.groupKey
+		out.groupOrderByDirection = &spec
+	}
+
+	return out, true
+}
+
+func parseFastTypedCollectDistinctEndpointExpr(rawExpr, leftVar, rightVar string) (fastTypedCollectDistinctEndpointExpr, bool) {
+	rawExpr = strings.TrimSpace(rawExpr)
+	if rawExpr == "" {
+		return fastTypedCollectDistinctEndpointExpr{}, false
+	}
+	if identifierRE.MatchString(rawExpr) {
+		if rawExpr == leftVar || rawExpr == rightVar {
+			return fastTypedCollectDistinctEndpointExpr{Var: rawExpr}, true
+		}
+		return fastTypedCollectDistinctEndpointExpr{}, false
+	}
+	parts := strings.Split(rawExpr, ".")
+	if len(parts) != 2 {
+		return fastTypedCollectDistinctEndpointExpr{}, false
+	}
+	base := strings.TrimSpace(parts[0])
+	prop := strings.TrimSpace(parts[1])
+	if !identifierRE.MatchString(base) || !identifierRE.MatchString(prop) {
+		return fastTypedCollectDistinctEndpointExpr{}, false
+	}
+	if base != leftVar && base != rightVar {
+		return fastTypedCollectDistinctEndpointExpr{}, false
+	}
+	return fastTypedCollectDistinctEndpointExpr{Var: base, Property: prop}, true
 }
 
 func (e *Executor) tryFastEdgeCountQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {

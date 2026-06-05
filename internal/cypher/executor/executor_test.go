@@ -4564,6 +4564,179 @@ func TestExecuteTwoHopDistinctCreateRecommendationEdges(t *testing.T) {
 	}
 }
 
+func TestExecuteTypedCollectDistinctReturnRecommendations(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Alice")}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Bob")}},
+			{Tenant: "acme", ID: "p3", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Cora")}},
+			{Tenant: "acme", ID: "p4", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Drew")}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "k1", Type: "KNOWS", SrcID: "p1", DstID: "p2"},
+			{Tenant: "acme", ID: "k2", Type: "KNOWS", SrcID: "p1", DstID: "p3"},
+			{Tenant: "acme", ID: "k3", Type: "KNOWS", SrcID: "p1", DstID: "p3"},
+			{Tenant: "acme", ID: "k4", Type: "KNOWS", SrcID: "p2", DstID: "p3"},
+			{Tenant: "acme", ID: "k5", Type: "KNOWS", SrcID: "p2", DstID: "p4"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (src:Person)-[:KNOWS]->(dst:Person) RETURN src.name AS person, collect(DISTINCT dst.name) AS suggested ORDER BY person")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+
+	toStringSet := func(raw any) map[string]struct{} {
+		out := map[string]struct{}{}
+		switch typed := raw.(type) {
+		case []any:
+			for _, item := range typed {
+				text, ok := item.(string)
+				if !ok {
+					t.Fatalf("expected collected value to be string, got %#v", item)
+				}
+				out[text] = struct{}{}
+			}
+		case []string:
+			for _, item := range typed {
+				out[item] = struct{}{}
+			}
+		default:
+			t.Fatalf("expected collected list, got %#v", raw)
+		}
+		return out
+	}
+
+	people := make([]string, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		person, _ := row["person"].(string)
+		people = append(people, person)
+		suggested := toStringSet(row["suggested"])
+		switch person {
+		case "Alice":
+			if len(suggested) != 2 {
+				t.Fatalf("expected two distinct suggestions for Alice, got %#v", row["suggested"])
+			}
+			if _, ok := suggested["Bob"]; !ok {
+				t.Fatalf("missing Bob suggestion for Alice: %#v", row["suggested"])
+			}
+			if _, ok := suggested["Cora"]; !ok {
+				t.Fatalf("missing Cora suggestion for Alice: %#v", row["suggested"])
+			}
+		case "Bob":
+			if len(suggested) != 2 {
+				t.Fatalf("expected two distinct suggestions for Bob, got %#v", row["suggested"])
+			}
+			if _, ok := suggested["Cora"]; !ok {
+				t.Fatalf("missing Cora suggestion for Bob: %#v", row["suggested"])
+			}
+			if _, ok := suggested["Drew"]; !ok {
+				t.Fatalf("missing Drew suggestion for Bob: %#v", row["suggested"])
+			}
+		default:
+			t.Fatalf("unexpected person row: %#v", row)
+		}
+	}
+	if !reflect.DeepEqual(people, []string{"Alice", "Bob"}) {
+		t.Fatalf("unexpected ordering: %#v", people)
+	}
+}
+
+func TestExecuteCollectReturnPreservesDuplicatesWithoutDistinct(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Alice")}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Bob")}},
+			{Tenant: "acme", ID: "p3", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Cora")}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "k1", Type: "KNOWS", SrcID: "p1", DstID: "p2"},
+			{Tenant: "acme", ID: "k2", Type: "KNOWS", SrcID: "p1", DstID: "p3"},
+			{Tenant: "acme", ID: "k3", Type: "KNOWS", SrcID: "p1", DstID: "p3"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (src:Person)-[:KNOWS]->(dst:Person) RETURN src.name AS person, collect(dst.name) AS suggested ORDER BY person")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one grouped row, got %d", len(res.Rows))
+	}
+	if person, _ := res.Rows[0]["person"].(string); person != "Alice" {
+		t.Fatalf("unexpected grouped person: %#v", res.Rows[0]["person"])
+	}
+
+	collected, ok := res.Rows[0]["suggested"].([]any)
+	if !ok {
+		t.Fatalf("expected collected values as []any, got %#v", res.Rows[0]["suggested"])
+	}
+	values := make([]string, 0, len(collected))
+	for _, item := range collected {
+		text, ok := item.(string)
+		if !ok {
+			t.Fatalf("expected collected value to be string, got %#v", item)
+		}
+		values = append(values, text)
+	}
+	if !reflect.DeepEqual(values, []string{"Bob", "Cora", "Cora"}) {
+		t.Fatalf("expected duplicate suggestion to be preserved, got %#v", values)
+	}
+}
+
 func TestExecuteSetVertexLabels(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

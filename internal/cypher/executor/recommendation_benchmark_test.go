@@ -20,10 +20,9 @@ var recommendationBenchmarkMultiTargetQuery = strings.Replace(recommendationBenc
 type recommendationBenchmarkMode int
 
 const (
-	recommendationBenchmarkModeStep1TopK recommendationBenchmarkMode = iota
-	recommendationBenchmarkModeStep2LateMaterialization
-	recommendationBenchmarkModeStep2IndexPushdownBaseline
-	recommendationBenchmarkModeStep2IndexPushdownEnabled
+	recommendationBenchmarkModeStage1TopKAdaptive recommendationBenchmarkMode = iota
+	recommendationBenchmarkModeStage2LateMaterialization
+	recommendationBenchmarkModeStage2IndexPushdown
 )
 
 type recommendationBenchmarkTargetMode int
@@ -31,14 +30,6 @@ type recommendationBenchmarkTargetMode int
 const (
 	recommendationBenchmarkTargetModeSingle recommendationBenchmarkTargetMode = iota
 	recommendationBenchmarkTargetModeMulti
-)
-
-type recommendationBenchmarkStage1ExpansionMode int
-
-const (
-	recommendationBenchmarkStage1ExpansionAuto recommendationBenchmarkStage1ExpansionMode = iota
-	recommendationBenchmarkStage1ExpansionNested
-	recommendationBenchmarkStage1ExpansionSharedSeed
 )
 
 type recommendationBenchmarkSeedProfile int
@@ -49,74 +40,58 @@ const (
 	recommendationBenchmarkSeedProfileRangePredicateActivation
 )
 
-func BenchmarkRecommendationQueryStep1TopKPushdown(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep1TopK, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
+func BenchmarkRecommendationQueryStage1TopKAdaptive(b *testing.B) {
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStage1TopKAdaptive, recommendationBenchmarkTargetModeSingle)
 }
 
-func BenchmarkRecommendationQueryStep1TopKPushdownEnabled(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
+func BenchmarkRecommendationQueryStage1TopKPushdownCurrent(b *testing.B) {
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStage2LateMaterialization, recommendationBenchmarkTargetModeSingle)
 }
 
-func BenchmarkRecommendationQueryStep2LateMaterialization(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
+func BenchmarkRecommendationQueryStage2LateMaterialization(b *testing.B) {
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStage2LateMaterialization, recommendationBenchmarkTargetModeSingle)
 }
 
-func BenchmarkRecommendationQueryMultiTargetStage1NestedBaseline(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeMulti, recommendationBenchmarkStage1ExpansionNested)
+func BenchmarkRecommendationQueryMultiTargetStage1Nested(b *testing.B) {
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStage2LateMaterialization, recommendationBenchmarkTargetModeMulti)
 }
 
 func BenchmarkRecommendationQueryMultiTargetStage1SharedSeedExpansion(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2LateMaterialization, recommendationBenchmarkTargetModeMulti, recommendationBenchmarkStage1ExpansionSharedSeed)
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStage2LateMaterialization, recommendationBenchmarkTargetModeMulti)
 }
 
-func BenchmarkRecommendationQueryStep2IndexPushdownBaseline(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2IndexPushdownBaseline, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
+func BenchmarkRecommendationQueryStage2IndexPushdown(b *testing.B) {
+	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStage2IndexPushdown, recommendationBenchmarkTargetModeSingle)
 }
 
-func BenchmarkRecommendationQueryStep2IndexPushdownEnabled(b *testing.B) {
-	benchmarkRecommendationQuery(b, recommendationBenchmarkModeStep2IndexPushdownEnabled, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto)
+func BenchmarkRecommendationQuerySelectiveStage2IndexPushdown(b *testing.B) {
+	benchmarkRecommendationQueryWithQuery(b, recommendationBenchmarkModeStage2IndexPushdown, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkSelectiveQuery)
 }
 
-func BenchmarkRecommendationQuerySelectiveStep2IndexPushdownBaseline(b *testing.B) {
-	benchmarkRecommendationQueryWithQuery(b, recommendationBenchmarkModeStep2IndexPushdownBaseline, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto, recommendationBenchmarkSelectiveQuery)
+func BenchmarkRecommendationQueryIndexedSelectiveStage2IndexPushdown(b *testing.B) {
+	// Uses a dedicated seed profile that keeps stage2 index candidates selective
+	// enough to exercise the stage2 early-stop path.
+	benchmarkRecommendationQueryWithQueryAndSeed(b, recommendationBenchmarkModeStage2IndexPushdown, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkIndexedSelectiveQuery, seedRecommendationBenchmarkGraphStage2Activation)
 }
 
-func BenchmarkRecommendationQuerySelectiveStep2IndexPushdownEnabled(b *testing.B) {
-	benchmarkRecommendationQueryWithQuery(b, recommendationBenchmarkModeStep2IndexPushdownEnabled, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto, recommendationBenchmarkSelectiveQuery)
+func BenchmarkRecommendationQueryRangePredicateStage2IndexPushdown(b *testing.B) {
+	// Exercises the production recommendation query shape with a dedicated seed
+	// profile so the one-sided numeric range can activate stage2 index pushdown
+	// without tripping the generic probe cap.
+	benchmarkRecommendationQueryWithQueryAndSeedProfile(b, recommendationBenchmarkModeStage2IndexPushdown, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkQuery, recommendationBenchmarkSeedProfileRangePredicateActivation)
 }
 
-func BenchmarkRecommendationQueryIndexedSelectiveStep2IndexPushdownBaseline(b *testing.B) {
-	// This pair uses a dedicated seed profile that keeps stage2 index candidates
-	// selective enough to apply pushdown and exercise the stage2 early-stop path.
-	benchmarkRecommendationQueryWithQueryAndSeed(b, recommendationBenchmarkModeStep2IndexPushdownBaseline, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto, recommendationBenchmarkIndexedSelectiveQuery, seedRecommendationBenchmarkGraphStage2Activation)
+func benchmarkRecommendationQuery(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode) {
+	benchmarkRecommendationQueryWithQueryAndSeedProfile(b, mode, targetMode, "", recommendationBenchmarkSeedProfileDefault)
 }
 
-func BenchmarkRecommendationQueryIndexedSelectiveStep2IndexPushdownEnabled(b *testing.B) {
-	benchmarkRecommendationQueryWithQueryAndSeed(b, recommendationBenchmarkModeStep2IndexPushdownEnabled, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto, recommendationBenchmarkIndexedSelectiveQuery, seedRecommendationBenchmarkGraphStage2Activation)
+func benchmarkRecommendationQueryWithQuery(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode, queryOverride string) {
+	benchmarkRecommendationQueryWithQueryAndSeedProfile(b, mode, targetMode, queryOverride, recommendationBenchmarkSeedProfileDefault)
 }
 
-func BenchmarkRecommendationQueryRangePredicateStep2IndexPushdownBaseline(b *testing.B) {
-	// This pair exercises the production recommendation query shape with a
-	// dedicated seed profile so the one-sided numeric range can activate stage2
-	// index pushdown without tripping the generic probe cap.
-	benchmarkRecommendationQueryWithQueryAndSeedProfile(b, recommendationBenchmarkModeStep2IndexPushdownBaseline, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto, recommendationBenchmarkQuery, recommendationBenchmarkSeedProfileRangePredicateActivation)
-}
-
-func BenchmarkRecommendationQueryRangePredicateStep2IndexPushdownEnabled(b *testing.B) {
-	benchmarkRecommendationQueryWithQueryAndSeedProfile(b, recommendationBenchmarkModeStep2IndexPushdownEnabled, recommendationBenchmarkTargetModeSingle, recommendationBenchmarkStage1ExpansionAuto, recommendationBenchmarkQuery, recommendationBenchmarkSeedProfileRangePredicateActivation)
-}
-
-func benchmarkRecommendationQuery(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode, stage1ExpansionMode recommendationBenchmarkStage1ExpansionMode) {
-	benchmarkRecommendationQueryWithQueryAndSeedProfile(b, mode, targetMode, stage1ExpansionMode, "", recommendationBenchmarkSeedProfileDefault)
-}
-
-func benchmarkRecommendationQueryWithQuery(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode, stage1ExpansionMode recommendationBenchmarkStage1ExpansionMode, queryOverride string) {
-	benchmarkRecommendationQueryWithQueryAndSeedProfile(b, mode, targetMode, stage1ExpansionMode, queryOverride, recommendationBenchmarkSeedProfileDefault)
-}
-
-func benchmarkRecommendationQueryWithQueryAndSeedProfile(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode, stage1ExpansionMode recommendationBenchmarkStage1ExpansionMode, queryOverride string, seedProfile recommendationBenchmarkSeedProfile) {
+func benchmarkRecommendationQueryWithQueryAndSeedProfile(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode, queryOverride string, seedProfile recommendationBenchmarkSeedProfile) {
 	seedFn := seedRecommendationBenchmarkGraphProfile(seedProfile)
-	benchmarkRecommendationQueryWithQueryAndSeed(b, mode, targetMode, stage1ExpansionMode, queryOverride, seedFn)
+	benchmarkRecommendationQueryWithQueryAndSeed(b, mode, targetMode, queryOverride, seedFn)
 }
 
 func seedRecommendationBenchmarkGraphProfile(profile recommendationBenchmarkSeedProfile) func(context.Context, graph.GraphStore) error {
@@ -130,7 +105,7 @@ func seedRecommendationBenchmarkGraphProfile(profile recommendationBenchmarkSeed
 	}
 }
 
-func benchmarkRecommendationQueryWithQueryAndSeed(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode, stage1ExpansionMode recommendationBenchmarkStage1ExpansionMode, queryOverride string, seedFn func(context.Context, graph.GraphStore) error) {
+func benchmarkRecommendationQueryWithQueryAndSeed(b *testing.B, mode recommendationBenchmarkMode, targetMode recommendationBenchmarkTargetMode, queryOverride string, seedFn func(context.Context, graph.GraphStore) error) {
 	ctx := context.Background()
 	store := openBenchmarkStore(b)
 	defer func() { _ = store.Close() }()
@@ -157,17 +132,8 @@ func benchmarkRecommendationQueryWithQueryAndSeed(b *testing.B, mode recommendat
 	collector := NewCollector()
 	catalog := indexschema.NewCatalog()
 	opts := Options{Metrics: collector, IndexCatalog: catalog}
-	if mode == recommendationBenchmarkModeStep1TopK {
-		opts.DisableStage1TopKPushdown = true
-	}
-	if mode == recommendationBenchmarkModeStep2IndexPushdownBaseline {
-		opts.DisableStage2EdgeIndexPushdown = true
-	}
-	if stage1ExpansionMode == recommendationBenchmarkStage1ExpansionNested {
-		opts.DisableStage1SharedSeedExpansion = true
-	}
 	exec := New(store, opts)
-	if mode == recommendationBenchmarkModeStep2IndexPushdownBaseline || mode == recommendationBenchmarkModeStep2IndexPushdownEnabled {
+	if mode == recommendationBenchmarkModeStage2IndexPushdown {
 		catalog.AddEdgePropertyIndex("bench-rec", "RATED", "rating")
 		if _, err := exec.BackfillEdgePropertyIndex(ctx, "bench-rec", "RATED", "rating"); err != nil {
 			b.Fatalf("backfill edge index failed: %v", err)

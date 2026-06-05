@@ -11,6 +11,10 @@ import (
 	"strings"
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
+	cypherexplain "github.com/paegun/vitaledge/internal/cypher/explain"
+	"github.com/paegun/vitaledge/internal/cypher/logical"
+	"github.com/paegun/vitaledge/internal/cypher/physical"
+	"github.com/paegun/vitaledge/internal/cypher/semantic"
 	"github.com/paegun/vitaledge/internal/graph"
 )
 
@@ -55,6 +59,17 @@ func (e *Executor) executeExplainStatement(ctx context.Context, stmt *ast.Explai
 	if stmt == nil || stmt.Statement == nil {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "EXPLAIN requires an inner statement", nil)
 	}
+	routeDecision := decideExplainRoute(stmt, map[string]any(params), e != nil && e.enablePipelineExplainPayload)
+	if routeDecision.route == explainRoutePipelinePayload {
+		if payload, err := buildPipelineExplainPayload(stmt, params, routeDecision); err == nil {
+			return &Result{
+				Columns: []string{"explain"},
+				Rows:    []Row{{"explain": payload}},
+				Stats:   Stats{RowsReturned: 1},
+			}, nil
+		}
+		routeDecision = explainRouteDecision{route: explainRouteLegacyPayload, reason: "pipeline_payload_fallback"}
+	}
 
 	analysis, err := e.buildExplainAnalysis(ctx, stmt.Statement, params)
 	if err != nil {
@@ -62,6 +77,10 @@ func (e *Executor) executeExplainStatement(ctx context.Context, stmt *ast.Explai
 	}
 
 	payload := e.buildExplainPayload(stmt, params, analysis)
+	if metadata, ok := payload["metadata"].(map[string]any); ok {
+		metadata["explainRoute"] = string(routeDecision.route)
+		metadata["explainRouteReason"] = routeDecision.reason
+	}
 	return &Result{
 		Columns: []string{"explain"},
 		Rows:    []Row{{"explain": payload}},
@@ -103,6 +122,7 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params, analysis *explainAnalysis) map[string]any {
 	tenant := tenantFromParams(params)
 	planVertexes := buildExplainPlanNodes(stmt.Statement, e.indexCatalog, tenant, params)
+	pipelineExplainText, hasPipelineExplain := buildPipelineExplainText(stmt.Statement)
 	rootVertexID := ""
 	if len(planVertexes) > 0 {
 		rootVertexID = planVertexes[len(planVertexes)-1]["id"].(string)
@@ -149,11 +169,101 @@ func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params
 		"executionStrategies": analysis.fastPaths,
 		"warnings":            analysis.warnings,
 		"metadata": map[string]any{
-			"transport": "json",
+			"transport":             "json",
+			"pipelineExplainStatus": "unavailable",
 		},
+	}
+	if hasPipelineExplain {
+		metadata := payload["metadata"].(map[string]any)
+		metadata["pipelineExplain"] = pipelineExplainText
+		metadata["pipelineExplainStatus"] = "ok"
 	}
 
 	return payload
+}
+
+func buildPipelineExplainText(stmt ast.Statement) (string, bool) {
+	semanticModel, err := semantic.Build(stmt)
+	if err != nil {
+		return "", false
+	}
+	logicalPlan := logical.Build(semanticModel)
+	physicalPlan := physical.Build(logicalPlan)
+	return cypherexplain.RenderPipeline(logicalPlan, physicalPlan), true
+}
+
+func buildPipelineExplainPayload(stmt *ast.ExplainStatement, params Params, routeDecision explainRouteDecision) (map[string]any, error) {
+	semanticModel, err := semantic.Build(stmt.Statement)
+	if err != nil {
+		return nil, err
+	}
+	logicalPlan := logical.Build(semanticModel)
+	physicalPlan := physical.Build(logicalPlan)
+	pipelineExplainText := cypherexplain.RenderPipeline(logicalPlan, physicalPlan)
+
+	logicalNodes := make([]map[string]any, 0, len(logicalPlan.Nodes))
+	for _, node := range logicalPlan.Nodes {
+		logicalNodes = append(logicalNodes, map[string]any{
+			"id":       node.ID,
+			"op":       node.Op,
+			"children": append([]string(nil), node.Children...),
+			"attrs":    node.Attrs,
+		})
+	}
+	physicalNodes := make([]map[string]any, 0, len(physicalPlan.Nodes))
+	for _, node := range physicalPlan.Nodes {
+		physicalNodes = append(physicalNodes, map[string]any{
+			"id":       node.ID,
+			"op":       node.Op,
+			"children": append([]string(nil), node.Children...),
+			"attrs":    node.Attrs,
+		})
+	}
+
+	payload := map[string]any{
+		"version": "v2-pipeline",
+		"query": map[string]any{
+			"text":          explainedQueryText(stmt),
+			"fingerprint":   explainFingerprint(stmt),
+			"statementKind": string(stmt.Statement.Kind()),
+			"tenant":        tenantFromParams(params),
+			"params":        parameterNamesForStatement(stmt.Statement),
+			"options":       buildExplainQueryOptions(stmt.Statement),
+		},
+		"summary": map[string]any{
+			"dryRun":              true,
+			"readOnly":            true,
+			"writesDetected":      statementMayWrite(stmt.Statement),
+			"semanticPhaseStatus": "ok",
+			"planningPhaseStatus": "ok",
+			"route":               string(routeDecision.route),
+		},
+		"semantic": map[string]any{
+			"statementKind": string(semanticModel.StatementKind),
+			"patterns":      semanticModel.Patterns,
+			"projections":   semanticModel.Projections,
+			"ordering":      semanticModel.Ordering,
+			"pagination":    semanticModel.Pagination,
+			"writeActions":  semanticModel.WriteActions,
+		},
+		"logicalPlan": map[string]any{
+			"rootNodeId": logicalPlan.RootNodeID,
+			"nodes":      logicalNodes,
+		},
+		"physicalPlan": map[string]any{
+			"rootNodeId": physicalPlan.RootNodeID,
+			"nodes":      physicalNodes,
+		},
+		"metadata": map[string]any{
+			"transport":             "json",
+			"pipelineExplainStatus": "ok",
+			"pipelineExplain":       pipelineExplainText,
+			"explainRoute":          string(routeDecision.route),
+			"explainRouteReason":    routeDecision.reason,
+		},
+	}
+
+	return payload, nil
 }
 
 func collectExplainStoreStats(ctx context.Context, tx graph.Tx, tenant string, stmt ast.Statement, params Params) (explainStoreStats, error) {

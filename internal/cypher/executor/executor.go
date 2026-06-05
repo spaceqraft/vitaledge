@@ -87,33 +87,22 @@ type IndexCatalog interface {
 type Options struct {
 	Metrics      Metrics
 	IndexCatalog IndexCatalog
-	// DisableStage1TopKPushdown forces the stage-1 recommendation fast path to
-	// materialize the full peer aggregate set instead of applying the immediate
-	// follow-on WITH similarity ORDER BY/LIMIT pushdown.
-	DisableStage1TopKPushdown bool
-	// DisableStage1SharedSeedExpansion forces the stage-1 recommendation fast
-	// path to use direct nested expansion instead of shared-seed expansion.
-	DisableStage1SharedSeedExpansion bool
-	// DisableStage2TopKPushdown forces the stage-2 recommendation fast path to
-	// run full projection post-processing instead of top-k pushdown.
-	DisableStage2TopKPushdown bool
-	// DisableStage2LateMaterialization forces eager per-update projection
-	// materialization in the stage-2 recommendation fast path.
-	DisableStage2LateMaterialization bool
-	// DisableStage2EdgeIndexPushdown forces stage-2 recommendation candidate
-	// expansion to use adjacency scans instead of edge-property index pushdown.
-	DisableStage2EdgeIndexPushdown bool
+	// EnableRuntimePipelineDefault enables runtime pipeline routing for
+	// supported query shapes by default, without requiring the per-query
+	// __ve_use_runtime_pipeline parameter. The query parameter still overrides
+	// this default when present.
+	EnableRuntimePipelineDefault bool
+	// EnablePipelineExplainPayload opts EXPLAIN route decisions into the
+	// pipeline payload route while migration is in progress.
+	EnablePipelineExplainPayload bool
 }
 
 type Executor struct {
-	store                            graph.GraphStore
-	metrics                          Metrics
-	indexCatalog                     IndexCatalog
-	stage1TopKPushdownEnabled        bool
-	stage1SharedSeedExpansionEnabled bool
-	stage2TopKPushdownEnabled        bool
-	stage2LateMaterializationEnabled bool
-	stage2EdgeIndexPushdownEnabled   bool
+	store                        graph.GraphStore
+	metrics                      Metrics
+	indexCatalog                 IndexCatalog
+	enableRuntimePipelineDefault bool
+	enablePipelineExplainPayload bool
 
 	fastPathFeedbackMu sync.RWMutex
 	fastPathFeedback   map[string]fastPathFeedbackSummary
@@ -152,15 +141,12 @@ func New(store graph.GraphStore, opts Options) *Executor {
 		metrics = noopMetrics{}
 	}
 	return &Executor{
-		store:                            store,
-		metrics:                          metrics,
-		indexCatalog:                     opts.IndexCatalog,
-		stage1TopKPushdownEnabled:        !opts.DisableStage1TopKPushdown,
-		stage1SharedSeedExpansionEnabled: !opts.DisableStage1SharedSeedExpansion,
-		stage2TopKPushdownEnabled:        !opts.DisableStage2TopKPushdown,
-		stage2LateMaterializationEnabled: !opts.DisableStage2LateMaterialization,
-		stage2EdgeIndexPushdownEnabled:   !opts.DisableStage2EdgeIndexPushdown,
-		fastPathFeedback:                 map[string]fastPathFeedbackSummary{},
+		store:                        store,
+		metrics:                      metrics,
+		indexCatalog:                 opts.IndexCatalog,
+		enableRuntimePipelineDefault: opts.EnableRuntimePipelineDefault,
+		enablePipelineExplainPayload: opts.EnablePipelineExplainPayload,
+		fastPathFeedback:             map[string]fastPathFeedbackSummary{},
 	}
 }
 
@@ -307,6 +293,12 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 		e.metrics.ObserveRowsReturned(len(res.Rows))
 		return res, nil
 	case *ast.QueryStatement:
+		if runtimeRes, ok, execErr := e.tryExecuteViaRuntimePipeline(ctx, s, params); execErr != nil {
+			return nil, execErr
+		} else if ok {
+			e.metrics.ObserveRowsReturned(len(runtimeRes.Rows))
+			return runtimeRes, nil
+		}
 		res, execErr := e.executeQueryStatement(ctx, s, params)
 		if execErr != nil {
 			return nil, execErr

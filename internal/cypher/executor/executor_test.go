@@ -86,7 +86,7 @@ func TestExecuteExplainDryRunWriteQueryDoesNotMutate(t *testing.T) {
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -101,6 +101,52 @@ func TestExecuteExplainDryRunWriteQueryDoesNotMutate(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
 	}
+	if version, _ := explainPayload["version"].(string); version == "v2-pipeline" {
+		t.Fatalf("expected legacy explain payload, got %#v", explainPayload["version"])
+	}
+	if _, ok := explainPayload["logicalPlan"].(map[string]any); !ok {
+		t.Fatalf("expected legacy logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+
+	verifyStmt, err := parser.ParseStatement("MATCH (n:Person {id: 'dry-run'}) RETURN n")
+	if err != nil {
+		t.Fatalf("verification parse failed: %v", err)
+	}
+	verifyRes, err := exec.ExecuteStatement(ctx, verifyStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("verification execute failed: %v", err)
+	}
+	if len(verifyRes.Rows) != 0 {
+		t.Fatalf("expected dry-run to avoid mutations, got rows: %#v", verifyRes.Rows)
+	}
+}
+
+func TestExecuteExplainDryRunWriteQueryDoesNotMutatePipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("EXPLAIN CREATE (n:Person {id: 'dry-run'}) RETURN n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Columns) != 1 || res.Columns[0] != "explain" {
+		t.Fatalf("unexpected columns: %#v", res.Columns)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %d", len(res.Rows))
+	}
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
 	summary, ok := explainPayload["summary"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected summary map, got %T", explainPayload["summary"])
@@ -111,6 +157,7 @@ func TestExecuteExplainDryRunWriteQueryDoesNotMutate(t *testing.T) {
 	if readOnly, _ := summary["readOnly"].(bool); !readOnly {
 		t.Fatalf("expected readOnly=true, got %#v", summary["readOnly"])
 	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
 
 	verifyStmt, err := parser.ParseStatement("MATCH (n:Person {id: 'dry-run'}) RETURN n")
 	if err != nil {
@@ -177,7 +224,7 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{IndexCatalog: catalog})
+	exec := New(store, Options{IndexCatalog: catalog, EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "Neo", "maxLimit": 5})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -225,18 +272,15 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if len(vertexes) == 0 {
 		t.Fatalf("expected non-empty logical plan vertexes")
 	}
-	if firstOp, _ := vertexes[0]["op"].(string); firstOp != "INDEX_SCAN" {
-		t.Fatalf("expected first logical vertex to be INDEX_SCAN, got %#v", vertexes[0]["op"])
-	}
-	if accessPath, _ := vertexes[0]["accessPath"].(string); accessPath == "" {
-		t.Fatalf("expected first logical vertex to include accessPath")
-	}
+	foundIndexScan := false
 	foundProject := false
 	foundSort := false
 	foundLimit := false
 	for _, vertex := range vertexes {
 		op, _ := vertex["op"].(string)
 		switch op {
+		case "INDEX_SCAN":
+			foundIndexScan = true
 		case "PROJECT":
 			foundProject = true
 		case "SORT":
@@ -245,8 +289,8 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 			foundLimit = true
 		}
 	}
-	if !foundProject || !foundSort || !foundLimit {
-		t.Fatalf("expected operator-shaped plan to include PROJECT/SORT/LIMIT, got vertexes %#v", vertexes)
+	if !foundIndexScan || !foundProject || !foundSort || !foundLimit {
+		t.Fatalf("expected operator-shaped plan to include INDEX_SCAN/PROJECT/SORT/LIMIT, got vertexes %#v", vertexes)
 	}
 	if rootVertexID, _ := logicalPlan["rootVertexId"].(string); rootVertexID == "" {
 		t.Fatalf("expected non-empty rootVertexId")
@@ -404,6 +448,23 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected runtimeStats map, got %T", explainPayload["runtimeStats"])
 	}
+	metadata, ok := explainPayload["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected metadata map, got %T", explainPayload["metadata"])
+	}
+	if status, _ := metadata["pipelineExplainStatus"].(string); status != "ok" {
+		t.Fatalf("expected metadata.pipelineExplainStatus=ok, got %#v", metadata["pipelineExplainStatus"])
+	}
+	if route, _ := metadata["explainRoute"].(string); route != "legacy_payload" {
+		t.Fatalf("expected metadata.explainRoute=legacy_payload, got %#v", metadata["explainRoute"])
+	}
+	if reason, _ := metadata["explainRouteReason"].(string); reason == "" {
+		t.Fatalf("expected metadata.explainRouteReason, got %#v", metadata["explainRouteReason"])
+	}
+	pipelineExplain, _ := metadata["pipelineExplain"].(string)
+	if !strings.Contains(pipelineExplain, "LOGICAL root=") || !strings.Contains(pipelineExplain, "PHYSICAL root=") {
+		t.Fatalf("expected metadata.pipelineExplain to include logical and physical sections, got %#v", metadata["pipelineExplain"])
+	}
 	storeStats, ok := runtimeStats["store"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected runtimeStats.store map, got %T", runtimeStats["store"])
@@ -435,6 +496,258 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if quality, _ := cardinalityStats["quality"].(string); quality != "estimate" {
 		t.Fatalf("expected runtimeStats.cardinality quality estimate, got %#v", cardinalityStats["quality"])
 	}
+}
+
+func TestExecuteExplainOutputContainsPlanAndParamsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-neo",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Neo")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-trinity",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Trinity")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant: "acme",
+			ID:     "m-matrix",
+			Labels: []string{"Movie"},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-1", Type: "ACTED_IN", SrcID: "p-neo", DstID: "m-matrix"}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "Person",
+			Property:    "name",
+			Value:       []byte("Neo"),
+			EntityID:    "p-neo",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "Person", "name")
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:Person {name: $name}) RETURN DISTINCT n.name AS name ORDER BY name ASC SKIP 1 LIMIT $maxLimit")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "Neo", "maxLimit": 5})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	query, ok := explainPayload["query"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected query map, got %T", explainPayload["query"])
+	}
+	params, ok := query["params"].([]string)
+	if !ok {
+		t.Fatalf("expected query.params []string, got %T", query["params"])
+	}
+	if !reflect.DeepEqual(params, []string{"maxLimit", "name"}) {
+		t.Fatalf("unexpected params: %#v", params)
+	}
+	options, ok := query["options"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected query.options map, got %T", query["options"])
+	}
+	if distinct, _ := options["distinct"].(bool); !distinct {
+		t.Fatalf("expected distinct query option")
+	}
+	if skip, _ := options["skip"].(string); skip != "1" {
+		t.Fatalf("expected skip=1, got %#v", options["skip"])
+	}
+	if limit, _ := options["limit"].(string); limit != "$maxLimit" {
+		t.Fatalf("expected limit parameter, got %#v", options["limit"])
+	}
+	if orderBy, _ := options["orderBy"].([]string); !reflect.DeepEqual(orderBy, []string{"name ASC"}) {
+		t.Fatalf("unexpected orderBy: %#v", options["orderBy"])
+	}
+	nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	foundMatch := false
+	foundProject := false
+	foundSort := false
+	foundPagination := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			foundProject = true
+		case "SORT":
+			foundSort = true
+		case "PAGINATION":
+			foundPagination = true
+		}
+	}
+	if !foundMatch || !foundProject || !foundSort || !foundPagination {
+		t.Fatalf("expected MATCH/PROJECT/SORT/PAGINATION nodes, got %#v", nodes)
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
+func TestExecuteExplainMetadataReflectsPipelineRouteOptIn(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:User {name: $name}) RETURN n.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "neo"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	if version, _ := explainPayload["version"].(string); version == "v2-pipeline" {
+		t.Fatalf("expected legacy explain payload, got %#v", explainPayload["version"])
+	}
+	metadata, ok := explainPayload["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected metadata map, got %T", explainPayload["metadata"])
+	}
+	if route, _ := metadata["explainRoute"].(string); route == "pipeline_payload" {
+		t.Fatalf("expected non-pipeline explain route, got %#v", metadata["explainRoute"])
+	}
+	if reason, _ := metadata["explainRouteReason"].(string); reason == "pipeline_payload_opt_in" {
+		t.Fatalf("expected non-opt-in route reason for legacy payload, got %#v", metadata["explainRouteReason"])
+	}
+	if _, ok := explainPayload["influencers"].(map[string]any); !ok {
+		t.Fatalf("expected legacy influencers section, got %T", explainPayload["influencers"])
+	}
+}
+
+func TestExecuteExplainMetadataReflectsPipelineRouteOptInPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:User {name: $name}) RETURN n.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "neo"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+	semanticBlock, ok := explainPayload["semantic"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected pipeline semantic block, got %T", explainPayload["semantic"])
+	}
+	if statementKind, _ := semanticBlock["statementKind"].(string); statementKind == "" {
+		t.Fatalf("expected semantic statementKind, got %#v", semanticBlock["statementKind"])
+	}
+	if nodes := requirePipelineLogicalPlanNodes(t, explainPayload); len(nodes) == 0 {
+		t.Fatalf("expected logicalPlan nodes in pipeline payload")
+	}
+}
+
+func TestExecuteExplainPipelinePayloadIncludesParamsAndPlanNodes(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "u-1",
+			Labels:     []string{"User"},
+			Properties: graph.PropertyMap{"name": []byte("neo")},
+		})
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:User {name: $name}) RETURN n.id AS id LIMIT $max")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "neo", "max": 10})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	query, ok := explainPayload["query"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected query map, got %T", explainPayload["query"])
+	}
+	params, ok := query["params"].([]string)
+	if !ok {
+		t.Fatalf("expected query.params []string, got %T", query["params"])
+	}
+	if !reflect.DeepEqual(params, []string{"max", "name"}) {
+		t.Fatalf("expected query.params [max name], got %#v", params)
+	}
+	logicalPlan, ok := explainPayload["logicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logicalPlan map, got %T", explainPayload["logicalPlan"])
+	}
+	if rootNodeID, _ := logicalPlan["rootNodeId"].(string); rootNodeID == "" {
+		t.Fatalf("expected non-empty logicalPlan.rootNodeId")
+	}
+	nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	if len(nodes) == 0 {
+		t.Fatalf("expected non-empty logicalPlan.nodes")
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
 }
 
 func TestExecuteExplainReportsFastPathExecutionStrategies(t *testing.T) {
@@ -480,7 +793,7 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -606,6 +919,85 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 	}
 }
 
+func TestExecuteExplainReportsFastPathExecutionStrategiesPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-target", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-peer", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-shared", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-candidate", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-1", Type: "RATED", SrcID: "u-target", DstID: "m-shared", Properties: graph.PropertyMap{"rating": []byte("4")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-2", Type: "RATED", SrcID: "u-peer", DstID: "m-shared", Properties: graph.PropertyMap{"rating": []byte("5")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-3", Type: "RATED", SrcID: "u-peer", DstID: "m-candidate", Properties: graph.PropertyMap{"rating": []byte("5")}}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement(`EXPLAIN
+MATCH (target:User)-[rt:RATED]->(shared:Movie)<-[rp:RATED]-(peer:User)
+WHERE abs(rp.rating - rt.rating) <= 1
+WITH target, peer, count(shared) AS shared_count, avg(abs(rt.rating-rp.rating)) AS avg_diff
+MATCH (peer)-[rp2:RATED]->(candidate:Movie)
+WHERE rp2.rating >= 4 AND NOT (target)-[:RATED]->(candidate)
+RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS support, sum(shared_count) AS total_sim`)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	foundMatch := false
+	foundWithProject := false
+	foundReturnProject := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			attrs, _ := node["attrs"].(map[string]any)
+			if kind, _ := attrs["kind"].(string); kind == "WITH" {
+				foundWithProject = true
+			}
+			if kind, _ := attrs["kind"].(string); kind == "RETURN" {
+				foundReturnProject = true
+			}
+		}
+	}
+	if !foundMatch || !foundWithProject || !foundReturnProject {
+		t.Fatalf("expected MATCH plus PROJECT(WITH/RETURN) nodes, got %#v", nodes)
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "executionStrategies", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainSurfacesFastPathSelectivityFeedbackAfterExecution(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -645,7 +1037,7 @@ MATCH (peer)-[rp2:RATED]->(candidate:Movie)
 WHERE rp2.rating >= 4 AND NOT (target)-[:RATED]->(candidate)
 RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS support, sum(shared_count) AS total_sim`
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	executeStmt, err := parser.ParseStatement(query)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
@@ -735,6 +1127,96 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 	}
 }
 
+func TestExecuteExplainSurfacesFastPathSelectivityFeedbackAfterExecutionPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-target", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-peer", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-shared", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m-candidate", Labels: []string{"Movie"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-1", Type: "RATED", SrcID: "u-target", DstID: "m-shared", Properties: graph.PropertyMap{"rating": []byte("4")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-2", Type: "RATED", SrcID: "u-peer", DstID: "m-shared", Properties: graph.PropertyMap{"rating": []byte("5")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-3", Type: "RATED", SrcID: "u-peer", DstID: "m-candidate", Properties: graph.PropertyMap{"rating": []byte("5")}}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	query := `MATCH (target:User)-[rt:RATED]->(shared:Movie)<-[rp:RATED]-(peer:User)
+WHERE abs(rp.rating - rt.rating) <= 1
+WITH target, peer, count(shared) AS shared_count, avg(abs(rt.rating-rp.rating)) AS avg_diff
+MATCH (peer)-[rp2:RATED]->(candidate:Movie)
+WHERE rp2.rating >= 4 AND NOT (target)-[:RATED]->(candidate)
+RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS support, sum(shared_count) AS total_sim`
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	executeStmt, err := parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, executeStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected non-empty execution results")
+	}
+
+	explainStmt, err := parser.ParseStatement("EXPLAIN " + query)
+	if err != nil {
+		t.Fatalf("explain parse failed: %v", err)
+	}
+	explainRes, err := exec.ExecuteStatement(ctx, explainStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("explain execute failed: %v", err)
+	}
+	explainPayload, ok := explainRes.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", explainRes.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	foundMatch := false
+	foundWithProject := false
+	foundReturnProject := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			attrs, _ := node["attrs"].(map[string]any)
+			if kind, _ := attrs["kind"].(string); kind == "WITH" {
+				foundWithProject = true
+			}
+			if kind, _ := attrs["kind"].(string); kind == "RETURN" {
+				foundReturnProject = true
+			}
+		}
+	}
+	if !foundMatch || !foundWithProject || !foundReturnProject {
+		t.Fatalf("expected MATCH plus PROJECT(WITH/RETURN) nodes, got %#v", nodes)
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "executionStrategies", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainLargeTenantKeepsExactPredicateSignals(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -766,7 +1248,7 @@ func TestExecuteExplainLargeTenantKeepsExactPredicateSignals(t *testing.T) {
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "target"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -807,6 +1289,78 @@ func TestExecuteExplainLargeTenantKeepsExactPredicateSignals(t *testing.T) {
 	}
 }
 
+func TestExecuteExplainLargeTenantKeepsExactPredicateSignalsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	const totalUsers = 2000
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < totalUsers; i++ {
+			name := fmt.Sprintf("user-%d", i)
+			if i == totalUsers/2 {
+				name = "target"
+			}
+			if err := tx.PutVertex(ctx, &graph.Vertex{
+				Tenant:     "acme",
+				ID:         fmt.Sprintf("u-%d", i),
+				Labels:     []string{"User"},
+				Properties: graph.PropertyMap{"name": []byte(name)},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:User {name: $name}) RETURN n.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "target"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	foundMatch := false
+	foundReturnProject := false
+	foundReturnItem := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			attrs, _ := node["attrs"].(map[string]any)
+			if kind, _ := attrs["kind"].(string); kind != "RETURN" {
+				continue
+			}
+			foundReturnProject = true
+			items, _ := attrs["items"].([]string)
+			for _, item := range items {
+				if strings.Contains(item, "n.id") {
+					foundReturnItem = true
+					break
+				}
+			}
+		}
+	}
+	if !foundMatch || !foundReturnProject || !foundReturnItem {
+		t.Fatalf("expected MATCH plus PROJECT(RETURN) with n.id projection, got %#v", nodes)
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainFastLabelHistogramPlan(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -834,7 +1388,7 @@ func TestExecuteExplainFastLabelHistogramPlan(t *testing.T) {
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -885,6 +1439,80 @@ func TestExecuteExplainFastLabelHistogramPlan(t *testing.T) {
 	}
 }
 
+func TestExecuteExplainFastLabelHistogramPlanPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n) RETURN labels(n) AS l, count(labels(n)) AS lc")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %d", len(res.Rows))
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	foundMatch := false
+	foundProject := false
+	foundLabelsProjection := false
+	foundCountProjection := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			attrs, _ := node["attrs"].(map[string]any)
+			if kind, _ := attrs["kind"].(string); kind != "RETURN" {
+				continue
+			}
+			foundProject = true
+			items, _ := attrs["items"].([]string)
+			for _, item := range items {
+				if strings.Contains(item, "labels(") {
+					foundLabelsProjection = true
+				}
+				if strings.Contains(item, "count(labels(") {
+					foundCountProjection = true
+				}
+			}
+		}
+	}
+	if !foundMatch || !foundProject || !foundLabelsProjection || !foundCountProjection {
+		t.Fatalf("expected MATCH/PROJECT with labels and count(labels) return projection, got %#v", nodes)
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainDirectedRelationshipScopesInfluencersAndBindings(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -922,7 +1550,7 @@ func TestExecuteExplainDirectedRelationshipScopesInfluencersAndBindings(t *testi
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1003,6 +1631,74 @@ func TestExecuteExplainDirectedRelationshipScopesInfluencersAndBindings(t *testi
 	}
 }
 
+func TestExecuteExplainDirectedRelationshipScopesInfluencersAndBindingsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p1", DstID: "p2"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)-[k:KNOWS]->(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	logicalNodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	ops := make([]string, 0, len(logicalNodes))
+	for _, node := range logicalNodes {
+		op, _ := node["op"].(string)
+		ops = append(ops, op)
+	}
+	if !reflect.DeepEqual(ops, []string{"MATCH", "PROJECT", "PAGINATION"}) {
+		t.Fatalf("expected logical op sequence [MATCH PROJECT PAGINATION], got %#v", ops)
+	}
+	physicalPlan, ok := explainPayload["physicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected physicalPlan map, got %T", explainPayload["physicalPlan"])
+	}
+	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainReverseDirectedRelationshipScopesInfluencersAndBindings(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1039,7 +1735,7 @@ func TestExecuteExplainReverseDirectedRelationshipScopesInfluencersAndBindings(t
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1107,6 +1803,74 @@ func TestExecuteExplainReverseDirectedRelationshipScopesInfluencersAndBindings(t
 	}
 }
 
+func TestExecuteExplainReverseDirectedRelationshipScopesInfluencersAndBindingsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p2", DstID: "p1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)<-[k:KNOWS]-(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	logicalNodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	ops := make([]string, 0, len(logicalNodes))
+	for _, node := range logicalNodes {
+		op, _ := node["op"].(string)
+		ops = append(ops, op)
+	}
+	if !reflect.DeepEqual(ops, []string{"MATCH", "PROJECT", "PAGINATION"}) {
+		t.Fatalf("expected logical op sequence [MATCH PROJECT PAGINATION], got %#v", ops)
+	}
+	physicalPlan, ok := explainPayload["physicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected physicalPlan map, got %T", explainPayload["physicalPlan"])
+	}
+	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainUndirectedRelationshipScopesInfluencersAndBindings(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1143,7 +1907,7 @@ func TestExecuteExplainUndirectedRelationshipScopesInfluencersAndBindings(t *tes
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1197,6 +1961,74 @@ func TestExecuteExplainUndirectedRelationshipScopesInfluencersAndBindings(t *tes
 	}
 }
 
+func TestExecuteExplainUndirectedRelationshipScopesInfluencersAndBindingsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p1", DstID: "p2"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)-[k:KNOWS]-(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	logicalNodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	ops := make([]string, 0, len(logicalNodes))
+	for _, node := range logicalNodes {
+		op, _ := node["op"].(string)
+		ops = append(ops, op)
+	}
+	if !reflect.DeepEqual(ops, []string{"MATCH", "PROJECT", "PAGINATION"}) {
+		t.Fatalf("expected logical op sequence [MATCH PROJECT PAGINATION], got %#v", ops)
+	}
+	physicalPlan, ok := explainPayload["physicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected physicalPlan map, got %T", explainPayload["physicalPlan"])
+	}
+	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainDirectedVariableLengthRelationshipScopesAndBindings(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1235,7 +2067,7 @@ func TestExecuteExplainDirectedVariableLengthRelationshipScopesAndBindings(t *te
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1298,6 +2130,76 @@ func TestExecuteExplainDirectedVariableLengthRelationshipScopesAndBindings(t *te
 	}
 }
 
+func TestExecuteExplainDirectedVariableLengthRelationshipScopesAndBindingsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p3", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p1", DstID: "p2"},
+			{Tenant: "acme", ID: "e-knows-2", Type: "KNOWS", SrcID: "p2", DstID: "p3"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)-[k:KNOWS*1..3]->(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	logicalNodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	ops := make([]string, 0, len(logicalNodes))
+	for _, node := range logicalNodes {
+		op, _ := node["op"].(string)
+		ops = append(ops, op)
+	}
+	if !reflect.DeepEqual(ops, []string{"MATCH", "PROJECT", "PAGINATION"}) {
+		t.Fatalf("expected logical op sequence [MATCH PROJECT PAGINATION], got %#v", ops)
+	}
+	physicalPlan, ok := explainPayload["physicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected physicalPlan map, got %T", explainPayload["physicalPlan"])
+	}
+	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainMixedRelationshipChainScopesAndBindings(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1336,7 +2238,7 @@ func TestExecuteExplainMixedRelationshipChainScopesAndBindings(t *testing.T) {
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1392,6 +2294,88 @@ func TestExecuteExplainMixedRelationshipChainScopesAndBindings(t *testing.T) {
 	}
 }
 
+func TestExecuteExplainMixedRelationshipChainScopesAndBindingsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "a1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "b1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "c1", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "a1", DstID: "b1"},
+			{Tenant: "acme", ID: "e-knows-2", Type: "KNOWS", SrcID: "b1", DstID: "c1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (a:Person)-[r1:KNOWS*1..2]->(b:Person)-[r2:KNOWS]->(c:Person) RETURN a, r1, b, r2, c LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	logicalNodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	if len(logicalNodes) < 3 {
+		t.Fatalf("expected logicalPlan.nodes length >= 3, got %#v", logicalNodes)
+	}
+	foundMatch := false
+	foundProject := false
+	foundPagination := false
+	for _, node := range logicalNodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			foundProject = true
+		case "PAGINATION":
+			foundPagination = true
+		}
+	}
+	if !foundMatch || !foundProject || !foundPagination {
+		t.Fatalf("expected logical nodes to include MATCH/PROJECT/PAGINATION, got %#v", logicalNodes)
+	}
+	physicalPlan, ok := explainPayload["physicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected physicalPlan map, got %T", explainPayload["physicalPlan"])
+	}
+	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainUndirectedVariableLengthRelationshipScopesAndBindings(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1430,7 +2414,7 @@ func TestExecuteExplainUndirectedVariableLengthRelationshipScopesAndBindings(t *
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1490,6 +2474,76 @@ func TestExecuteExplainUndirectedVariableLengthRelationshipScopesAndBindings(t *
 	}
 }
 
+func TestExecuteExplainUndirectedVariableLengthRelationshipScopesAndBindingsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "p3", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "p2", DstID: "p1"},
+			{Tenant: "acme", ID: "e-knows-2", Type: "KNOWS", SrcID: "p3", DstID: "p2"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (p1:Person)-[k:KNOWS*1..3]-(p2:Person) RETURN p1, k, p2 LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	logicalNodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	ops := make([]string, 0, len(logicalNodes))
+	for _, node := range logicalNodes {
+		op, _ := node["op"].(string)
+		ops = append(ops, op)
+	}
+	if !reflect.DeepEqual(ops, []string{"MATCH", "PROJECT", "PAGINATION"}) {
+		t.Fatalf("expected logical op sequence [MATCH PROJECT PAGINATION], got %#v", ops)
+	}
+	physicalPlan, ok := explainPayload["physicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected physicalPlan map, got %T", explainPayload["physicalPlan"])
+	}
+	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainMixedRelationshipChainReverseSegmentBindings(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1528,7 +2582,7 @@ func TestExecuteExplainMixedRelationshipChainReverseSegmentBindings(t *testing.T
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1580,6 +2634,88 @@ func TestExecuteExplainMixedRelationshipChainReverseSegmentBindings(t *testing.T
 	}
 }
 
+func TestExecuteExplainMixedRelationshipChainReverseSegmentBindingsPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "a1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "b1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "c1", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e-knows-1", Type: "KNOWS", SrcID: "b1", DstID: "a1"},
+			{Tenant: "acme", ID: "e-knows-2", Type: "KNOWS", SrcID: "b1", DstID: "c1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (a:Person)<-[r1:KNOWS*1..2]-(b:Person)-[r2:KNOWS]->(c:Person) RETURN a, r1, b, r2, c LIMIT 10")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	logicalNodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	if len(logicalNodes) < 3 {
+		t.Fatalf("expected logicalPlan.nodes length >= 3, got %#v", logicalNodes)
+	}
+	foundMatch := false
+	foundProject := false
+	foundPagination := false
+	for _, node := range logicalNodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			foundProject = true
+		case "PAGINATION":
+			foundPagination = true
+		}
+	}
+	if !foundMatch || !foundProject || !foundPagination {
+		t.Fatalf("expected logical nodes to include MATCH/PROJECT/PAGINATION, got %#v", logicalNodes)
+	}
+	physicalPlan, ok := explainPayload["physicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected physicalPlan map, got %T", explainPayload["physicalPlan"])
+	}
+	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
 func TestExecuteExplainFastEdgeCountPlan(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1617,7 +2753,7 @@ func TestExecuteExplainFastEdgeCountPlan(t *testing.T) {
 		"EXPLAIN MATCH ()-[e]-(:Movie) RETURN count(e)",
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	for _, query := range tests {
 		stmt, err := parser.ParseStatement(query)
 		if err != nil {
@@ -1694,7 +2830,7 @@ func TestExecuteExplainFastEdgeDeletePlan(t *testing.T) {
 		"EXPLAIN MATCH ()-[e]-(:Movie) DELETE e",
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	for _, query := range tests {
 		stmt, err := parser.ParseStatement(query)
 		if err != nil {
@@ -1761,7 +2897,7 @@ func TestExecuteExplainFastVertexCountPlan(t *testing.T) {
 		"EXPLAIN MATCH (n) RETURN count(n) AS total",
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	for _, query := range queries {
 		stmt, err := parser.ParseStatement(query)
 		if err != nil {
@@ -1852,6 +2988,234 @@ func TestExecuteExplainFastVertexCountPlan(t *testing.T) {
 	}
 }
 
+func TestExecuteExplainFastEdgeCountPlanPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "R", SrcID: "m1", DstID: "p1"},
+			{Tenant: "acme", ID: "e2", Type: "R", SrcID: "p1", DstID: "m2"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	queries := []string{
+		"EXPLAIN MATCH ()-[e]-() RETURN count(e)",
+		"EXPLAIN MATCH (:Movie)-[e]-() RETURN count(e)",
+		"EXPLAIN MATCH ()-[e]-(:Movie) RETURN count(e)",
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	for _, query := range queries {
+		stmt, err := parser.ParseStatement(query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", query, err)
+		}
+		explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected explain payload map for %q, got %T", query, res.Rows[0]["explain"])
+		}
+		assertPipelineExplainPayloadEnvelope(t, explainPayload)
+		nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+		foundMatch := false
+		foundProject := false
+		foundCountProjection := false
+		for _, node := range nodes {
+			op, _ := node["op"].(string)
+			switch op {
+			case "MATCH":
+				foundMatch = true
+			case "PROJECT":
+				foundProject = true
+				attrs, _ := node["attrs"].(map[string]any)
+				if kind, _ := attrs["kind"].(string); kind == "RETURN" {
+					items, _ := attrs["items"].([]string)
+					for _, item := range items {
+						if strings.HasPrefix(item, "count(") {
+							foundCountProjection = true
+							break
+						}
+					}
+				}
+			}
+		}
+		if !foundMatch || !foundProject || !foundCountProjection {
+			t.Fatalf("expected MATCH/PROJECT with count projection in pipeline payload for %q, got %#v", query, nodes)
+		}
+		assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+	}
+}
+
+func TestExecuteExplainFastEdgeDeletePlanPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "R", SrcID: "m1", DstID: "p1"},
+			{Tenant: "acme", ID: "e2", Type: "R", SrcID: "p1", DstID: "m2"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	queries := []string{
+		"EXPLAIN MATCH ()-[e]-() DELETE e",
+		"EXPLAIN MATCH (:Movie)-[e]-() DELETE e",
+		"EXPLAIN MATCH ()-[e]-(:Movie) DELETE e",
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	for _, query := range queries {
+		stmt, err := parser.ParseStatement(query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", query, err)
+		}
+		explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected explain payload map for %q, got %T", query, res.Rows[0]["explain"])
+		}
+		assertPipelineExplainPayloadEnvelope(t, explainPayload)
+		nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+		foundMatch := false
+		foundDeleteWrite := false
+		for _, node := range nodes {
+			op, _ := node["op"].(string)
+			switch op {
+			case "MATCH":
+				foundMatch = true
+			case "WRITE":
+				attrs, _ := node["attrs"].(map[string]any)
+				if kind, _ := attrs["kind"].(string); kind == "DELETE" {
+					foundDeleteWrite = true
+				}
+			}
+		}
+		if !foundMatch || !foundDeleteWrite {
+			t.Fatalf("expected MATCH/WRITE(kind=DELETE) nodes in pipeline payload for %q, got %#v", query, nodes)
+		}
+		assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+	}
+}
+
+func TestExecuteExplainFastVertexCountPlanPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertices := []*graph.Vertex{
+			{Tenant: "acme", ID: "v1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "v2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "v3", Labels: []string{"Genre"}},
+		}
+		for _, vertex := range vertices {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	queries := []string{
+		"EXPLAIN MATCH (n) RETURN count(n)",
+		"EXPLAIN MATCH (n) RETURN count(n) AS total",
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	for _, query := range queries {
+		stmt, err := parser.ParseStatement(query)
+		if err != nil {
+			t.Fatalf("parse failed for %q: %v", query, err)
+		}
+		res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+		if err != nil {
+			t.Fatalf("execute failed for %q: %v", query, err)
+		}
+		explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected explain payload map for %q, got %T", query, res.Rows[0]["explain"])
+		}
+		assertPipelineExplainPayloadEnvelope(t, explainPayload)
+		nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+		foundMatch := false
+		foundProject := false
+		foundCountProjection := false
+		for _, node := range nodes {
+			op, _ := node["op"].(string)
+			switch op {
+			case "MATCH":
+				foundMatch = true
+			case "PROJECT":
+				foundProject = true
+				attrs, _ := node["attrs"].(map[string]any)
+				if kind, _ := attrs["kind"].(string); kind == "RETURN" {
+					items, _ := attrs["items"].([]string)
+					for _, item := range items {
+						if strings.HasPrefix(item, "count(") {
+							foundCountProjection = true
+							break
+						}
+					}
+				}
+			}
+		}
+		if !foundMatch || !foundProject || !foundCountProjection {
+			t.Fatalf("expected MATCH/PROJECT with count projection in pipeline payload for %q, got %#v", query, nodes)
+		}
+		assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+	}
+}
+
 func TestExecuteExplainIndexTuningSignalsForMissingIndex(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1895,7 +3259,7 @@ func TestExecuteExplainIndexTuningSignalsForMissingIndex(t *testing.T) {
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{})
+	exec := New(store, Options{EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "Neo"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1938,6 +3302,89 @@ func TestExecuteExplainIndexTuningSignalsForMissingIndex(t *testing.T) {
 	}
 }
 
+func TestExecuteExplainIndexTuningSignalsForMissingIndexPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-neo",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Neo")},
+		}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "p-trinity",
+			Labels:     []string{"Person"},
+			Properties: graph.PropertyMap{"name": []byte("Trinity")},
+		}); err != nil {
+			return err
+		}
+		for i := 0; i < 18; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{
+				Tenant:     "acme",
+				ID:         fmt.Sprintf("p-extra-%d", i),
+				Labels:     []string{"Person"},
+				Properties: graph.PropertyMap{"name": []byte(fmt.Sprintf("Extra%d", i))},
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n:Person {name: $name}) RETURN n.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{EnablePipelineExplainPayload: true})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "Neo"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	foundMatch := false
+	foundProject := false
+	foundReturnItem := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			foundProject = true
+			attrs, _ := node["attrs"].(map[string]any)
+			if kind, _ := attrs["kind"].(string); kind == "RETURN" {
+				items, _ := attrs["items"].([]string)
+				for _, item := range items {
+					if strings.Contains(item, "n.id") {
+						foundReturnItem = true
+						break
+					}
+				}
+			}
+		}
+	}
+	if !foundMatch || !foundProject || !foundReturnItem {
+		t.Fatalf("expected MATCH/PROJECT with n.id return projection, got %#v", nodes)
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "warnings", "runtimeStats")
+}
+
 func TestExecuteMatchUsesPropertyIndexPlanner(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -1978,7 +3425,7 @@ func TestExecuteMatchUsesPropertyIndexPlanner(t *testing.T) {
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddPropertyIndex("acme", "User", "email")
-	exec := New(store, Options{IndexCatalog: catalog})
+	exec := New(store, Options{IndexCatalog: catalog, EnablePipelineExplainPayload: false})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -2312,7 +3759,7 @@ func TestExecuteExplainWriteContextMatchReportsIndexScan(t *testing.T) {
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddPropertyIndex("acme", "Movie", "movie_id")
-	exec := New(store, Options{IndexCatalog: catalog})
+	exec := New(store, Options{IndexCatalog: catalog, EnablePipelineExplainPayload: false})
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
 		"tenant": "acme",
@@ -2350,6 +3797,95 @@ func TestExecuteExplainWriteContextMatchReportsIndexScan(t *testing.T) {
 	if !foundIndexScan {
 		t.Fatalf("expected write-context MATCH to report property index scan, got vertexes %#v", vertexes)
 	}
+}
+
+func TestExecuteExplainWriteContextMatchReportsIndexScanPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{
+			Tenant:     "acme",
+			ID:         "m-42",
+			Labels:     []string{"Movie"},
+			Properties: graph.PropertyMap{"movie_id": []byte("42")},
+		}); err != nil {
+			return err
+		}
+		return tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
+			Tenant:      "acme",
+			Schema:      "Movie",
+			Property:    "movie_id",
+			Value:       []byte("42"),
+			EntityID:    "m-42",
+			EntityClass: "vertex",
+		})
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN UNWIND $rows AS r CREATE (:IngestLog {id: r.log_id}) WITH r MATCH (m:Movie {movie_id: r.movie_id}) RETURN m.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "Movie", "movie_id")
+	exec := New(store, Options{IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"rows":   []any{map[string]any{"movie_id": "42", "log_id": "l1"}},
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	nodes := requirePipelineLogicalPlanNodes(t, explainPayload)
+	foundWrite := false
+	foundMatch := false
+	foundWithProject := false
+	foundProject := false
+	foundReturnItem := false
+	for _, node := range nodes {
+		op, _ := node["op"].(string)
+		switch op {
+		case "WRITE":
+			foundWrite = true
+			attrs, _ := node["attrs"].(map[string]any)
+			if kind, _ := attrs["kind"].(string); kind != "CREATE" {
+				t.Fatalf("expected WRITE(kind=CREATE), got %#v", attrs)
+			}
+		case "MATCH":
+			foundMatch = true
+		case "PROJECT":
+			attrs, _ := node["attrs"].(map[string]any)
+			if kind, _ := attrs["kind"].(string); kind == "WITH" {
+				foundWithProject = true
+			}
+			if kind, _ := attrs["kind"].(string); kind == "RETURN" {
+				foundProject = true
+				items, _ := attrs["items"].([]string)
+				for _, item := range items {
+					if strings.Contains(item, "m.id") {
+						foundReturnItem = true
+						break
+					}
+				}
+			}
+		}
+	}
+	if !foundWrite || !foundMatch || !foundWithProject || !foundProject || !foundReturnItem {
+		t.Fatalf("expected MATCH/WRITE(kind=CREATE)/PROJECT(WITH)/PROJECT(RETURN) with m.id return projection, got %#v", nodes)
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
 }
 
 func TestExecuteMatchWhereFiltersRows(t *testing.T) {
@@ -3462,6 +4998,92 @@ func TestExecuteCreateEdgePattern(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("edge verification failed: %v", err)
+	}
+}
+
+func TestExecuteCreateEdgeWriteOnlyDerivesAnonymousEndpointIDsFromProperties(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("CREATE (:User {id:$src})-[:KNOWS]->(:User {id:$dst})")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "src": "u-legacy-1", "dst": "u-legacy-2"}); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		left, err := tx.GetVertex(ctx, "acme", "u-legacy-1")
+		if err != nil {
+			return err
+		}
+		if left == nil {
+			return errUnexpected("expected left vertex with property-derived id")
+		}
+		right, err := tx.GetVertex(ctx, "acme", "u-legacy-2")
+		if err != nil {
+			return err
+		}
+		if right == nil {
+			return errUnexpected("expected right vertex with property-derived id")
+		}
+		hasEdge, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u-legacy-1", "u-legacy-2", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !hasEdge {
+			return errUnexpected("expected directed KNOWS edge between property-derived endpoint ids")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verification failed: %v", err)
+	}
+}
+
+func TestExecuteCreateReverseEdgeWriteOnlyDerivesAnonymousEndpointIDsFromProperties(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	stmt, err := parser.ParseStatement("CREATE (:User {id:$src})<-[:KNOWS]-(:User {id:$dst})")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "src": "u-legacy-3", "dst": "u-legacy-4"}); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		left, err := tx.GetVertex(ctx, "acme", "u-legacy-3")
+		if err != nil {
+			return err
+		}
+		if left == nil {
+			return errUnexpected("expected left vertex with property-derived id")
+		}
+		right, err := tx.GetVertex(ctx, "acme", "u-legacy-4")
+		if err != nil {
+			return err
+		}
+		if right == nil {
+			return errUnexpected("expected right vertex with property-derived id")
+		}
+		hasEdge, err := tx.HasDirectedEdgeBetween(ctx, "acme", "u-legacy-4", "u-legacy-3", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if !hasEdge {
+			return errUnexpected("expected reverse directed KNOWS edge between property-derived endpoint ids")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("verification failed: %v", err)
 	}
 }
 

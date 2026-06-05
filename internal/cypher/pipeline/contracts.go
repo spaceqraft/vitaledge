@@ -24,12 +24,21 @@ type SemanticModel struct {
 	WriteActions  []WriteActionIntent
 }
 
+// ProjectionItemIntent carries one projected expression and optional alias.
+type ProjectionItemIntent struct {
+	Expression string
+	Alias      string
+}
+
 // ProjectionIntent carries semantic projection details for WITH/RETURN forms.
 type ProjectionIntent struct {
 	Kind       ast.ClauseKind
 	Distinct   bool
 	IncludeAll bool
-	Items      []string
+	Items      []ProjectionItemIntent
+	WhereExpr  string
+	OrderBy    []OrderingIntent
+	Pagination PaginationIntent
 }
 
 // OrderingIntent carries semantic ORDER BY details.
@@ -46,6 +55,7 @@ type PaginationIntent struct {
 
 // PatternIntent carries semantic MATCH/OPTIONAL MATCH pattern details.
 type PatternIntent struct {
+	Kind     ast.ClauseKind
 	Optional bool
 	Pattern  string
 	Where    string
@@ -53,8 +63,11 @@ type PatternIntent struct {
 
 // WriteActionIntent carries semantic write action sequencing details.
 type WriteActionIntent struct {
-	ClauseKind ast.ClauseKind
-	Raw        string
+	ClauseKind    ast.ClauseKind
+	Raw           string
+	MergePattern  string
+	MergeOnCreate string
+	MergeOnMatch  string
 }
 
 // LogicalPlan is the explicit handoff contract from logical planning to
@@ -75,13 +88,28 @@ type LogicalNode struct {
 	Attrs    map[string]any
 }
 
+// PhysicalPlan is the explicit handoff contract from physical planning to
+// runtime execution.
+type PhysicalPlan struct {
+	RootNodeID string
+	Nodes      []PhysicalNode
+}
+
+// PhysicalNode is a normalized physical operator with child links.
+type PhysicalNode struct {
+	ID       string
+	Op       string
+	Children []string
+	Attrs    map[string]any
+}
+
 // PhysicalExecutionInput is the execution-stage contract consumed by runtime
 // operator execution.
 //
 // QP-0 baseline: execution consumes structured plans and runtime context and
 // must not reinterpret raw clause text to recover core semantics.
 type PhysicalExecutionInput struct {
-	Plan   LogicalPlan
+	Plan   PhysicalPlan
 	Tenant string
 	Params map[string]any
 }

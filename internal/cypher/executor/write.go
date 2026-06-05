@@ -688,9 +688,6 @@ type fastTargetSharedPeerRankedRow struct {
 }
 
 func (e *Executor) tryFastTargetSharedPeerAggregationWithTopKClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, topKWithClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
-	if !e.stage1TopKPushdownEnabled {
-		return nil, nil, false, nil
-	}
 	if feedback, ok := e.fastPathFeedbackSnapshot(stage1TopKPushdownImplementation); ok && stage1TopKPushdownShouldDisableFromFeedback(feedback) {
 		e.observeRuntimeCounter(params, "fast_path.stage1.topk_pushdown_skipped_adaptive", 1)
 		return nil, nil, false, nil
@@ -785,7 +782,7 @@ func (e *Executor) collectFastTargetSharedPeerAggregates(ctx context.Context, tx
 		agg.sumAbsDiff += math.Abs(firstValue - secondValue)
 	}
 
-	if !e.stage1SharedSeedExpansionEnabled || len(targetCandidates) <= 1 {
+	if len(targetCandidates) <= 1 {
 		for _, target := range targetCandidates {
 			if target == nil {
 				continue
@@ -2305,9 +2302,6 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 	if err != nil {
 		return nil, nil, false, err
 	}
-	if !e.stage2TopKPushdownEnabled {
-		useTopK = false
-	}
 	earlyStopEnabled := useTopK && topKSpec.descending && topKSpec.limit > 0
 	earlyStopKeep := topKSpec.skip + topKSpec.limit
 	if earlyStopKeep <= 0 {
@@ -2406,99 +2400,97 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 		collectStarted := time.Now()
 		defer e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_collect_peer_edges_micros", collectStarted)
 
-		if e.stage2EdgeIndexPushdownEnabled {
-			predicateShapeEligible := stage2PredicateShapeEligible
-			if !stage2PredicateShapeDecisive {
-				predicateShapeEligible = stage2IndexPushdownEligibleByPredicateShape(pattern, matchSpec.Where, row, params)
+		predicateShapeEligible := stage2PredicateShapeEligible
+		if !stage2PredicateShapeDecisive {
+			predicateShapeEligible = stage2IndexPushdownEligibleByPredicateShape(pattern, matchSpec.Where, row, params)
+		}
+		if !predicateShapeEligible {
+			if !stage2PredicateShapeSkipNoted {
+				e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_predicate_shape", 1)
+				stage2PredicateShapeSkipNoted = true
 			}
-			if !predicateShapeEligible {
-				if !stage2PredicateShapeSkipNoted {
-					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_predicate_shape", 1)
-					stage2PredicateShapeSkipNoted = true
-				}
-			} else {
-				if stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, matchSpec.Where, row, params) {
-					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_eligible_one_sided_range", 1)
-				}
-				rowHasNumericRangeShape := false
-				if constraints, ok := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params); ok {
-					for _, constraint := range constraints {
-						if constraint.isContradictory() {
-							rowHasNumericRangeShape = true
-							break
-						}
-						if constraint.lowerSet || constraint.upperSet {
-							rowHasNumericRangeShape = true
-							break
-						}
+		} else {
+			if stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, matchSpec.Where, row, params) {
+				e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_eligible_one_sided_range", 1)
+			}
+			rowHasNumericRangeShape := false
+			if constraints, ok := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params); ok {
+				for _, constraint := range constraints {
+					if constraint.isContradictory() {
+						rowHasNumericRangeShape = true
+						break
+					}
+					if constraint.lowerSet || constraint.upperSet {
+						rowHasNumericRangeShape = true
+						break
 					}
 				}
-				if len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources && !rowHasNumericRangeShape {
-					if !stage2WideNonRangeProbeSkipNoted {
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_wide_non_range", 1)
-						stage2WideNonRangeProbeSkipNoted = true
-					}
-					return nil, false, nil
+			}
+			if len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources && !rowHasNumericRangeShape {
+				if !stage2WideNonRangeProbeSkipNoted {
+					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_wide_non_range", 1)
+					stage2WideNonRangeProbeSkipNoted = true
 				}
-				cacheKey, cacheable := stage2IndexLookupCacheKey(pattern, matchSpec.Where, row, params)
-				if cacheable {
-					lookupCacheKey := cacheKey
-					probeSourceFilter := stage2ProbeSourceFilter
-					if probeSourceFilter == nil && len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources {
-						if !stage2SourceScopedPerPeerProbeNoted {
-							e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_source_scoped_per_peer", 1)
-							stage2SourceScopedPerPeerProbeNoted = true
-						}
-						lookupCacheKey = cacheKey + "|src=" + peerID
-						probeSourceFilter = map[string]struct{}{peerID: {}}
+				return nil, false, nil
+			}
+			cacheKey, cacheable := stage2IndexLookupCacheKey(pattern, matchSpec.Where, row, params)
+			if cacheable {
+				lookupCacheKey := cacheKey
+				probeSourceFilter := stage2ProbeSourceFilter
+				if probeSourceFilter == nil && len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources {
+					if !stage2SourceScopedPerPeerProbeNoted {
+						e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_source_scoped_per_peer", 1)
+						stage2SourceScopedPerPeerProbeNoted = true
 					}
-					lookupByIndex := false
-					if cachedLookup, ok := stage2IndexPushdownDecisionCache[lookupCacheKey]; ok {
-						lookupByIndex = cachedLookup
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_hits", 1)
-					} else {
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_misses", 1)
-						edges, indexed, probeCapExceeded, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, matchSpec.Where, "", row, params, probeSourceFilter, stage2IndexProbeLimit)
-						if err != nil {
-							return nil, false, err
-						}
-						applyPushdown := false
-						if probeCapExceeded {
-							e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_cap_exceeded", 1)
-							e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_probe_cap", 1)
-						}
-						if indexed {
-							edgesBySource := map[string][]*graph.Edge{}
-							for _, candidateEdge := range edges {
-								if candidateEdge == nil || strings.TrimSpace(candidateEdge.SrcID) == "" {
-									continue
-								}
-								edgesBySource[candidateEdge.SrcID] = append(edgesBySource[candidateEdge.SrcID], candidateEdge)
+					lookupCacheKey = cacheKey + "|src=" + peerID
+					probeSourceFilter = map[string]struct{}{peerID: {}}
+				}
+				lookupByIndex := false
+				if cachedLookup, ok := stage2IndexPushdownDecisionCache[lookupCacheKey]; ok {
+					lookupByIndex = cachedLookup
+					e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_hits", 1)
+				} else {
+					e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_misses", 1)
+					edges, indexed, probeCapExceeded, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, matchSpec.Where, "", row, params, probeSourceFilter, stage2IndexProbeLimit)
+					if err != nil {
+						return nil, false, err
+					}
+					applyPushdown := false
+					if probeCapExceeded {
+						e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_cap_exceeded", 1)
+						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_probe_cap", 1)
+					}
+					if indexed {
+						edgesBySource := map[string][]*graph.Edge{}
+						for _, candidateEdge := range edges {
+							if candidateEdge == nil || strings.TrimSpace(candidateEdge.SrcID) == "" {
+								continue
 							}
-							totalCandidates := 0
-							for _, sourceEdges := range edgesBySource {
-								totalCandidates += len(sourceEdges)
-							}
-							e.observeRuntimeCounter(params, "fast_path.stage2.index_candidates_total", int64(totalCandidates))
-							applyPushdown = shouldApplyStage2IndexPushdown(edgesBySource)
-							if applyPushdown {
-								stage2IndexedEdgeCache[lookupCacheKey] = edgesBySource
-							} else {
-								e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_unselective", 1)
-							}
+							edgesBySource[candidateEdge.SrcID] = append(edgesBySource[candidateEdge.SrcID], candidateEdge)
 						}
-						stage2IndexPushdownDecisionCache[lookupCacheKey] = applyPushdown
-						lookupByIndex = applyPushdown
-					}
-					if lookupByIndex {
-						if !stage2IndexPushdownUsed {
-							e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_applied", 1)
-							stage2IndexPushdownUsed = true
+						totalCandidates := 0
+						for _, sourceEdges := range edgesBySource {
+							totalCandidates += len(sourceEdges)
 						}
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_rows", 1)
-						indexedEdges := stage2IndexedEdgeCache[lookupCacheKey][peerID]
-						return append([]*graph.Edge(nil), indexedEdges...), true, nil
+						e.observeRuntimeCounter(params, "fast_path.stage2.index_candidates_total", int64(totalCandidates))
+						applyPushdown = shouldApplyStage2IndexPushdown(edgesBySource)
+						if applyPushdown {
+							stage2IndexedEdgeCache[lookupCacheKey] = edgesBySource
+						} else {
+							e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_unselective", 1)
+						}
 					}
+					stage2IndexPushdownDecisionCache[lookupCacheKey] = applyPushdown
+					lookupByIndex = applyPushdown
+				}
+				if lookupByIndex {
+					if !stage2IndexPushdownUsed {
+						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_applied", 1)
+						stage2IndexPushdownUsed = true
+					}
+					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_rows", 1)
+					indexedEdges := stage2IndexedEdgeCache[lookupCacheKey][peerID]
+					return append([]*graph.Edge(nil), indexedEdges...), true, nil
 				}
 			}
 		}
@@ -2658,12 +2650,6 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 			}
 			if item.similarityNumericOK {
 				agg.similaritySum += item.similarityNumeric
-			}
-			if !e.stage2LateMaterializationEnabled {
-				e.observeRuntimeCounter(params, "fast_path.stage2.eager_projection_updates", 1)
-				if _, err := buildFastPeerCandidateResultRow(agg, projection, params); err != nil {
-					return err
-				}
 			}
 			return nil
 		}
@@ -9871,7 +9857,7 @@ func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row,
 		if err != nil {
 			return nil, err
 		}
-		leftVertex, leftCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, workRow, leftVar, leftLabels, leftProps, merge)
+		leftVertex, leftCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, workRow, leftVar, leftLabels, leftProps, merge, true)
 		if err != nil {
 			return nil, err
 		}
@@ -9887,7 +9873,7 @@ func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row,
 		if err != nil {
 			return nil, err
 		}
-		rightVertex, rightCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, workRow, rightVar, rightLabels, rightProps, merge)
+		rightVertex, rightCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, workRow, rightVar, rightLabels, rightProps, merge, true)
 		if err != nil {
 			return nil, err
 		}
@@ -9968,7 +9954,7 @@ func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, row
 			if err != nil {
 				return nil, err
 			}
-			vertex, vertexCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, merged, vertexPattern.Var, vertexPattern.Labels, props, merge)
+			vertex, vertexCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, merged, vertexPattern.Var, vertexPattern.Labels, props, merge, true)
 			if err != nil {
 				return nil, err
 			}
@@ -20388,7 +20374,7 @@ func resolvePatternSourceID(row Row, params Params, varName, paramName string) (
 	return requireStringParam(params, paramName)
 }
 
-func (e *Executor) resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row Row, varName string, labels []string, props map[string]any, merge bool) (*graph.Vertex, bool, error) {
+func (e *Executor) resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row Row, varName string, labels []string, props map[string]any, merge bool, allowAnonymousIDFromProps bool) (*graph.Vertex, bool, error) {
 	if binding, ok := row[varName]; ok {
 		if v, ok := binding.(*graph.Vertex); ok {
 			return v, false, nil
@@ -20405,7 +20391,7 @@ func (e *Executor) resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenan
 	}
 
 	vertexID := ""
-	if strings.TrimSpace(varName) != "" {
+	if strings.TrimSpace(varName) != "" || allowAnonymousIDFromProps {
 		if derivedID, ok := vertexIDFromPatternProperties(props); ok {
 			vertexID = derivedID
 		}

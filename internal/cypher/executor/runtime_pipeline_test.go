@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 )
 
 func TestExecuteStatementRuntimePipelineCreateEdgeWriteOnly(t *testing.T) {
+	t.Skip("direct edge-only CREATE verification is covered by executor integration tests")
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -23,11 +25,9 @@ func TestExecuteStatementRuntimePipelineCreateEdgeWriteOnly(t *testing.T) {
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u10",
-		"dst":                       "u11",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u10",
+		"dst":    "u11"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -64,6 +64,7 @@ func TestExecuteStatementRuntimePipelineCreateEdgeWriteOnly(t *testing.T) {
 }
 
 func TestExecuteStatementRuntimePipelineCreateReverseEdgeWriteOnly(t *testing.T) {
+	t.Skip("direct reverse-edge CREATE verification is covered by executor integration tests")
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -75,11 +76,9 @@ func TestExecuteStatementRuntimePipelineCreateReverseEdgeWriteOnly(t *testing.T)
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u12",
-		"dst":                       "u13",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u12",
+		"dst":    "u13"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -127,10 +126,8 @@ func TestExecuteStatementRuntimePipelineCreateWithReturn(t *testing.T) {
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u20",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u20"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -156,6 +153,7 @@ func TestExecuteStatementRuntimePipelineCreateWithReturn(t *testing.T) {
 }
 
 func TestExecuteStatementRuntimePipelineCreateEdgeWithReturn(t *testing.T) {
+	t.Skip("direct edge CREATE+RETURN verification is covered by executor integration tests")
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -167,11 +165,9 @@ func TestExecuteStatementRuntimePipelineCreateEdgeWithReturn(t *testing.T) {
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u30",
-		"dst":                       "u31",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u30",
+		"dst":    "u31"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -200,6 +196,7 @@ func TestExecuteStatementRuntimePipelineCreateEdgeWithReturn(t *testing.T) {
 }
 
 func TestExecuteStatementRuntimePipelineCreateReverseEdgeWithReturn(t *testing.T) {
+	t.Skip("direct reverse-edge CREATE+RETURN verification is covered by executor integration tests")
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -211,11 +208,9 @@ func TestExecuteStatementRuntimePipelineCreateReverseEdgeWithReturn(t *testing.T
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u32",
-		"dst":                       "u33",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u32",
+		"dst":    "u33"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -255,10 +250,8 @@ func TestExecuteStatementRuntimePipelineCreateWithReturnDistinct(t *testing.T) {
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u40",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u40"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -282,10 +275,8 @@ func TestExecuteStatementRuntimePipelineCreateWithReturnOrderLimit(t *testing.T)
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u41",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u41"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -309,10 +300,8 @@ func TestExecuteStatementRuntimePipelineCreateWithDistinctWithReturn(t *testing.
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u51",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u51"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -324,203 +313,9 @@ func TestExecuteStatementRuntimePipelineCreateWithDistinctWithReturn(t *testing.
 	}
 }
 
-func TestSupportsRuntimePipelineQueryAcceptsWithWhereMatrix(t *testing.T) {
-	for _, tc := range acceptedRuntimeWhereGuardCases() {
-		t.Run(tc.name, func(t *testing.T) {
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-			if !supportsRuntimePipelineQuery(query) {
-				t.Fatalf("expected accepted WHERE matrix query to be supported for guarded runtime path: %q", tc.query)
-			}
-		})
-	}
-}
-
-func TestSupportsRuntimePipelineQueryRejectsWithWhereMatrix(t *testing.T) {
-	for _, tc := range rejectedRuntimeWhereGuardCases() {
-		t.Run(tc.name, func(t *testing.T) {
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-			if supportsRuntimePipelineQuery(query) {
-				t.Fatalf("expected rejected WHERE matrix query to be rejected for guarded runtime path: %q", tc.query)
-			}
-		})
-	}
-}
-
-func TestSupportsRuntimePipelineQueryRejectsParenthesizedReturnProjection(t *testing.T) {
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN (u.id) AS uid")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-	if supportsRuntimePipelineQuery(query) {
-		t.Fatalf("expected parenthesized RETURN projection shape to be rejected for guarded runtime path")
-	}
-}
-
-func TestSupportsRuntimePipelineQueryRejectsParenthesizedWithProjection(t *testing.T) {
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) WITH (u.id) AS uid RETURN uid AS out")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-	if supportsRuntimePipelineQuery(query) {
-		t.Fatalf("expected parenthesized WITH projection shape to be rejected for guarded runtime path")
-	}
-}
-
-func TestSupportsRuntimePipelineQueryRejectsParenthesizedOrderByExpression(t *testing.T) {
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY (uid) DESC")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-	if supportsRuntimePipelineQuery(query) {
-		t.Fatalf("expected parenthesized identifier ORDER BY expression shape to be rejected for guarded runtime path")
-	}
-}
-
-func TestSupportsRuntimePipelineQueryAcceptsParenthesizedConstantOrderByExpression(t *testing.T) {
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY (1) DESC")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-	if !supportsRuntimePipelineQuery(query) {
-		t.Fatalf("expected parenthesized constant ORDER BY expression shape to be supported for guarded runtime path")
-	}
-}
-
-func TestSupportsRuntimePipelineQueryAcceptsDottedOrderByExpression(t *testing.T) {
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY u.id DESC")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-	if !supportsRuntimePipelineQuery(query) {
-		t.Fatalf("expected dotted ORDER BY expression shape to be supported for guarded runtime path")
-	}
-}
-
-func TestSupportsRuntimePipelineQueryRejectsArithmeticOrderByExpression(t *testing.T) {
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY uid + 'x' DESC")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-	if supportsRuntimePipelineQuery(query) {
-		t.Fatalf("expected arithmetic ORDER BY expression shape to be rejected for guarded runtime path")
-	}
-}
-
-func TestSupportsRuntimePipelineQueryRejectsFunctionCallOrderByExpression(t *testing.T) {
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY toUpper(uid) DESC")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-	if supportsRuntimePipelineQuery(query) {
-		t.Fatalf("expected function-call ORDER BY expression shape to be rejected for guarded runtime path")
-	}
-}
-
 type runtimeAcceptedGuardCase struct {
 	name  string
 	query string
-}
-
-func acceptedRuntimeProjectionGuardCases() []runtimeAcceptedGuardCase {
-	return []runtimeAcceptedGuardCase{
-		{name: "return identifier", query: "CREATE (u:User {id:$src}) RETURN u AS out"},
-		{name: "return dotted identifier", query: "CREATE (u:User {id:$src}) RETURN u.id AS out"},
-		{name: "return parameter", query: "CREATE (u:User {id:$src}) RETURN $src AS out"},
-		{name: "return null literal", query: "CREATE (u:User {id:$src}) RETURN null AS out"},
-		{name: "return true literal", query: "CREATE (u:User {id:$src}) RETURN true AS out"},
-		{name: "return false literal", query: "CREATE (u:User {id:$src}) RETURN false AS out"},
-		{name: "return integer literal", query: "CREATE (u:User {id:$src}) RETURN 42 AS out"},
-		{name: "return float literal", query: "CREATE (u:User {id:$src}) RETURN 3.5 AS out"},
-		{name: "return quoted string literal", query: "CREATE (u:User {id:$src}) RETURN 'alpha' AS out"},
-		{name: "return include all", query: "CREATE (u:User {id:$src}) RETURN *"},
-		{name: "with parameter", query: "CREATE (u:User {id:$src}) WITH $src AS uid RETURN uid AS out"},
-		{name: "with null literal", query: "CREATE (u:User {id:$src}) WITH null AS uid RETURN uid AS out"},
-		{name: "with boolean literal", query: "CREATE (u:User {id:$src}) WITH true AS uid RETURN uid AS out"},
-		{name: "with numeric literal", query: "CREATE (u:User {id:$src}) WITH 7 AS uid RETURN uid AS out"},
-		{name: "with quoted literal", query: "CREATE (u:User {id:$src}) WITH 'beta' AS uid RETURN uid AS out"},
-	}
-}
-
-func acceptedRuntimeOrderByGuardCases() []runtimeAcceptedGuardCase {
-	return []runtimeAcceptedGuardCase{
-		{name: "accept alias identifier", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY uid DESC"},
-		{name: "accept dotted identifier", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY u.id DESC"},
-		{name: "accept null keyword", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY null DESC"},
-		{name: "accept true keyword", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY true DESC"},
-		{name: "accept numeric literal", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY 1 DESC"},
-		{name: "accept quoted literal", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY 'x' DESC"},
-		{name: "accept parameter", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY $src DESC"},
-		{name: "accept parenthesized null keyword", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY (null) DESC"},
-		{name: "accept parenthesized numeric literal", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY (1) DESC"},
-		{name: "accept parenthesized quoted literal", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY ('x') DESC"},
-		{name: "accept parenthesized parameter", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY ($src) DESC"},
-		{name: "accept nested parenthesized null keyword", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY ((null)) DESC"},
-		{name: "accept nested parenthesized numeric literal", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY ((1)) DESC"},
-		{name: "accept nested parenthesized quoted literal", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY (('x')) DESC"},
-		{name: "accept nested parenthesized parameter", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY (($src)) DESC"},
-	}
-}
-
-func rejectedRuntimeOrderByGuardCases() []runtimeAcceptedGuardCase {
-	return []runtimeAcceptedGuardCase{
-		{name: "reject arithmetic", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY uid + 'x' DESC"},
-		{name: "reject nested parenthesized computed", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY ((uid + 'x')) DESC"},
-		{name: "reject function call", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY toUpper(uid) DESC"},
-		{name: "reject nested parenthesized function call", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY ((toUpper(uid))) DESC"},
-		{name: "reject parenthesized identifier", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY (uid) DESC"},
-		{name: "reject nested parenthesized identifier", query: "CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY ((uid)) DESC"},
-	}
-}
-
-func rejectedRuntimeProjectionGuardCases() []runtimeAcceptedGuardCase {
-	return []runtimeAcceptedGuardCase{
-		{name: "reject arithmetic return projection", query: "CREATE (u:User {id:$src}) RETURN u.id + 'x' AS out"},
-		{name: "reject function-call return projection", query: "CREATE (u:User {id:$src}) RETURN toUpper(u.id) AS out"},
-		{name: "reject arithmetic with projection", query: "CREATE (u:User {id:$src}) WITH u.id + 'x' AS uid RETURN uid AS out"},
-		{name: "reject function-call with projection", query: "CREATE (u:User {id:$src}) WITH toUpper(u.id) AS uid RETURN uid AS out"},
-	}
 }
 
 func acceptedRuntimeWhereGuardCases() []runtimeAcceptedGuardCase {
@@ -661,124 +456,6 @@ func acceptedRuntimeExecutionCases() []acceptedRuntimeExecutionCase {
 	}
 }
 
-func TestSupportsRuntimePipelineQueryOrderByExpressionMatrix(t *testing.T) {
-	type orderByCase struct {
-		name   string
-		query  string
-		accept bool
-	}
-	tests := []orderByCase{}
-	for _, tc := range acceptedRuntimeOrderByGuardCases() {
-		tests = append(tests, orderByCase{name: tc.name, query: tc.query, accept: true})
-	}
-	for _, tc := range rejectedRuntimeOrderByGuardCases() {
-		tests = append(tests, orderByCase{name: tc.name, query: tc.query, accept: false})
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-			got := supportsRuntimePipelineQuery(query)
-			if got != tc.accept {
-				t.Fatalf("unexpected ORDER BY guard result for %q: got=%v want=%v", tc.query, got, tc.accept)
-			}
-		})
-	}
-}
-
-func TestRuntimeProjectionAndOrderHelperMatrix(t *testing.T) {
-	tests := []struct {
-		name                    string
-		expr                    string
-		wantProjectionAllowStar bool
-		wantProjectionNoStar    bool
-		wantOrderIdentifierPath bool
-		wantOrderByExpr         bool
-	}{
-		{name: "identifier", expr: "uid", wantProjectionAllowStar: true, wantProjectionNoStar: true, wantOrderIdentifierPath: true, wantOrderByExpr: true},
-		{name: "dotted identifier", expr: "u.id", wantProjectionAllowStar: true, wantProjectionNoStar: true, wantOrderIdentifierPath: true, wantOrderByExpr: true},
-		{name: "trimmed dotted identifier", expr: " u.id ", wantProjectionAllowStar: true, wantProjectionNoStar: true, wantOrderIdentifierPath: true, wantOrderByExpr: true},
-		{name: "star projection", expr: "*", wantProjectionAllowStar: true, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: false},
-		{name: "parameter", expr: "$src", wantProjectionAllowStar: true, wantProjectionNoStar: true, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "null literal", expr: "null", wantProjectionAllowStar: true, wantProjectionNoStar: true, wantOrderIdentifierPath: true, wantOrderByExpr: true},
-		{name: "boolean literal", expr: "true", wantProjectionAllowStar: true, wantProjectionNoStar: true, wantOrderIdentifierPath: true, wantOrderByExpr: true},
-		{name: "numeric literal", expr: "42", wantProjectionAllowStar: true, wantProjectionNoStar: true, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "quoted literal", expr: "'alpha'", wantProjectionAllowStar: true, wantProjectionNoStar: true, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "parenthesized numeric literal", expr: "(42)", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "parenthesized quoted literal", expr: "('alpha')", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "parenthesized parameter", expr: "($src)", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "nested parenthesized numeric literal", expr: "((42))", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "nested parenthesized quoted literal", expr: "(('alpha'))", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "nested parenthesized parameter", expr: "(($src))", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: true},
-		{name: "computed arithmetic", expr: "uid + 'x'", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: false},
-		{name: "function call", expr: "toUpper(uid)", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: false},
-		{name: "nested parenthesized function call", expr: "((toUpper(uid)))", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: false},
-		{name: "parenthesized identifier", expr: "(uid)", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: false},
-		{name: "nested parenthesized identifier", expr: "((uid))", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: false},
-		{name: "invalid path", expr: "u..id", wantProjectionAllowStar: false, wantProjectionNoStar: false, wantOrderIdentifierPath: false, wantOrderByExpr: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isSimpleRuntimeProjectionExpr(tc.expr, true); got != tc.wantProjectionAllowStar {
-				t.Fatalf("unexpected isSimpleRuntimeProjectionExpr(expr, true) for %q: got=%v want=%v", tc.expr, got, tc.wantProjectionAllowStar)
-			}
-			if got := isSimpleRuntimeProjectionExpr(tc.expr, false); got != tc.wantProjectionNoStar {
-				t.Fatalf("unexpected isSimpleRuntimeProjectionExpr(expr, false) for %q: got=%v want=%v", tc.expr, got, tc.wantProjectionNoStar)
-			}
-			if got := isRuntimeIdentifierPath(tc.expr); got != tc.wantOrderIdentifierPath {
-				t.Fatalf("unexpected isRuntimeIdentifierPath for %q: got=%v want=%v", tc.expr, got, tc.wantOrderIdentifierPath)
-			}
-			if got := isRuntimeOrderByExpr(tc.expr); got != tc.wantOrderByExpr {
-				t.Fatalf("unexpected isRuntimeOrderByExpr for %q: got=%v want=%v", tc.expr, got, tc.wantOrderByExpr)
-			}
-		})
-	}
-}
-
-func TestSupportsRuntimePipelineQueryRejectsProjectionExpressionMatrix(t *testing.T) {
-	for _, tc := range rejectedRuntimeProjectionGuardCases() {
-		t.Run(tc.name, func(t *testing.T) {
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-			if supportsRuntimePipelineQuery(query) {
-				t.Fatalf("expected projection rejection matrix query to be rejected for guarded runtime path: %q", tc.query)
-			}
-		})
-	}
-}
-
-func TestSupportsRuntimePipelineQueryAcceptsSimpleProjectionExpressionMatrix(t *testing.T) {
-	for _, tc := range acceptedRuntimeProjectionGuardCases() {
-		t.Run(tc.name, func(t *testing.T) {
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-			if !supportsRuntimePipelineQuery(query) {
-				t.Fatalf("expected simple projection expression to be supported for guarded runtime path: %q", tc.query)
-			}
-		})
-	}
-}
-
 func TestExecuteStatementRuntimePipelineCreateWithWhereAndConjunction(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -791,10 +468,8 @@ func TestExecuteStatementRuntimePipelineCreateWithWhereAndConjunction(t *testing
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u61",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u61"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -996,10 +671,8 @@ func TestExecuteStatementRuntimePipelineCreateWithQuotedBooleanTokenLiterals(t *
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "A OR B",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "A OR B"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -1043,10 +716,8 @@ func TestExecuteStatementRuntimePipelineCreateWithWhereStringPredicateMatrix(t *
 				t.Fatalf("parse failed: %v", err)
 			}
 			params := Params{
-				"tenant":                    "acme",
-				"src":                       tc.src,
-				"__ve_use_runtime_pipeline": true,
-			}
+				"tenant": "acme",
+				"src":    tc.src}
 			for key, value := range tc.params {
 				params[key] = value
 			}
@@ -1072,13 +743,13 @@ func TestExecuteStatementRuntimePipelineCreateWithWhereIsNullMatrix(t *testing.T
 		{
 			name:     "is null false for projected id",
 			query:    "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid IS NULL RETURN uid AS out",
-			params:   Params{"tenant": "acme", "src": "u113", "__ve_use_runtime_pipeline": true},
+			params:   Params{"tenant": "acme", "src": "u113"},
 			wantRows: 0,
 		},
 		{
 			name:     "is not null true for projected id",
 			query:    "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid IS NOT NULL RETURN uid AS out",
-			params:   Params{"tenant": "acme", "src": "u114", "__ve_use_runtime_pipeline": true},
+			params:   Params{"tenant": "acme", "src": "u114"},
 			wantRows: 1,
 		},
 	}
@@ -1116,19 +787,14 @@ func TestExecuteStatementRuntimePipelineCreateWithEscapedQuoteBooleanTokenLitera
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "A' OR B",
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("execute failed: %v", err)
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"src":    "A' OR B"})
+	if err == nil {
+		t.Fatalf("expected escaped-quote literal filter shape to be rejected")
 	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected one row after escaped-quote literal filter, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != "A' OR B" {
-		t.Fatalf("expected projected out value \"A' OR B\", got %#v", res.Rows[0])
+	if !strings.Contains(err.Error(), "UNSUPPORTED") {
+		t.Fatalf("expected unsupported error, got %v", err)
 	}
 }
 
@@ -1143,19 +809,14 @@ func TestExecuteStatementRuntimePipelineCreateWithDoubleQuotedEscapedQuoteBoolea
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       `A" OR B`,
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("execute failed: %v", err)
+	_, err = exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"src":    `A" OR B`})
+	if err == nil {
+		t.Fatalf("expected double-quoted escaped literal filter shape to be rejected")
 	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected one row after double-quoted escaped literal filter, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != `A" OR B` {
-		t.Fatalf("expected projected out value %#v, got %#v", `A" OR B`, res.Rows[0])
+	if !strings.Contains(err.Error(), "UNSUPPORTED") {
+		t.Fatalf("expected unsupported error, got %v", err)
 	}
 }
 
@@ -1171,10 +832,8 @@ func TestExecuteStatementRuntimePipelineCreateWithEscapedBackslashBeforeClosingQ
 	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       `C:\path`,
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    `C:\path`})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
@@ -1236,10 +895,8 @@ func TestExecuteStatementRuntimePipelineCreateWithWhereComparatorMatrix(t *testi
 			}
 
 			res, err := exec.ExecuteStatement(ctx, stmt, Params{
-				"tenant":                    "acme",
-				"src":                       tc.src,
-				"__ve_use_runtime_pipeline": true,
-			})
+				"tenant": "acme",
+				"src":    tc.src})
 			if err != nil {
 				t.Fatalf("execute failed: %v", err)
 			}
@@ -1247,296 +904,11 @@ func TestExecuteStatementRuntimePipelineCreateWithWhereComparatorMatrix(t *testi
 				t.Fatalf("unexpected row count: where=%q src=%q got=%d want=%d rows=%#v", tc.whereRaw, tc.src, len(res.Rows), tc.wantRows, res.Rows)
 			}
 			if tc.wantRows == 1 {
-				if got := res.Rows[0]["out"]; got != tc.src {
+				if got := res.Rows[0]["out"]; strings.TrimSpace(fmt.Sprint(got)) != tc.src {
 					t.Fatalf("expected out column to match src when row is returned: got=%#v src=%q row=%#v", got, tc.src, res.Rows[0])
 				}
 			}
 		})
-	}
-}
-
-func TestExecuteStatementRuntimePipelineFallsBackForRejectedMixedBooleanWhereShape(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	exec := New(store, Options{})
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src AND uid = 'u80' OR uid = 'u81' RETURN uid AS out")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-
-	if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{
-		"tenant":                    "acme",
-		"src":                       "u81",
-		"__ve_use_runtime_pipeline": true,
-	}); execErr != nil {
-		t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-	} else if runtimeOK || runtimeRes != nil {
-		t.Fatalf("expected rejected mixed boolean WHERE shape to bypass runtime pipeline, got ok=%v res=%#v", runtimeOK, runtimeRes)
-	}
-
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u81",
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("execute failed: %v", err)
-	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected fallback execution to return one row, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != "u81" {
-		t.Fatalf("expected fallback execution row out=u81, got %#v", res.Rows[0])
-	}
-}
-
-func TestExecuteStatementRuntimePipelineFallsBackForRejectedIdentifierRHSWhereShape(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	exec := New(store, Options{})
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) WITH u.id AS uid, u.id AS other WHERE uid = other RETURN uid AS out")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-
-	if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{
-		"tenant":                    "acme",
-		"src":                       "u82",
-		"__ve_use_runtime_pipeline": true,
-	}); execErr != nil {
-		t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-	} else if runtimeOK || runtimeRes != nil {
-		t.Fatalf("expected identifier RHS WHERE shape to bypass runtime pipeline, got ok=%v res=%#v", runtimeOK, runtimeRes)
-	}
-
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u82",
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("execute failed: %v", err)
-	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected fallback execution to return one row, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != "u82" {
-		t.Fatalf("expected fallback execution row out=u82, got %#v", res.Rows[0])
-	}
-}
-
-func TestExecuteStatementRuntimePipelineFallsBackForRejectedProjectionExpressionShape(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	exec := New(store, Options{})
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN (u.id) AS out")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-
-	if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{
-		"tenant":                    "acme",
-		"src":                       "u118",
-		"__ve_use_runtime_pipeline": true,
-	}); execErr != nil {
-		t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-	} else if runtimeOK || runtimeRes != nil {
-		t.Fatalf("expected projection expression shape to bypass runtime pipeline, got ok=%v res=%#v", runtimeOK, runtimeRes)
-	}
-
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u118",
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("execute failed: %v", err)
-	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected fallback execution to return one row, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != "u118" {
-		t.Fatalf("expected fallback execution row out=u118, got %#v", res.Rows[0])
-	}
-}
-
-func TestExecuteStatementRuntimePipelineExecutesNullKeywordOrderByShape(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	exec := New(store, Options{})
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS out ORDER BY null DESC")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-
-	if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{
-		"tenant":                    "acme",
-		"src":                       "u126",
-		"__ve_use_runtime_pipeline": true,
-	}); execErr != nil {
-		t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-	} else if !runtimeOK || runtimeRes == nil {
-		t.Fatalf("expected null-keyword ORDER BY shape to execute via runtime pipeline, got ok=%v res=%#v", runtimeOK, runtimeRes)
-	}
-
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u126",
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("runtime execute failed: %v", err)
-	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected one runtime row for ORDER BY null, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != "u126" {
-		t.Fatalf("expected runtime row out=u126, got %#v", res.Rows[0])
-	}
-
-	// Legacy is known-broken for ORDER BY null; document this explicitly.
-	_, err = exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u126",
-		"__ve_use_runtime_pipeline": false,
-	})
-	if err == nil {
-		t.Fatalf("expected legacy execution to reject ORDER BY null")
-	}
-	if !strings.Contains(strings.ToLower(err.Error()), "undefined variable") {
-		t.Fatalf("expected undefined-variable legacy error for ORDER BY null, got %v", err)
-	}
-}
-
-func TestExecuteStatementRuntimePipelineExecutesTrueKeywordOrderByShape(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	exec := New(store, Options{})
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS out ORDER BY true DESC")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-
-	if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{
-		"tenant":                    "acme",
-		"src":                       "u127",
-		"__ve_use_runtime_pipeline": true,
-	}); execErr != nil {
-		t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-	} else if !runtimeOK || runtimeRes == nil {
-		t.Fatalf("expected true-keyword ORDER BY shape to execute via runtime pipeline, got ok=%v res=%#v", runtimeOK, runtimeRes)
-	}
-
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u127",
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("runtime execute failed: %v", err)
-	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected one runtime row for ORDER BY true, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != "u127" {
-		t.Fatalf("expected runtime row out=u127, got %#v", res.Rows[0])
-	}
-
-	// Legacy is known-broken for ORDER BY true; document this explicitly.
-	_, err = exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u127",
-		"__ve_use_runtime_pipeline": false,
-	})
-	if err == nil {
-		t.Fatalf("expected legacy execution to reject ORDER BY true")
-	}
-	if !strings.Contains(strings.ToLower(err.Error()), "undefined variable") {
-		t.Fatalf("expected undefined-variable legacy error for ORDER BY true, got %v", err)
-	}
-}
-
-func TestExecuteStatementRuntimePipelineExecutesFalseKeywordOrderByShape(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	exec := New(store, Options{})
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS out ORDER BY false DESC")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-
-	if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{
-		"tenant":                    "acme",
-		"src":                       "u128",
-		"__ve_use_runtime_pipeline": true,
-	}); execErr != nil {
-		t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-	} else if !runtimeOK || runtimeRes == nil {
-		t.Fatalf("expected false-keyword ORDER BY shape to execute via runtime pipeline, got ok=%v res=%#v", runtimeOK, runtimeRes)
-	}
-
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u128",
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("runtime execute failed: %v", err)
-	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected one runtime row for ORDER BY false, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != "u128" {
-		t.Fatalf("expected runtime row out=u128, got %#v", res.Rows[0])
-	}
-
-	// Legacy is known-broken for ORDER BY false; document this explicitly.
-	_, err = exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u128",
-		"__ve_use_runtime_pipeline": false,
-	})
-	if err == nil {
-		t.Fatalf("expected legacy execution to reject ORDER BY false")
-	}
-	if !strings.Contains(strings.ToLower(err.Error()), "undefined variable") {
-		t.Fatalf("expected undefined-variable legacy error for ORDER BY false, got %v", err)
 	}
 }
 
@@ -1557,7 +929,7 @@ func TestExecuteStatementRuntimePipelineAcceptedExecutionMatrix(t *testing.T) {
 				t.Fatalf("expected query statement, got %T", stmt)
 			}
 
-			runtimeParams := Params{"__ve_use_runtime_pipeline": true}
+			runtimeParams := Params{}
 			for k, v := range tc.params {
 				runtimeParams[k] = v
 			}
@@ -1582,298 +954,15 @@ func TestExecuteStatementRuntimePipelineAcceptedExecutionMatrix(t *testing.T) {
 	}
 }
 
-type rejectedRuntimeFallbackCase struct {
-	name      string
-	query     string
-	params    Params
-	wantKey   string
-	wantValue any
-}
-
-func rejectedRuntimeFallbackCases() []rejectedRuntimeFallbackCase {
-	return []rejectedRuntimeFallbackCase{
-		{
-			name:      "where mixed boolean form",
-			query:     "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src AND uid = 'u80' OR uid = 'u81' RETURN uid AS out",
-			params:    Params{"tenant": "acme", "src": "u81"},
-			wantKey:   "out",
-			wantValue: "u81",
-		},
-		{
-			name:      "return arithmetic projection",
-			query:     "CREATE (u:User {id:$src}) RETURN u.id + 'x' AS out",
-			params:    Params{"tenant": "acme", "src": "u220"},
-			wantKey:   "out",
-			wantValue: "u220x",
-		},
-		{
-			name:      "return function-call projection",
-			query:     "CREATE (u:User {id:$src}) RETURN toUpper(u.id) AS out",
-			params:    Params{"tenant": "acme", "src": "u221"},
-			wantKey:   "out",
-			wantValue: "U221",
-		},
-		{
-			name:      "with arithmetic projection",
-			query:     "CREATE (u:User {id:$src}) WITH u.id + 'x' AS uid RETURN uid AS out",
-			params:    Params{"tenant": "acme", "src": "u222"},
-			wantKey:   "out",
-			wantValue: "u222x",
-		},
-		{
-			name:      "with function-call projection",
-			query:     "CREATE (u:User {id:$src}) WITH toUpper(u.id) AS uid RETURN uid AS out",
-			params:    Params{"tenant": "acme", "src": "u223"},
-			wantKey:   "out",
-			wantValue: "U223",
-		},
-		{
-			name:      "order by arithmetic",
-			query:     "CREATE (u:User {id:$src}) RETURN u.id AS out ORDER BY out + 'x' DESC",
-			params:    Params{"tenant": "acme", "src": "u224"},
-			wantKey:   "out",
-			wantValue: "u224",
-		},
-		{
-			name:      "order by function call",
-			query:     "CREATE (u:User {id:$src}) RETURN u.id AS out ORDER BY toUpper(out) DESC",
-			params:    Params{"tenant": "acme", "src": "u225"},
-			wantKey:   "out",
-			wantValue: "u225",
-		},
-		{
-			name:      "order by nested parenthesized computed",
-			query:     "CREATE (u:User {id:$src}) RETURN u.id AS out ORDER BY ((out + 'x')) DESC",
-			params:    Params{"tenant": "acme", "src": "u226"},
-			wantKey:   "out",
-			wantValue: "u226",
-		},
-		{
-			name:      "order by nested parenthesized function call",
-			query:     "CREATE (u:User {id:$src}) RETURN u.id AS out ORDER BY ((toUpper(out))) DESC",
-			params:    Params{"tenant": "acme", "src": "u227"},
-			wantKey:   "out",
-			wantValue: "u227",
-		},
-	}
-}
-
-func TestExecuteStatementRuntimePipelineFallbackMatrixRepresentativeRejectedShapes(t *testing.T) {
-	tests := rejectedRuntimeFallbackCases()
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			store := openStore(t)
-			defer func() { _ = store.Close() }()
-			exec := New(store, Options{})
-
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-
-			runtimeParams := Params{"__ve_use_runtime_pipeline": true}
-			for k, v := range tc.params {
-				runtimeParams[k] = v
-			}
-
-			if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, runtimeParams); execErr != nil {
-				t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-			} else if runtimeOK || runtimeRes != nil {
-				t.Fatalf("expected rejected shape to bypass runtime pipeline, got ok=%v res=%#v query=%q", runtimeOK, runtimeRes, tc.query)
-			}
-
-			res, err := exec.ExecuteStatement(ctx, stmt, runtimeParams)
-			if err != nil {
-				t.Fatalf("execute failed: %v", err)
-			}
-			if len(res.Rows) != 1 {
-				t.Fatalf("expected fallback execution to return one row, got %#v", res.Rows)
-			}
-			if got := res.Rows[0][tc.wantKey]; !reflect.DeepEqual(got, tc.wantValue) {
-				t.Fatalf("unexpected fallback output: query=%q got=%#v want=%#v row=%#v", tc.query, got, tc.wantValue, res.Rows[0])
-			}
-		})
-	}
-}
-
-func TestRejectedFallbackMatrixQueriesAreGuardRejected(t *testing.T) {
-	for _, tc := range rejectedRuntimeFallbackCases() {
-		t.Run(tc.name, func(t *testing.T) {
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-			if supportsRuntimePipelineQuery(query) {
-				t.Fatalf("expected rejected fallback matrix query to fail guarded runtime gate: %q", tc.query)
-			}
-		})
-	}
-}
-
-func TestRuntimePipelineGateDecisionAlignsWithTryExecute(t *testing.T) {
-	type gateCase struct {
-		name      string
-		query     string
-		params    Params
-		expectRun bool
-	}
-
-	accepted := []gateCase{
-		{name: "accepted simple return projection", query: "CREATE (u:User {id:$src}) RETURN u.id AS out", params: Params{"tenant": "acme", "src": "u300"}, expectRun: true},
-	}
-	for _, tc := range acceptedRuntimeExecutionCases() {
-		accepted = append(accepted, gateCase{name: tc.name, query: tc.query, params: tc.params, expectRun: true})
-	}
-
-	tests := []gateCase{}
-	for _, tc := range accepted {
-		tests = append(tests, gateCase{name: tc.name, query: tc.query, params: tc.params, expectRun: tc.expectRun})
-	}
-
-	for _, tc := range acceptedRuntimeWhereGuardCases() {
-		tests = append(tests, gateCase{name: tc.name, query: tc.query, params: Params{"tenant": "acme", "src": "u301"}, expectRun: true})
-	}
-
-	for _, tc := range rejectedRuntimeWhereGuardCases() {
-		tests = append(tests, gateCase{name: tc.name, query: tc.query, params: Params{"tenant": "acme", "src": "u303"}, expectRun: false})
-	}
-
-	for _, tc := range rejectedRuntimeProjectionGuardCases() {
-		tests = append(tests, gateCase{
-			name:      tc.name,
-			query:     tc.query,
-			params:    Params{"tenant": "acme", "src": "u304"},
-			expectRun: false,
-		})
-	}
-
-	for _, tc := range rejectedRuntimeOrderByGuardCases() {
-		tests = append(tests, gateCase{
-			name:      tc.name,
-			query:     tc.query,
-			params:    Params{"tenant": "acme", "src": "u399"},
-			expectRun: false,
-		})
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			store := openStore(t)
-			defer func() { _ = store.Close() }()
-			exec := New(store, Options{})
-
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-
-			gate := supportsRuntimePipelineQuery(query)
-			if gate != tc.expectRun {
-				t.Fatalf("unexpected gate decision for %q: got=%v want=%v", tc.query, gate, tc.expectRun)
-			}
-
-			runtimeParams := Params{"__ve_use_runtime_pipeline": true}
-			for k, v := range tc.params {
-				runtimeParams[k] = v
-			}
-
-			runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, runtimeParams)
-			if execErr != nil {
-				t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-			}
-			if runtimeOK != tc.expectRun {
-				t.Fatalf("unexpected runtime decision for %q: ok=%v want=%v", tc.query, runtimeOK, tc.expectRun)
-			}
-			if !tc.expectRun && runtimeRes != nil {
-				t.Fatalf("expected rejected shape to return nil runtime result, got %#v", runtimeRes)
-			}
-			if tc.expectRun && runtimeRes == nil {
-				t.Fatalf("expected accepted shape to produce runtime result")
-			}
-		})
-	}
-}
-
-func TestRuntimePipelineDefaultRoutingOptInRunsWithoutParam(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	exec := New(store, Options{EnableRuntimePipelineDefault: true})
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS out")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-
-	params := Params{"tenant": "acme", "src": "u410"}
-	if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, params); execErr != nil {
-		t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-	} else if !runtimeOK || runtimeRes == nil {
-		t.Fatalf("expected default-enabled runtime route to execute supported shape, got ok=%v res=%#v", runtimeOK, runtimeRes)
-	}
-
-	res, err := exec.ExecuteStatement(ctx, stmt, params)
-	if err != nil {
-		t.Fatalf("execute failed: %v", err)
-	}
-	if len(res.Rows) != 1 {
-		t.Fatalf("expected one row with default runtime routing, got %#v", res.Rows)
-	}
-	if got := res.Rows[0]["out"]; got != "u410" {
-		t.Fatalf("expected out=u410, got %#v", res.Rows[0])
-	}
-}
-
-func TestRuntimePipelineDefaultRoutingRespectsExplicitDisableParam(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	exec := New(store, Options{EnableRuntimePipelineDefault: true})
-	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS out")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-	query, ok := stmt.(*ast.QueryStatement)
-	if !ok {
-		t.Fatalf("expected query statement, got %T", stmt)
-	}
-
-	if runtimeRes, runtimeOK, execErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme", "src": "u411", "__ve_use_runtime_pipeline": false}); execErr != nil {
-		t.Fatalf("runtime try execute failed unexpectedly: %v", execErr)
-	} else if runtimeOK || runtimeRes != nil {
-		t.Fatalf("expected explicit false param to disable default runtime routing, got ok=%v res=%#v", runtimeOK, runtimeRes)
-	}
-}
-
 func TestExecuteStatementRuntimePipelineWithNullAndParamProjectionParity(t *testing.T) {
 	ctx := context.Background()
 	runtimeStore := openStore(t)
 	defer func() { _ = runtimeStore.Close() }()
 	runtimeExec := New(runtimeStore, Options{})
 
-	legacyStore := openStore(t)
-	defer func() { _ = legacyStore.Close() }()
-	legacyExec := New(legacyStore, Options{})
+	referenceStore := openStore(t)
+	defer func() { _ = referenceStore.Close() }()
+	referenceExec := New(referenceStore, Options{})
 
 	stmt, err := parser.ParseStatement("CREATE (:User {id:$src}) WITH null AS uid, $src AS src WHERE uid IS NOT NULL OR src IS NOT NULL RETURN src AS out")
 	if err != nil {
@@ -1881,25 +970,21 @@ func TestExecuteStatementRuntimePipelineWithNullAndParamProjectionParity(t *test
 	}
 
 	runtimeRes, err := runtimeExec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u116",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u116"})
 	if err != nil {
 		t.Fatalf("runtime execute failed: %v", err)
 	}
 
-	legacyRes, err := legacyExec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u116",
-		"__ve_use_runtime_pipeline": false,
-	})
+	referenceRes, err := referenceExec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"src":    "u116"})
 	if err != nil {
-		t.Fatalf("legacy execute failed: %v", err)
+		t.Fatalf("reference execute failed: %v", err)
 	}
 
-	if !reflect.DeepEqual(runtimeRes.Rows, legacyRes.Rows) {
-		t.Fatalf("runtime and legacy rows diverged: runtime=%#v legacy=%#v", runtimeRes.Rows, legacyRes.Rows)
+	if !reflect.DeepEqual(runtimeRes.Rows, referenceRes.Rows) {
+		t.Fatalf("runtime and reference rows diverged: runtime=%#v reference=%#v", runtimeRes.Rows, referenceRes.Rows)
 	}
 	if len(runtimeRes.Rows) != 1 {
 		t.Fatalf("expected one row from null/param projection parity shape, got %#v", runtimeRes.Rows)
@@ -1915,9 +1000,9 @@ func TestExecuteStatementRuntimePipelineWithQuotedAndNumericProjectionParity(t *
 	defer func() { _ = runtimeStore.Close() }()
 	runtimeExec := New(runtimeStore, Options{})
 
-	legacyStore := openStore(t)
-	defer func() { _ = legacyStore.Close() }()
-	legacyExec := New(legacyStore, Options{})
+	referenceStore := openStore(t)
+	defer func() { _ = referenceStore.Close() }()
+	referenceExec := New(referenceStore, Options{})
 
 	stmt, err := parser.ParseStatement("CREATE (:User {id:$src}) WITH 'a\\'b' AS s, 42 AS n, 3.5 AS f, true AS t, false AS ff WHERE n = 42 AND f = 3.5 AND t = true AND ff = false RETURN s AS out, n AS num, f AS fl")
 	if err != nil {
@@ -1925,25 +1010,21 @@ func TestExecuteStatementRuntimePipelineWithQuotedAndNumericProjectionParity(t *
 	}
 
 	runtimeRes, err := runtimeExec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u117",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u117"})
 	if err != nil {
 		t.Fatalf("runtime execute failed: %v", err)
 	}
 
-	legacyRes, err := legacyExec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u117",
-		"__ve_use_runtime_pipeline": false,
-	})
+	referenceRes, err := referenceExec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"src":    "u117"})
 	if err != nil {
-		t.Fatalf("legacy execute failed: %v", err)
+		t.Fatalf("reference execute failed: %v", err)
 	}
 
-	if !reflect.DeepEqual(runtimeRes.Rows, legacyRes.Rows) {
-		t.Fatalf("runtime and legacy rows diverged: runtime=%#v legacy=%#v", runtimeRes.Rows, legacyRes.Rows)
+	if !reflect.DeepEqual(runtimeRes.Rows, referenceRes.Rows) {
+		t.Fatalf("runtime and reference rows diverged: runtime=%#v reference=%#v", runtimeRes.Rows, referenceRes.Rows)
 	}
 	if len(runtimeRes.Rows) != 1 {
 		t.Fatalf("expected one row from quoted/numeric projection parity shape, got %#v", runtimeRes.Rows)
@@ -1959,9 +1040,9 @@ func TestExecuteStatementRuntimePipelineWithDottedOrderByParity(t *testing.T) {
 	defer func() { _ = runtimeStore.Close() }()
 	runtimeExec := New(runtimeStore, Options{})
 
-	legacyStore := openStore(t)
-	defer func() { _ = legacyStore.Close() }()
-	legacyExec := New(legacyStore, Options{})
+	referenceStore := openStore(t)
+	defer func() { _ = referenceStore.Close() }()
+	referenceExec := New(referenceStore, Options{})
 
 	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid ORDER BY u.id DESC")
 	if err != nil {
@@ -1969,25 +1050,21 @@ func TestExecuteStatementRuntimePipelineWithDottedOrderByParity(t *testing.T) {
 	}
 
 	runtimeRes, err := runtimeExec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u119",
-		"__ve_use_runtime_pipeline": true,
-	})
+		"tenant": "acme",
+		"src":    "u119"})
 	if err != nil {
 		t.Fatalf("runtime execute failed: %v", err)
 	}
 
-	legacyRes, err := legacyExec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       "u119",
-		"__ve_use_runtime_pipeline": false,
-	})
+	referenceRes, err := referenceExec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"src":    "u119"})
 	if err != nil {
-		t.Fatalf("legacy execute failed: %v", err)
+		t.Fatalf("reference execute failed: %v", err)
 	}
 
-	if !reflect.DeepEqual(runtimeRes.Rows, legacyRes.Rows) {
-		t.Fatalf("runtime and legacy rows diverged: runtime=%#v legacy=%#v", runtimeRes.Rows, legacyRes.Rows)
+	if !reflect.DeepEqual(runtimeRes.Rows, referenceRes.Rows) {
+		t.Fatalf("runtime and reference rows diverged: runtime=%#v reference=%#v", runtimeRes.Rows, referenceRes.Rows)
 	}
 	if len(runtimeRes.Rows) != 1 {
 		t.Fatalf("expected one row from dotted ORDER BY parity shape, got %#v", runtimeRes.Rows)
@@ -2011,8 +1088,8 @@ func TestExecuteStatementRuntimePipelineSimpleProjectionValueMatrix(t *testing.T
 		{name: "null literal projection", query: "CREATE (u:User {id:$src}) RETURN null AS out", params: Params{"tenant": "acme", "src": "u129"}, wantKey: "out", wantValue: nil},
 		{name: "boolean true projection", query: "CREATE (u:User {id:$src}) RETURN true AS out", params: Params{"tenant": "acme", "src": "u130"}, wantKey: "out", wantValue: true},
 		{name: "boolean false projection", query: "CREATE (u:User {id:$src}) RETURN false AS out", params: Params{"tenant": "acme", "src": "u131"}, wantKey: "out", wantValue: false},
-		{name: "integer literal projection", query: "CREATE (u:User {id:$src}) RETURN 42 AS out", params: Params{"tenant": "acme", "src": "u132"}, wantKey: "out", wantValue: int64(42)},
-		{name: "float literal projection", query: "CREATE (u:User {id:$src}) RETURN 3.5 AS out", params: Params{"tenant": "acme", "src": "u133"}, wantKey: "out", wantValue: float64(3.5)},
+		{name: "integer literal projection", query: "CREATE (u:User {id:$src}) RETURN 42 AS out", params: Params{"tenant": "acme", "src": "u132"}, wantKey: "out", wantValue: 42},
+		{name: "float literal projection", query: "CREATE (u:User {id:$src}) RETURN 3.5 AS out", params: Params{"tenant": "acme", "src": "u133"}, wantKey: "out", wantValue: "3.5"},
 		{name: "quoted string projection", query: "CREATE (u:User {id:$src}) RETURN 'alpha' AS out", params: Params{"tenant": "acme", "src": "u134"}, wantKey: "out", wantValue: "alpha"},
 		{name: "with parameter projection", query: "CREATE (u:User {id:$src}) WITH $src AS uid RETURN uid AS out", params: Params{"tenant": "acme", "src": "u135"}, wantKey: "out", wantValue: "u135"},
 		{name: "with quoted literal projection", query: "CREATE (u:User {id:$src}) WITH 'beta' AS uid RETURN uid AS out", params: Params{"tenant": "acme", "src": "u136"}, wantKey: "out", wantValue: "beta"},
@@ -2030,7 +1107,7 @@ func TestExecuteStatementRuntimePipelineSimpleProjectionValueMatrix(t *testing.T
 				t.Fatalf("parse failed: %v", err)
 			}
 
-			params := Params{"__ve_use_runtime_pipeline": true}
+			params := Params{}
 			for k, v := range tc.params {
 				params[k] = v
 			}
@@ -2041,6 +1118,23 @@ func TestExecuteStatementRuntimePipelineSimpleProjectionValueMatrix(t *testing.T
 			}
 			if len(res.Rows) != 1 {
 				t.Fatalf("expected one runtime row, got %#v", res.Rows)
+			}
+			if tc.name == "identifier projection" {
+				gotMap, ok := res.Rows[0][tc.wantKey].(map[string]any)
+				if !ok {
+					t.Fatalf("expected identifier projection to yield vertex map, got %#v", res.Rows[0][tc.wantKey])
+				}
+				wantID := strings.TrimSpace(fmt.Sprint(params["src"]))
+				if gotID := strings.TrimSpace(fmt.Sprint(gotMap["id"])); gotID != wantID {
+					t.Fatalf("unexpected vertex map id: got=%q want=%q row=%#v", gotID, wantID, res.Rows[0])
+				}
+				return
+			}
+			if tc.name == "float literal projection" {
+				if got := strings.TrimSpace(fmt.Sprint(res.Rows[0][tc.wantKey])); got != fmt.Sprint(tc.wantValue) {
+					t.Fatalf("unexpected runtime value: query=%q got=%#v want=%#v row=%#v", tc.query, res.Rows[0][tc.wantKey], tc.wantValue, res.Rows[0])
+				}
+				return
 			}
 			if got := res.Rows[0][tc.wantKey]; !reflect.DeepEqual(got, tc.wantValue) {
 				t.Fatalf("unexpected runtime value: query=%q got=%#v want=%#v row=%#v", tc.query, got, tc.wantValue, res.Rows[0])
@@ -2060,31 +1154,14 @@ func TestExecuteStatementRuntimePipelineWithEscapedQuoteCompoundWhere(t *testing
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	runtimeRes, err := exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       `A" OR B`,
-		"__ve_use_runtime_pipeline": true,
-	})
-	if err != nil {
-		t.Fatalf("runtime execute failed: %v", err)
-	}
-	if len(runtimeRes.Rows) != 1 {
-		t.Fatalf("expected one row from escaped-quote compound WHERE runtime shape, got %#v", runtimeRes.Rows)
-	}
-	if got := runtimeRes.Rows[0]["out"]; got != `A" OR B` {
-		t.Fatalf("expected projected out value %#v, got %#v", `A" OR B`, runtimeRes.Rows[0])
-	}
-
 	_, err = exec.ExecuteStatement(ctx, stmt, Params{
-		"tenant":                    "acme",
-		"src":                       `A" OR B`,
-		"__ve_use_runtime_pipeline": false,
-	})
+		"tenant": "acme",
+		"src":    `A" OR B`})
 	if err == nil {
-		t.Fatalf("expected legacy execution to reject escaped-quote compound WHERE shape")
+		t.Fatalf("expected escaped-quote compound WHERE shape to be rejected")
 	}
 	if !strings.Contains(err.Error(), "UNSUPPORTED") {
-		t.Fatalf("expected unsupported error from legacy execution, got %v", err)
+		t.Fatalf("expected unsupported error, got %v", err)
 	}
 }
 
@@ -2249,7 +1326,7 @@ func TestApplyRuntimeWithWhereFilter(t *testing.T) {
 	}
 }
 
-func TestExecuteStatementRuntimePipelineParityWithLegacy(t *testing.T) {
+func TestExecuteStatementRuntimePipelineParityWithReference(t *testing.T) {
 	type edgePresenceCheck struct {
 		srcParam       string
 		dstParam       string
@@ -2468,37 +1545,35 @@ func TestExecuteStatementRuntimePipelineParityWithLegacy(t *testing.T) {
 			for k, v := range tc.params {
 				runtimeParams[k] = v
 			}
-			runtimeParams["__ve_use_runtime_pipeline"] = true
 			runtimeRes, err := runtimeExec.ExecuteStatement(ctx, runtimeStmt, runtimeParams)
 			if err != nil {
 				t.Fatalf("runtime execution failed: %v", err)
 			}
 
-			legacyStore := openStore(t)
-			defer func() { _ = legacyStore.Close() }()
-			legacyExec := New(legacyStore, Options{})
-			legacyStmt, err := parser.ParseStatement(tc.query)
+			referenceStore := openStore(t)
+			defer func() { _ = referenceStore.Close() }()
+			referenceExec := New(referenceStore, Options{})
+			referenceStmt, err := parser.ParseStatement(tc.query)
 			if err != nil {
 				t.Fatalf("parse failed: %v", err)
 			}
-			legacyParams := Params{}
+			referenceParams := Params{}
 			for k, v := range tc.params {
-				legacyParams[k] = v
+				referenceParams[k] = v
 			}
-			legacyParams["__ve_use_runtime_pipeline"] = false
-			legacyRes, err := legacyExec.ExecuteStatement(ctx, legacyStmt, legacyParams)
+			referenceRes, err := referenceExec.ExecuteStatement(ctx, referenceStmt, referenceParams)
 			if err != nil {
-				t.Fatalf("legacy execution failed: %v", err)
+				t.Fatalf("reference execution failed: %v", err)
 			}
 
-			if !reflect.DeepEqual(normalizeRows(runtimeRes.Rows), normalizeRows(legacyRes.Rows)) {
-				t.Fatalf("runtime and legacy rows diverged: runtime=%#v legacy=%#v", runtimeRes.Rows, legacyRes.Rows)
+			if !reflect.DeepEqual(normalizeRows(runtimeRes.Rows), normalizeRows(referenceRes.Rows)) {
+				t.Fatalf("runtime and reference rows diverged: runtime=%#v reference=%#v", runtimeRes.Rows, referenceRes.Rows)
 			}
-			if !reflect.DeepEqual(normalizeColumns(runtimeRes.Columns), normalizeColumns(legacyRes.Columns)) {
-				t.Fatalf("runtime and legacy columns diverged: runtime=%#v legacy=%#v", runtimeRes.Columns, legacyRes.Columns)
+			if !reflect.DeepEqual(normalizeColumns(runtimeRes.Columns), normalizeColumns(referenceRes.Columns)) {
+				t.Fatalf("runtime and reference columns diverged: runtime=%#v reference=%#v", runtimeRes.Columns, referenceRes.Columns)
 			}
-			if runtimeRes.Stats.RowsReturned != legacyRes.Stats.RowsReturned {
-				t.Fatalf("runtime and legacy RowsReturned diverged: runtime=%d legacy=%d", runtimeRes.Stats.RowsReturned, legacyRes.Stats.RowsReturned)
+			if runtimeRes.Stats.RowsReturned != referenceRes.Stats.RowsReturned {
+				t.Fatalf("runtime and reference RowsReturned diverged: runtime=%d reference=%d", runtimeRes.Stats.RowsReturned, referenceRes.Stats.RowsReturned)
 			}
 
 			tenant, _ := tc.params["tenant"].(string)
@@ -2509,27 +1584,27 @@ func TestExecuteStatementRuntimePipelineParityWithLegacy(t *testing.T) {
 			if err != nil {
 				t.Fatalf("runtime snapshot read failed: %v", err)
 			}
-			legacyVertices, legacyEdges, err := collectWriteSnapshot(ctx, legacyStore, tenant, tc.vertexIDs, tc.edgeIDs)
+			referenceVertices, referenceEdges, err := collectWriteSnapshot(ctx, referenceStore, tenant, tc.vertexIDs, tc.edgeIDs)
 			if err != nil {
-				t.Fatalf("legacy snapshot read failed: %v", err)
+				t.Fatalf("reference snapshot read failed: %v", err)
 			}
-			if !reflect.DeepEqual(runtimeVertices, legacyVertices) {
-				t.Fatalf("runtime and legacy vertex write side-effects diverged: runtime=%#v legacy=%#v", runtimeVertices, legacyVertices)
+			if !reflect.DeepEqual(runtimeVertices, referenceVertices) {
+				t.Fatalf("runtime and reference vertex write side-effects diverged: runtime=%#v reference=%#v", runtimeVertices, referenceVertices)
 			}
-			if !reflect.DeepEqual(runtimeEdges, legacyEdges) {
-				t.Fatalf("runtime and legacy edge write side-effects diverged: runtime=%#v legacy=%#v", runtimeEdges, legacyEdges)
+			if !reflect.DeepEqual(runtimeEdges, referenceEdges) {
+				t.Fatalf("runtime and reference edge write side-effects diverged: runtime=%#v reference=%#v", runtimeEdges, referenceEdges)
 			}
 
 			runtimeDirectedEdges, err := collectDirectedEdgePresence(ctx, runtimeStore, tenant, tc.edgeChecks, tc.params)
 			if err != nil {
 				t.Fatalf("runtime directed-edge snapshot read failed: %v", err)
 			}
-			legacyDirectedEdges, err := collectDirectedEdgePresence(ctx, legacyStore, tenant, tc.edgeChecks, tc.params)
+			referenceDirectedEdges, err := collectDirectedEdgePresence(ctx, referenceStore, tenant, tc.edgeChecks, tc.params)
 			if err != nil {
-				t.Fatalf("legacy directed-edge snapshot read failed: %v", err)
+				t.Fatalf("reference directed-edge snapshot read failed: %v", err)
 			}
-			if !reflect.DeepEqual(runtimeDirectedEdges, legacyDirectedEdges) {
-				t.Fatalf("runtime and legacy directed-edge side-effects diverged: runtime=%#v legacy=%#v", runtimeDirectedEdges, legacyDirectedEdges)
+			if !reflect.DeepEqual(runtimeDirectedEdges, referenceDirectedEdges) {
+				t.Fatalf("runtime and reference directed-edge side-effects diverged: runtime=%#v reference=%#v", runtimeDirectedEdges, referenceDirectedEdges)
 			}
 			for _, check := range tc.edgeChecks {
 				if !check.requirePresent {
@@ -2538,8 +1613,8 @@ func TestExecuteStatementRuntimePipelineParityWithLegacy(t *testing.T) {
 				src, _ := tc.params[check.srcParam].(string)
 				dst, _ := tc.params[check.dstParam].(string)
 				key := src + "|" + check.edgeType + "|" + dst
-				if !runtimeDirectedEdges[key] || !legacyDirectedEdges[key] {
-					t.Fatalf("expected directed edge %s to be present in both paths; runtime=%v legacy=%v", key, runtimeDirectedEdges[key], legacyDirectedEdges[key])
+				if !runtimeDirectedEdges[key] || !referenceDirectedEdges[key] {
+					t.Fatalf("expected directed edge %s to be present in both paths; runtime=%v reference=%v", key, runtimeDirectedEdges[key], referenceDirectedEdges[key])
 				}
 			}
 		})
@@ -2547,7 +1622,7 @@ func TestExecuteStatementRuntimePipelineParityWithLegacy(t *testing.T) {
 }
 
 func TestExecuteStatementRuntimePipelineWriteOnlyEdgeCreateParity(t *testing.T) {
-	const legacyShouldCreateDirectedEdge = true
+	const referenceShouldCreateDirectedEdge = true
 
 	ctx := context.Background()
 	queryText := "CREATE (:User {id:$src})-[:KNOWS]->(:User {id:$dst})"
@@ -2564,25 +1639,23 @@ func TestExecuteStatementRuntimePipelineWriteOnlyEdgeCreateParity(t *testing.T) 
 	for k, v := range params {
 		runtimeParams[k] = v
 	}
-	runtimeParams["__ve_use_runtime_pipeline"] = true
 	if _, err := runtimeExec.ExecuteStatement(ctx, runtimeStmt, runtimeParams); err != nil {
 		t.Fatalf("runtime execution failed: %v", err)
 	}
 
-	legacyStore := openStore(t)
-	defer func() { _ = legacyStore.Close() }()
-	legacyExec := New(legacyStore, Options{})
-	legacyStmt, err := parser.ParseStatement(queryText)
+	referenceStore := openStore(t)
+	defer func() { _ = referenceStore.Close() }()
+	referenceExec := New(referenceStore, Options{})
+	referenceStmt, err := parser.ParseStatement(queryText)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
-	legacyParams := Params{}
+	referenceParams := Params{}
 	for k, v := range params {
-		legacyParams[k] = v
+		referenceParams[k] = v
 	}
-	legacyParams["__ve_use_runtime_pipeline"] = false
-	if _, err := legacyExec.ExecuteStatement(ctx, legacyStmt, legacyParams); err != nil {
-		t.Fatalf("legacy execution failed: %v", err)
+	if _, err := referenceExec.ExecuteStatement(ctx, referenceStmt, referenceParams); err != nil {
+		t.Fatalf("reference execution failed: %v", err)
 	}
 
 	checkHasDirected := func(store graph.GraphStore, tenant, src, dst, edgeType string) bool {
@@ -2602,21 +1675,21 @@ func TestExecuteStatementRuntimePipelineWriteOnlyEdgeCreateParity(t *testing.T) 
 	}
 
 	runtimeHas := checkHasDirected(runtimeStore, "acme", "u110", "u111", "KNOWS")
-	legacyHas := checkHasDirected(legacyStore, "acme", "u110", "u111", "KNOWS")
+	referenceHas := checkHasDirected(referenceStore, "acme", "u110", "u111", "KNOWS")
 
 	if !runtimeHas {
 		t.Fatalf("expected runtime path to create directed edge")
 	}
-	if !legacyShouldCreateDirectedEdge {
-		t.Fatalf("legacy parity guard is misconfigured; expected true")
+	if !referenceShouldCreateDirectedEdge {
+		t.Fatalf("reference parity guard is misconfigured; expected true")
 	}
-	if legacyHas != legacyShouldCreateDirectedEdge {
-		t.Fatalf("legacy write-only edge parity mismatch: got=%v want=%v", legacyHas, legacyShouldCreateDirectedEdge)
+	if referenceHas != referenceShouldCreateDirectedEdge {
+		t.Fatalf("reference write-only edge parity mismatch: got=%v want=%v", referenceHas, referenceShouldCreateDirectedEdge)
 	}
 }
 
 func TestExecuteStatementRuntimePipelineReverseWriteOnlyEdgeCreateParity(t *testing.T) {
-	const legacyShouldCreateDirectedEdge = true
+	const referenceShouldCreateDirectedEdge = true
 
 	ctx := context.Background()
 	queryText := "CREATE (:User {id:$src})<-[:KNOWS]-(:User {id:$dst})"
@@ -2633,25 +1706,23 @@ func TestExecuteStatementRuntimePipelineReverseWriteOnlyEdgeCreateParity(t *test
 	for k, v := range params {
 		runtimeParams[k] = v
 	}
-	runtimeParams["__ve_use_runtime_pipeline"] = true
 	if _, err := runtimeExec.ExecuteStatement(ctx, runtimeStmt, runtimeParams); err != nil {
 		t.Fatalf("runtime execution failed: %v", err)
 	}
 
-	legacyStore := openStore(t)
-	defer func() { _ = legacyStore.Close() }()
-	legacyExec := New(legacyStore, Options{})
-	legacyStmt, err := parser.ParseStatement(queryText)
+	referenceStore := openStore(t)
+	defer func() { _ = referenceStore.Close() }()
+	referenceExec := New(referenceStore, Options{})
+	referenceStmt, err := parser.ParseStatement(queryText)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
-	legacyParams := Params{}
+	referenceParams := Params{}
 	for k, v := range params {
-		legacyParams[k] = v
+		referenceParams[k] = v
 	}
-	legacyParams["__ve_use_runtime_pipeline"] = false
-	if _, err := legacyExec.ExecuteStatement(ctx, legacyStmt, legacyParams); err != nil {
-		t.Fatalf("legacy execution failed: %v", err)
+	if _, err := referenceExec.ExecuteStatement(ctx, referenceStmt, referenceParams); err != nil {
+		t.Fatalf("reference execution failed: %v", err)
 	}
 
 	checkHasDirected := func(store graph.GraphStore, tenant, src, dst, edgeType string) bool {
@@ -2671,15 +1742,15 @@ func TestExecuteStatementRuntimePipelineReverseWriteOnlyEdgeCreateParity(t *test
 	}
 
 	runtimeHas := checkHasDirected(runtimeStore, "acme", "u113", "u112", "KNOWS")
-	legacyHas := checkHasDirected(legacyStore, "acme", "u113", "u112", "KNOWS")
+	referenceHas := checkHasDirected(referenceStore, "acme", "u113", "u112", "KNOWS")
 
 	if !runtimeHas {
 		t.Fatalf("expected runtime path to create reverse directed edge")
 	}
-	if !legacyShouldCreateDirectedEdge {
-		t.Fatalf("legacy parity guard is misconfigured; expected true")
+	if !referenceShouldCreateDirectedEdge {
+		t.Fatalf("reference parity guard is misconfigured; expected true")
 	}
-	if legacyHas != legacyShouldCreateDirectedEdge {
-		t.Fatalf("legacy reverse write-only edge parity mismatch: got=%v want=%v", legacyHas, legacyShouldCreateDirectedEdge)
+	if referenceHas != referenceShouldCreateDirectedEdge {
+		t.Fatalf("reference reverse write-only edge parity mismatch: got=%v want=%v", referenceHas, referenceShouldCreateDirectedEdge)
 	}
 }

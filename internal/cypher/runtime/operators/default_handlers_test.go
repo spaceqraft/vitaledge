@@ -5,8 +5,9 @@ import "testing"
 func TestWriteHandlerRecordsEventAndMarksRows(t *testing.T) {
 	h := NewWriteHandler()
 	state := &State{
-		Rows:   []map[string]any{{"u": "u1"}},
-		Params: map[string]any{"peer": "u2", "id": "u1"},
+		Rows:                     []map[string]any{{"u": "u1"}},
+		Params:                   map[string]any{"peer": "u2", "id": "u1"},
+		MaterializeWriteBindings: true,
 	}
 
 	err := h.Execute("p2", map[string]any{
@@ -78,7 +79,7 @@ func TestWriteHandlerRecordsEventAndMarksRows(t *testing.T) {
 
 func TestWriteHandlerSeedsRowsWhenEmpty(t *testing.T) {
 	h := NewWriteHandler()
-	state := &State{}
+	state := &State{MaterializeWriteBindings: true}
 
 	err := h.Execute("p3", map[string]any{"kind": "CREATE"}, state)
 	if err != nil {
@@ -99,7 +100,7 @@ func TestWriteHandlerSeedsRowsWhenEmpty(t *testing.T) {
 
 func TestWriteHandlerBuildsVertexMutationPayload(t *testing.T) {
 	h := NewWriteHandler()
-	state := &State{Params: map[string]any{"id": "u1"}}
+	state := &State{Params: map[string]any{"id": "u1"}, MaterializeWriteBindings: true}
 
 	err := h.Execute("p4", map[string]any{
 		"kind":         "CREATE",
@@ -133,7 +134,7 @@ func TestWriteHandlerBuildsVertexMutationPayload(t *testing.T) {
 
 func TestWriteHandlerMaterializesVertexVariableBindings(t *testing.T) {
 	h := NewWriteHandler()
-	state := &State{Params: map[string]any{"id": "u7"}}
+	state := &State{Params: map[string]any{"id": "u7"}, MaterializeWriteBindings: true}
 
 	err := h.Execute("p5", map[string]any{
 		"kind":         "CREATE",
@@ -157,7 +158,7 @@ func TestWriteHandlerMaterializesVertexVariableBindings(t *testing.T) {
 
 func TestWriteHandlerMaterializesEdgeEndpointBindings(t *testing.T) {
 	h := NewWriteHandler()
-	state := &State{Params: map[string]any{"src": "u8", "dst": "u9"}}
+	state := &State{Params: map[string]any{"src": "u8", "dst": "u9"}, MaterializeWriteBindings: true}
 
 	err := h.Execute("p6", map[string]any{
 		"kind":         "CREATE",
@@ -187,7 +188,7 @@ func TestWriteHandlerMaterializesEdgeEndpointBindings(t *testing.T) {
 
 func TestWriteHandlerMaterializesReverseEdgeEndpointBindings(t *testing.T) {
 	h := NewWriteHandler()
-	state := &State{Params: map[string]any{"src": "u14", "dst": "u15"}}
+	state := &State{Params: map[string]any{"src": "u14", "dst": "u15"}, MaterializeWriteBindings: true}
 
 	err := h.Execute("p6r", map[string]any{
 		"kind":         "CREATE",
@@ -240,7 +241,7 @@ func TestWriteHandlerSkipsMaterializationWhenDisabled(t *testing.T) {
 
 func TestWriteHandlerBuildsReverseEdgeMutationPayload(t *testing.T) {
 	h := NewWriteHandler()
-	state := &State{Params: map[string]any{"src": "u10", "dst": "u11"}}
+	state := &State{Params: map[string]any{"src": "u10", "dst": "u11"}, MaterializeWriteBindings: true}
 
 	err := h.Execute("p8", map[string]any{
 		"kind":         "CREATE",

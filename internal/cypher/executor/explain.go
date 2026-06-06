@@ -59,27 +59,9 @@ func (e *Executor) executeExplainStatement(ctx context.Context, stmt *ast.Explai
 	if stmt == nil || stmt.Statement == nil {
 		return nil, graph.NewError(graph.ErrKindInvalidInput, "EXPLAIN requires an inner statement", nil)
 	}
-	routeDecision := decideExplainRoute(stmt, map[string]any(params), e != nil && e.enablePipelineExplainPayload)
-	if routeDecision.route == explainRoutePipelinePayload {
-		if payload, err := buildPipelineExplainPayload(stmt, params, routeDecision); err == nil {
-			return &Result{
-				Columns: []string{"explain"},
-				Rows:    []Row{{"explain": payload}},
-				Stats:   Stats{RowsReturned: 1},
-			}, nil
-		}
-		routeDecision = explainRouteDecision{route: explainRouteLegacyPayload, reason: "pipeline_payload_fallback"}
-	}
-
-	analysis, err := e.buildExplainAnalysis(ctx, stmt.Statement, params)
+	payload, err := buildPipelineExplainPayload(ctx, e, stmt, params)
 	if err != nil {
 		return nil, err
-	}
-
-	payload := e.buildExplainPayload(stmt, params, analysis)
-	if metadata, ok := payload["metadata"].(map[string]any); ok {
-		metadata["explainRoute"] = string(routeDecision.route)
-		metadata["explainRouteReason"] = routeDecision.reason
 	}
 	return &Result{
 		Columns: []string{"explain"},
@@ -119,69 +101,6 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	return analysis, nil
 }
 
-func (e *Executor) buildExplainPayload(stmt *ast.ExplainStatement, params Params, analysis *explainAnalysis) map[string]any {
-	tenant := tenantFromParams(params)
-	planVertexes := buildExplainPlanNodes(stmt.Statement, e.indexCatalog, tenant, params)
-	pipelineExplainText, hasPipelineExplain := buildPipelineExplainText(stmt.Statement)
-	rootVertexID := ""
-	if len(planVertexes) > 0 {
-		rootVertexID = planVertexes[len(planVertexes)-1]["id"].(string)
-	}
-
-	payload := map[string]any{
-		"version": "v1",
-		"query": map[string]any{
-			"text":          explainedQueryText(stmt),
-			"fingerprint":   explainFingerprint(stmt),
-			"statementKind": string(stmt.Statement.Kind()),
-			"tenant":        tenantFromParams(params),
-			"params":        parameterNamesForStatement(stmt.Statement),
-			"options":       buildExplainQueryOptions(stmt.Statement),
-		},
-		"summary": map[string]any{
-			"dryRun":              true,
-			"readOnly":            true,
-			"writesDetected":      statementMayWrite(stmt.Statement),
-			"semanticPhaseStatus": "ok",
-			"planningPhaseStatus": "ok",
-		},
-		"logicalPlan": map[string]any{
-			"rootVertexId": rootVertexID,
-			"vertexes":     planVertexes,
-		},
-		"physicalPlan": map[string]any{
-			"rootVertexId": rootVertexID,
-			"vertexes":     planVertexes,
-		},
-		"influencers": map[string]any{
-			"vertexCounts": analysis.vertexCounts,
-			"edgeCounts":   analysis.edgeCounts,
-			"totals": map[string]any{
-				"vertexes": analysis.vertexTotal,
-				"edges":    analysis.edgeTotal,
-			},
-			"predicateSignals": analysis.predicateSignals,
-		},
-		"cardinality":         analysis.cardinality,
-		"costEstimate":        analysis.costEstimate,
-		"runtimeStats":        analysis.runtimeStats,
-		"indexDecisions":      analysis.indexDecisions,
-		"executionStrategies": analysis.fastPaths,
-		"warnings":            analysis.warnings,
-		"metadata": map[string]any{
-			"transport":             "json",
-			"pipelineExplainStatus": "unavailable",
-		},
-	}
-	if hasPipelineExplain {
-		metadata := payload["metadata"].(map[string]any)
-		metadata["pipelineExplain"] = pipelineExplainText
-		metadata["pipelineExplainStatus"] = "ok"
-	}
-
-	return payload
-}
-
 func buildPipelineExplainText(stmt ast.Statement) (string, bool) {
 	semanticModel, err := semantic.Build(stmt)
 	if err != nil {
@@ -192,7 +111,12 @@ func buildPipelineExplainText(stmt ast.Statement) (string, bool) {
 	return cypherexplain.RenderPipeline(logicalPlan, physicalPlan), true
 }
 
-func buildPipelineExplainPayload(stmt *ast.ExplainStatement, params Params, routeDecision explainRouteDecision) (map[string]any, error) {
+func buildPipelineExplainPayload(ctx context.Context, e *Executor, stmt *ast.ExplainStatement, params Params) (map[string]any, error) {
+	analysis, err := e.buildExplainAnalysis(ctx, stmt.Statement, params)
+	if err != nil {
+		return nil, err
+	}
+
 	semanticModel, err := semantic.Build(stmt.Statement)
 	if err != nil {
 		return nil, err
@@ -203,21 +127,29 @@ func buildPipelineExplainPayload(stmt *ast.ExplainStatement, params Params, rout
 
 	logicalNodes := make([]map[string]any, 0, len(logicalPlan.Nodes))
 	for _, node := range logicalPlan.Nodes {
-		logicalNodes = append(logicalNodes, map[string]any{
+		nodePayload := map[string]any{
 			"id":       node.ID,
 			"op":       node.Op,
 			"children": append([]string(nil), node.Children...),
 			"attrs":    node.Attrs,
-		})
+		}
+		for key, value := range node.Attrs {
+			nodePayload[key] = value
+		}
+		logicalNodes = append(logicalNodes, nodePayload)
 	}
 	physicalNodes := make([]map[string]any, 0, len(physicalPlan.Nodes))
 	for _, node := range physicalPlan.Nodes {
-		physicalNodes = append(physicalNodes, map[string]any{
+		nodePayload := map[string]any{
 			"id":       node.ID,
 			"op":       node.Op,
 			"children": append([]string(nil), node.Children...),
 			"attrs":    node.Attrs,
-		})
+		}
+		for key, value := range node.Attrs {
+			nodePayload[key] = value
+		}
+		physicalNodes = append(physicalNodes, nodePayload)
 	}
 
 	payload := map[string]any{
@@ -236,7 +168,6 @@ func buildPipelineExplainPayload(stmt *ast.ExplainStatement, params Params, rout
 			"writesDetected":      statementMayWrite(stmt.Statement),
 			"semanticPhaseStatus": "ok",
 			"planningPhaseStatus": "ok",
-			"route":               string(routeDecision.route),
 		},
 		"semantic": map[string]any{
 			"statementKind": string(semanticModel.StatementKind),
@@ -254,12 +185,25 @@ func buildPipelineExplainPayload(stmt *ast.ExplainStatement, params Params, rout
 			"rootNodeId": physicalPlan.RootNodeID,
 			"nodes":      physicalNodes,
 		},
+		"influencers": map[string]any{
+			"vertexCounts": analysis.vertexCounts,
+			"edgeCounts":   analysis.edgeCounts,
+			"totals": map[string]any{
+				"vertexes": analysis.vertexTotal,
+				"edges":    analysis.edgeTotal,
+			},
+			"predicateSignals": analysis.predicateSignals,
+		},
+		"cardinality":         analysis.cardinality,
+		"costEstimate":        analysis.costEstimate,
+		"runtimeStats":        analysis.runtimeStats,
+		"indexDecisions":      analysis.indexDecisions,
+		"executionStrategies": analysis.fastPaths,
+		"warnings":            analysis.warnings,
 		"metadata": map[string]any{
 			"transport":             "json",
 			"pipelineExplainStatus": "ok",
 			"pipelineExplain":       pipelineExplainText,
-			"explainRoute":          string(routeDecision.route),
-			"explainRouteReason":    routeDecision.reason,
 		},
 	}
 
@@ -306,7 +250,7 @@ func collectExplainStoreStats(ctx context.Context, tx graph.Tx, tenant string, s
 			return nil
 		}
 		for _, matcher := range matchers {
-			if matchesExplainNodePattern(v, matcher.pattern, params) {
+			if matchesExplainVertexPattern(v, matcher.pattern, params) {
 				stats.patternMatchCounts[matcher.key]++
 			}
 		}
@@ -610,7 +554,7 @@ func buildExplainPredicateSignals(stmt ast.Statement, params Params, tenant stri
 		return buildExplainPredicateSignals(s.Statement, params, tenant, stats)
 	case *ast.MatchQueryStatement:
 		for _, match := range s.MatchClauses {
-			if pattern, ok := tryParseExplainNodePattern(match.Pattern); ok {
+			if pattern, ok := tryParseExplainVertexPattern(match.Pattern); ok {
 				if expr, ok := explainPatternExpression(pattern, params); ok {
 					appendFromClause(pattern, expr)
 				}
@@ -624,7 +568,7 @@ func buildExplainPredicateSignals(stmt ast.Statement, params Params, tenant stri
 	case *ast.QueryStatement:
 		for _, part := range s.Parts {
 			for _, clause := range part.Clauses {
-				if pattern, ok := tryParseExplainNodePattern(clause.Raw); ok {
+				if pattern, ok := tryParseExplainVertexPattern(clause.Raw); ok {
 					if expr, ok := explainPatternExpression(pattern, params); ok {
 						appendFromClause(pattern, expr)
 					}
@@ -774,7 +718,7 @@ type explainScanPlanVertex struct {
 
 func collectExplainIndexCandidates(stmt ast.Statement, params Params, stats explainStoreStats) []explainIndexCandidate {
 	candidates := make([]explainIndexCandidate, 0)
-	appendNodePattern := func(schema string, props map[string]any, matchedCount int, quality string) {
+	appendVertexPattern := func(schema string, props map[string]any, matchedCount int, quality string) {
 		for property := range props {
 			if strings.EqualFold(property, "id") {
 				continue
@@ -850,20 +794,20 @@ func collectExplainIndexCandidates(stmt ast.Statement, params Params, stats expl
 		return collectExplainIndexCandidates(s.Statement, params, stats)
 	case *ast.MatchQueryStatement:
 		for _, match := range s.MatchClauses {
-			if pattern, ok := tryParseExplainNodePattern(match.Pattern); ok {
+			if pattern, ok := tryParseExplainVertexPattern(match.Pattern); ok {
 				props, err := explainPatternProperties(pattern.PropertiesRaw, params)
 				if err == nil && len(props) > 0 {
-					appendNodePattern(explainPatternSchema(pattern), props, countMatchingVertices(stats, pattern, params), "exact")
+					appendVertexPattern(explainPatternSchema(pattern), props, countMatchingVertices(stats, pattern, params), "exact")
 				} else if keys := explainPropertyKeys(pattern.PropertiesRaw); len(keys) > 0 {
-					appendNodePattern(explainPatternSchema(pattern), keys, 0, "estimate")
+					appendVertexPattern(explainPatternSchema(pattern), keys, 0, "estimate")
 				}
 			}
 			if anchored, ok := tryParseExplainAnchoredPattern(match.Pattern); ok {
 				props, err := explainPropertyMap(anchored.SourcePropertiesRaw, params)
 				if err == nil && len(props) > 0 {
-					appendNodePattern(anchored.SourceLabel, props, countAnchoredRows(stats, anchored, params), "exact")
+					appendVertexPattern(anchored.SourceLabel, props, countAnchoredRows(stats, anchored, params), "exact")
 				} else if keys := explainPropertyKeys(anchored.SourcePropertiesRaw); len(keys) > 0 {
-					appendNodePattern(anchored.SourceLabel, keys, 0, "estimate")
+					appendVertexPattern(anchored.SourceLabel, keys, 0, "estimate")
 				}
 			}
 			appendEdgePatternFromRaw(match.Pattern)
@@ -878,20 +822,20 @@ func collectExplainIndexCandidates(stmt ast.Statement, params Params, stats expl
 				if clause.Kind == ast.ClauseKindOptionalMatch {
 					patternRaw = strings.TrimSpace(stripCypherLineComments(stripLeadingClauseKeyword(clause.Raw, "OPTIONAL MATCH")))
 				}
-				if pattern, ok := tryParseExplainNodePattern(patternRaw); ok {
+				if pattern, ok := tryParseExplainVertexPattern(patternRaw); ok {
 					props, err := explainPatternProperties(pattern.PropertiesRaw, params)
 					if err == nil && len(props) > 0 {
-						appendNodePattern(explainPatternSchema(pattern), props, countMatchingVertices(stats, pattern, params), "exact")
+						appendVertexPattern(explainPatternSchema(pattern), props, countMatchingVertices(stats, pattern, params), "exact")
 					} else if keys := explainPropertyKeys(pattern.PropertiesRaw); len(keys) > 0 {
-						appendNodePattern(explainPatternSchema(pattern), keys, 0, "estimate")
+						appendVertexPattern(explainPatternSchema(pattern), keys, 0, "estimate")
 					}
 				}
 				if anchored, ok := tryParseExplainAnchoredPattern(patternRaw); ok {
 					props, err := explainPropertyMap(anchored.SourcePropertiesRaw, params)
 					if err == nil && len(props) > 0 {
-						appendNodePattern(anchored.SourceLabel, props, countAnchoredRows(stats, anchored, params), "exact")
+						appendVertexPattern(anchored.SourceLabel, props, countAnchoredRows(stats, anchored, params), "exact")
 					} else if keys := explainPropertyKeys(anchored.SourcePropertiesRaw); len(keys) > 0 {
-						appendNodePattern(anchored.SourceLabel, keys, 0, "estimate")
+						appendVertexPattern(anchored.SourceLabel, keys, 0, "estimate")
 					}
 				}
 				appendEdgePatternFromRaw(patternRaw)
@@ -950,7 +894,7 @@ func collectExplainVertexMatchers(stmt ast.Statement) []explainVertexMatcher {
 		if raw == "" {
 			return
 		}
-		if pattern, ok := tryParseExplainNodePattern(raw); ok {
+		if pattern, ok := tryParseExplainVertexPattern(raw); ok {
 			appendMatcher(pattern)
 		}
 		if anchored, ok := tryParseExplainAnchoredPattern(raw); ok {
@@ -1252,7 +1196,7 @@ func explainQueryBindingsForPlanVertex(vertex map[string]any) []string {
 	appendBinding(vertex["leftVar"])
 	appendBinding(vertex["edgeVar"])
 	appendBinding(vertex["rightVar"])
-	appendBinding(vertex["nodeVar"])
+	appendBinding(vertex["vertexVar"])
 	appendBinding(vertex["sourceVar"])
 	appendBinding(vertex["targetVar"])
 	return bindings
@@ -1451,7 +1395,7 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 
 	rowsRead := 0
 	rowsOutput := 0
-	rowsOutByNode := map[string]int{}
+	rowsOutByVertex := map[string]int{}
 	bookkeepingOnlyFilterVertexes := map[string]struct{}{}
 	for _, vertex := range planVertexes {
 		op, _ := vertex["op"].(string)
@@ -1477,7 +1421,7 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 		}
 		rowsOutput = rowsOut
 		if strings.TrimSpace(vertexID) != "" {
-			rowsOutByNode[vertexID] = rowsOut
+			rowsOutByVertex[vertexID] = rowsOut
 		}
 		if quality, _ := entry["quality"].(string); quality != "exact" {
 			allExactCardinality = false
@@ -1493,7 +1437,7 @@ func buildExplainRuntimeStats(planVertexes []map[string]any, cardinality []map[s
 	for _, vertex := range planVertexes {
 		vertexID, _ := vertex["id"].(string)
 		op, _ := vertex["op"].(string)
-		rowsOut := rowsOutByNode[vertexID]
+		rowsOut := rowsOutByVertex[vertexID]
 		switch op {
 		case "INDEX_SCAN", "OPTIONAL_INDEX_SCAN", "LABEL_SCAN", "OPTIONAL_LABEL_SCAN", "ALL_VERTEXES_SCAN", "OPTIONAL_ALL_VERTEXES_SCAN":
 			verticesScanned += rowsOut
@@ -2750,8 +2694,8 @@ func (b *explainPlanBuilder) addNodeScan(optional bool, pattern vertexPattern, w
 		op = "OPTIONAL_" + op
 	}
 	attrs := map[string]any{"accessPath": indexPath}
-	if nodeVar := strings.TrimSpace(pattern.Var); nodeVar != "" {
-		attrs["nodeVar"] = nodeVar
+	if vertexVar := strings.TrimSpace(pattern.Var); vertexVar != "" {
+		attrs["vertexVar"] = vertexVar
 	}
 	if indexed && strings.TrimSpace(pattern.PropertiesRaw) != "" {
 		attrs["predicate"] = strings.TrimSpace(pattern.PropertiesRaw)
@@ -2803,10 +2747,10 @@ func (b *explainPlanBuilder) addProjectionClause(clause ast.Clause) {
 	if projection == nil {
 		return
 	}
-	if nodeVar, ok := b.canUseFastVertexCount(); ok {
-		if output, ok := explainFastVertexCountProjection(projection, nodeVar); ok {
+	if vertexVar, ok := b.canUseFastVertexCount(); ok {
+		if output, ok := explainFastVertexCountProjection(projection, vertexVar); ok {
 			attrs := map[string]any{
-				"aggregates":     []string{fmt.Sprintf("count(%s)", nodeVar)},
+				"aggregates":     []string{fmt.Sprintf("count(%s)", vertexVar)},
 				"projection":     []string{output},
 				"implementation": "fast_vertex_count",
 			}
@@ -2939,7 +2883,7 @@ func explainFastEdgeCountProjection(projection *ast.ReturnClause, edgeVar string
 	return expr, true
 }
 
-func explainFastVertexCountProjection(projection *ast.ReturnClause, nodeVar string) (string, bool) {
+func explainFastVertexCountProjection(projection *ast.ReturnClause, vertexVar string) (string, bool) {
 	if projection == nil || projection.Distinct || projection.IncludeAll || projection.Skip != nil || projection.Limit != nil || len(projection.OrderBy) != 0 || len(projection.Items) != 1 {
 		return "", false
 	}
@@ -2953,7 +2897,7 @@ func explainFastVertexCountProjection(projection *ast.ReturnClause, nodeVar stri
 	if strings.HasPrefix(strings.ToUpper(countArg), "DISTINCT") {
 		return "", false
 	}
-	if countArg != nodeVar {
+	if countArg != vertexVar {
 		return "", false
 	}
 	if alias := strings.TrimSpace(item.Alias); alias != "" {
@@ -3074,12 +3018,12 @@ func (b *explainPlanBuilder) canUseFastVertexCount() (string, bool) {
 	if op != "ALL_VERTEXES_SCAN" {
 		return "", false
 	}
-	nodeVar, _ := last["nodeVar"].(string)
-	nodeVar = strings.TrimSpace(nodeVar)
-	if nodeVar == "" {
+	vertexVar, _ := last["vertexVar"].(string)
+	vertexVar = strings.TrimSpace(vertexVar)
+	if vertexVar == "" {
 		return "", false
 	}
-	return nodeVar, true
+	return vertexVar, true
 }
 
 func (b *explainPlanBuilder) canUseFastEdgeDelete() (string, bool) {
@@ -3194,7 +3138,7 @@ func tenantFromParams(params Params) string {
 	return ""
 }
 
-func tryParseExplainNodePattern(raw string) (vertexPattern, bool) {
+func tryParseExplainVertexPattern(raw string) (vertexPattern, bool) {
 	pattern, err := parseVertexPattern(raw)
 	if err != nil {
 		return vertexPattern{}, false
@@ -3298,7 +3242,7 @@ func countAnchoredRows(stats explainStoreStats, pattern anchoredOutPattern, para
 	return countMatchingVertices(stats, left, params)
 }
 
-func matchesExplainNodePattern(vertex *graph.Vertex, pattern vertexPattern, params Params) bool {
+func matchesExplainVertexPattern(vertex *graph.Vertex, pattern vertexPattern, params Params) bool {
 	if vertex == nil {
 		return false
 	}

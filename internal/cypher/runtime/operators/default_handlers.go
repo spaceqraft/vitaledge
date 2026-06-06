@@ -361,12 +361,15 @@ func (h writeHandler) Execute(nodeID string, attrs map[string]any, state *State)
 }
 
 func shouldMaterializeWriteBindings(state *State) bool {
-	if state == nil || state.Params == nil {
+	if state == nil {
 		return true
+	}
+	if state.Params == nil {
+		return state.MaterializeWriteBindings
 	}
 	value, ok := state.Params["__ve_materialize_write_bindings"]
 	if !ok || value == nil {
-		return true
+		return state.MaterializeWriteBindings
 	}
 	switch typed := value.(type) {
 	case bool:
@@ -378,10 +381,10 @@ func shouldMaterializeWriteBindings(state *State) bool {
 		case "false", "0", "no", "off":
 			return false
 		default:
-			return true
+			return state.MaterializeWriteBindings
 		}
 	default:
-		return true
+		return state.MaterializeWriteBindings
 	}
 }
 

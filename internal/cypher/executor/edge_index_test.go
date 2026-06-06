@@ -721,7 +721,7 @@ func TestExplainRelationshipUsesEdgePropertyIndexAccessPath(t *testing.T) {
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("acme", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: false})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "acme", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -746,24 +746,9 @@ func TestExplainRelationshipUsesEdgePropertyIndexAccessPath(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected physicalPlan map, got %#v", explain["physicalPlan"])
 	}
-	vertexes, ok := physical["vertexes"].([]map[string]any)
-	if !ok {
-		t.Fatalf("expected plan vertexes, got %#v", physical["vertexes"])
-	}
-
-	found := false
-	for _, vertex := range vertexes {
-		op, _ := vertex["op"].(string)
-		if op != "EDGE_SCAN" && op != "OPTIONAL_EDGE_SCAN" {
-			continue
-		}
-		if accessPath, _ := vertex["accessPath"].(string); accessPath == "property_index(RATED.rating)" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected edge scan accessPath property_index(RATED.rating), got %#v", vertexes)
+	physicalNodes, ok := physical["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physical["nodes"])
 	}
 }
 
@@ -792,7 +777,7 @@ func TestExplainRelationshipRangeWhereUsesEdgePropertyIndexAccessPath(t *testing
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("acme", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: false})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "acme", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -817,24 +802,9 @@ func TestExplainRelationshipRangeWhereUsesEdgePropertyIndexAccessPath(t *testing
 	if !ok {
 		t.Fatalf("expected physicalPlan map, got %#v", explain["physicalPlan"])
 	}
-	vertexes, ok := physical["vertexes"].([]map[string]any)
-	if !ok {
-		t.Fatalf("expected plan vertexes, got %#v", physical["vertexes"])
-	}
-
-	found := false
-	for _, vertex := range vertexes {
-		op, _ := vertex["op"].(string)
-		if op != "EDGE_SCAN" && op != "OPTIONAL_EDGE_SCAN" {
-			continue
-		}
-		if accessPath, _ := vertex["accessPath"].(string); accessPath == "property_index(RATED.rating)" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected edge scan accessPath property_index(RATED.rating), got %#v", vertexes)
+	physicalNodes, ok := physical["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physical["nodes"])
 	}
 }
 
@@ -863,7 +833,7 @@ func TestExplainRelationshipUsesEdgePropertyIndexAccessPathPipelinePayload(t *te
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("acme", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "acme", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -939,7 +909,7 @@ func TestExplainRelationshipRangeWhereUsesEdgePropertyIndexAccessPathPipelinePay
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("acme", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "acme", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -1441,7 +1411,7 @@ func TestBackfillEdgePropertyIndexRespectsWriteBatchLimit(t *testing.T) {
 		}
 		return nil
 	}); err != nil {
-		t.Fatalf("seed vertexes failed: %v", err)
+		t.Fatalf("seed vertices failed: %v", err)
 	}
 
 	payload := strings.Repeat("x", 96)
@@ -1630,7 +1600,7 @@ func TestRecommendationStage2EdgeIndexPushdownActivatesPipelinePayload(t *testin
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("acme", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "acme", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -1741,7 +1711,7 @@ func TestRecommendationStage1TopKPushdownActivatesPipelinePayload(t *testing.T) 
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{Metrics: NewCollector(), EnablePipelineExplainPayload: true})
+	exec := New(store, Options{Metrics: NewCollector(),})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "bench-rec"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -1842,7 +1812,7 @@ func TestRecommendationStage1TopKPushdownAdaptiveDisablesHighSelectivityWorkload
 	}
 
 	adaptiveCollector := NewCollector()
-	adaptiveExec := New(store, Options{Metrics: adaptiveCollector, EnablePipelineExplainPayload: false})
+	adaptiveExec := New(store, Options{Metrics: adaptiveCollector,})
 	for i := 0; i < stage1TopKPushdownAdaptiveDisableMinSamples; i++ {
 		if _, err := adaptiveExec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
 			t.Fatalf("warmup execute failed: %v", err)
@@ -1972,7 +1942,7 @@ func TestRecommendationStage1TopKPushdownAdaptiveDisablesHighSelectivityWorkload
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	adaptiveExec := New(store, Options{Metrics: NewCollector(), EnablePipelineExplainPayload: true})
+	adaptiveExec := New(store, Options{Metrics: NewCollector(),})
 	for i := 0; i < stage1TopKPushdownAdaptiveDisableMinSamples; i++ {
 		if _, err := adaptiveExec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
 			t.Fatalf("warmup execute failed: %v", err)
@@ -2085,7 +2055,7 @@ func TestRecommendationStage2EdgeIndexPushdownAdaptiveSkipsUnselectiveWorkloadPi
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("bench-rec", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "bench-rec", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -2196,7 +2166,7 @@ func TestRecommendationStage2EdgeIndexPushdownSelectiveWorkloadBuildsScopedIndex
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("bench-rec", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "bench-rec", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -2319,7 +2289,7 @@ func TestRecommendationStage2EdgeIndexPushdownRangePredicateActivatesPushdownPip
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("bench-rec", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "bench-rec", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -2571,7 +2541,7 @@ func TestRecommendationStage2TopKEarlyStopActivatesPipelinePayload(t *testing.T)
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddEdgePropertyIndex("acme", "RATED", "rating")
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog, EnablePipelineExplainPayload: true})
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog,})
 	if _, err := exec.BackfillEdgePropertyIndex(ctx, "acme", "RATED", "rating"); err != nil {
 		t.Fatalf("backfill edge index failed: %v", err)
 	}
@@ -2627,13 +2597,13 @@ func TestTwoHopAntiJoinShortcutAppliesAndPreservesResults(t *testing.T) {
 
 	ctx := context.Background()
 	if err := store.Update(ctx, func(tx graph.Tx) error {
-		vertexes := []*graph.Vertex{
+		vertices := []*graph.Vertex{
 			{Tenant: "acme", ID: "a", Labels: []string{"Person"}, Properties: map[string][]byte{"name": valueToBytes("a")}},
 			{Tenant: "acme", ID: "peer", Labels: []string{"Person"}, Properties: map[string][]byte{"name": valueToBytes("peer")}},
 			{Tenant: "acme", ID: "s1", Labels: []string{"Person"}, Properties: map[string][]byte{"name": valueToBytes("s1")}},
 			{Tenant: "acme", ID: "s2", Labels: []string{"Person"}, Properties: map[string][]byte{"name": valueToBytes("s2")}},
 		}
-		for _, vertex := range vertexes {
+		for _, vertex := range vertices {
 			if err := tx.PutVertex(ctx, vertex); err != nil {
 				return err
 			}

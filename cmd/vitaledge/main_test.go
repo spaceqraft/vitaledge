@@ -89,7 +89,7 @@ func TestApplyIndexMigrationsBackfillsConfiguredIndexes(t *testing.T) {
 	catalog.AddPropertyIndex("acme", "User", "email")
 	catalog.AddEdgePropertyIndex("acme", "RATED", "rating")
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: catalog, EnableRuntimePipelineDefault: true, EnablePipelineExplainPayload: true})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: catalog})
 	if err := applyIndexMigrations(ctx, exec, catalog); err != nil {
 		t.Fatalf("applyIndexMigrations failed: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	store := openTestStore(t)
 	defer func() { _ = store.Close() }()
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), EnableRuntimePipelineDefault: true, EnablePipelineExplainPayload: true})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
@@ -313,7 +313,7 @@ func TestGRPCQueryServiceCapabilitiesReflectTunedMaxWriteBatch(t *testing.T) {
 	store := openTestStore(t)
 	defer func() { _ = store.Close() }()
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), EnableRuntimePipelineDefault: true, EnablePipelineExplainPayload: true})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	const configuredMaxWriteBatchBytes = int64(pebblestore.DefaultMaxWriteBatchBytes)
 	const effectiveMaxWriteBatchBytes = 32 * 1024 * 1024
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{
@@ -380,7 +380,7 @@ func TestGRPCQueryServiceExplainReportsWriteBatchSettings(t *testing.T) {
 	store := openTestStore(t)
 	defer func() { _ = store.Close() }()
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), EnableRuntimePipelineDefault: true, EnablePipelineExplainPayload: true})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{
 		executor:                     exec,
 		defaultTenant:                "acme",
@@ -510,36 +510,17 @@ func TestLoadConfigFromStartupPipelineRoutingDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config failed: %v", err)
 	}
-	if !cfg.EnableRuntimePipelineDefault {
-		t.Fatalf("expected EnableRuntimePipelineDefault=true by default")
-	}
-	if !cfg.EnablePipelineExplainPayload {
-		t.Fatalf("expected EnablePipelineExplainPayload=true by default")
+	if cfg.ExecutorMetrics == nil {
+		t.Fatalf("expected executor metrics collector to be configured")
 	}
 }
 
-func TestLoadConfigFromStartupParsesPipelineRoutingEnv(t *testing.T) {
-	t.Setenv(runtimePipelineDefaultEnv, "false")
-	t.Setenv(pipelineExplainPayloadEnv, "false")
-
-	cfg, err := loadConfigFromStartupForTest(t, []string{"vitaledge-test"})
-	if err != nil {
-		t.Fatalf("load config failed: %v", err)
-	}
-	if cfg.EnableRuntimePipelineDefault {
-		t.Fatalf("expected EnableRuntimePipelineDefault=false from env override")
-	}
-	if cfg.EnablePipelineExplainPayload {
-		t.Fatalf("expected EnablePipelineExplainPayload=false from env override")
-	}
-}
-
-func TestLoadConfigFromStartupRejectsInvalidPipelineRoutingEnv(t *testing.T) {
-	t.Setenv(runtimePipelineDefaultEnv, "definitely-not-bool")
+func TestLoadConfigFromStartupIgnoresDeprecatedPipelineRoutingEnv(t *testing.T) {
+	t.Setenv("VITALEDGE_ENABLE_RUNTIME_PIPELINE_DEFAULT", "definitely-not-bool")
 
 	_, err := loadConfigFromStartupForTest(t, []string{"vitaledge-test"})
-	if err == nil {
-		t.Fatalf("expected invalid runtime pipeline env to fail")
+	if err != nil {
+		t.Fatalf("expected deprecated runtime pipeline env to be ignored, got %v", err)
 	}
 }
 
@@ -612,7 +593,7 @@ func TestGRPCQueryServiceCreatePropertyIndex(t *testing.T) {
 		t.Fatalf("seed store failed: %v", err)
 	}
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: indexschema.NewCatalog(), EnableRuntimePipelineDefault: true, EnablePipelineExplainPayload: true})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: indexschema.NewCatalog()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)

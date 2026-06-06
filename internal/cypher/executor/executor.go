@@ -87,22 +87,12 @@ type IndexCatalog interface {
 type Options struct {
 	Metrics      Metrics
 	IndexCatalog IndexCatalog
-	// EnableRuntimePipelineDefault enables runtime pipeline routing for
-	// supported query shapes by default, without requiring the per-query
-	// __ve_use_runtime_pipeline parameter. The query parameter still overrides
-	// this default when present.
-	EnableRuntimePipelineDefault bool
-	// EnablePipelineExplainPayload opts EXPLAIN route decisions into the
-	// pipeline payload route while migration is in progress.
-	EnablePipelineExplainPayload bool
 }
 
 type Executor struct {
-	store                        graph.GraphStore
-	metrics                      Metrics
-	indexCatalog                 IndexCatalog
-	enableRuntimePipelineDefault bool
-	enablePipelineExplainPayload bool
+	store        graph.GraphStore
+	metrics      Metrics
+	indexCatalog IndexCatalog
 
 	fastPathFeedbackMu sync.RWMutex
 	fastPathFeedback   map[string]fastPathFeedbackSummary
@@ -141,12 +131,10 @@ func New(store graph.GraphStore, opts Options) *Executor {
 		metrics = noopMetrics{}
 	}
 	return &Executor{
-		store:                        store,
-		metrics:                      metrics,
-		indexCatalog:                 opts.IndexCatalog,
-		enableRuntimePipelineDefault: opts.EnableRuntimePipelineDefault,
-		enablePipelineExplainPayload: opts.EnablePipelineExplainPayload,
-		fastPathFeedback:             map[string]fastPathFeedbackSummary{},
+		store:            store,
+		metrics:          metrics,
+		indexCatalog:     opts.IndexCatalog,
+		fastPathFeedback: map[string]fastPathFeedbackSummary{},
 	}
 }
 
@@ -293,18 +281,12 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 		e.metrics.ObserveRowsReturned(len(res.Rows))
 		return res, nil
 	case *ast.QueryStatement:
-		if runtimeRes, ok, execErr := e.tryExecuteViaRuntimePipeline(ctx, s, params); execErr != nil {
-			return nil, execErr
-		} else if ok {
-			e.metrics.ObserveRowsReturned(len(runtimeRes.Rows))
-			return runtimeRes, nil
-		}
-		res, execErr := e.executeQueryStatement(ctx, s, params)
+		runtimeRes, _, execErr := e.tryExecuteViaRuntimePipeline(ctx, s, params)
 		if execErr != nil {
 			return nil, execErr
 		}
-		e.metrics.ObserveRowsReturned(len(res.Rows))
-		return res, nil
+		e.metrics.ObserveRowsReturned(len(runtimeRes.Rows))
+		return runtimeRes, nil
 	case *ast.StandaloneCallStatement:
 		res, execErr := e.executeStandaloneCallStatement(ctx, s, params)
 		if execErr != nil {

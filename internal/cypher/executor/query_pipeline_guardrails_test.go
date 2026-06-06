@@ -137,7 +137,7 @@ func TestQueryPipelineBaselineSupportedShapes(t *testing.T) {
 	})
 }
 
-func TestExplainTestsDeclareExplicitPayloadRoute(t *testing.T) {
+func TestExplainTestsParseExplainQueries(t *testing.T) {
 	testFiles, err := filepath.Glob("*_test.go")
 	if err != nil {
 		t.Fatalf("glob test files failed: %v", err)
@@ -145,10 +145,6 @@ func TestExplainTestsDeclareExplicitPayloadRoute(t *testing.T) {
 	if len(testFiles) == 0 {
 		t.Fatalf("expected test files in executor package")
 	}
-
-	allExplainTests := map[string]string{}
-	allTestFunctions := map[string]string{}
-	pipelineExplainTests := map[string]string{}
 
 	for _, file := range testFiles {
 		if file == "query_pipeline_guardrails_test.go" {
@@ -170,43 +166,12 @@ func TestExplainTestsDeclareExplicitPayloadRoute(t *testing.T) {
 			if !ok || !isGoTestFunc(fn) || fn.Body == nil {
 				continue
 			}
-			allTestFunctions[fn.Name.Name] = file
 			parsesExplain := functionParsesExplain(fn.Body)
 			if strings.Contains(fn.Name.Name, "PipelinePayload") {
 				if !parsesExplain {
 					t.Fatalf("PipelinePayload test must parse EXPLAIN query: %s in %s", fn.Name.Name, file)
 				}
 			}
-
-			if !parsesExplain {
-				continue
-			}
-			allExplainTests[fn.Name.Name] = file
-			if strings.Contains(fn.Name.Name, "PipelinePayload") {
-				pipelineExplainTests[fn.Name.Name] = file
-			}
-			setRoute, routeValue := functionExplainPayloadRouteValue(fn.Body)
-			if !setRoute {
-				t.Fatalf("EXPLAIN test must set EnablePipelineExplainPayload explicitly: %s in %s", fn.Name.Name, file)
-			}
-			if routeValue == nil {
-				t.Fatalf("EXPLAIN test must set EnablePipelineExplainPayload to a literal true/false value: %s in %s", fn.Name.Name, file)
-			}
-			if strings.Contains(fn.Name.Name, "PipelinePayload") {
-				if !*routeValue {
-					t.Fatalf("PipelinePayload EXPLAIN test must set EnablePipelineExplainPayload:true explicitly: %s in %s", fn.Name.Name, file)
-				}
-			}
-			if *routeValue && !strings.Contains(fn.Name.Name, "PipelinePayload") {
-				t.Fatalf("EXPLAIN test with EnablePipelineExplainPayload:true must include PipelinePayload in test name: %s in %s", fn.Name.Name, file)
-			}
-		}
-	}
-
-	for pipelineName, file := range pipelineExplainTests {
-		baseName := strings.TrimSuffix(pipelineName, "PipelinePayload")
-		if _, ok := allTestFunctions[baseName]; !ok {
-			t.Fatalf("PipelinePayload EXPLAIN test must have matching legacy counterpart %s: %s in %s", baseName, pipelineName, file)
 		}
 	}
 }
@@ -530,39 +495,6 @@ func functionParsesExplain(body *ast.BlockStmt) bool {
 	return found || (hasParseStatementCall && hasExplainLiteral)
 }
 
-func functionExplainPayloadRouteValue(body *ast.BlockStmt) (bool, *bool) {
-	set := false
-	var value *bool
-	found := false
-	ast.Inspect(body, func(n ast.Node) bool {
-		if found {
-			return false
-		}
-		kv, ok := n.(*ast.KeyValueExpr)
-		if !ok {
-			return true
-		}
-		key, ok := kv.Key.(*ast.Ident)
-		if ok && key.Name == "EnablePipelineExplainPayload" {
-			set = true
-			if lit, ok := kv.Value.(*ast.Ident); ok {
-				switch lit.Name {
-				case "true":
-					v := true
-					value = &v
-				case "false":
-					v := false
-					value = &v
-				}
-			}
-			found = true
-			return false
-		}
-		return true
-	})
-	return set, value
-}
-
 func exprContainsExplainLiteral(expr ast.Expr, explainExprByIdent map[string]bool) bool {
 	switch e := expr.(type) {
 	case *ast.BasicLit:
@@ -614,11 +546,9 @@ func isGoTestFunc(fn *ast.FuncDecl) bool {
 
 func TestExplainGuardrailHelperDetection(t *testing.T) {
 	testCases := []struct {
-		name                 string
-		snippet              string
-		wantParsesExplain    bool
-		wantSetsPayloadRoute bool
-		wantRouteValue       *bool
+		name              string
+		snippet           string
+		wantParsesExplain bool
 	}{
 		{
 			name: "inline explain and explicit true route",
@@ -627,13 +557,11 @@ func TestInlineExplain(t *testing.T) {
 	stmt, err := parser.ParseStatement("EXPLAIN MATCH (n) RETURN n")
 	_ = stmt
 	_ = err
-	exec := New(nil, Options{EnablePipelineExplainPayload: true})
+	exec := New(nil, Options{})
 	_ = exec
 }
 `,
-			wantParsesExplain:    true,
-			wantSetsPayloadRoute: true,
-			wantRouteValue:       boolPtr(true),
+			wantParsesExplain: true,
 		},
 		{
 			name: "identifier explain expression and explicit false route",
@@ -644,13 +572,11 @@ func TestIdentifierExplain(t *testing.T) {
 	stmt, err := parser.ParseStatement(explainQuery)
 	_ = stmt
 	_ = err
-	exec := New(nil, Options{EnablePipelineExplainPayload: false})
+	exec := New(nil, Options{})
 	_ = exec
 }
 `,
-			wantParsesExplain:    true,
-			wantSetsPayloadRoute: true,
-			wantRouteValue:       boolPtr(false),
+			wantParsesExplain: true,
 		},
 		{
 			name: "no explain parse",
@@ -659,13 +585,11 @@ func TestNoExplain(t *testing.T) {
 	stmt, err := parser.ParseStatement("MATCH (n) RETURN n")
 	_ = stmt
 	_ = err
-	exec := New(nil, Options{EnablePipelineExplainPayload: true})
+	exec := New(nil, Options{})
 	_ = exec
 }
 `,
-			wantParsesExplain:    false,
-			wantSetsPayloadRoute: true,
-			wantRouteValue:       boolPtr(true),
+			wantParsesExplain: false,
 		},
 		{
 			name: "explain parse without explicit route",
@@ -679,9 +603,7 @@ func TestExplainNoRoute(t *testing.T) {
 	_ = exec
 }
 `,
-			wantParsesExplain:    true,
-			wantSetsPayloadRoute: false,
-			wantRouteValue:       nil,
+			wantParsesExplain: true,
 		},
 		{
 			name: "explain parse with non-literal route value",
@@ -692,13 +614,11 @@ func TestExplainNonLiteralRouteValue(t *testing.T) {
 	stmt, err := parser.ParseStatement(query)
 	_ = stmt
 	_ = err
-	exec := New(nil, Options{EnablePipelineExplainPayload: enabled})
+	exec := New(nil, Options{})
 	_ = exec
 }
 `,
-			wantParsesExplain:    true,
-			wantSetsPayloadRoute: true,
-			wantRouteValue:       nil,
+			wantParsesExplain: true,
 		},
 	}
 
@@ -724,13 +644,6 @@ func TestExplainNonLiteralRouteValue(t *testing.T) {
 
 			if got := functionParsesExplain(fn.Body); got != tc.wantParsesExplain {
 				t.Fatalf("functionParsesExplain=%v want %v", got, tc.wantParsesExplain)
-			}
-			setRoute, gotRouteValue := functionExplainPayloadRouteValue(fn.Body)
-			if setRoute != tc.wantSetsPayloadRoute {
-				t.Fatalf("functionExplainPayloadRouteValue(set)=%v want %v", setRoute, tc.wantSetsPayloadRoute)
-			}
-			if !reflect.DeepEqual(gotRouteValue, tc.wantRouteValue) {
-				t.Fatalf("functionExplainPayloadRouteValue(value)=%#v want %#v", gotRouteValue, tc.wantRouteValue)
 			}
 		})
 	}
@@ -808,11 +721,11 @@ func TestPipelinePayloadUsesHelpers(t *testing.T) {
 			wantMissingOmitKeys: []string{},
 		},
 		{
-			name: "legacy route checks do not trigger pipeline route detection",
+			name: "route checks do not trigger pipeline route detection",
 			snippet: `
-func TestLegacyRouteAssertions(t *testing.T) {
-	if route, _ := metadata["explainRoute"].(string); route != "legacy_payload" {
-		t.Fatalf("expected legacy route")
+func TestRouteAssertions(t *testing.T) {
+	if route, _ := metadata["explainRoute"].(string); route != "payload" {
+		t.Fatalf("expected payload route")
 	}
 }
 `,
@@ -907,8 +820,4 @@ func TestPipelinePayloadUsesPartialOmitKeys(t *testing.T) {
 			}
 		})
 	}
-}
-
-func boolPtr(v bool) *bool {
-	return &v
 }

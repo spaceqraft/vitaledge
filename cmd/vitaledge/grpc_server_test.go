@@ -218,7 +218,7 @@ func TestGRPCExecuteIntegrationSerializesNumericAggregatesAndProperties(t *testi
 		t.Fatalf("seed metrics vertices failed: %v", err)
 	}
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), EnableRuntimePipelineDefault: true, EnablePipelineExplainPayload: true})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(),})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
@@ -329,7 +329,7 @@ func TestGRPCExecuteIntegrationSerializesIntegerOnlyAggregatesAndProperties(t *t
 		t.Fatalf("seed integer metrics vertices failed: %v", err)
 	}
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), EnableRuntimePipelineDefault: true, EnablePipelineExplainPayload: true})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(),})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
@@ -443,7 +443,7 @@ func TestGRPCExecuteIntegrationParameterizedThresholdAndLimit(t *testing.T) {
 		t.Fatalf("seed host/flow graph failed: %v", err)
 	}
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), EnableRuntimePipelineDefault: true, EnablePipelineExplainPayload: true})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(),})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)

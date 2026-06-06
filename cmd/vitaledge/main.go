@@ -35,8 +35,6 @@ const goMemoryLimitBytesEnv = "VITALEDGE_GO_MEMORY_LIMIT_BYTES"
 const pebbleBlockCacheBytesEnv = "VITALEDGE_PEBBLE_BLOCK_CACHE_BYTES"
 const pebbleMemTableSizeBytesEnv = "VITALEDGE_PEBBLE_MEMTABLE_SIZE_BYTES"
 const pebbleMemTableStopWritesThresholdEnv = "VITALEDGE_PEBBLE_MEMTABLE_STOP_WRITES_THRESHOLD"
-const runtimePipelineDefaultEnv = "VITALEDGE_ENABLE_RUNTIME_PIPELINE_DEFAULT"
-const pipelineExplainPayloadEnv = "VITALEDGE_ENABLE_PIPELINE_EXPLAIN_PAYLOAD"
 
 type Config struct {
 	GraphPath                         string
@@ -54,8 +52,6 @@ type Config struct {
 	PebbleBlockCacheBytes             int64
 	PebbleMemTableSizeBytes           int
 	PebbleMemTableStopWritesThreshold int
-	EnableRuntimePipelineDefault      bool
-	EnablePipelineExplainPayload      bool
 	Store                             graph.GraphStore
 	Executor                          *executor.Executor
 }
@@ -145,10 +141,8 @@ func main() {
 	}
 	config.Store = store
 	config.Executor = executor.New(store, executor.Options{
-		Metrics:                      config.ExecutorMetrics,
-		IndexCatalog:                 config.IndexCatalog,
-		EnableRuntimePipelineDefault: config.EnableRuntimePipelineDefault,
-		EnablePipelineExplainPayload: config.EnablePipelineExplainPayload,
+		Metrics:      config.ExecutorMetrics,
+		IndexCatalog: config.IndexCatalog,
 	})
 	if err := applyIndexMigrations(context.Background(), config.Executor, config.IndexCatalog); err != nil {
 		log.Fatalf("startup index migration error: %v", err)
@@ -175,8 +169,6 @@ func loadConfigFromStartup() (Config, error) {
 	var pebbleBlockCacheBytes int64
 	var pebbleMemTableSizeBytes int
 	var pebbleMemTableStopWritesThreshold int
-	var enableRuntimePipelineDefault bool
-	var enablePipelineExplainPayload bool
 
 	flag.StringVar(&graphPath, "graph-path", defaultGraphPath, "Path to graph store directory")
 	flag.StringVar(&tenant, "tenant", defaultTenant, "Default tenant used for query execution")
@@ -188,8 +180,6 @@ func loadConfigFromStartup() (Config, error) {
 	flag.Int64Var(&pebbleBlockCacheBytes, "pebble-block-cache-bytes", 0, "Optional Pebble block cache size in bytes (0 uses Pebble defaults)")
 	flag.IntVar(&pebbleMemTableSizeBytes, "pebble-memtable-size-bytes", 0, "Optional Pebble memtable size in bytes (0 uses Pebble defaults)")
 	flag.IntVar(&pebbleMemTableStopWritesThreshold, "pebble-memtable-stop-writes-threshold", 0, "Optional Pebble memtable stop-writes threshold (0 uses Pebble defaults)")
-	flag.BoolVar(&enableRuntimePipelineDefault, "enable-runtime-pipeline-default", true, "Route supported query shapes through runtime pipeline by default")
-	flag.BoolVar(&enablePipelineExplainPayload, "enable-pipeline-explain-payload", true, "Return pipeline-native EXPLAIN payload shape")
 	flag.Parse()
 
 	if strings.TrimSpace(indexConfigPath) == "" {
@@ -242,20 +232,6 @@ func loadConfigFromStartup() (Config, error) {
 		}
 		pebbleMemTableStopWritesThreshold = parsed
 	}
-	if env := strings.TrimSpace(os.Getenv(runtimePipelineDefaultEnv)); env != "" {
-		parsed, err := strconv.ParseBool(env)
-		if err != nil {
-			return Config{}, err
-		}
-		enableRuntimePipelineDefault = parsed
-	}
-	if env := strings.TrimSpace(os.Getenv(pipelineExplainPayloadEnv)); env != "" {
-		parsed, err := strconv.ParseBool(env)
-		if err != nil {
-			return Config{}, err
-		}
-		enablePipelineExplainPayload = parsed
-	}
 	configuredMaxWriteBatchBytes, effectiveMaxWriteBatchBytes, autoTuned, hostMemoryBytes, err := resolveMaxWriteBatchBytes(maxWriteBatchBytes)
 	if err != nil {
 		return Config{}, err
@@ -288,8 +264,6 @@ func loadConfigFromStartup() (Config, error) {
 		PebbleBlockCacheBytes:             pebbleBlockCacheBytes,
 		PebbleMemTableSizeBytes:           pebbleMemTableSizeBytes,
 		PebbleMemTableStopWritesThreshold: pebbleMemTableStopWritesThreshold,
-		EnableRuntimePipelineDefault:      enableRuntimePipelineDefault,
-		EnablePipelineExplainPayload:      enablePipelineExplainPayload,
 		ExecutorMetrics:                   executor.NewCollector(),
 	}
 	if strings.TrimSpace(indexConfigPath) == "" {

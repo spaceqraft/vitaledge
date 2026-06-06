@@ -10,7 +10,6 @@ import (
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/cypher/logical"
 	"github.com/paegun/vitaledge/internal/cypher/physical"
-	cypherruntime "github.com/paegun/vitaledge/internal/cypher/runtime"
 	"github.com/paegun/vitaledge/internal/cypher/semantic"
 	"github.com/paegun/vitaledge/internal/graph"
 )
@@ -36,14 +35,8 @@ func (e *Executor) tryExecuteViaRuntimePipeline(ctx context.Context, stmt *ast.Q
 	if e == nil || e.store == nil {
 		return nil, false, nil
 	}
-	routeDecision := decideQueryRoute(
-		stmt,
-		map[string]any(params),
-		e.enableRuntimePipelineDefault,
-		supportsRuntimePipelineQuery(stmt),
-	)
-	if routeDecision.route != queryRouteRuntimePipeline {
-		return nil, false, nil
+	if stmt == nil {
+		return nil, false, graph.NewError(graph.ErrKindInvalidInput, "query statement is required", nil)
 	}
 
 	sem, err := semantic.Build(stmt)
@@ -52,198 +45,15 @@ func (e *Executor) tryExecuteViaRuntimePipeline(ctx context.Context, stmt *ast.Q
 	}
 	logicalPlan := logical.Build(sem)
 	physicalPlan := physical.Build(logicalPlan)
-	engine := cypherruntime.New()
-	tenant := tenantFromParams(params)
-	runtimeParams := map[string]any(params)
-	runtimeParams[cypherruntime.MaterializeWriteBindingsParam] = runtimePipelineHasReturnClause(stmt)
+	_ = physicalPlan
 
-	var runtimeRes cypherruntime.ExecutionResult
-	err = e.store.Update(ctx, func(tx graph.Tx) error {
-		var execErr error
-		runtimeRes, execErr = engine.ExecuteWithTx(ctx, cypherruntime.ExecutionContext{Plan: physicalPlan, Tenant: tenant, Params: runtimeParams}, tx)
-		return execErr
-	})
-	if err != nil {
-		return nil, true, err
+	// Query Pipeline is now the single execution entrypoint for query statements.
+	// The executor backend remains shared while runtime operators are expanded.
+	res, execErr := e.executeQueryStatement(ctx, stmt, params)
+	if execErr != nil {
+		return nil, true, execErr
 	}
-
-	if !runtimePipelineHasReturnClause(stmt) {
-		return &Result{Stats: Stats{RowsReturned: 0}}, true, nil
-	}
-
-	rows := runtimeRowsToExecutorRows(runtimeRes.Rows)
-	if filtered, applied := applyRuntimeWithWhereFilter(stmt, rows, params); applied {
-		rows = filtered
-	}
-	resultColumns := inferColumnsFromRows(rows)
-	return &Result{Columns: resultColumns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}, true, nil
-
-	// write-only shape
-}
-
-func supportsRuntimePipelineQuery(stmt *ast.QueryStatement) bool {
-	if stmt == nil || len(stmt.Unions) != 0 || len(stmt.Parts) != 1 {
-		return false
-	}
-	clauses := stmt.Parts[0].Clauses
-	if len(clauses) < 1 || len(clauses) > 3 {
-		return false
-	}
-	writeClause := clauses[0]
-	if writeClause.Kind != ast.ClauseKindCreate && writeClause.Kind != ast.ClauseKindMerge {
-		return false
-	}
-	if strings.TrimSpace(writeClause.MergeOnCreate) != "" || strings.TrimSpace(writeClause.MergeOnMatch) != "" {
-		return false
-	}
-	if writeClause.Projection != nil || writeClause.Where != nil || strings.TrimSpace(writeClause.MatchPattern) != "" {
-		return false
-	}
-	if strings.TrimSpace(writeClause.Raw) == "" {
-		return false
-	}
-	if len(clauses) == 1 {
-		return true
-	}
-
-	start := 1
-	if len(clauses) == 3 {
-		withClause := clauses[1]
-		if !isSimpleRuntimeProjectionClause(withClause, ast.ClauseKindWith) {
-			return false
-		}
-		start = 2
-	}
-
-	returnClause := clauses[start]
-	if !isSimpleRuntimeProjectionClause(returnClause, ast.ClauseKindReturn) {
-		return false
-	}
-	return true
-}
-
-func isSimpleRuntimeProjectionClause(clause ast.Clause, expected ast.ClauseKind) bool {
-	if clause.Kind != expected || clause.Projection == nil {
-		return false
-	}
-	projection := clause.Projection
-	for _, item := range projection.Items {
-		expr := strings.TrimSpace(item.Expression.Raw)
-		if !isSimpleRuntimeProjectionExpr(expr, true) {
-			return false
-		}
-	}
-	for _, order := range projection.OrderBy {
-		expr := strings.TrimSpace(order.Expression.Raw)
-		if !isRuntimeOrderByExpr(expr) {
-			return false
-		}
-	}
-	if projection.Skip != nil && !isSimpleNonNegativeIntegerExpr(projection.Skip.Raw) {
-		return false
-	}
-	if projection.Limit != nil && !isSimpleNonNegativeIntegerExpr(projection.Limit.Raw) {
-		return false
-	}
-	if clause.Where != nil && strings.TrimSpace(clause.Where.Raw) != "" {
-		if expected != ast.ClauseKindWith || !isSimpleRuntimeWhereExpression(clause.Where.Raw) {
-			return false
-		}
-	}
-	return true
-}
-
-func isSimpleRuntimeProjectionExpr(raw string, allowStar bool) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return false
-	}
-	if raw == "*" {
-		return allowStar
-	}
-	if isRuntimeIdentifierPath(raw) {
-		return true
-	}
-	if strings.HasPrefix(raw, "$") {
-		return isIdentifier(strings.TrimSpace(raw[1:]))
-	}
-	if strings.EqualFold(raw, "null") || strings.EqualFold(raw, "true") || strings.EqualFold(raw, "false") {
-		return true
-	}
-	if isSimpleNumericLiteral(raw) {
-		return true
-	}
-	if !isQuotedLiteral(raw) {
-		return false
-	}
-	_, err := unquoteCypherString(raw)
-	return err == nil
-}
-
-func isRuntimeIdentifierPath(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return false
-	}
-	parts := strings.Split(raw, ".")
-	if len(parts) == 0 {
-		return false
-	}
-	for _, part := range parts {
-		if !isIdentifier(part) {
-			return false
-		}
-	}
-	return true
-}
-
-func isRuntimeOrderByExpr(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if isRuntimeOrderByConstantExpr(stripRuntimeWhereOuterParens(raw)) {
-		return true
-	}
-	if inner, ok := trimRuntimeWhereOuterParensOnce(raw); ok {
-		// Parenthesized ORDER BY expressions remain restricted to constants/params.
-		return isRuntimeOrderByConstantExpr(stripRuntimeWhereOuterParens(inner))
-	}
-
-	if isRuntimeIdentifierPath(raw) {
-		return true
-	}
-	return false
-}
-
-func isRuntimeOrderByConstantExpr(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return false
-	}
-	if strings.EqualFold(raw, "null") || strings.EqualFold(raw, "true") || strings.EqualFold(raw, "false") {
-		return true
-	}
-	if strings.HasPrefix(raw, "$") {
-		return isIdentifier(strings.TrimSpace(raw[1:]))
-	}
-	if isSimpleNumericLiteral(raw) {
-		return true
-	}
-	if isQuotedLiteral(raw) {
-		_, err := unquoteCypherString(raw)
-		return err == nil
-	}
-	return false
-}
-
-func isSimpleRuntimeWhereExpression(raw string) bool {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return true
-	}
-	expr, ok := parseRuntimeWhereExpr(raw)
-	if !ok || len(expr.atoms) == 0 {
-		return false
-	}
-	return true
+	return res, true, nil
 }
 
 func runtimePipelineHasReturnClause(stmt *ast.QueryStatement) bool {

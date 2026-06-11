@@ -1376,41 +1376,251 @@ func expandVertexPatternRow(state *State, row map[string]any, vertex *VertexMuta
 	}
 
 	out := make([]map[string]any, 0)
-	err := state.Tx.ScanVertices(ctx, tenant, 0, func(found *graph.Vertex) error {
-		if found == nil {
-			return nil
+	indexProbeAttempted := false
+	if tenant != "" && len(vertex.Labels) > 0 && len(expectedProps) > 0 {
+		keys := make([]string, 0, len(expectedProps))
+		for key := range expectedProps {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			keys = append(keys, key)
 		}
-		candidate := found
-		if !vertexHasAllLabels(candidate, vertex.Labels) {
-			return nil
-		}
-		if len(expectedProps) > 0 && len(candidate.Properties) == 0 {
-			if hydrated, err := state.Tx.GetVertex(ctx, tenant, strings.TrimSpace(candidate.ID)); err == nil && hydrated != nil {
-				candidate = hydrated
+		sort.Strings(keys)
+		seenVertexes := map[string]struct{}{}
+		for _, probeKey := range keys {
+			probeValue, valueOK := writePathPropertyValueToBytes(expectedProps[probeKey])
+			if !valueOK {
+				continue
+			}
+			for _, label := range vertex.Labels {
+				label = strings.TrimSpace(label)
+				if label == "" {
+					continue
+				}
+				indexProbeAttempted = true
+				if err := state.Tx.ScanPropertyIndex(ctx, tenant, label, probeKey, probeValue, 0, func(entry *graph.PropertyIndexEntry) error {
+					if entry == nil {
+						return nil
+					}
+					if !strings.EqualFold(strings.TrimSpace(entry.EntityClass), "vertex") {
+						return nil
+					}
+					candidateID := strings.TrimSpace(entry.EntityID)
+					if candidateID == "" {
+						return nil
+					}
+					if _, seen := seenVertexes[candidateID]; seen {
+						return nil
+					}
+					candidate, err := state.Tx.GetVertex(ctx, tenant, candidateID)
+					if err != nil || candidate == nil {
+						return nil
+					}
+					if !vertexHasAllLabels(candidate, vertex.Labels) {
+						return nil
+					}
+					if !vertexHasExpectedProperties(candidate, expectedProps) {
+						return nil
+					}
+					next := cloneRow(row)
+					bindPatternVar(next, vertex.Var, candidate.ID)
+					seenVertexes[candidateID] = struct{}{}
+					out = append(out, next)
+					return nil
+				}); err != nil {
+					return nil, err
+				}
 			}
 		}
-		if !vertexHasExpectedProperties(candidate, expectedProps) {
-			return nil
+		if len(out) > 0 {
+			if state.Metrics != nil {
+				state.Metrics.ObserveIndexLookup("property_index", "hit", len(out))
+			}
+			return out, nil
 		}
-		next := cloneRow(row)
-		bindPatternVar(next, vertex.Var, candidate.ID)
-		out = append(out, next)
-		return nil
-	})
-	if err != nil {
-		return nil, err
+	}
+
+	fallbackCacheAttempted := false
+	if tenant != "" && len(vertex.Labels) > 0 && len(expectedProps) > 0 {
+		cacheKeys := make([]string, 0, len(expectedProps))
+		for key := range expectedProps {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			cacheKeys = append(cacheKeys, key)
+		}
+		sort.Strings(cacheKeys)
+		for _, cacheKey := range cacheKeys {
+			fallbackCacheAttempted = true
+			cachedRows, cacheErr := expandVertexPatternRowsFromFallbackCache(ctx, state, row, tenant, vertex, expectedProps, cacheKey)
+			if cacheErr != nil {
+				return nil, cacheErr
+			}
+			if len(cachedRows) > 0 {
+				out = cachedRows
+				break
+			}
+		}
+	}
+
+	if !fallbackCacheAttempted {
+		err := state.Tx.ScanVertices(ctx, tenant, 0, func(found *graph.Vertex) error {
+			if found == nil {
+				return nil
+			}
+			candidate := found
+			if !vertexHasAllLabels(candidate, vertex.Labels) {
+				return nil
+			}
+			if len(expectedProps) > 0 && len(candidate.Properties) == 0 {
+				if hydrated, err := state.Tx.GetVertex(ctx, tenant, strings.TrimSpace(candidate.ID)); err == nil && hydrated != nil {
+					candidate = hydrated
+				}
+			}
+			if !vertexHasExpectedProperties(candidate, expectedProps) {
+				return nil
+			}
+			next := cloneRow(row)
+			bindPatternVar(next, vertex.Var, candidate.ID)
+			out = append(out, next)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 	if hasPropertyPredicate && state.Metrics != nil {
 		if len(out) == 0 {
-			state.Metrics.ObserveIndexLookup("property_index", "miss", 0)
+			if indexProbeAttempted {
+				state.Metrics.ObserveIndexLookup("property_index", "miss", 0)
+			}
 		} else {
-			state.Metrics.ObserveIndexLookup("property_index", "hit", len(out))
+			if indexProbeAttempted {
+				state.Metrics.ObserveIndexLookup("property_index", "hit", len(out))
+			}
 		}
 	}
 	if len(out) == 0 && optional {
 		return []map[string]any{cloneRow(row)}, nil
 	}
 	return out, nil
+}
+
+func expandVertexPatternRowsFromFallbackCache(ctx context.Context, state *State, row map[string]any, tenant string, vertex *VertexMutation, expectedProps map[string]any, propKey string) ([]map[string]any, error) {
+	if state == nil || state.Tx == nil || vertex == nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(propKey) == "" {
+		return nil, nil
+	}
+	encodedValue, ok := writePathPropertyValueToBytes(expectedProps[propKey])
+	if !ok {
+		return nil, nil
+	}
+	indexByValue, err := runtimeVertexFallbackLookupByProperty(state, ctx, tenant, vertex.Labels, propKey)
+	if err != nil {
+		return nil, err
+	}
+	candidateIDs := indexByValue[string(encodedValue)]
+	if len(candidateIDs) == 0 {
+		return nil, nil
+	}
+	out := make([]map[string]any, 0, len(candidateIDs))
+	seen := map[string]struct{}{}
+	for _, candidateID := range candidateIDs {
+		candidateID = strings.TrimSpace(candidateID)
+		if candidateID == "" {
+			continue
+		}
+		if _, dup := seen[candidateID]; dup {
+			continue
+		}
+		candidate, getErr := state.Tx.GetVertex(ctx, tenant, candidateID)
+		if getErr != nil || candidate == nil {
+			continue
+		}
+		if !vertexHasAllLabels(candidate, vertex.Labels) {
+			continue
+		}
+		if !vertexHasExpectedProperties(candidate, expectedProps) {
+			continue
+		}
+		next := cloneRow(row)
+		bindPatternVar(next, vertex.Var, candidate.ID)
+		out = append(out, next)
+		seen[candidateID] = struct{}{}
+	}
+	return out, nil
+}
+
+func runtimeVertexFallbackLookupByProperty(state *State, ctx context.Context, tenant string, labels []string, propKey string) (map[string][]string, error) {
+	if state == nil || state.Tx == nil || tenant == "" {
+		return nil, nil
+	}
+	normalizedLabels := make([]string, 0, len(labels))
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label == "" {
+			continue
+		}
+		normalizedLabels = append(normalizedLabels, label)
+	}
+	if len(normalizedLabels) == 0 || strings.TrimSpace(propKey) == "" {
+		return nil, nil
+	}
+	sort.Strings(normalizedLabels)
+
+	cache := runtimeVertexFallbackLookupCache(state)
+	cacheKey := tenant + "|" + strings.Join(normalizedLabels, ":") + "|" + strings.TrimSpace(propKey)
+	if existing, ok := cache[cacheKey]; ok {
+		return existing, nil
+	}
+
+	built := map[string][]string{}
+	err := state.Tx.ScanVertices(ctx, tenant, 0, func(found *graph.Vertex) error {
+		if found == nil {
+			return nil
+		}
+		if !vertexHasAllLabels(found, normalizedLabels) {
+			return nil
+		}
+		rawValue, ok := found.Properties[propKey]
+		if !ok {
+			return nil
+		}
+		vertexID := strings.TrimSpace(found.ID)
+		if vertexID == "" {
+			return nil
+		}
+		encoded := string(rawValue)
+		built[encoded] = append(built[encoded], vertexID)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	cache[cacheKey] = built
+	return built, nil
+}
+
+func runtimeVertexFallbackLookupCache(state *State) map[string]map[string][]string {
+	if state == nil {
+		return map[string]map[string][]string{}
+	}
+	if state.Params == nil {
+		state.Params = map[string]any{}
+	}
+	const cacheParamKey = "__ve_runtime_vertex_fallback_lookup"
+	if existing, ok := state.Params[cacheParamKey]; ok {
+		if typed, ok := existing.(map[string]map[string][]string); ok && typed != nil {
+			return typed
+		}
+	}
+	built := map[string]map[string][]string{}
+	state.Params[cacheParamKey] = built
+	return built
 }
 
 func vertexHasExpectedProperties(vertex *graph.Vertex, expected map[string]any) bool {
@@ -13130,12 +13340,30 @@ func writePathPropertyValueToBytes(value any) ([]byte, bool) {
 			return []byte("true"), true
 		}
 		return []byte("false"), true
-	case int, int8, int16, int32, int64:
-		return []byte(fmt.Sprintf("%d", typed)), true
-	case uint, uint8, uint16, uint32, uint64:
-		return []byte(fmt.Sprintf("%d", typed)), true
-	case float32, float64:
-		return []byte(fmt.Sprint(typed)), true
+	case int:
+		return []byte(strconv.Itoa(typed)), true
+	case int8:
+		return []byte(strconv.FormatInt(int64(typed), 10)), true
+	case int16:
+		return []byte(strconv.FormatInt(int64(typed), 10)), true
+	case int32:
+		return []byte(strconv.FormatInt(int64(typed), 10)), true
+	case int64:
+		return []byte(strconv.FormatInt(typed, 10)), true
+	case uint:
+		return []byte(strconv.FormatUint(uint64(typed), 10)), true
+	case uint8:
+		return []byte(strconv.FormatUint(uint64(typed), 10)), true
+	case uint16:
+		return []byte(strconv.FormatUint(uint64(typed), 10)), true
+	case uint32:
+		return []byte(strconv.FormatUint(uint64(typed), 10)), true
+	case uint64:
+		return []byte(strconv.FormatUint(typed, 10)), true
+	case float32:
+		return []byte(strconv.FormatFloat(float64(typed), 'f', -1, 32)), true
+	case float64:
+		return []byte(strconv.FormatFloat(typed, 'f', -1, 64)), true
 	default:
 		encoded, err := json.Marshal(typed)
 		if err != nil {

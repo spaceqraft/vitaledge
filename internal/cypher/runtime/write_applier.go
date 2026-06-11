@@ -41,6 +41,8 @@ func applyWriteEventsToSink(ctx context.Context, sink runtimestorage.WriteSink, 
 	nextAutoVertexID := 0
 	createEdgeCounts := map[string]int{}
 	mergeEdgeCounts := map[string]int{}
+	createPatternItemsCache := map[string][]string{}
+	simpleMergeEdgeExistsCache := map[string]bool{}
 	deletedVertexIDs := map[string]struct{}{}
 	deletedEdgeIDs := map[string]struct{}{}
 	hasDeleteClause := false
@@ -53,15 +55,27 @@ func applyWriteEventsToSink(ctx context.Context, sink runtimestorage.WriteSink, 
 			collectDeletedEntityIDsFromEventWithLookup(ctx, lookup, tenant, event, deletedVertexIDs, deletedEdgeIDs)
 		}
 	}
-	for _, event := range events {
+	for i := 0; i < len(events); i++ {
+		event := events[i]
 		kind := strings.ToUpper(strings.TrimSpace(event.Kind))
 		if kind == "CREATE" {
-			if err := applyCreateLikeWriteEvent(ctx, sink, tenant, event, &nextAutoVertexID, createEdgeCounts); err != nil {
+			if err := applyCreateLikeWriteEvent(ctx, sink, tenant, event, &nextAutoVertexID, createEdgeCounts, createPatternItemsCache); err != nil {
 				return err
 			}
 			continue
 		}
 		if kind == "MERGE" {
+			if consumed, err := tryBatchApplyZeroTypeSimpleMergeEdges(ctx, sink, tenant, events, i, hasDeleteClause); err != nil {
+				return err
+			} else if consumed > 0 {
+				i += consumed - 1
+				continue
+			}
+			if handled, err := tryApplySimpleDirectedMergeEdgeFastPath(ctx, sink, tenant, event, hasDeleteClause, simpleMergeEdgeExistsCache); err != nil {
+				return err
+			} else if handled {
+				continue
+			}
 			if err := applyMergeWriteEvent(ctx, sink, tenant, event, &nextAutoVertexID, deletedVertexIDs, deletedEdgeIDs, mergeVertexCache, mergeEdgeCounts, hasDeleteClause); err != nil {
 				return err
 			}
@@ -90,7 +104,7 @@ func applyWriteEventsToSink(ctx context.Context, sink runtimestorage.WriteSink, 
 		default:
 			switch kind {
 			case "CREATE":
-				if err := applyCreateLikeWriteEvent(ctx, sink, tenant, event, &nextAutoVertexID, createEdgeCounts); err != nil {
+				if err := applyCreateLikeWriteEvent(ctx, sink, tenant, event, &nextAutoVertexID, createEdgeCounts, createPatternItemsCache); err != nil {
 					return err
 				}
 			case "SET", "REMOVE":
@@ -108,9 +122,96 @@ func applyWriteEventsToSink(ctx context.Context, sink runtimestorage.WriteSink, 
 	return nil
 }
 
-func applyCreateLikeWriteEvent(ctx context.Context, sink runtimestorage.WriteSink, tenant string, event operators.WriteEvent, nextAutoVertexID *int, createEdgeCounts map[string]int) error {
+func tryApplySimpleDirectedMergeEdgeFastPath(ctx context.Context, sink runtimestorage.WriteSink, tenant string, event operators.WriteEvent, hasDeleteClause bool, existsCache map[string]bool) (bool, error) {
+	if hasDeleteClause || event.Edge == nil {
+		return false, nil
+	}
+	if len(event.MergeOnCreate) != 0 || len(event.MergeOnMatch) != 0 {
+		return false, nil
+	}
+	if strings.TrimSpace(event.Edge.Var) != "" {
+		return false, nil
+	}
+	edgeType := strings.TrimSpace(event.Edge.Type)
+	if edgeType == "" || len(event.Edge.LeftLabels) != 0 || len(event.Edge.RightLabels) != 0 {
+		return false, nil
+	}
+	if isUndirectedMergeEdgePattern(event.Edge.Pattern) {
+		return false, nil
+	}
+	lookup, _ := sink.(writeLookupTx)
+	props, hasNullProp := resolveEdgeMutationProperties(ctx, lookup, tenant, event)
+	if hasNullProp || len(props) != 0 {
+		return false, nil
+	}
+	leftID := resolveEntityID(event.Edge.LeftVar, event.Edge.LeftIDParam, event.Bindings, event.ResolvedParams)
+	rightID := resolveEntityID(event.Edge.RightVar, event.Edge.RightIDParam, event.Bindings, event.ResolvedParams)
+	if leftID == "" || rightID == "" {
+		return false, nil
+	}
+	srcID := leftID
+	dstID := rightID
+	if event.Edge.Reverse {
+		srcID = rightID
+		dstID = leftID
+	}
+	edgeID := fmt.Sprintf("%s|%s|%s|%s", tenant, srcID, edgeType, dstID)
+	if existsCache == nil {
+		existsCache = map[string]bool{}
+	}
+	if exists, ok := existsCache[edgeID]; ok {
+		if exists {
+			return true, nil
+		}
+	} else {
+		exists, err := simpleDirectedMergeEdgeExists(ctx, sink, lookup, tenant, srcID, dstID, edgeType, edgeID)
+		if err != nil {
+			return true, err
+		}
+		existsCache[edgeID] = exists
+		if exists {
+			return true, nil
+		}
+	}
+	if fast, ok := sink.(appendOnlyEdgeWriter); ok {
+		if err := fast.PutEdgeNew(ctx, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID}); err != nil {
+			return true, err
+		}
+	} else {
+		if err := sink.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID}); err != nil {
+			return true, err
+		}
+	}
+	existsCache[edgeID] = true
+	return true, nil
+}
+
+func simpleDirectedMergeEdgeExists(ctx context.Context, sink runtimestorage.WriteSink, lookup writeLookupTx, tenant, srcID, dstID, edgeType, edgeID string) (bool, error) {
+	if existsTx, ok := sink.(writeEdgeExistenceTx); ok {
+		exists, err := existsTx.HasDirectedEdgeBetween(ctx, tenant, srcID, dstID, edgeType)
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			return true, nil
+		}
+	}
+	if lookup != nil {
+		edge, err := lookup.GetEdge(ctx, tenant, edgeID)
+		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		return edge != nil, nil
+	}
+	return false, nil
+}
+
+func applyCreateLikeWriteEvent(ctx context.Context, sink runtimestorage.WriteSink, tenant string, event operators.WriteEvent, nextAutoVertexID *int, createEdgeCounts map[string]int, createPatternItemsCache map[string][]string) error {
 	if strings.EqualFold(strings.TrimSpace(event.Kind), "CREATE") {
-		if err := applyCreateWriteEventPatterns(ctx, sink, tenant, event, nextAutoVertexID, createEdgeCounts); err != nil {
+		if err := applyCreateWriteEventPatterns(ctx, sink, tenant, event, nextAutoVertexID, createEdgeCounts, createPatternItemsCache); err != nil {
 			return err
 		}
 		return nil
@@ -234,6 +335,12 @@ func applyMergeEdgeWriteEvent(ctx context.Context, sink runtimestorage.WriteSink
 		}
 	}
 	edgeID = allocateMergeEdgeID(ctx, lookup, tenant, srcID, edgeType, dstID, deletedEdgeIDs, mergeEdgeCounts, forceUniqueID)
+	if fast, ok := sink.(appendOnlyEdgeWriter); ok {
+		if err := fast.PutEdgeNew(ctx, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID, Properties: props}); err != nil {
+			return false, "", err
+		}
+		return false, edgeID, nil
+	}
 	if err := sink.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID, Properties: props}); err != nil {
 		return false, "", err
 	}
@@ -343,7 +450,7 @@ func applyMergeVertexWriteEvent(ctx context.Context, sink runtimestorage.WriteSi
 		}
 	}
 	if vertexID == "" {
-		vertexID = allocateAnonymousVertexIDForTenantWithReserved(ctx, sink, tenant, nextAutoVertexID, deletedVertexIDs)
+		vertexID, _ = allocateAnonymousVertexIDForTenantWithReserved(ctx, sink, tenant, nextAutoVertexID, deletedVertexIDs)
 	}
 	if err := sink.PutVertex(ctx, &graph.Vertex{
 		Tenant:     tenant,
@@ -475,13 +582,15 @@ func applyVertexWriteEvent(ctx context.Context, sink runtimestorage.WriteSink, t
 	lookup, _ := sink.(writeLookupTx)
 	props := resolveVertexMutationProperties(ctx, lookup, tenant, event)
 	vertexID := resolveEntityID(event.Vertex.Var, event.Vertex.IDParam, event.Bindings, event.ResolvedParams)
+	skipLookupMerge := false
 	if vertexID == "" && isCreateLikeWriteKind(event.Kind) {
-		vertexID = allocateAnonymousVertexIDForTenant(ctx, sink, tenant, nextAutoVertexID)
+		vertexID, skipLookupMerge = allocateAnonymousVertexIDForTenantChecked(ctx, sink, tenant, nextAutoVertexID)
 	}
 	if vertexID == "" {
 		return nil
 	}
-	return putCreateLikeVertex(ctx, sink, tenant, vertexID, event.Vertex.Labels, props)
+	mergeExisting := !strings.EqualFold(strings.TrimSpace(event.Kind), "CREATE")
+	return putCreateLikeVertex(ctx, sink, tenant, vertexID, event.Vertex.Labels, props, skipLookupMerge, mergeExisting)
 }
 
 func resolveVertexMutationProperties(ctx context.Context, lookup writeLookupTx, tenant string, event operators.WriteEvent) graph.PropertyMap {
@@ -664,9 +773,148 @@ type writeVertexScanner interface {
 	ScanVertices(context.Context, string, int, func(*graph.Vertex) error) error
 }
 
+type writePropertyIndexScanner interface {
+	ScanPropertyIndex(context.Context, string, string, string, []byte, int, func(*graph.PropertyIndexEntry) error) error
+}
+
 type writeEdgeScanner interface {
 	ScanVertices(context.Context, string, int, func(*graph.Vertex) error) error
 	ScanOutEdges(context.Context, string, string, string, int, func(*graph.Edge) error) error
+}
+
+type writeEdgeExistenceTx interface {
+	HasDirectedEdgeBetween(context.Context, string, string, string, string) (bool, error)
+}
+
+type appendOnlyVertexWriter interface {
+	PutVertexNew(context.Context, *graph.Vertex) error
+}
+
+type appendOnlyEdgeWriter interface {
+	PutEdgeNew(context.Context, *graph.Edge) error
+}
+
+type appendOnlyEdgeBatchWriter interface {
+	PutEdgeNewBatch(context.Context, []*graph.Edge) error
+}
+
+type writeStatsSnapshotTx interface {
+	GetStatsSnapshot(context.Context, string) (*graph.StatsSnapshot, error)
+}
+
+type simpleMergeEdgeSpec struct {
+	edgeType string
+	edge     *graph.Edge
+}
+
+func tryBatchApplyZeroTypeSimpleMergeEdges(ctx context.Context, sink runtimestorage.WriteSink, tenant string, events []operators.WriteEvent, start int, hasDeleteClause bool) (int, error) {
+	if hasDeleteClause || start < 0 || start >= len(events) {
+		return 0, nil
+	}
+	statsTx, ok := sink.(writeStatsSnapshotTx)
+	if !ok {
+		return 0, nil
+	}
+	firstSpec, ok := simpleAnonymousMergeEdgeSpecForBatch(ctx, sink, tenant, events[start])
+	if !ok {
+		return 0, nil
+	}
+	snapshot, err := statsTx.GetStatsSnapshot(ctx, tenant)
+	if err != nil {
+		if !graph.IsKind(err, graph.ErrKindNotFound) {
+			return 0, err
+		}
+		snapshot = nil
+	}
+	normalizedType := strings.TrimSpace(firstSpec.edgeType)
+	if normalizedType == "" {
+		normalizedType = "UNTYPED"
+	}
+	if snapshot != nil && snapshot.EdgeCounts != nil && snapshot.EdgeCounts[normalizedType] > 0 {
+		return 0, nil
+	}
+	batchWriter, hasBatchWriter := sink.(appendOnlyEdgeBatchWriter)
+	fastWriter, hasFastWriter := sink.(appendOnlyEdgeWriter)
+	if !hasBatchWriter && !hasFastWriter {
+		return 0, nil
+	}
+	edges := make([]*graph.Edge, 0)
+	seen := map[string]struct{}{}
+	consumed := 0
+	for i := start; i < len(events); i++ {
+		event := events[i]
+		if strings.ToUpper(strings.TrimSpace(event.Kind)) != "MERGE" {
+			break
+		}
+		spec, ok := simpleAnonymousMergeEdgeSpecForBatch(ctx, sink, tenant, event)
+		if !ok || !strings.EqualFold(strings.TrimSpace(spec.edgeType), firstSpec.edgeType) {
+			break
+		}
+		consumed++
+		if spec.edge == nil || strings.TrimSpace(spec.edge.ID) == "" {
+			continue
+		}
+		if _, exists := seen[spec.edge.ID]; exists {
+			continue
+		}
+		seen[spec.edge.ID] = struct{}{}
+		edges = append(edges, spec.edge)
+	}
+	if consumed == 0 {
+		return 0, nil
+	}
+	if len(edges) == 0 {
+		return consumed, nil
+	}
+	if hasBatchWriter {
+		if err := batchWriter.PutEdgeNewBatch(ctx, edges); err != nil {
+			return 0, err
+		}
+		return consumed, nil
+	}
+	for _, edge := range edges {
+		if err := fastWriter.PutEdgeNew(ctx, edge); err != nil {
+			return 0, err
+		}
+	}
+	return consumed, nil
+}
+
+func simpleAnonymousMergeEdgeSpecForBatch(ctx context.Context, sink runtimestorage.WriteSink, tenant string, event operators.WriteEvent) (simpleMergeEdgeSpec, bool) {
+	if event.Edge == nil {
+		return simpleMergeEdgeSpec{}, false
+	}
+	if len(event.MergeOnCreate) != 0 || len(event.MergeOnMatch) != 0 {
+		return simpleMergeEdgeSpec{}, false
+	}
+	if strings.TrimSpace(event.Edge.Var) != "" {
+		return simpleMergeEdgeSpec{}, false
+	}
+	edgeType := strings.TrimSpace(event.Edge.Type)
+	if edgeType == "" || len(event.Edge.LeftLabels) != 0 || len(event.Edge.RightLabels) != 0 || isUndirectedMergeEdgePattern(event.Edge.Pattern) {
+		return simpleMergeEdgeSpec{}, false
+	}
+	lookup, _ := sink.(writeLookupTx)
+	props, hasNullProp := resolveEdgeMutationProperties(ctx, lookup, tenant, event)
+	if hasNullProp || len(props) != 0 {
+		return simpleMergeEdgeSpec{}, false
+	}
+	leftID := resolveEntityID(event.Edge.LeftVar, event.Edge.LeftIDParam, event.Bindings, event.ResolvedParams)
+	rightID := resolveEntityID(event.Edge.RightVar, event.Edge.RightIDParam, event.Bindings, event.ResolvedParams)
+	if leftID == "" || rightID == "" {
+		return simpleMergeEdgeSpec{}, false
+	}
+	srcID := leftID
+	dstID := rightID
+	if event.Edge.Reverse {
+		srcID = rightID
+		dstID = leftID
+	}
+	edgeID := fmt.Sprintf("%s|%s|%s|%s", tenant, srcID, edgeType, dstID)
+	return simpleMergeEdgeSpec{
+		edgeType: edgeType,
+		edge:     &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID},
+	}, true
 }
 
 var errMergeVertexMatchFound = errors.New("merge vertex match found")
@@ -684,16 +932,27 @@ type createEdgePattern struct {
 	props    graph.PropertyMap
 }
 
-func applyCreateWriteEventPatterns(ctx context.Context, sink runtimestorage.WriteSink, tenant string, event operators.WriteEvent, nextAutoVertexID *int, createEdgeCounts map[string]int) error {
-	body, ok := extractCreateLikeClauseBody(event)
-	if !ok || strings.TrimSpace(body) == "" {
-		return applyCreateLikeWriteEventFallback(ctx, sink, tenant, event, nextAutoVertexID, createEdgeCounts)
+func applyCreateWriteEventPatterns(ctx context.Context, sink runtimestorage.WriteSink, tenant string, event operators.WriteEvent, nextAutoVertexID *int, createEdgeCounts map[string]int, createPatternItemsCache map[string][]string) error {
+	cacheKey := strings.TrimSpace(event.Pattern)
+	if cacheKey == "" {
+		cacheKey = strings.TrimSpace(event.Raw)
 	}
-	body = stripCypherLineComments(body)
+	items, cached := createPatternItemsCache[cacheKey]
+	if !cached {
+		body, ok := extractCreateLikeClauseBody(event)
+		if !ok || strings.TrimSpace(body) == "" {
+			return applyCreateLikeWriteEventFallback(ctx, sink, tenant, event, nextAutoVertexID, createEdgeCounts)
+		}
+		body = stripCypherLineComments(body)
+		items = splitTopLevelByComma(body)
+		if createPatternItemsCache != nil {
+			createPatternItemsCache[cacheKey] = items
+		}
+	}
 
 	bindings := cloneWriteBindings(event.Bindings)
 	lookup, _ := sink.(writeLookupTx)
-	for _, item := range splitTopLevelByComma(body) {
+	for _, item := range items {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
@@ -786,8 +1045,9 @@ func applyCreatePatternItem(ctx context.Context, sink runtimestorage.WriteSink, 
 
 func ensureCreatePatternVertex(ctx context.Context, sink runtimestorage.WriteSink, tenant string, event operators.WriteEvent, vertex createVertexPattern, bindings map[string]any, nextAutoVertexID *int) (string, error) {
 	vertexID := resolveCreatePatternVertexID(vertex, event.ResolvedParams, bindings)
+	skipLookupMerge := false
 	if vertexID == "" && isCreateLikeWriteKind(event.Kind) {
-		vertexID = allocateAnonymousVertexIDForTenant(ctx, sink, tenant, nextAutoVertexID)
+		vertexID, skipLookupMerge = allocateAnonymousVertexIDForTenantChecked(ctx, sink, tenant, nextAutoVertexID)
 	}
 	if vertexID == "" {
 		return "", nil
@@ -810,7 +1070,7 @@ func ensureCreatePatternVertex(ctx context.Context, sink runtimestorage.WriteSin
 	}
 
 	if writeVertex {
-		if err := putCreateLikeVertex(ctx, sink, tenant, vertexID, vertex.labels, vertex.props); err != nil {
+		if err := putCreateLikeVertex(ctx, sink, tenant, vertexID, vertex.labels, vertex.props, skipLookupMerge, false); err != nil {
 			return "", err
 		}
 	}
@@ -837,6 +1097,16 @@ func putCreatePatternEdge(ctx context.Context, sink runtimestorage.WriteSink, te
 	}
 	lookup, _ := sink.(writeLookupTx)
 	edgeID := allocateCreateEdgeIDWithLookup(ctx, lookup, tenant, srcID, edgeType, dstID, createEdgeCounts)
+	if fast, ok := sink.(appendOnlyEdgeWriter); ok {
+		return fast.PutEdgeNew(ctx, &graph.Edge{
+			Tenant:     tenant,
+			ID:         edgeID,
+			Type:       edgeType,
+			SrcID:      srcID,
+			DstID:      dstID,
+			Properties: clonePropertyMap(edge.props),
+		})
+	}
 	return sink.PutEdge(ctx, &graph.Edge{
 		Tenant:     tenant,
 		ID:         edgeID,
@@ -1439,11 +1709,21 @@ func clonePropertyMap(in graph.PropertyMap) graph.PropertyMap {
 	return out
 }
 
-func putCreateLikeVertex(ctx context.Context, sink runtimestorage.WriteSink, tenant, vertexID string, labels []string, props graph.PropertyMap) error {
+func putCreateLikeVertex(ctx context.Context, sink runtimestorage.WriteSink, tenant, vertexID string, labels []string, props graph.PropertyMap, skipLookupMerge bool, mergeExisting bool) error {
+	if skipLookupMerge {
+		if fast, ok := sink.(appendOnlyVertexWriter); ok {
+			return fast.PutVertexNew(ctx, &graph.Vertex{
+				Tenant:     tenant,
+				ID:         vertexID,
+				Labels:     append([]string(nil), labels...),
+				Properties: clonePropertyMap(props),
+			})
+		}
+	}
 	lookup, _ := sink.(writeLookupTx)
 	mergedLabels := append([]string(nil), labels...)
 	mergedProps := clonePropertyMap(props)
-	if lookup != nil {
+	if lookup != nil && !skipLookupMerge && mergeExisting {
 		existing, err := lookup.GetVertex(ctx, tenant, vertexID)
 		if err != nil {
 			if !graph.IsKind(err, graph.ErrKindNotFound) {
@@ -1495,6 +1775,27 @@ func mergeLabelSets(existing, incoming []string) []string {
 }
 
 func findAnonymousMergeVertexID(ctx context.Context, sink runtimestorage.WriteSink, tenant string, labels []string, props graph.PropertyMap, deletedVertexIDs map[string]struct{}) (string, error) {
+	lookup, _ := sink.(writeLookupTx)
+	if lookup != nil {
+		if vertexID, ok := mergeVertexIDProperty(props); ok {
+			vertex, err := lookup.GetVertex(ctx, tenant, vertexID)
+			if err != nil {
+				if !graph.IsKind(err, graph.ErrKindNotFound) {
+					return "", err
+				}
+			} else if vertex != nil {
+				if _, deleted := deletedVertexIDs[strings.TrimSpace(vertex.ID)]; !deleted && mergeVertexMatches(vertex, labels, props) {
+					return strings.TrimSpace(vertex.ID), nil
+				}
+			}
+		}
+		if matchedID, err := findAnonymousMergeVertexIDByPropertyIndex(ctx, sink, lookup, tenant, labels, props, deletedVertexIDs); err != nil {
+			return "", err
+		} else if matchedID != "" {
+			return matchedID, nil
+		}
+	}
+
 	scanner, ok := sink.(writeVertexScanner)
 	if !ok {
 		return "", nil
@@ -1518,6 +1819,82 @@ func findAnonymousMergeVertexID(ctx context.Context, sink runtimestorage.WriteSi
 		return "", err
 	}
 	return matchedID, nil
+}
+
+func mergeVertexIDProperty(props graph.PropertyMap) (string, bool) {
+	for key, raw := range props {
+		if !strings.EqualFold(strings.TrimSpace(key), "id") {
+			continue
+		}
+		id := strings.TrimSpace(scalarString(decodeWriteStoredPropertyValue(raw)))
+		if id == "" {
+			return "", false
+		}
+		return id, true
+	}
+	return "", false
+}
+
+func findAnonymousMergeVertexIDByPropertyIndex(ctx context.Context, sink runtimestorage.WriteSink, lookup writeLookupTx, tenant string, labels []string, props graph.PropertyMap, deletedVertexIDs map[string]struct{}) (string, error) {
+	indexScanner, ok := sink.(writePropertyIndexScanner)
+	if !ok || lookup == nil || tenant == "" || len(labels) == 0 || len(props) == 0 {
+		return "", nil
+	}
+
+	keys := make([]string, 0, len(props))
+	for key := range props {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	matchedID := ""
+	for _, key := range keys {
+		encoded, ok := props[key]
+		if !ok {
+			continue
+		}
+		for _, label := range labels {
+			label = strings.TrimSpace(label)
+			if label == "" {
+				continue
+			}
+			err := indexScanner.ScanPropertyIndex(ctx, tenant, label, key, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
+				if entry == nil || !strings.EqualFold(strings.TrimSpace(entry.EntityClass), "vertex") {
+					return nil
+				}
+				candidateID := strings.TrimSpace(entry.EntityID)
+				if candidateID == "" {
+					return nil
+				}
+				if _, deleted := deletedVertexIDs[candidateID]; deleted {
+					return nil
+				}
+				candidate, err := lookup.GetVertex(ctx, tenant, candidateID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+				if candidate == nil || !mergeVertexMatches(candidate, labels, props) {
+					return nil
+				}
+				matchedID = candidateID
+				return errMergeVertexMatchFound
+			})
+			if err != nil {
+				if errors.Is(err, errMergeVertexMatchFound) {
+					return matchedID, nil
+				}
+				return "", err
+			}
+		}
+	}
+	return "", nil
 }
 
 func collectDeletedEntityIDsFromBindings(bindings map[string]any, vertexOut map[string]struct{}, edgeOut map[string]struct{}) {
@@ -4309,10 +4686,15 @@ func allocateAnonymousVertexID(nextAutoVertexID *int) string {
 }
 
 func allocateAnonymousVertexIDForTenant(ctx context.Context, sink runtimestorage.WriteSink, tenant string, nextAutoVertexID *int) string {
+	id, _ := allocateAnonymousVertexIDForTenantWithReserved(ctx, sink, tenant, nextAutoVertexID, nil)
+	return id
+}
+
+func allocateAnonymousVertexIDForTenantChecked(ctx context.Context, sink runtimestorage.WriteSink, tenant string, nextAutoVertexID *int) (string, bool) {
 	return allocateAnonymousVertexIDForTenantWithReserved(ctx, sink, tenant, nextAutoVertexID, nil)
 }
 
-func allocateAnonymousVertexIDForTenantWithReserved(ctx context.Context, sink runtimestorage.WriteSink, tenant string, nextAutoVertexID *int, reserved map[string]struct{}) string {
+func allocateAnonymousVertexIDForTenantWithReserved(ctx context.Context, sink runtimestorage.WriteSink, tenant string, nextAutoVertexID *int, reserved map[string]struct{}) (string, bool) {
 	lookup, _ := sink.(writeLookupTx)
 	if lookup == nil {
 		for attempts := 0; attempts < 100000; attempts++ {
@@ -4320,9 +4702,9 @@ func allocateAnonymousVertexIDForTenantWithReserved(ctx context.Context, sink ru
 			if _, blocked := reserved[candidate]; blocked {
 				continue
 			}
-			return candidate
+			return candidate, false
 		}
-		return allocateAnonymousVertexID(nextAutoVertexID)
+		return allocateAnonymousVertexID(nextAutoVertexID), false
 	}
 	for attempts := 0; attempts < 100000; attempts++ {
 		candidate := allocateAnonymousVertexID(nextAutoVertexID)
@@ -4332,15 +4714,15 @@ func allocateAnonymousVertexIDForTenantWithReserved(ctx context.Context, sink ru
 		existing, err := lookup.GetVertex(ctx, tenant, candidate)
 		if err != nil {
 			if !graph.IsKind(err, graph.ErrKindNotFound) {
-				return candidate
+				return candidate, false
 			}
 			existing = nil
 		}
 		if existing == nil {
-			return candidate
+			return candidate, true
 		}
 	}
-	return allocateAnonymousVertexID(nextAutoVertexID)
+	return allocateAnonymousVertexID(nextAutoVertexID), false
 }
 
 func allocateCreateEdgeIDWithLookup(ctx context.Context, lookup writeLookupTx, tenant, srcID, edgeType, dstID string, createEdgeCounts map[string]int) string {
@@ -4430,6 +4812,20 @@ func applyEdgeWriteEvent(ctx context.Context, sink runtimestorage.WriteSink, ten
 }
 
 func findDirectedExistingEdgeID(ctx context.Context, sink runtimestorage.WriteSink, lookup writeLookupTx, tenant, srcID, dstID, edgeType string, props graph.PropertyMap, excluded map[string]struct{}) (string, error) {
+	// Fast no-match short-circuit: for property-agnostic MERGE checks with no
+	// excluded IDs, endpoint existence can avoid an adjacency scan entirely.
+	if len(props) == 0 && len(excluded) == 0 {
+		if probe, ok := sink.(writeEdgeExistenceTx); ok {
+			exists, err := probe.HasDirectedEdgeBetween(ctx, tenant, srcID, dstID, edgeType)
+			if err != nil {
+				return "", err
+			}
+			if !exists {
+				return "", nil
+			}
+		}
+	}
+
 	found := ""
 	err := sink.ScanAdjacencyLinks(ctx, tenant, srcID, graph.EdgeDirectionOut, edgeType, 0, func(edgeID, peerID string) error {
 		if strings.TrimSpace(peerID) != dstID {

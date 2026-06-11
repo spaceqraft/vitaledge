@@ -19,6 +19,19 @@ type antiProbeCountingTx struct {
 	rowDirectedCalls   int
 }
 
+type expandFallbackCountingTx struct {
+	graph.Tx
+	scanVerticesCalls int
+}
+
+func (t *expandFallbackCountingTx) ScanVertices(ctx context.Context, tenant string, limit int, fn func(*graph.Vertex) error) error {
+	t.scanVerticesCalls++
+	if t.Tx == nil {
+		return nil
+	}
+	return t.Tx.ScanVertices(ctx, tenant, limit, fn)
+}
+
 func (t *antiProbeCountingTx) HasDirectedEdgeBetween(context.Context, string, string, string, string) (bool, error) {
 	t.rowDirectedCalls++
 	return false, nil
@@ -109,6 +122,59 @@ func TestWriteHandlerRecordsEventAndMarksRows(t *testing.T) {
 	}
 	if got, ok := state.Rows[0]["__write_event_count"].(int); !ok || got != 1 {
 		t.Fatalf("expected row write marker=1, got row=%#v", state.Rows[0])
+	}
+}
+
+func TestExpandVertexPatternRowFallbackCacheAvoidsRepeatScan(t *testing.T) {
+	ctx := context.Background()
+	tempDir, err := os.MkdirTemp("", "ve-runtime-expand-fallback-cache-")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+
+	store, err := pebblestore.Open(tempDir)
+	if err != nil {
+		t.Fatalf("open store failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1", Labels: []string{"Person"}, Properties: graph.PropertyMap{"id": []byte("p1")}}); err != nil {
+			return err
+		}
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p2", Labels: []string{"Person"}, Properties: graph.PropertyMap{"id": []byte("p2")}})
+	}); err != nil {
+		t.Fatalf("seed graph failed: %v", err)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		countingTx := &expandFallbackCountingTx{Tx: tx}
+		state := &State{Tx: countingTx, Tenant: "acme", Params: map[string]any{}}
+		vertex := &VertexMutation{Var: "a", Labels: []string{"Person"}, Pattern: "(a:Person {id: 'p1'})"}
+
+		firstRows, err := expandVertexPatternRow(state, map[string]any{}, vertex, false)
+		if err != nil {
+			return err
+		}
+		if len(firstRows) != 1 || fmt.Sprint(firstRows[0]["a"]) != "p1" {
+			return fmt.Errorf("expected first lookup to resolve p1, got %#v", firstRows)
+		}
+
+		secondRows, err := expandVertexPatternRow(state, map[string]any{}, vertex, false)
+		if err != nil {
+			return err
+		}
+		if len(secondRows) != 1 || fmt.Sprint(secondRows[0]["a"]) != "p1" {
+			return fmt.Errorf("expected second lookup to resolve p1, got %#v", secondRows)
+		}
+
+		if countingTx.scanVerticesCalls != 1 {
+			return fmt.Errorf("expected one fallback vertex scan across repeated lookups, got %d", countingTx.scanVerticesCalls)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("view failed: %v", err)
 	}
 }
 

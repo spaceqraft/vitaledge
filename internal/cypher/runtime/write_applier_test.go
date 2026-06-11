@@ -528,8 +528,10 @@ type recordingSink struct {
 	vertexes []*graph.Vertex
 	edges    []*graph.Edge
 
-	vertexByID map[string]*graph.Vertex
-	edgeByID   map[string]*graph.Edge
+	vertexByID           map[string]*graph.Vertex
+	edgeByID             map[string]*graph.Edge
+	propertyIndexEntries []*graph.PropertyIndexEntry
+	scanVerticesCalls    int
 
 	deletedVertexIDs       []string
 	deletedEdgeIDs         []string
@@ -655,6 +657,7 @@ func (s *recordingSink) GetEdge(_ context.Context, _ string, id string) (*graph.
 	return &copyEdge, nil
 }
 func (s *recordingSink) ScanVertices(_ context.Context, _ string, limit int, fn func(*graph.Vertex) error) error {
+	s.scanVerticesCalls++
 	if fn == nil || len(s.vertexByID) == 0 {
 		return nil
 	}
@@ -666,6 +669,40 @@ func (s *recordingSink) ScanVertices(_ context.Context, _ string, limit int, fn 
 		copyVertex := *vertex
 		copyVertex.Properties = clonePropertyMap(vertex.Properties)
 		if err := fn(&copyVertex); err != nil {
+			return err
+		}
+		seen++
+		if limit > 0 && seen >= limit {
+			break
+		}
+	}
+	return nil
+}
+
+func (s *recordingSink) ScanPropertyIndex(_ context.Context, tenant, schema, property string, encodedValue []byte, limit int, fn func(*graph.PropertyIndexEntry) error) error {
+	if fn == nil || len(s.propertyIndexEntries) == 0 {
+		return nil
+	}
+	seen := 0
+	for _, entry := range s.propertyIndexEntries {
+		if entry == nil {
+			continue
+		}
+		if strings.TrimSpace(entry.Tenant) != strings.TrimSpace(tenant) {
+			continue
+		}
+		if strings.TrimSpace(entry.Schema) != strings.TrimSpace(schema) {
+			continue
+		}
+		if strings.TrimSpace(entry.Property) != strings.TrimSpace(property) {
+			continue
+		}
+		if !reflect.DeepEqual(entry.Value, encodedValue) {
+			continue
+		}
+		copyEntry := *entry
+		copyEntry.Value = append([]byte(nil), entry.Value...)
+		if err := fn(&copyEntry); err != nil {
 			return err
 		}
 		seen++
@@ -2056,6 +2093,48 @@ func TestApplyWriteEventsToSinkMergeAnonymousVertexMatchesExistingByLabelAndProp
 	}
 	if len(sink.vertexes) != preWrites {
 		t.Fatalf("expected anonymous MERGE to match existing vertex, got writes %#v", sink.vertexes)
+	}
+}
+
+func TestFindAnonymousMergeVertexIDUsesPropertyIndexBeforeScan(t *testing.T) {
+	sink := &recordingSink{}
+	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+		Tenant: "acme",
+		ID:     "u1",
+		Labels: []string{"User"},
+		Properties: graph.PropertyMap{
+			"name": []byte("alice"),
+		},
+	}); err != nil {
+		t.Fatalf("seed vertex failed: %v", err)
+	}
+	sink.propertyIndexEntries = []*graph.PropertyIndexEntry{{
+		Tenant:      "acme",
+		Schema:      "User",
+		Property:    "name",
+		Value:       []byte("alice"),
+		EntityID:    "u1",
+		EntityClass: "vertex",
+	}}
+
+	event := operators.WriteEvent{
+		Kind:         "MERGE",
+		MutationType: operators.MutationTypeVertex,
+		Vertex: &operators.VertexMutation{
+			Labels:  []string{"User"},
+			Pattern: "(:User {name:'alice'})",
+		},
+	}
+
+	matchedID, err := findAnonymousMergeVertexID(context.Background(), sink, "acme", event.Vertex.Labels, resolveVertexMutationProperties(context.Background(), sink, "acme", event), nil)
+	if err != nil {
+		t.Fatalf("anonymous merge property-index match failed: %v", err)
+	}
+	if matchedID != "u1" {
+		t.Fatalf("expected property-index merge pre-match u1, got %q", matchedID)
+	}
+	if sink.scanVerticesCalls != 0 {
+		t.Fatalf("expected property-index match to avoid vertex scan, got %d scans", sink.scanVerticesCalls)
 	}
 }
 

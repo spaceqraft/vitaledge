@@ -58,6 +58,7 @@ type tx struct {
 	counterBasePresent   map[string]bool
 	counterDeltas        map[string]int
 	pendingPropertyStats map[string]propertyStatsTarget
+	pendingTenantStats   map[string]struct{}
 	closed               bool
 	maxWriteBatchBytes   int
 }
@@ -556,7 +557,45 @@ func (t *tx) PutVertex(ctx context.Context, vertex *graph.Vertex) (err error) {
 		return err
 	}
 	t.cacheVertex(vertex)
-	return t.refreshTenantStatsMetadata(vertex.Tenant)
+	t.queueTenantStatsRefresh(vertex.Tenant)
+	return nil
+}
+
+func (t *tx) PutVertexNew(ctx context.Context, vertex *graph.Vertex) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("put_vertex_new", err, started) }()
+
+	if err := t.ensureWrite(ctx); err != nil {
+		return err
+	}
+	if vertex == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "vertex is required", nil)
+	}
+	if err := t.addToCounter(keyspace.StatsVertexTotalKey(vertex.Tenant), 1); err != nil {
+		return err
+	}
+	nextLabelList := normalizedLabelsOrdered(vertex.Labels)
+	for idx, label := range nextLabelList {
+		if err := t.addToCounter(keyspace.StatsVertexLabelCountKey(vertex.Tenant, label), 1); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.VertexLabelKey(vertex.Tenant, vertex.ID, label), encodeVertexLabelOrder(idx, label), "write vertex label forward index"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.VertexLabelMembershipKey(vertex.Tenant, label, vertex.ID), []byte(vertex.ID), "write vertex label membership"); err != nil {
+			return err
+		}
+	}
+	if err := t.writeVertexProperties(vertex); err != nil {
+		return err
+	}
+	nextHash := vertexPHash(vertex)
+	if err := t.set(keyspace.VertexKey(vertex.Tenant, vertex.ID), nextHash, "write vertex"); err != nil {
+		return err
+	}
+	t.cacheVertex(vertex)
+	t.queueTenantStatsRefresh(vertex.Tenant)
+	return nil
 }
 
 func (t *tx) DeleteVertex(ctx context.Context, tenant, vertexID string) (err error) {
@@ -606,7 +645,8 @@ func (t *tx) DeleteVertex(ctx context.Context, tenant, vertexID string) (err err
 			return err
 		}
 	}
-	return t.refreshTenantStatsMetadata(tenant)
+	t.queueTenantStatsRefresh(tenant)
+	return nil
 }
 
 func (t *tx) PutVertexBatch(ctx context.Context, vertexes []*graph.Vertex) (err error) {
@@ -639,6 +679,96 @@ func (t *tx) PutEdgeBatch(ctx context.Context, edges []*graph.Edge) (err error) 
 			continue
 		}
 		if err := t.PutEdge(ctx, edge); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *tx) PutEdgeNewBatch(ctx context.Context, edges []*graph.Edge) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("put_edge_new_batch", err, started) }()
+
+	if err := t.ensureWrite(ctx); err != nil {
+		return err
+	}
+	tenantEdgeTotals := map[string]int{}
+	typeTotals := map[string]int{}
+	typeSourceDeltas := map[string]int{}
+	outPairDeltas := map[string]int{}
+	undirectedPairDeltas := map[string]int{}
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		t.lockEdgeForMutation(edge.Tenant, edge.ID)
+		if err := t.writeEdgeProperties(edge); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.EdgeKey(edge.Tenant, edge.ID), edgePHash(edge), "write edge"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.EdgeTypeKey(edge.Tenant, edge.ID, edge.Type), []byte(edge.Type), "write edge type"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.TypeEdgeKey(edge.Tenant, edge.Type, edge.ID), edgeEndpointsPayload(edge.SrcID, edge.DstID), "write type edge"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), []byte(outAdjDstValuePrefix+edge.DstID), "write out adjacency"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), []byte(edge.ID), "write in adjacency"); err != nil {
+			return err
+		}
+		if err := t.set(keyspace.OutEndpointKey(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, edge.ID), []byte(edge.ID), "write out endpoint"); err != nil {
+			return err
+		}
+		tenantEdgeTotals[edge.Tenant]++
+		typeTotals[edge.Tenant+"\x00"+normalizedEdgeType(edge.Type)]++
+		typeSourceDeltas[edge.Tenant+"\x00"+normalizedEdgeType(edge.Type)+"\x00"+strings.TrimSpace(edge.SrcID)]++
+		outPairDeltas[edge.Tenant+"\x00"+strings.TrimSpace(edge.SrcID)+"\x00"+strings.TrimSpace(edge.Type)+"\x00"+strings.TrimSpace(edge.DstID)]++
+		leftID, rightID := canonicalEndpointPair(strings.TrimSpace(edge.SrcID), strings.TrimSpace(edge.DstID))
+		undirectedPairDeltas[edge.Tenant+"\x00"+leftID+"\x00"+strings.TrimSpace(edge.Type)+"\x00"+rightID]++
+		t.queueTenantStatsRefresh(edge.Tenant)
+	}
+	for tenant, delta := range tenantEdgeTotals {
+		if err := t.addToCounter(keyspace.StatsEdgeTotalKey(tenant), delta); err != nil {
+			return err
+		}
+	}
+	for key, delta := range typeTotals {
+		parts := strings.Split(key, "\x00")
+		if len(parts) != 2 {
+			continue
+		}
+		if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(parts[0], parts[1]), delta); err != nil {
+			return err
+		}
+	}
+	for key, delta := range typeSourceDeltas {
+		parts := strings.Split(key, "\x00")
+		if len(parts) != 3 {
+			continue
+		}
+		if err := t.adjustEdgeTypeSourceDegree(parts[0], parts[1], parts[2], delta); err != nil {
+			return err
+		}
+	}
+	for key, delta := range outPairDeltas {
+		parts := strings.Split(key, "\x00")
+		if len(parts) != 4 {
+			continue
+		}
+		if err := t.adjustOutEndpointPairCount(parts[0], parts[1], parts[2], parts[3], delta); err != nil {
+			return err
+		}
+	}
+	for key, delta := range undirectedPairDeltas {
+		parts := strings.Split(key, "\x00")
+		if len(parts) != 4 {
+			continue
+		}
+		if err := t.adjustUndirectedEndpointPairCount(parts[0], parts[1], parts[2], parts[3], delta); err != nil {
 			return err
 		}
 	}
@@ -1711,7 +1841,59 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 	if err := t.adjustUndirectedEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, 1); err != nil {
 		return err
 	}
-	return t.refreshTenantStatsMetadata(edge.Tenant)
+	t.queueTenantStatsRefresh(edge.Tenant)
+	return nil
+}
+
+func (t *tx) PutEdgeNew(ctx context.Context, edge *graph.Edge) (err error) {
+	started := time.Now()
+	defer func() { t.observeOperation("put_edge_new", err, started) }()
+
+	if err := t.ensureWrite(ctx); err != nil {
+		return err
+	}
+	if edge == nil {
+		return graph.NewError(graph.ErrKindInvalidInput, "edge is required", nil)
+	}
+	t.lockEdgeForMutation(edge.Tenant, edge.ID)
+	if err := t.addToCounter(keyspace.StatsEdgeTotalKey(edge.Tenant), 1); err != nil {
+		return err
+	}
+	if err := t.addToCounter(keyspace.StatsEdgeTypeCountKey(edge.Tenant, normalizedEdgeType(edge.Type)), 1); err != nil {
+		return err
+	}
+	if err := t.adjustEdgeTypeSourceDegree(edge.Tenant, normalizedEdgeType(edge.Type), edge.SrcID, 1); err != nil {
+		return err
+	}
+	if err := t.writeEdgeProperties(edge); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.EdgeKey(edge.Tenant, edge.ID), edgePHash(edge), "write edge"); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.EdgeTypeKey(edge.Tenant, edge.ID, edge.Type), []byte(edge.Type), "write edge type"); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.TypeEdgeKey(edge.Tenant, edge.Type, edge.ID), edgeEndpointsPayload(edge.SrcID, edge.DstID), "write type edge"); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.OutAdjacencyKey(edge.Tenant, edge.SrcID, edge.Type, edge.ID), []byte(outAdjDstValuePrefix+edge.DstID), "write out adjacency"); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.InAdjacencyKey(edge.Tenant, edge.DstID, edge.Type, edge.ID), []byte(edge.ID), "write in adjacency"); err != nil {
+		return err
+	}
+	if err := t.set(keyspace.OutEndpointKey(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, edge.ID), []byte(edge.ID), "write out endpoint"); err != nil {
+		return err
+	}
+	if err := t.adjustOutEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, 1); err != nil {
+		return err
+	}
+	if err := t.adjustUndirectedEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, 1); err != nil {
+		return err
+	}
+	t.queueTenantStatsRefresh(edge.Tenant)
+	return nil
 }
 
 func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) {
@@ -1772,7 +1954,8 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 	if err := t.adjustUndirectedEndpointPairCount(tenant, srcID, edgeType, dstID, -1); err != nil {
 		return err
 	}
-	return t.refreshTenantStatsMetadata(tenant)
+	t.queueTenantStatsRefresh(tenant)
+	return nil
 }
 
 func (t *tx) adjustOutEndpointPairCount(tenant, srcID, edgeType, dstID string, delta int) error {
@@ -2763,8 +2946,40 @@ func (t *tx) Commit() error {
 	if err := t.flushCounterDeltas(); err != nil {
 		return err
 	}
+	if err := t.flushPendingTenantStatsMetadata(); err != nil {
+		return err
+	}
 	if err := t.batch.Commit(cpebble.Sync); err != nil {
 		return graph.NewError(graph.ErrKindStorage, "commit transaction", err)
+	}
+	return nil
+}
+
+func (t *tx) queueTenantStatsRefresh(tenant string) {
+	tenant = strings.TrimSpace(tenant)
+	if tenant == "" {
+		return
+	}
+	if t.pendingTenantStats == nil {
+		t.pendingTenantStats = map[string]struct{}{}
+	}
+	t.pendingTenantStats[tenant] = struct{}{}
+}
+
+func (t *tx) flushPendingTenantStatsMetadata() error {
+	if t == nil || t.mode != graph.TxReadWrite || len(t.pendingTenantStats) == 0 {
+		return nil
+	}
+	tenants := make([]string, 0, len(t.pendingTenantStats))
+	for tenant := range t.pendingTenantStats {
+		tenants = append(tenants, tenant)
+	}
+	t.pendingTenantStats = nil
+	sort.Strings(tenants)
+	for _, tenant := range tenants {
+		if err := t.refreshTenantStatsMetadata(tenant); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -2944,6 +3159,9 @@ func (t *tx) scanAdjacency(ctx context.Context, prefix []byte, limit int, tenant
 		}
 		edge, err := t.GetEdge(ctx, tenant, edgeID)
 		if err != nil {
+			if graph.IsKind(err, graph.ErrKindNotFound) {
+				continue
+			}
 			return err
 		}
 		if err := fn(edge); err != nil {

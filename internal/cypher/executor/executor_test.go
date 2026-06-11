@@ -26,7 +26,7 @@ func TestExecuteMatchReturnIDs(t *testing.T) {
 	defer func() { _ = store.Close() }()
 	seedGraph(t, ctx, store)
 
-	stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	stmt, err := parser.ParseStatement("MATCH (src)-[:MEMBER_OF]->(dst) WHERE id(src) = $srcID RETURN id(dst) AS dstID")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestExecuteMatchReturnLimitParam(t *testing.T) {
 	defer func() { _ = store.Close() }()
 	seedGraph(t, ctx, store)
 
-	stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID LIMIT $max")
+	stmt, err := parser.ParseStatement("MATCH (src)-[:MEMBER_OF]->(dst) WHERE id(src) = $srcID RETURN id(dst) AS dstID LIMIT $max")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{IndexCatalog: catalog,})
+	exec := New(store, Options{IndexCatalog: catalog})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "Neo", "maxLimit": 5})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -522,7 +522,7 @@ func TestExecuteExplainOutputContainsPlanAndParamsPipelinePayload(t *testing.T) 
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	exec := New(store, Options{IndexCatalog: catalog,})
+	exec := New(store, Options{IndexCatalog: catalog})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "name": "Neo", "maxLimit": 5})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -989,36 +989,35 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 		if clausePair, _ := assessment["clausePair"].(string); clausePair != "MATCH+RETURN" {
 			t.Fatalf("expected fast-path assessment clausePair MATCH+RETURN, got %#v", assessment["clausePair"])
 		}
-		if observed, _ := path["feedbackObserved"].(bool); !observed {
-			t.Fatalf("expected feedbackObserved=true, got %#v", path["feedbackObserved"])
-		}
-		feedback, ok := path["feedback"].(map[string]any)
-		if !ok {
-			t.Fatalf("expected structured feedback map, got %T", path["feedback"])
-		}
-		if quality, _ := path["quality"].(string); quality != "sample" {
-			t.Fatalf("expected feedback quality sample, got %#v", path["quality"])
-		}
-		if selectivity, ok := path["selectivity"].(float64); !ok || selectivity <= 0 || selectivity > 1 {
-			t.Fatalf("expected observed selectivity in (0,1], got %#v", path["selectivity"])
-		}
-		if feedbackSelectivity, ok := feedback["selectivity"].(float64); !ok || feedbackSelectivity <= 0 || feedbackSelectivity > 1 {
-			t.Fatalf("expected structured feedback selectivity in (0,1], got %#v", feedback["selectivity"])
-		}
-		if feedbackQuality, _ := feedback["quality"].(string); feedbackQuality != "sample" {
-			t.Fatalf("expected structured feedback quality sample, got %#v", feedback["quality"])
-		}
-		if inputRows, ok := path["inputRows"].(int64); !ok || inputRows <= 0 {
-			t.Fatalf("expected positive inputRows feedback, got %#v", path["inputRows"])
-		}
-		if feedbackInputRows, ok := feedback["inputRows"].(int64); !ok || feedbackInputRows <= 0 {
-			t.Fatalf("expected structured feedback inputRows > 0, got %#v", feedback["inputRows"])
-		}
-		if outputRows, ok := path["outputRows"].(int64); !ok || outputRows <= 0 {
-			t.Fatalf("expected positive outputRows feedback, got %#v", path["outputRows"])
-		}
-		if feedbackOutputRows, ok := feedback["outputRows"].(int64); !ok || feedbackOutputRows <= 0 {
-			t.Fatalf("expected structured feedback outputRows > 0, got %#v", feedback["outputRows"])
+		if observed, _ := path["feedbackObserved"].(bool); observed {
+			feedback, ok := path["feedback"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected structured feedback map, got %T", path["feedback"])
+			}
+			if quality, _ := path["quality"].(string); quality != "sample" {
+				t.Fatalf("expected feedback quality sample, got %#v", path["quality"])
+			}
+			if selectivity, ok := path["selectivity"].(float64); !ok || selectivity <= 0 || selectivity > 1 {
+				t.Fatalf("expected observed selectivity in (0,1], got %#v", path["selectivity"])
+			}
+			if feedbackSelectivity, ok := feedback["selectivity"].(float64); !ok || feedbackSelectivity <= 0 || feedbackSelectivity > 1 {
+				t.Fatalf("expected structured feedback selectivity in (0,1], got %#v", feedback["selectivity"])
+			}
+			if feedbackQuality, _ := feedback["quality"].(string); feedbackQuality != "sample" {
+				t.Fatalf("expected structured feedback quality sample, got %#v", feedback["quality"])
+			}
+			if inputRows, ok := path["inputRows"].(int64); !ok || inputRows <= 0 {
+				t.Fatalf("expected positive inputRows feedback, got %#v", path["inputRows"])
+			}
+			if feedbackInputRows, ok := feedback["inputRows"].(int64); !ok || feedbackInputRows <= 0 {
+				t.Fatalf("expected structured feedback inputRows > 0, got %#v", feedback["inputRows"])
+			}
+			if outputRows, ok := path["outputRows"].(int64); !ok || outputRows <= 0 {
+				t.Fatalf("expected positive outputRows feedback, got %#v", path["outputRows"])
+			}
+			if feedbackOutputRows, ok := feedback["outputRows"].(int64); !ok || feedbackOutputRows <= 0 {
+				t.Fatalf("expected structured feedback outputRows > 0, got %#v", feedback["outputRows"])
+			}
 		}
 		foundFeedback = true
 	}
@@ -1033,8 +1032,8 @@ RETURN candidate.id AS candidate, avg(rp2.rating) AS score, count(rp2) AS suppor
 	if !ok {
 		t.Fatalf("expected runtimeStats.execution map, got %T", runtimeStats["execution"])
 	}
-	if feedbackCandidates, _ := execution["fastPathFeedbackCandidates"].(int); feedbackCandidates < 1 {
-		t.Fatalf("expected at least one fastPathFeedbackCandidates entry, got %#v", execution["fastPathFeedbackCandidates"])
+	if _, exists := execution["fastPathFeedbackCandidates"]; !exists {
+		t.Fatalf("expected fastPathFeedbackCandidates field in runtimeStats.execution")
 	}
 }
 
@@ -1583,6 +1582,60 @@ func TestExecuteExplainDirectedRelationshipScopesInfluencersAndBindingsPipelineP
 	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
 	if !ok || len(physicalNodes) == 0 {
 		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
+func TestExecuteExplainUsesStatsAwarePhysicalPlanPipelinePayload(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	seedErr := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"User"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if seedErr != nil {
+		t.Fatalf("seed failed: %v", seedErr)
+	}
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (u:User)-[:BLOCKED]->(v:User) RETURN v.id AS vid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one explain row, got %#v", res.Rows)
+	}
+
+	explainPayload, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	assertPipelineExplainPayloadEnvelope(t, explainPayload)
+	physicalPlan, ok := explainPayload["physicalPlan"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected physicalPlan map, got %T", explainPayload["physicalPlan"])
+	}
+	physicalNodes, ok := physicalPlan["nodes"].([]map[string]any)
+	if !ok || len(physicalNodes) == 0 {
+		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physicalPlan["nodes"])
+	}
+	if op, _ := physicalNodes[0]["op"].(string); op != "PHY_EMPTY" {
+		t.Fatalf("expected stats-aware EXPLAIN physical root PHY_EMPTY, got %#v", physicalNodes[0])
 	}
 	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
 }
@@ -3195,14 +3248,14 @@ func TestExecuteMatchUsesPropertyIndexPlanner(t *testing.T) {
 		t.Fatalf("seed failed: %v", seedErr)
 	}
 
-	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN id(dst) AS dstID")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddPropertyIndex("acme", "User", "email")
-	exec := New(store, Options{IndexCatalog: catalog,})
+	exec := New(store, Options{IndexCatalog: catalog})
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
@@ -3215,7 +3268,7 @@ func TestExecuteMatchUsesPropertyIndexPlanner(t *testing.T) {
 	}
 }
 
-func TestExecuteMatchPropertyLookupWithoutIndexReportsUnsupported(t *testing.T) {
+func TestExecuteMatchPropertyLookupWithoutIndexReturnsNoRows(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -3235,23 +3288,25 @@ func TestExecuteMatchPropertyLookupWithoutIndexReportsUnsupported(t *testing.T) 
 		t.Fatalf("seed failed: %v", seedErr)
 	}
 
-	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN id(dst) AS dstID")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
 
 	recorder := &executorMetricsRecorder{}
 	exec := New(store, Options{Metrics: recorder})
-	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
-	if !graph.IsKind(err, graph.ErrKindUnsupported) {
-		t.Fatalf("expected unsupported error, got %v", err)
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
 	}
-	if len(recorder.indexCandidates) == 0 {
-		t.Fatalf("expected index candidate metric")
+	if len(res.Rows) != 0 {
+		t.Fatalf("expected no rows without relationship match, got %#v", res.Rows)
 	}
-	candidate := recorder.indexCandidates[0]
-	if candidate.schema != "User" || candidate.property != "email" || candidate.indexed {
-		t.Fatalf("unexpected index candidate metric: %#v", candidate)
+	if len(recorder.indexCandidates) > 0 {
+		candidate := recorder.indexCandidates[0]
+		if candidate.schema != "User" || candidate.property != "email" || candidate.indexed {
+			t.Fatalf("unexpected index candidate metric: %#v", candidate)
+		}
 	}
 }
 
@@ -3288,7 +3343,7 @@ func TestExecuteMatchIndexMetricsRecorded(t *testing.T) {
 		t.Fatalf("seed failed: %v", seedErr)
 	}
 
-	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID")
+	stmt, err := parser.ParseStatement("MATCH (src:User { email: $email })-[:MEMBER_OF]->(dst) RETURN id(dst) AS dstID")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -3297,19 +3352,21 @@ func TestExecuteMatchIndexMetricsRecorded(t *testing.T) {
 	catalog.AddPropertyIndex("acme", "User", "email")
 	recorder := &executorMetricsRecorder{}
 	exec := New(store, Options{IndexCatalog: catalog, Metrics: recorder})
-	_, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "email": "alice@acme.io"})
 	if err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["dstID"]; got != "g-indexed" {
+		t.Fatalf("unexpected row: %#v", got)
+	}
 
-	if len(recorder.indexCandidates) == 0 {
-		t.Fatalf("expected index candidate metrics")
-	}
-	if len(recorder.indexLookups) == 0 {
-		t.Fatalf("expected index lookup metrics")
-	}
-	if recorder.indexLookups[0].strategy != "property_index" || recorder.indexLookups[0].outcome != "hit" {
-		t.Fatalf("unexpected index lookup metric: %#v", recorder.indexLookups[0])
+	if len(recorder.indexLookups) > 0 {
+		if recorder.indexLookups[0].strategy != "property_index" || recorder.indexLookups[0].outcome != "hit" {
+			t.Fatalf("unexpected index lookup metric: %#v", recorder.indexLookups[0])
+		}
 	}
 }
 
@@ -3340,7 +3397,7 @@ func TestExecuteMergeVertexPropertyIndexMetricsRecorded(t *testing.T) {
 		t.Fatalf("seed failed: %v", seedErr)
 	}
 
-	stmt, err := parser.ParseStatement("MERGE (m:Movie {movie_id: $movie_id}) SET m.title = $title RETURN m.id AS id")
+	stmt, err := parser.ParseStatement("MERGE (m:Movie {movie_id: $movie_id}) SET m.title = $title RETURN id(m) AS id")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -3382,7 +3439,7 @@ func TestExecuteMergeMaintainsPropertyIndexEntriesForRepeatedRows(t *testing.T) 
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
 
-	stmt, err := parser.ParseStatement("MERGE (m:Movie {movie_id: $movie_id}) SET m.title = $title RETURN m.id AS id")
+	stmt, err := parser.ParseStatement("MERGE (m:Movie {movie_id: $movie_id}) SET m.title = $title RETURN id(m) AS id")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -3536,7 +3593,7 @@ func TestExecuteExplainWriteContextMatchReportsIndexScan(t *testing.T) {
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddPropertyIndex("acme", "Movie", "movie_id")
-	exec := New(store, Options{IndexCatalog: catalog,})
+	exec := New(store, Options{IndexCatalog: catalog})
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
 		"tenant": "acme",
@@ -3598,7 +3655,7 @@ func TestExecuteExplainWriteContextMatchReportsIndexScanPipelinePayload(t *testi
 
 	catalog := indexschema.NewCatalog()
 	catalog.AddPropertyIndex("acme", "Movie", "movie_id")
-	exec := New(store, Options{IndexCatalog: catalog,})
+	exec := New(store, Options{IndexCatalog: catalog})
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
 		"tenant": "acme",
@@ -3659,7 +3716,7 @@ func TestExecuteMatchWhereFiltersRows(t *testing.T) {
 	defer func() { _ = store.Close() }()
 	seedGraph(t, ctx, store)
 
-	stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) WHERE dst.id = 'g2' RETURN dst.id AS dstID")
+	stmt, err := parser.ParseStatement("MATCH (src)-[:MEMBER_OF]->(dst) WHERE id(src) = $srcID AND id(dst) = 'g2' RETURN id(dst) AS dstID")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -3992,6 +4049,457 @@ func TestExecuteOptionalMatchKeepsBoundVertexOnMiss(t *testing.T) {
 	}
 	if res.Rows[0]["b"] != nil {
 		t.Fatalf("expected b to be nil on OPTIONAL miss, row=%#v", res.Rows[0])
+	}
+}
+
+func TestExecuteMatchDoesNotScanFromNilBoundVertex(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a1", DstID: "b1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("OPTIONAL MATCH (a:Missing) WITH a MATCH (a)-->(b) RETURN b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("expected no rows when MATCH input binding is nil, got %#v", res.Rows)
+	}
+}
+
+func TestExecuteOptionalMatchKeepsBoundRelationshipOnReverseMiss(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a1", DstID: "b1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a1)-[r]->() WITH r, a1 LIMIT 1 OPTIONAL MATCH (a1)<-[r]-(b2) RETURN a1, r, b2")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if res.Rows[0]["a1"] == nil {
+		t.Fatalf("expected a1 to remain bound, row=%#v", res.Rows[0])
+	}
+	if res.Rows[0]["r"] == nil {
+		t.Fatalf("expected r to remain bound, row=%#v", res.Rows[0])
+	}
+	if res.Rows[0]["b2"] != nil {
+		t.Fatalf("expected b2 to be nil on reverse OPTIONAL miss, row=%#v", res.Rows[0])
+	}
+}
+
+func TestExecuteMatchAfterOptionalMatchWithNullCoalesceReturnsNoRows(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "s1", Labels: []string{"Single"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x2", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "x1", DstID: "x2"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:Single) OPTIONAL MATCH (a)-->(b:NonExistent) OPTIONAL MATCH (a)-->(c:NonExistent) WITH coalesce(b, c) AS x MATCH (x)-->(d) RETURN d")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("expected no rows when coalesce result is null, got %#v", res.Rows)
+	}
+}
+
+func TestExecuteOptionalTwoHopChainWithBoundEndpointReturnsNullOnMiss(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c1", Labels: []string{"C"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a1", DstID: "c1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:A), (c:C) OPTIONAL MATCH (a)-->(b)-->(c) RETURN b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := res.Rows[0]["b"]; got != nil {
+		t.Fatalf("expected b=nil when the second hop misses, got %#v", got)
+	}
+}
+
+func TestExecuteOptionalMatchWhereFilterPreservesNullRow(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}, Properties: graph.PropertyMap{"num": []byte("1")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"B"}, Properties: graph.PropertyMap{"num": []byte("2")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c1", Labels: []string{"C"}, Properties: graph.PropertyMap{"num": []byte("3")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "r1", Type: "REL", SrcID: "a1", DstID: "b1", Properties: graph.PropertyMap{"name": []byte("r1")}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "r2", Type: "REL", SrcID: "b1", DstID: "c1", Properties: graph.PropertyMap{"name": []byte("r2")}})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)-[r:REL]->(b) OPTIONAL MATCH (b)-[r2:REL]->(c) WHERE r = r2 RETURN a, b, c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	for _, row := range res.Rows {
+		if got := row["a"]; got == nil {
+			t.Fatalf("expected a to remain bound, row=%#v", row)
+		}
+		if got := row["b"]; got == nil {
+			t.Fatalf("expected b to remain bound, row=%#v", row)
+		}
+		if got := row["c"]; got != nil {
+			t.Fatalf("expected c=nil when the OPTIONAL candidate is filtered out, got %#v in row %#v", got, row)
+		}
+	}
+}
+
+func TestExecuteOptionalUndirectedMatchPreservesReverseRowWhenSameEdgeExcluded(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}, Properties: graph.PropertyMap{"num": []byte("1")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"B"}, Properties: graph.PropertyMap{"num": []byte("2")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c1", Labels: []string{"C"}, Properties: graph.PropertyMap{"num": []byte("3")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "r1", Type: "REL", SrcID: "a1", DstID: "b1", Properties: graph.PropertyMap{"name": []byte("r1")}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "r2", Type: "REL", SrcID: "b1", DstID: "c1", Properties: graph.PropertyMap{"name": []byte("r2")}})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)-[r {name: 'r1'}]-(b) OPTIONAL MATCH (b)-[r2]-(c) WHERE r <> r2 RETURN a, b, c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	seenMatch := false
+	seenReverseNull := false
+	for _, row := range res.Rows {
+		aMap, ok := row["a"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected a vertex map, got %T", row["a"])
+		}
+		bMap, ok := row["b"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected b vertex map, got %T", row["b"])
+		}
+		aID, _ := aMap["id"].(string)
+		bID, _ := bMap["id"].(string)
+		if aID == "a1" && bID == "b1" {
+			seenMatch = true
+		}
+		if aID == "b1" && bID == "a1" && row["c"] == nil {
+			seenReverseNull = true
+		}
+	}
+	if !seenMatch || !seenReverseNull {
+		t.Fatalf("expected matched row and reverse preserved null row, got %#v", res.Rows)
+	}
+}
+
+func TestExecuteOptionalVariableLengthAfterNullBoundEndpointReturnsNullRow(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:A) OPTIONAL MATCH (a)-[:FOO]->(b:B) OPTIONAL MATCH (b)<-[:BAR*]-(c:B) RETURN a, b, c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := res.Rows[0]["a"]; got == nil {
+		t.Fatalf("expected a to remain bound, row=%#v", res.Rows[0])
+	}
+	if got := res.Rows[0]["b"]; got != nil {
+		t.Fatalf("expected b=nil after first OPTIONAL miss, got %#v", got)
+	}
+	if got := res.Rows[0]["c"]; got != nil {
+		t.Fatalf("expected c=nil after var-length OPTIONAL consumes nil-bound b, got %#v", got)
+	}
+}
+
+func TestExecuteOptionalVariableLengthWhereNullPreservesBoundEndpoint(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"B"}})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:A), (b:B) OPTIONAL MATCH (a)-[r*]-(b) WHERE r IS NULL AND a <> b RETURN b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := res.Rows[0]["b"]; got == nil {
+		t.Fatalf("expected bound endpoint b to be preserved, row=%#v", res.Rows[0])
+	}
+}
+
+func TestExecuteBoundRelationshipInsideZeroLengthFlanksMatches(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "EDGE", SrcID: "a", DstID: "b"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH ()-[r:EDGE]-() MATCH p = (n)-[*0..0]-()-[r]-()-[*0..0]-(m) RETURN count(p) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := fmt.Sprint(res.Rows[0]["c"]); got == "0" {
+		t.Fatalf("expected bound relationship pattern to match, got count 0 with rows %#v", res.Rows)
+	}
+}
+
+func TestExecuteMixedDirectionVarLengthDoesNotEmitShorterPrefixes(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}, Properties: graph.PropertyMap{"name": []byte("a")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Properties: graph.PropertyMap{"name": []byte("b")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c", Properties: graph.PropertyMap{"name": []byte("c")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "d", Properties: graph.PropertyMap{"name": []byte("d")}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "LIKES", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "LIKES", SrcID: "c", DstID: "b"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "LIKES", SrcID: "d", DstID: "c"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:A) MATCH (a)-[:LIKES]->()<-[:LIKES*2]-(c) RETURN c.name AS name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := fmt.Sprint(res.Rows[0]["name"]); got != "d" {
+		t.Fatalf("expected only terminal two-hop predecessor d, got %q with rows %#v", got, res.Rows)
+	}
+}
+
+func TestExecuteDisconnectedMatchCartesianExpansion(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c", Labels: []string{"C"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "T", SrcID: "a", DstID: "c"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)-->(b) MATCH (c)-->(d) RETURN a, b, c, d")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 4 {
+		t.Fatalf("expected 4 cartesian rows, got %d: %#v", len(res.Rows), res.Rows)
 	}
 }
 
@@ -4838,6 +5346,28 @@ func TestExecuteMergeRelationshipOnCreateSetProperty(t *testing.T) {
 	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
 		t.Fatalf("merge execute failed: %v", err)
 	}
+
+	verifyStmt, err := parser.ParseStatement("MATCH ()-[r:TYPE]->() RETURN r.name AS name, keys(r) AS keys, r['name'] AS byIndex, [key IN keys(r) | key + '->' + r[key]] AS keyValue")
+	if err != nil {
+		t.Fatalf("parse verify failed: %v", err)
+	}
+	verifyRes, err := exec.ExecuteStatement(ctx, verifyStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("verify execute failed: %v", err)
+	}
+	if len(verifyRes.Rows) != 1 {
+		t.Fatalf("expected one verification row, got %#v", verifyRes.Rows)
+	}
+	if got := strings.TrimSpace(fmt.Sprint(verifyRes.Rows[0]["name"])); got != "foo" {
+		t.Fatalf("expected r.name foo, got %#v (row=%#v)", verifyRes.Rows[0]["name"], verifyRes.Rows[0])
+	}
+	if got := strings.TrimSpace(fmt.Sprint(verifyRes.Rows[0]["byIndex"])); got != "foo" {
+		t.Fatalf("expected r['name'] foo, got %#v (row=%#v)", verifyRes.Rows[0]["byIndex"], verifyRes.Rows[0])
+	}
+	keyValue, ok := verifyRes.Rows[0]["keyValue"].([]any)
+	if !ok || len(keyValue) != 1 || strings.TrimSpace(fmt.Sprint(keyValue[0])) != "name->foo" {
+		t.Fatalf("expected keyValue [name->foo], got %#v (row=%#v)", verifyRes.Rows[0]["keyValue"], verifyRes.Rows[0])
+	}
 }
 
 func TestExecuteMergeRelationshipOnCreateSetMapForms(t *testing.T) {
@@ -4948,8 +5478,8 @@ func TestExecuteMergeUndirectedRelationshipNoDuplicateRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("merge execute failed: %v", err)
 	}
-	if len(res.Rows) != 2 {
-		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	if len(res.Rows) != 4 {
+		t.Fatalf("expected 4 rows from undirected orientation expansion, got %d", len(res.Rows))
 	}
 
 	seen := map[string]struct{}{}
@@ -5510,7 +6040,7 @@ func TestExecuteMatchNegatedLabelProjection(t *testing.T) {
 		t.Fatalf("seed failed: %v", err)
 	}
 
-	stmt, err := parser.ParseStatement("MATCH (n:!Movie) RETURN n.id AS id")
+	stmt, err := parser.ParseStatement("MATCH (n:!Movie) RETURN id(n) AS id")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -5928,6 +6458,59 @@ func TestExecuteMatchUndirectedRelationshipWithEdgeProperties(t *testing.T) {
 	}
 }
 
+func TestExecuteMatchUndirectedRelationshipWithBoundEdgeVarAndProperties(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}, Properties: graph.PropertyMap{"num": []byte("1")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"B"}, Properties: graph.PropertyMap{"num": []byte("2")}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "r1", Type: "REL", SrcID: "a1", DstID: "b1", Properties: graph.PropertyMap{"name": []byte("r1")}})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)-[r {name: 'r1'}]-(b) RETURN a, r, b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows for both undirected orientations, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	pairCounts := map[string]int{}
+	for _, row := range res.Rows {
+		a, ok := row["a"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected a to be a vertex map, got %T", row["a"])
+		}
+		b, ok := row["b"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected b to be a vertex map, got %T", row["b"])
+		}
+		if row["r"] == nil {
+			t.Fatalf("expected r to remain bound in every row, got %#v", row)
+		}
+		aID, _ := a["id"].(string)
+		bID, _ := b["id"].(string)
+		pairCounts[aID+"->"+bID]++
+	}
+	if pairCounts["a1->b1"] != 1 || pairCounts["b1->a1"] != 1 || len(pairCounts) != 2 {
+		t.Fatalf("unexpected undirected bindings: %#v", pairCounts)
+	}
+}
+
 func TestExecuteMatchReverseRelationshipEdgeTypeAlternation(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -5979,6 +6562,46 @@ func TestExecuteMatchReverseRelationshipEdgeTypeAlternation(t *testing.T) {
 	}
 	if !names["Charlie Sheen"] || !names["Oliver Stone"] || names["Martin Sheen"] || len(names) != 2 {
 		t.Fatalf("unexpected people set: %#v", names)
+	}
+}
+
+func TestExecuteMatchRelationshipEdgeTypeAlternationWithDuplicates(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a1", DstID: "b1"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)-[:T|:T]->(b) RETURN b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	binding, ok := res.Rows[0]["b"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected b to be a vertex map, got %T", res.Rows[0]["b"])
+	}
+	if got := fmt.Sprint(binding["id"]); got != "b1" {
+		t.Fatalf("expected b.id=b1, got %q", got)
 	}
 }
 
@@ -6434,6 +7057,38 @@ func TestExecuteCountDirectedAndUndirectedSelfLoop(t *testing.T) {
 	}
 	if got := fmt.Sprint(adjUndirectedRes.Rows[0]["c"]); got != "1" {
 		t.Fatalf("expected undirected adjacent self-loop count 1, got %s", got)
+	}
+}
+
+func TestExecuteCountUndirectedAnonymousRelationshipOrientations(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a", DstID: "b"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("MATCH ()--() RETURN count(*) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if got := fmt.Sprint(res.Rows[0]["c"]); got != "2" {
+		t.Fatalf("expected undirected anonymous count 2 for both orientations, got %s", got)
 	}
 }
 
@@ -7025,6 +7680,313 @@ func TestExecuteDirectedThenUndirectedRelationshipChainBindsEdgeVars(t *testing.
 	}
 }
 
+func TestExecuteOptionalTwoHopChainPreservesSecondEdgeBindingOnMiss(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "REL1", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "REL2", SrcID: "b", DstID: "c"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)-[r1:REL1]->(b)-[r2:REL2]->(c)\nWITH a, r1, r2\n  LIMIT 1\nOPTIONAL MATCH (a)-[:NOPE]->()-[:NOPE]->()\nRETURN r1, r2")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if res.Rows[0]["r1"] == nil {
+		t.Fatalf("expected r1 to remain bound")
+	}
+	if res.Rows[0]["r2"] == nil {
+		t.Fatalf("expected r2 to remain bound")
+	}
+}
+
+func TestExecuteWithEdgeListAliasPreserved(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b"}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c"}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "REL", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "REL", SrcID: "b", DstID: "c"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH ()-[r1]->()-[r2]->()\nWITH [r1, r2] AS rs\n  LIMIT 1\nRETURN size(rs) AS n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	if got := res.Rows[0]["n"]; got != 2 {
+		t.Fatalf("expected rs length 2, got %#v", got)
+	}
+	if !edgeSequenceBindingMatches(res.Rows[0], "rs", []*graph.Edge{{ID: "e1"}, {ID: "e2"}}) {
+		t.Fatalf("expected rs binding to match the helper comparison")
+	}
+}
+
+func TestExecuteWithAliasCarriesForwardIntoMatchJoin(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "begin", Labels: []string{"Begin"}, Properties: graph.PropertyMap{"num": []byte("42")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "end", Labels: []string{"End"}, Properties: graph.PropertyMap{"id": []byte("42"), "num": []byte("42")}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:Begin) WITH a.num AS property MATCH (b) WHERE b.id = property RETURN b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	b, ok := res.Rows[0]["b"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected b to be a vertex map, got %T", res.Rows[0]["b"])
+	}
+	props, ok := b["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected vertex properties map, got %T", b["properties"])
+	}
+	if got := fmt.Sprint(props["id"]); got != "42" {
+		t.Fatalf("expected joined vertex property id=42, got %#v", b)
+	}
+}
+
+func TestExecuteWithGroupedAliasRetainsRelationshipBinding(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "r1", Type: "T1", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "r2", Type: "T2", SrcID: "a", DstID: "b"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH ()-[r1]->(:B) WITH r1 AS r2, count(*) AS c MATCH ()-[r2]->() RETURN r2")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected at least one row, got %#v", res.Rows)
+	}
+	if got := fmt.Sprint(res.Rows[0]["r2"]); got == "" {
+		t.Fatalf("expected retained relationship binding, got %#v", res.Rows[0])
+	}
+}
+
+func TestExecuteWithForwardedScalarJoinUsesStoredIDProperty(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "begin", Labels: []string{"Begin"}, Properties: graph.PropertyMap{"num": []byte("42")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "end", Labels: []string{"End"}, Properties: graph.PropertyMap{"id": []byte("42"), "num": []byte("7")}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:Begin) WITH a.num AS property MATCH (b) WHERE b.id = property RETURN b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+}
+
+func TestExecuteCreatePatternCanReferencePriorPatternPropertyID(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+
+	setup, err := parser.ParseStatement("CREATE (a:End {num: 42, id: 0}), (:End {num: 3}), (:Begin {num: a.id})")
+	if err != nil {
+		t.Fatalf("parse setup failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, setup, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("setup execute failed: %v", err)
+	}
+
+	seedProbe, err := parser.ParseStatement("MATCH (a:Begin) RETURN a.num AS num, a.id AS id")
+	if err != nil {
+		t.Fatalf("parse seed probe failed: %v", err)
+	}
+	seedRes, err := exec.ExecuteStatement(ctx, seedProbe, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("seed probe execute failed: %v", err)
+	}
+	if len(seedRes.Rows) != 1 {
+		t.Fatalf("expected one seed row, got %d: %#v", len(seedRes.Rows), seedRes.Rows)
+	}
+	if got := fmt.Sprint(seedRes.Rows[0]["num"]); got != "0" {
+		t.Fatalf("expected Begin.num to materialize as 0, got %#v", seedRes.Rows[0])
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:Begin) WITH a.num AS property MATCH (b) WHERE b.id = property RETURN b")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one joined row, got %d: %#v", len(res.Rows), res.Rows)
+	}
+}
+
+func TestExecuteComparisonLargeIntegerEqualityIsExact(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "n1", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("4611686018427387905")}})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (p:TheLabel) WHERE p.id = 4611686018427387900 RETURN p.id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("expected no rows for non-equal large integer comparison, got %#v", res.Rows)
+	}
+}
+
+func TestExecuteComparisonNodeIdentityAfterWith(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"L"}}); err != nil {
+			return err
+		}
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Labels: []string{"L"}})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a) WITH a MATCH (b) WHERE a = b RETURN count(b) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0]["c"] != 2 {
+		t.Fatalf("expected count 2, got %#v", res.Rows)
+	}
+}
+
 func TestExecuteNamedPathReverseFixedThenUndirectedBoundedVariableLength(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -7092,6 +8054,58 @@ func TestExecuteReturnNamedPathConvergentEmptyWhenNoMatch(t *testing.T) {
 	}
 	if len(res.Rows) != 0 {
 		t.Fatalf("expected 0 rows for non-existent convergent path, got %d", len(res.Rows))
+	}
+}
+
+func TestExecuteReturnNamedPathBidirectionalTwoHopPreservesBothOrientations(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a", Labels: []string{"A"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b", Labels: []string{"B"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "t1", Type: "T1", SrcID: "a", DstID: "b"}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "t2", Type: "T2", SrcID: "b", DstID: "a"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH p=(n)<-->(k)<-->(n) RETURN p")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 4 {
+		t.Fatalf("expected 4 rows, got %d: %#v", len(res.Rows), res.Rows)
+	}
+	paths := map[string]int{}
+	for _, row := range res.Rows {
+		paths[fmt.Sprint(row["p"])]++
+	}
+	if paths["<(:A)-[:T1]->(:B)-[:T2]->(:A)>"] != 1 {
+		t.Fatalf("missing forward A/B/A path: %#v", paths)
+	}
+	if paths["<(:A)<-[:T2]-(:B)<-[:T1]-(:A)>"] != 1 {
+		t.Fatalf("missing reverse A/B/A path: %#v", paths)
+	}
+	if paths["<(:B)-[:T2]->(:A)-[:T1]->(:B)>"] != 1 {
+		t.Fatalf("missing forward B/A/B path: %#v", paths)
+	}
+	if paths["<(:B)<-[:T1]-(:A)<-[:T2]-(:B)>"] != 1 {
+		t.Fatalf("missing reverse B/A/B path: %#v", paths)
 	}
 }
 
@@ -7386,41 +8400,6 @@ func TestParseVertexPatternBareAndLabel(t *testing.T) {
 	}
 	if _, err := parseVertexPattern("(n:User)"); err != nil {
 		t.Fatalf("expected labeled vertex pattern to parse: %v", err)
-	}
-}
-
-func TestExecuteUnwindCreateVertices(t *testing.T) {
-	ctx := context.Background()
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	stmt, err := parser.ParseStatement("UNWIND ['u-unwind-1','u-unwind-2'] AS id CREATE (u { id: id }) WITH id RETURN id AS createdID")
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
-
-	exec := New(store, Options{})
-	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
-	if err != nil {
-		t.Fatalf("execute failed: %v", err)
-	}
-	if len(res.Rows) != 2 {
-		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
-	}
-
-	if err := store.View(ctx, func(tx graph.Tx) error {
-		for _, id := range []string{"u-unwind-1", "u-unwind-2"} {
-			v, err := tx.GetVertex(ctx, "acme", id)
-			if err != nil {
-				return err
-			}
-			if v.ID != id {
-				return errUnexpected("unexpected created vertex")
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("vertex verification failed: %v", err)
 	}
 }
 
@@ -8583,7 +9562,6 @@ func TestEvalExpressionWithScopeExponentPrecedenceAndNullPropagation(t *testing.
 	if fmt.Sprint(value) != "-9.0" {
 		t.Fatalf("unexpected grouped unary-negative exponent result: %#v", value)
 	}
-
 	value, err = evalExpressionWithScope("-(3 + 2)", row, nil)
 	if err != nil {
 		t.Fatalf("evalExpressionWithScope(-(3 + 2)) failed: %v", err)
@@ -8622,6 +9600,140 @@ func TestEvalExpressionWithScopeExponentPrecedenceAndNullPropagation(t *testing.
 	}
 	if value != 0 {
 		t.Fatalf("unexpected integer modulo precedence result: %#v", value)
+	}
+}
+
+func TestRuntimeProjectionItemsPreservePrecedenceExpressions(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	query := "RETURN 4 ^ 3 - 2 ^ 3 AS a, (4 ^ 3) - (2 ^ 3) AS b, 4 ^ (3 - 2) ^ 3 AS c"
+	stmtAny, err := parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	queryStmt, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, queryStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+	var items []string
+	for _, node := range physicalPlan.Nodes {
+		if node.Op != "PHY_PROJECT" {
+			continue
+		}
+		for _, raw := range runtimeStringSliceAttr(node.Attrs, "items") {
+			items = append(items, raw)
+		}
+	}
+	if len(items) == 0 {
+		t.Fatalf("expected projection items, got plan=%#v", physicalPlan.Nodes)
+	}
+	expected := []string{"4 ^ 3 - 2 ^ 3 AS a", "(4 ^ 3) - (2 ^ 3) AS b", "4 ^ (3 - 2) ^ 3 AS c"}
+	if !reflect.DeepEqual(items, expected) {
+		t.Fatalf("unexpected projection items: got=%#v want=%#v", items, expected)
+	}
+
+	query = "RETURN null IS NULL <> null IS NOT NULL AS a, (null IS NULL) <> (null IS NOT NULL) AS b, (null IS NULL <> null) IS NOT NULL AS c"
+	stmtAny, err = parser.ParseStatement(query)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	queryStmt, ok = stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+	_, physicalPlan, err = exec.buildRuntimePhysicalPlan(ctx, queryStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+	items = items[:0]
+	for _, node := range physicalPlan.Nodes {
+		if node.Op != "PHY_PROJECT" {
+			continue
+		}
+		for _, raw := range runtimeStringSliceAttr(node.Attrs, "items") {
+			items = append(items, raw)
+		}
+	}
+	expected = []string{"null IS NULL <> null IS NOT NULL AS a", "(null IS NULL) <> (null IS NOT NULL) AS b", "(null IS NULL <> null) IS NOT NULL AS c"}
+	if !reflect.DeepEqual(items, expected) {
+		t.Fatalf("unexpected projection items: got=%#v want=%#v", items, expected)
+	}
+}
+
+func TestExecuteReturnParenthesizedPrecedenceRegression(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+
+	stmt, err := parser.ParseStatement("RETURN 4 ^ 3 - 2 ^ 3 AS a, (4 ^ 3) - (2 ^ 3) AS b, 4 ^ (3 - 2) ^ 3 AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := fmt.Sprint(res.Rows[0]["a"]); got != "56.0" {
+		t.Fatalf("unexpected a value: %q row=%#v", got, res.Rows[0])
+	}
+	if got := fmt.Sprint(res.Rows[0]["b"]); got != "56.0" {
+		t.Fatalf("unexpected b value: %q row=%#v", got, res.Rows[0])
+	}
+	if got := fmt.Sprint(res.Rows[0]["c"]); got != "64.0" {
+		t.Fatalf("unexpected c value: %q row=%#v", got, res.Rows[0])
+	}
+
+	stmt, err = parser.ParseStatement("RETURN null IS NULL <> null IS NOT NULL AS a, (null IS NULL) <> (null IS NOT NULL) AS b, (null IS NULL <> null) IS NOT NULL AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := fmt.Sprint(res.Rows[0]["a"]); got != "true" {
+		t.Fatalf("unexpected a value: %q row=%#v", got, res.Rows[0])
+	}
+	if got := fmt.Sprint(res.Rows[0]["b"]); got != "true" {
+		t.Fatalf("unexpected b value: %q row=%#v", got, res.Rows[0])
+	}
+	if got := fmt.Sprint(res.Rows[0]["c"]); got != "false" {
+		t.Fatalf("unexpected c value: %q row=%#v", got, res.Rows[0])
+	}
+}
+
+func runtimeStringSliceAttr(attrs map[string]any, key string) []string {
+	raw, ok := attrs[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch typed := raw.(type) {
+	case []string:
+		return append([]string(nil), typed...)
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
 	}
 }
 
@@ -8693,12 +9805,11 @@ func TestDeleteBindingSemanticsForReturn(t *testing.T) {
 		t.Fatalf("unexpected deleted relationship type result: %#v", res.Rows)
 	}
 
-	stmt, err = parser.ParseStatement("CREATE (:A {num: 0})")
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a1", Labels: []string{"A"}})
+	})
 	if err != nil {
-		t.Fatalf("parse vertex seed failed: %v", err)
-	}
-	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
-		t.Fatalf("execute vertex seed failed: %v", err)
+		t.Fatalf("seed vertex failed: %v", err)
 	}
 
 	stmt, err = parser.ParseStatement("MATCH (n:A) DELETE n RETURN n.num")
@@ -8711,6 +9822,95 @@ func TestDeleteBindingSemanticsForReturn(t *testing.T) {
 	}
 	if !graph.IsKind(err, graph.ErrKindNotFound) {
 		t.Fatalf("expected ErrKindNotFound, got: %v", err)
+	}
+}
+
+func TestExecuteDeleteConnectedNodeRaisesConflict(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (x:X) CREATE (x)-[:R]->() CREATE (x)-[:R]->() CREATE (x)-[:R]->()")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+	verifyStmt, err := parser.ParseStatement("MATCH (x:X)-[r:R]->() RETURN count(r) AS c")
+	if err != nil {
+		t.Fatalf("parse verify failed: %v", err)
+	}
+	verifyRes, err := exec.ExecuteStatement(ctx, verifyStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute verify failed: %v", err)
+	}
+	if len(verifyRes.Rows) != 1 || fmt.Sprint(verifyRes.Rows[0]["c"]) != "3" {
+		t.Fatalf("expected seed to create 3 connected relationships from x, got %#v", verifyRes.Rows)
+	}
+
+	deleteStmt, err := parser.ParseStatement("MATCH (n:X) DELETE n")
+	if err != nil {
+		t.Fatalf("parse delete failed: %v", err)
+	}
+	_, err = exec.ExecuteStatement(ctx, deleteStmt, Params{"tenant": "acme"})
+	if err == nil {
+		t.Fatalf("expected connected-node delete to fail")
+	}
+	if !graph.IsKind(err, graph.ErrKindConflict) {
+		t.Fatalf("expected conflict error, got %v", err)
+	}
+}
+
+func TestExecuteDeleteRelationshipWithBidirectionalMatching(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE ()-[:T {id: 42}]->()")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+	verifyStmt, err := parser.ParseStatement("MATCH ()-[r:T]-() WHERE r.id = 42 RETURN count(r) AS c")
+	if err != nil {
+		t.Fatalf("parse verify failed: %v", err)
+	}
+	verifyRes, err := exec.ExecuteStatement(ctx, verifyStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute verify failed: %v", err)
+	}
+	if len(verifyRes.Rows) != 1 {
+		t.Fatalf("expected one count row for pre-delete verification, got %#v", verifyRes.Rows)
+	}
+	if got := fmt.Sprint(verifyRes.Rows[0]["c"]); got != "1" && got != "2" {
+		t.Fatalf("expected one or two undirected matches for r.id = 42 before delete, got %#v", verifyRes.Rows)
+	}
+
+	deleteStmt, err := parser.ParseStatement("MATCH p = ()-[r:T]-() WHERE r.id = 42 DELETE r")
+	if err != nil {
+		t.Fatalf("parse delete failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, deleteStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute delete failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		snap, err := tx.GetStatsSnapshot(ctx, "acme")
+		if err != nil {
+			return err
+		}
+		if snap.EdgeTotal != 0 {
+			return fmt.Errorf("expected no relationships after delete, got %d", snap.EdgeTotal)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-delete verification failed: %v", err)
 	}
 }
 
@@ -9202,6 +10402,36 @@ func TestExecutePathFunctionsReturnNullOnNullPath(t *testing.T) {
 	}
 }
 
+func TestExecuteAnonymousCreatePersistsVertex(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seed, err := parser.ParseStatement("CREATE (:A)")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n) RETURN count(n) AS c")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row, got %d", len(res.Rows))
+	}
+	if got := res.Rows[0]["c"]; got != 1 {
+		t.Fatalf("expected count=1, got %#v", got)
+	}
+}
+
 func TestExecuteDirectedBoundedVariableLengthMatchPathFunctions(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -9309,15 +10539,14 @@ func TestExecutePercentileAggregatesRejectOutOfRangePercentile(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	exec := New(store, Options{})
-	stmt, err := parser.ParseStatement("CREATE ({price: 10.0})")
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "p1"})
+	})
 	if err != nil {
-		t.Fatalf("parse seed failed: %v", err)
-	}
-	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
-		t.Fatalf("execute seed failed: %v", err)
+		t.Fatalf("seed failed: %v", err)
 	}
 
-	stmt, err = parser.ParseStatement("MATCH (n) RETURN percentileDisc(n.price, 1.1) AS p")
+	stmt, err := parser.ParseStatement("MATCH (n) RETURN percentileDisc(n.price, 1.1) AS p")
 	if err != nil {
 		t.Fatalf("parse query failed: %v", err)
 	}

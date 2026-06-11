@@ -20,5 +20,8 @@ type PaginationIntent = pipeline.PaginationIntent
 // PatternIntent aliases pipeline-level pattern intent.
 type PatternIntent = pipeline.PatternIntent
 
+// CallIntent aliases pipeline-level call intent.
+type CallIntent = pipeline.CallIntent
+
 // WriteActionIntent aliases pipeline-level write sequencing intent.
 type WriteActionIntent = pipeline.WriteActionIntent

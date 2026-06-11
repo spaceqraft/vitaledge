@@ -85,14 +85,16 @@ type IndexCatalog interface {
 }
 
 type Options struct {
-	Metrics      Metrics
-	IndexCatalog IndexCatalog
+	Metrics                      Metrics
+	IndexCatalog                 IndexCatalog
+	StrictRuntimeVariantDispatch bool
 }
 
 type Executor struct {
-	store        graph.GraphStore
-	metrics      Metrics
-	indexCatalog IndexCatalog
+	store                        graph.GraphStore
+	metrics                      Metrics
+	indexCatalog                 IndexCatalog
+	strictRuntimeVariantDispatch bool
 
 	fastPathFeedbackMu sync.RWMutex
 	fastPathFeedback   map[string]fastPathFeedbackSummary
@@ -131,35 +133,12 @@ func New(store graph.GraphStore, opts Options) *Executor {
 		metrics = noopMetrics{}
 	}
 	return &Executor{
-		store:            store,
-		metrics:          metrics,
-		indexCatalog:     opts.IndexCatalog,
-		fastPathFeedback: map[string]fastPathFeedbackSummary{},
+		store:                        store,
+		metrics:                      metrics,
+		indexCatalog:                 opts.IndexCatalog,
+		strictRuntimeVariantDispatch: opts.StrictRuntimeVariantDispatch,
+		fastPathFeedback:             map[string]fastPathFeedbackSummary{},
 	}
-}
-
-func (e *Executor) recordFastPathFeedback(implementation string, inputRows, outputRows int64) {
-	implementation = strings.TrimSpace(implementation)
-	if e == nil || implementation == "" || inputRows <= 0 {
-		return
-	}
-	if outputRows < 0 {
-		outputRows = 0
-	}
-	summary := fastPathFeedbackSummary{Samples: 1, InputRows: inputRows, OutputRows: outputRows}
-	e.fastPathFeedbackMu.Lock()
-	defer e.fastPathFeedbackMu.Unlock()
-	if e.fastPathFeedback == nil {
-		e.fastPathFeedback = map[string]fastPathFeedbackSummary{}
-	}
-	current := e.fastPathFeedback[implementation]
-	current.Samples += summary.Samples
-	current.InputRows += summary.InputRows
-	current.OutputRows += summary.OutputRows
-	if current.InputRows > 0 {
-		current.Selectivity = float64(current.OutputRows) / float64(current.InputRows)
-	}
-	e.fastPathFeedback[implementation] = current
 }
 
 func (e *Executor) fastPathFeedbackSnapshot(implementation string) (map[string]any, bool) {
@@ -182,6 +161,32 @@ func (e *Executor) fastPathFeedbackSnapshot(implementation string) (map[string]a
 		"source":         "runtime",
 		"implementation": implementation,
 	}, true
+}
+
+func (e *Executor) observeFastPathFeedback(implementation string, inputRows, outputRows int64) {
+	implementation = strings.TrimSpace(implementation)
+	if e == nil || implementation == "" || inputRows <= 0 || outputRows < 0 {
+		return
+	}
+	if outputRows > inputRows {
+		outputRows = inputRows
+	}
+	selectivity := 0.0
+	if inputRows > 0 {
+		selectivity = float64(outputRows) / float64(inputRows)
+	}
+	e.fastPathFeedbackMu.Lock()
+	defer e.fastPathFeedbackMu.Unlock()
+	current := e.fastPathFeedback[implementation]
+	current.Samples++
+	current.InputRows += inputRows
+	current.OutputRows += outputRows
+	if current.InputRows > 0 {
+		current.Selectivity = float64(current.OutputRows) / float64(current.InputRows)
+	} else {
+		current.Selectivity = selectivity
+	}
+	e.fastPathFeedback[implementation] = current
 }
 
 func stage1TopKPushdownShouldDisableFromFeedback(feedback map[string]any) bool {
@@ -274,12 +279,12 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 		e.metrics.ObserveRowsReturned(len(res.Rows))
 		return res, nil
 	case *ast.MatchQueryStatement:
-		res, execErr := e.executeMatchQuery(ctx, s, params)
+		runtimeRes, _, execErr := e.tryExecuteViaRuntimePipeline(ctx, s, params)
 		if execErr != nil {
 			return nil, execErr
 		}
-		e.metrics.ObserveRowsReturned(len(res.Rows))
-		return res, nil
+		e.metrics.ObserveRowsReturned(len(runtimeRes.Rows))
+		return runtimeRes, nil
 	case *ast.QueryStatement:
 		runtimeRes, _, execErr := e.tryExecuteViaRuntimePipeline(ctx, s, params)
 		if execErr != nil {
@@ -297,49 +302,6 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 	default:
 		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("statement kind %s not yet executable", stmt.Kind()), nil)
 	}
-}
-
-func (e *Executor) executeMatchQuery(ctx context.Context, stmt *ast.MatchQueryStatement, params Params) (*Result, error) {
-	if stmt == nil {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "match query statement is required", nil)
-	}
-	if len(stmt.MatchClauses) == 0 {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "at least one MATCH clause is required", nil)
-	}
-
-	rows := []Row{{}}
-	resultColumns := []string{}
-
-	execErr := e.store.View(ctx, func(tx graph.Tx) error {
-		for _, match := range stmt.MatchClauses {
-			kind := ast.ClauseKindMatch
-			if match.Optional {
-				kind = ast.ClauseKindOptionalMatch
-			}
-			matchClause := ast.Clause{Kind: kind, Raw: renderMatchClauseRaw(match), MatchPattern: strings.TrimSpace(match.Pattern), MatchOptional: match.Optional, Where: match.Where}
-			nextRows, err := e.applyMatchClause(ctx, tx, rows, matchClause, params)
-			if err != nil {
-				return err
-			}
-			rows = nextRows
-			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumnsForClause(matchClause)...)
-		}
-
-		projectedRows, cols, err := e.applyProjectionClause(ctx, tx, rows, ast.Clause{Kind: ast.ClauseKindReturn, Raw: renderReturnClauseRaw(stmt.Return), Projection: &stmt.Return}, params, resultColumns)
-		if err != nil {
-			return err
-		}
-		rows = projectedRows
-		resultColumns = cols
-		return nil
-	})
-	if execErr != nil {
-		return nil, execErr
-	}
-
-	result := &Result{Columns: resultColumns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}
-	result.Rows = normalizeResultRows(result.Rows)
-	return result, nil
 }
 
 func appendUniqueColumns(columns []string, candidates ...string) []string {
@@ -408,29 +370,6 @@ func inferMatchScopeColumns(clauseRaw string) []string {
 	}
 
 	return columns
-}
-
-func inferMatchScopeColumnsForClause(clause ast.Clause) []string {
-	if strings.TrimSpace(clause.MatchPattern) != "" {
-		pattern := strings.TrimSpace(clause.MatchPattern)
-		columns := []string{}
-		if pathVar, innerPattern, ok := parseBoundPathPattern(pattern); ok {
-			columns = appendUniqueColumns(columns, pathVar)
-			pattern = strings.TrimSpace(innerPattern)
-		}
-		for _, match := range patternVertexVarRE.FindAllStringSubmatch(pattern, -1) {
-			if len(match) > 1 {
-				columns = appendUniqueColumns(columns, match[1])
-			}
-		}
-		for _, match := range patternEdgeVarRE.FindAllStringSubmatch(pattern, -1) {
-			if len(match) > 1 {
-				columns = appendUniqueColumns(columns, match[1])
-			}
-		}
-		return columns
-	}
-	return inferMatchScopeColumns(clause.Raw)
 }
 
 func renderMatchClauseRaw(match ast.MatchClause) string {
@@ -599,9 +538,24 @@ func decodeStoredPropertyValue(raw []byte) any {
 		return mapped
 	}
 	if list, ok := parseStoredListString(text); ok {
-		return list
+		return normalizeResultValue(list)
+	}
+	if looksLikeTemporalConstructor(text) {
+		if temporal, ok := parseTemporalStringValue(text); ok {
+			return temporal
+		}
 	}
 	return text
+}
+
+func looksLikeTemporalConstructor(raw string) bool {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	for _, prefix := range []string{"date(", "localtime(", "local_time(", "time(", "zoned_time(", "localdatetime(", "local_datetime(", "datetime(", "zoned_datetime(", "duration("} {
+		if strings.HasPrefix(raw, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func evalTemporalAccessor(base map[string]any, field string) (any, bool) {
@@ -663,8 +617,9 @@ func evalTemporalAccessor(base map[string]any, field string) (any, bool) {
 		case "nanosecond":
 			return dateTime.Nanosecond(), true
 		case "timezone":
-			if tz, ok := base["timezone"]; ok {
-				return fmt.Sprint(tz), true
+			tz := temporalTimezoneValue(base)
+			if tz != "" {
+				return tz, true
 			}
 			if typeName == "datetime" {
 				return "Z", true
@@ -752,10 +707,7 @@ func parseAccessorTime(src map[string]any) (int, int, int, int, string, bool) {
 	if !hasHour && !hasMinute && !hasSecond && !hasNano {
 		return 0, 0, 0, 0, "", false
 	}
-	tz := ""
-	if tzRaw, ok := src["timezone"]; ok {
-		tz = strings.TrimSpace(fmt.Sprint(tzRaw))
-	}
+	tz := temporalTimezoneValue(src)
 	return hour, minute, second, nano, tz, true
 }
 
@@ -1019,6 +971,35 @@ func normalizeResultRows(rows []Row) []Row {
 
 func normalizeResultValue(value any) any {
 	switch typed := value.(type) {
+	case int8:
+		return int(typed)
+	case int16:
+		return int(typed)
+	case int32:
+		return int(typed)
+	case int64:
+		if typed <= math.MaxInt && typed >= math.MinInt {
+			return int(typed)
+		}
+		return typed
+	case uint8:
+		return int(typed)
+	case uint16:
+		return int(typed)
+	case uint32:
+		if uint64(typed) <= uint64(math.MaxInt) {
+			return int(typed)
+		}
+		return typed
+	case uint64:
+		if typed <= uint64(math.MaxInt) {
+			return int(typed)
+		}
+		return typed
+	case float32:
+		return normalizeFloatAsJSONNumber(float64(typed))
+	case float64:
+		return normalizeFloatAsJSONNumber(typed)
 	case *graph.Vertex:
 		return vertexToMap(typed)
 	case *graph.Edge:
@@ -1039,6 +1020,13 @@ func normalizeResultValue(value any) any {
 			}
 			if rendered, ok := renderSpatialValue(mapped); ok {
 				return rendered
+			}
+		}
+		if looksLikeTemporalConstructor(typed) {
+			if temporal, ok := parseTemporalStringValue(typed); ok {
+				if rendered, ok := renderTemporalValue(temporal); ok {
+					return rendered
+				}
 			}
 		}
 		if parsed, ok := parseStoredListString(typed); ok {
@@ -1093,6 +1081,16 @@ func normalizeResultValue(value any) any {
 	}
 }
 
+func normalizeFloatAsJSONNumber(value float64) any {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return value
+	}
+	if math.Trunc(value) == value {
+		return json.Number(strconv.FormatFloat(value, 'f', 1, 64))
+	}
+	return json.Number(strconv.FormatFloat(value, 'g', -1, 64))
+}
+
 func renderTemporalValue(value map[string]any) (string, bool) {
 	typeNameRaw, ok := value["__temporal_type"]
 	if !ok {
@@ -1103,8 +1101,16 @@ func renderTemporalValue(value map[string]any) (string, bool) {
 		return "", false
 	}
 
-	if raw, ok := value["value"]; ok && strings.TrimSpace(fmt.Sprint(raw)) != "" {
-		return fmt.Sprint(raw), true
+	if raw, ok := value["value"]; ok {
+		rawText := strings.TrimSpace(fmt.Sprint(raw))
+		if rawText != "" {
+			if parsed, ok := parseTemporalStringValue(rawText); ok {
+				if rendered, ok := renderTemporalValue(parsed); ok {
+					return rendered, true
+				}
+			}
+			return rawText, true
+		}
 	}
 
 	if typeName == "duration" {
@@ -1448,14 +1454,12 @@ func temporalDateTime(src map[string]any, withTimezone bool) (time.Time, bool) {
 
 	loc := time.UTC
 	if withTimezone {
-		if tzRaw, ok := src["timezone"]; ok {
-			tz := strings.TrimSpace(fmt.Sprint(tzRaw))
-			if tz != "" {
-				if offset, err := parseOffsetSeconds(tz); err == nil {
-					loc = time.FixedZone("", offset)
-				} else if l, err := time.LoadLocation(tz); err == nil {
-					loc = l
-				}
+		tz := temporalTimezoneValue(src)
+		if tz != "" {
+			if offset, err := parseOffsetSeconds(tz); err == nil {
+				loc = time.FixedZone("", offset)
+			} else if l, err := time.LoadLocation(tz); err == nil {
+				loc = l
 			}
 		}
 	}
@@ -1593,7 +1597,7 @@ func isoWeekDate(year, week, dayOfWeek int) (time.Time, bool) {
 
 func formatTimeWithNamedTimezone(t time.Time, src map[string]any) string {
 	base := formatTimeString(t, false)
-	tz := strings.TrimSpace(fmt.Sprint(src["timezone"]))
+	tz := temporalTimezoneValue(src)
 	if tz == "" {
 		_, off := t.Zone()
 		return base + formatOffsetString(off)
@@ -1655,7 +1659,7 @@ func renderDurationFromRawSeconds(value map[string]any) (string, bool) {
 
 func formatDateTimeWithNamedTimezone(t time.Time, src map[string]any) string {
 	base := formatDateTimeString(t, false)
-	tz := strings.TrimSpace(fmt.Sprint(src["timezone"]))
+	tz := temporalTimezoneValue(src)
 	if tz == "" {
 		_, off := t.Zone()
 		return base + formatOffsetString(off)
@@ -1675,6 +1679,18 @@ func formatDateTimeWithNamedTimezone(t time.Time, src map[string]any) string {
 	}
 	_, off := t.Zone()
 	return base + formatOffsetString(off)
+}
+
+func temporalTimezoneValue(src map[string]any) string {
+	raw, ok := src["timezone"]
+	if !ok || raw == nil {
+		return ""
+	}
+	tz := strings.TrimSpace(fmt.Sprint(raw))
+	if strings.EqualFold(tz, "<nil>") {
+		return ""
+	}
+	return tz
 }
 
 func outcomeFromError(err error) string {

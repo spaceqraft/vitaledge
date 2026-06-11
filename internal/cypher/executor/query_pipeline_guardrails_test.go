@@ -28,7 +28,7 @@ func TestQueryPipelineBaselineSupportedShapes(t *testing.T) {
 	exec := New(store, Options{})
 
 	t.Run("order-skip-limit-shape", func(t *testing.T) {
-		stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN dst.id AS dstID ORDER BY dstID DESC SKIP 1 LIMIT 1")
+		stmt, err := parser.ParseStatement("MATCH (src)-[:MEMBER_OF]->(dst) WHERE id(src) = $srcID RETURN id(dst) AS dstID ORDER BY dstID DESC SKIP 1 LIMIT 1")
 		if err != nil {
 			t.Fatalf("parse failed: %v", err)
 		}
@@ -42,7 +42,7 @@ func TestQueryPipelineBaselineSupportedShapes(t *testing.T) {
 	})
 
 	t.Run("distinct-projection-shape", func(t *testing.T) {
-		stmt, err := parser.ParseStatement("MATCH (src { id: $srcID })-[:MEMBER_OF]->(dst) RETURN DISTINCT dst.id AS dstID ORDER BY dstID ASC")
+		stmt, err := parser.ParseStatement("MATCH (src)-[:MEMBER_OF]->(dst) WHERE id(src) = $srcID RETURN DISTINCT id(dst) AS dstID ORDER BY dstID ASC")
 		if err != nil {
 			t.Fatalf("parse failed: %v", err)
 		}

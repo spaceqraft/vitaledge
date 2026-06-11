@@ -237,8 +237,14 @@ func parseAnchoredOutPattern(raw string) (anchoredOutPattern, error) {
 	}
 	props := m[3]
 	sourceIDParam := ""
-	if strings.HasPrefix(props, "id:$") && !strings.Contains(props, ",") {
-		sourceIDParam = strings.TrimPrefix(props, "id:$")
+	if !strings.Contains(props, ",") {
+		parts := strings.SplitN(props, ":", 2)
+		if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "id") {
+			rhs := strings.TrimSpace(parts[1])
+			if strings.HasPrefix(rhs, "$") {
+				sourceIDParam = strings.TrimPrefix(rhs, "$")
+			}
+		}
 	}
 	return anchoredOutPattern{
 		SourceVar:           m[1],

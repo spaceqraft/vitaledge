@@ -28,6 +28,29 @@ type ExecutionStats struct {
 // bindings for downstream projection operators.
 const MaterializeWriteBindingsParam = "__ve_materialize_write_bindings"
 
+// StrictVariantDispatchParam toggles fail-fast validation for variantized
+// runtime operator families. When enabled, unsupported variant names for
+// known variant-dispatch ops are rejected instead of falling back.
+const StrictVariantDispatchParam = "__ve_strict_variant_dispatch"
+
+// InQueryCallExecutorParam carries an injected in-query CALL executor callback.
+const InQueryCallExecutorParam = "__ve_in_query_call_executor"
+
+// ExistsSubqueryEvaluatorParam carries an injected WHERE EXISTS { ... }
+// evaluator callback.
+const ExistsSubqueryEvaluatorParam = "__ve_exists_subquery_evaluator"
+
+// MetricsObserverParam carries an injected metrics sink for runtime operators.
+const MetricsObserverParam = "__ve_metrics_observer"
+
+// InQueryCallExecutor bridges runtime PHY_CALL execution back to executor-level
+// procedure semantics without introducing package cycles.
+type InQueryCallExecutor = operators.InQueryCallExecutor
+
+// ExistsSubqueryEvaluator bridges runtime WHERE EXISTS evaluation back to
+// executor-level semantics without introducing package cycles.
+type ExistsSubqueryEvaluator = operators.ExistsSubqueryEvaluator
+
 // OperatorState is mutable execution state shared across operator handlers.
 type OperatorState = operators.State
 

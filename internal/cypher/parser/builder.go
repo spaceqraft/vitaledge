@@ -264,10 +264,17 @@ func buildReadingClause(c cyphergen.IOC_ReadingClauseContext, seg statementSegme
 
 func buildUpdatingClause(c cyphergen.IOC_UpdatingClauseContext, seg statementSegment, fullQuery string) (ast.Clause, error) {
 	if create := c.OC_Create(); create != nil {
-		return buildClause(ast.ClauseKindCreate, create, seg, fullQuery), nil
+		clause := buildClause(ast.ClauseKindCreate, create, seg, fullQuery)
+		if pattern := create.OC_Pattern(); pattern != nil {
+			clause.MatchPattern = strings.TrimSpace(pattern.GetText())
+		}
+		return clause, nil
 	}
 	if merge := c.OC_Merge(); merge != nil {
 		clause := buildClause(ast.ClauseKindMerge, merge, seg, fullQuery)
+		if pattern := merge.OC_PatternPart(); pattern != nil {
+			clause.MatchPattern = strings.TrimSpace(pattern.GetText())
+		}
 		pattern, onCreateSet, onMatchSet := splitMergePatternAndActions(clause.Raw)
 		clause.MergePattern = pattern
 		clause.MergeOnCreate = onCreateSet

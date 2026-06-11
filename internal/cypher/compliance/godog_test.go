@@ -3,9 +3,11 @@ package compliance
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -36,6 +38,7 @@ type graphSnapshot struct {
 	VertexSet       map[string]struct{}
 	RelationshipSet map[string]struct{}
 	PropertySet     map[string]struct{}
+	LabelSet        map[string]struct{}
 }
 
 func (g graphSnapshot) Delta(before graphSnapshot) graphSnapshot {
@@ -59,10 +62,10 @@ type graphSideEffects struct {
 }
 
 func diffGraphSideEffects(before, after graphSnapshot) graphSideEffects {
-	delta := after.Delta(before)
 	addedVertexes, removedVertexes := propertySetDelta(before.VertexSet, after.VertexSet)
 	addedRelationships, removedRelationships := propertySetDelta(before.RelationshipSet, after.RelationshipSet)
 	addedProps, removedProps := propertySetDelta(before.PropertySet, after.PropertySet)
+	addedLabels, removedLabels := propertySetDelta(before.LabelSet, after.LabelSet)
 	return graphSideEffects{
 		AddedVertexes:        addedVertexes,
 		RemovedVertexes:      removedVertexes,
@@ -70,8 +73,8 @@ func diffGraphSideEffects(before, after graphSnapshot) graphSideEffects {
 		RemovedRelationships: removedRelationships,
 		AddedProperties:      addedProps,
 		RemovedProperties:    removedProps,
-		AddedLabels:          max(delta.Labels, 0),
-		RemovedLabels:        max(-delta.Labels, 0),
+		AddedLabels:          addedLabels,
+		RemovedLabels:        removedLabels,
 	}
 }
 
@@ -335,13 +338,13 @@ func (f *cypherTCKFeature) executingControlQuery(doc *godog.DocString) error {
 
 func (f *cypherTCKFeature) resultShouldBeEmpty() error {
 	if f.lastErr != nil {
-		return fmt.Errorf("query returned error instead of an empty result: %w", f.lastErr)
+		return fmt.Errorf("query returned error instead of an empty result: %w\n%s", f.lastErr, f.failureContext())
 	}
 	if f.lastResult == nil {
-		return fmt.Errorf("no query result captured")
+		return fmt.Errorf("no query result captured\n%s", f.failureContext())
 	}
 	if len(f.lastResult.Rows) != 0 {
-		return fmt.Errorf("expected no rows, got %d", len(f.lastResult.Rows))
+		return fmt.Errorf("expected no rows, got %d\n%s", len(f.lastResult.Rows), f.failureContext())
 	}
 	return nil
 }
@@ -501,10 +504,10 @@ func (f *cypherTCKFeature) assertResultTable(table *godog.Table, ordered bool) e
 
 func (f *cypherTCKFeature) assertResultTableWithOptions(table *godog.Table, ordered bool, ignoreListOrder bool) error {
 	if f.lastErr != nil {
-		return fmt.Errorf("query returned error instead of rows: %w", f.lastErr)
+		return fmt.Errorf("query returned error instead of rows: %w\n%s", f.lastErr, f.failureContext())
 	}
 	if f.lastResult == nil {
-		return fmt.Errorf("no query result captured")
+		return fmt.Errorf("no query result captured\n%s", f.failureContext())
 	}
 
 	headers, expectedRows, err := readTable(table)
@@ -520,7 +523,7 @@ func (f *cypherTCKFeature) assertResultTableWithOptions(table *godog.Table, orde
 		normalizedActualHeaders[i] = normalizeColumnName(header)
 	}
 	if !reflect.DeepEqual(normalizedActualHeaders, normalizedExpectedHeaders) {
-		return fmt.Errorf("expected columns %v, got %v", headers, f.lastResult.Columns)
+		return fmt.Errorf("expected columns %v, got %v\n%s", headers, f.lastResult.Columns, f.failureContext())
 	}
 
 	actualRows := make([][]string, 0, len(f.lastResult.Rows))
@@ -555,7 +558,7 @@ func (f *cypherTCKFeature) assertResultTableWithOptions(table *godog.Table, orde
 
 	if ordered {
 		if !reflect.DeepEqual(actualRows, expectedRows) {
-			return fmt.Errorf("expected rows %v, got %v", expectedRows, actualRows)
+			return fmt.Errorf("expected rows %v, got %v\n%s", expectedRows, actualRows, f.failureContextWithRows(actualRows))
 		}
 		return nil
 	}
@@ -567,9 +570,130 @@ func (f *cypherTCKFeature) assertResultTableWithOptions(table *godog.Table, orde
 		return strings.Join(expectedRows[i], "\x00") < strings.Join(expectedRows[j], "\x00")
 	})
 	if !reflect.DeepEqual(actualRows, expectedRows) {
-		return fmt.Errorf("expected rows %v, got %v", expectedRows, actualRows)
+		return fmt.Errorf("expected rows %v, got %v\n%s", expectedRows, actualRows, f.failureContextWithRows(actualRows))
 	}
 	return nil
+}
+
+func (f *cypherTCKFeature) failureContext() string {
+	return f.failureContextWithRows(nil)
+}
+
+func (f *cypherTCKFeature) failureContextWithRows(actualRows [][]string) string {
+	parts := []string{
+		fmt.Sprintf("query=%q", strings.TrimSpace(f.lastQuery)),
+		fmt.Sprintf("params=%s", formatDebugParams(f.params)),
+	}
+	if explainSummary := f.failureExplainSummary(); explainSummary != "" {
+		parts = append(parts, explainSummary)
+	}
+	if f.lastResult != nil {
+		parts = append(parts, fmt.Sprintf("columns=%v", f.lastResult.Columns))
+		parts = append(parts, fmt.Sprintf("row_count=%d", len(f.lastResult.Rows)))
+	}
+	if len(actualRows) > 0 {
+		parts = append(parts, fmt.Sprintf("actual_rows_sample=%s", formatDebugRowSample(actualRows, 5)))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (f *cypherTCKFeature) failureExplainSummary() string {
+	query := strings.TrimSpace(f.lastQuery)
+	if query == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToUpper(query), "EXPLAIN ") {
+		return ""
+	}
+
+	result, err := f.runBatch("EXPLAIN "+query, f.params)
+	if err != nil {
+		return fmt.Sprintf("explain_error=%v", err)
+	}
+	if result == nil || len(result.Rows) == 0 {
+		return "explain_error=no explain rows returned"
+	}
+	payload, ok := result.Rows[0]["explain"].(map[string]any)
+	if !ok || payload == nil {
+		return "explain_error=unexpected explain payload shape"
+	}
+	ops := explainPhysicalOps(payload)
+	if len(ops) == 0 {
+		return "physical_ops=[]"
+	}
+	if len(ops) > 12 {
+		return fmt.Sprintf("physical_ops=%v ... (+%d more)", ops[:12], len(ops)-12)
+	}
+	return fmt.Sprintf("physical_ops=%v", ops)
+}
+
+func explainPhysicalOps(payload map[string]any) []string {
+	physicalPlan, ok := payload["physicalPlan"].(map[string]any)
+	if !ok || physicalPlan == nil {
+		return nil
+	}
+	rawNodes, ok := physicalPlan["nodes"]
+	if !ok || rawNodes == nil {
+		return nil
+	}
+	nodes := make([]map[string]any, 0)
+	switch typed := rawNodes.(type) {
+	case []any:
+		for _, item := range typed {
+			node, ok := item.(map[string]any)
+			if !ok || node == nil {
+				continue
+			}
+			nodes = append(nodes, node)
+		}
+	case []map[string]any:
+		nodes = append(nodes, typed...)
+	default:
+		return nil
+	}
+	ops := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		op := strings.TrimSpace(fmt.Sprint(node["op"]))
+		if op == "" {
+			continue
+		}
+		ops = append(ops, op)
+	}
+	return ops
+}
+
+func formatDebugParams(params executor.Params) string {
+	if len(params) == 0 {
+		return "{}"
+	}
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", key, params[key]))
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+func formatDebugRowSample(rows [][]string, limit int) string {
+	if len(rows) == 0 {
+		return "[]"
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	end := len(rows)
+	if end > limit {
+		end = limit
+	}
+	sample := rows[:end]
+	if len(rows) <= limit {
+		return fmt.Sprintf("%v", sample)
+	}
+	return fmt.Sprintf("%v ... (+%d more)", sample, len(rows)-limit)
 }
 
 func normalizeColumnName(value string) string {
@@ -785,25 +909,55 @@ func (f *cypherTCKFeature) snapshotGraph() (graphSnapshot, error) {
 		VertexSet:       map[string]struct{}{},
 		RelationshipSet: map[string]struct{}{},
 		PropertySet:     map[string]struct{}{},
+		LabelSet:        map[string]struct{}{},
 	}
-	seenEdges := map[string]struct{}{}
-	seenLabels := map[string]struct{}{}
 	err := f.store.View(f.ctx, func(tx graph.Tx) error {
-		return tx.ScanVertices(f.ctx, defaultTenant, 0, func(vertex *graph.Vertex) error {
+		if err := tx.ScanVertices(f.ctx, defaultTenant, 0, func(vertex *graph.Vertex) error {
 			stats.Vertexes++
 			stats.VertexSet[fmt.Sprintf("%s:%s", vertex.Tenant, vertex.ID)] = struct{}{}
 			for _, label := range vertex.Labels {
-				seenLabels[label] = struct{}{}
+				stats.LabelSet[fmt.Sprintf("%s:%s", vertex.Tenant, label)] = struct{}{}
 			}
 			stats.Properties += len(vertex.Properties)
 			for key, value := range vertex.Properties {
 				stats.PropertySet[fmt.Sprintf("v:%s:%s:%s", vertex.ID, key, hex.EncodeToString(value))] = struct{}{}
 			}
-			return tx.ScanOutEdges(f.ctx, defaultTenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
-				if _, ok := seenEdges[edge.ID]; ok {
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		edgeTypes := map[string]struct{}{}
+		if snapshot, err := tx.GetStatsSnapshot(f.ctx, defaultTenant); err == nil && snapshot != nil {
+			for edgeType := range snapshot.EdgeCounts {
+				edgeType = strings.TrimSpace(edgeType)
+				if edgeType == "" {
+					continue
+				}
+				edgeTypes[edgeType] = struct{}{}
+			}
+		}
+		seenEdges := map[string]struct{}{}
+		for edgeType := range edgeTypes {
+			if err := tx.ScanOutEdgeLinksByType(f.ctx, defaultTenant, edgeType, 0, func(_, edgeID, _ string) error {
+				edgeID = strings.TrimSpace(edgeID)
+				if edgeID == "" {
 					return nil
 				}
-				seenEdges[edge.ID] = struct{}{}
+				if _, ok := seenEdges[edgeID]; ok {
+					return nil
+				}
+				edge, err := tx.GetEdge(f.ctx, defaultTenant, edgeID)
+				if err != nil {
+					if graph.IsKind(err, graph.ErrKindNotFound) {
+						return nil
+					}
+					return err
+				}
+				if edge == nil {
+					return nil
+				}
+				seenEdges[edgeID] = struct{}{}
 				stats.Relationships++
 				stats.RelationshipSet[fmt.Sprintf("%s:%s", edge.Tenant, edge.ID)] = struct{}{}
 				stats.Properties += len(edge.Properties)
@@ -811,10 +965,13 @@ func (f *cypherTCKFeature) snapshotGraph() (graphSnapshot, error) {
 					stats.PropertySet[fmt.Sprintf("e:%s:%s:%s", edge.ID, key, hex.EncodeToString(value))] = struct{}{}
 				}
 				return nil
-			})
-		})
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
-	stats.Labels = len(seenLabels)
+	stats.Labels = len(stats.LabelSet)
 	return stats, err
 }
 
@@ -827,6 +984,9 @@ func classifyError(err error) (phase string, category string) {
 		case parser.ParseErrorSemantic:
 			return "compile time", "SemanticError"
 		case parser.ParseErrorUnsupported:
+			if strings.Contains(strings.ToLower(parseErr.Message), "invalidargumenttypepropertyaccess") {
+				return "compile time", "TypeError"
+			}
 			return "compile time", "SyntaxError"
 		default:
 			return "compile time", "SyntaxError"
@@ -965,14 +1125,6 @@ func readTable(table *godog.Table) ([]string, [][]string, error) {
 	return headers, rows, nil
 }
 
-func trimmedStrings(values []string) []string {
-	trimmed := make([]string, 0, len(values))
-	for _, value := range values {
-		trimmed = append(trimmed, strings.TrimSpace(value))
-	}
-	return trimmed
-}
-
 func renderTCKValue(value any) string {
 	switch typed := value.(type) {
 	case nil:
@@ -994,10 +1146,18 @@ func renderTCKValue(value any) string {
 		return strconv.FormatUint(uint64(typed), 10)
 	case uint64:
 		return strconv.FormatUint(typed, 10)
+	case json.Number:
+		if i, err := typed.Int64(); err == nil {
+			return strconv.FormatInt(i, 10)
+		}
+		if f, err := typed.Float64(); err == nil {
+			return renderTCKFloat64(f)
+		}
+		return typed.String()
 	case float64:
-		return strconv.FormatFloat(typed, 'g', -1, 64)
+		return renderTCKFloat64(typed)
 	case float32:
-		return strconv.FormatFloat(float64(typed), 'g', -1, 32)
+		return renderTCKFloat64(float64(typed))
 	case []string:
 		items := make([]string, 0, len(typed))
 		for _, item := range typed {
@@ -1032,8 +1192,79 @@ func renderTCKValue(value any) string {
 			}
 			return "[" + strings.Join(items, ", ") + "]"
 		}
-		return fmt.Sprintf("%v", typed)
+		rendered := fmt.Sprintf("%v", typed)
+		if normalized, ok := renderFloatLikeStringValue(rendered); ok {
+			return normalized
+		}
+		return rendered
 	}
+}
+
+func renderFloatLikeStringValue(rendered string) (string, bool) {
+	trimmed := strings.TrimSpace(rendered)
+	if trimmed == "" {
+		return "", false
+	}
+	if !strings.ContainsAny(trimmed, ".eE") {
+		return "", false
+	}
+	if f, err := strconv.ParseFloat(trimmed, 64); err == nil {
+		return renderTCKFloat64(f), true
+	}
+	return "", false
+}
+
+func renderTCKFloat64(value float64) string {
+	if math.IsNaN(value) {
+		return "NaN"
+	}
+	if math.IsInf(value, 1) {
+		return "Infinity"
+	}
+	if math.IsInf(value, -1) {
+		return "-Infinity"
+	}
+	if value == 0 {
+		return "0.0"
+	}
+	abs := math.Abs(value)
+	if math.Trunc(value) == value && abs < 1e20 {
+		return strconv.FormatFloat(value, 'f', 1, 64)
+	}
+	if abs >= 1e20 || abs < 1e-100 {
+		rendered := strconv.FormatFloat(value, 'g', -1, 64)
+		return normalizeTCKExponent(rendered)
+	}
+	rendered := strconv.FormatFloat(value, 'f', -1, 64)
+	if strings.ContainsAny(rendered, ".eE") {
+		return rendered
+	}
+	return rendered + ".0"
+}
+
+func normalizeTCKExponent(rendered string) string {
+	i := strings.IndexAny(rendered, "eE")
+	if i <= 0 || i+1 >= len(rendered) {
+		return rendered
+	}
+	mantissa := rendered[:i]
+	exponent := rendered[i+1:]
+	if exponent == "" {
+		return rendered
+	}
+	sign := ""
+	if exponent[0] == '+' || exponent[0] == '-' {
+		sign = string(exponent[0])
+		exponent = exponent[1:]
+	}
+	exponent = strings.TrimLeft(exponent, "0")
+	if exponent == "" {
+		exponent = "0"
+	}
+	if sign == "+" {
+		sign = ""
+	}
+	return mantissa + "e" + sign + exponent
 }
 
 func renderVertexValue(value map[string]any) string {

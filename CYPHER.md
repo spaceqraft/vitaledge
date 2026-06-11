@@ -87,4 +87,8 @@ Team operating rhythm:
 3. Re-run the same command after the change to confirm net reduction in failure categories.
 4. Keep unsupported behavior explicit; do not hide or skip failing TCK scenarios.
 
+## Semantics Deep Dive
+
+For id-specific semantics, current implementation anchors, and reconciliation plan, see [CYPHER_ID_SEMANTICS.md](CYPHER_ID_SEMANTICS.md).
+
 Back to [README.md](README.md).

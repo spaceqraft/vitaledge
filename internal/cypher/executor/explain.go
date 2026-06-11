@@ -12,8 +12,6 @@ import (
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	cypherexplain "github.com/paegun/vitaledge/internal/cypher/explain"
-	"github.com/paegun/vitaledge/internal/cypher/logical"
-	"github.com/paegun/vitaledge/internal/cypher/physical"
 	"github.com/paegun/vitaledge/internal/cypher/semantic"
 	"github.com/paegun/vitaledge/internal/graph"
 )
@@ -101,16 +99,6 @@ func (e *Executor) buildExplainAnalysis(ctx context.Context, stmt ast.Statement,
 	return analysis, nil
 }
 
-func buildPipelineExplainText(stmt ast.Statement) (string, bool) {
-	semanticModel, err := semantic.Build(stmt)
-	if err != nil {
-		return "", false
-	}
-	logicalPlan := logical.Build(semanticModel)
-	physicalPlan := physical.Build(logicalPlan)
-	return cypherexplain.RenderPipeline(logicalPlan, physicalPlan), true
-}
-
 func buildPipelineExplainPayload(ctx context.Context, e *Executor, stmt *ast.ExplainStatement, params Params) (map[string]any, error) {
 	analysis, err := e.buildExplainAnalysis(ctx, stmt.Statement, params)
 	if err != nil {
@@ -121,8 +109,10 @@ func buildPipelineExplainPayload(ctx context.Context, e *Executor, stmt *ast.Exp
 	if err != nil {
 		return nil, err
 	}
-	logicalPlan := logical.Build(semanticModel)
-	physicalPlan := physical.Build(logicalPlan)
+	logicalPlan, physicalPlan, err := e.buildRuntimePhysicalPlan(ctx, stmt.Statement, params)
+	if err != nil {
+		return nil, err
+	}
 	pipelineExplainText := cypherexplain.RenderPipeline(logicalPlan, physicalPlan)
 
 	logicalNodes := make([]map[string]any, 0, len(logicalPlan.Nodes))

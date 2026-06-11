@@ -208,6 +208,9 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	if !capResp.GetIndexDdlSupported() {
 		t.Fatalf("expected index DDL support to be true")
 	}
+	if !capResp.GetStrictVariantDispatchSupported() {
+		t.Fatalf("expected strict variant dispatch capability to be true")
+	}
 	if capResp.GetMaxWriteBatchBytes() != int64(pebblestore.DefaultMaxWriteBatchBytes) {
 		t.Fatalf("unexpected max_write_batch_bytes capability: %#v", capResp.GetMaxWriteBatchBytes())
 	}
@@ -223,7 +226,7 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 
 	execResp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",
-		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN id(n) AS id"}},
 	})
 	if err != nil {
 		t.Fatalf("Execute failed: %v", err)
@@ -260,7 +263,7 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 		Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: &v1.PreparedQuery{
 			ParserVersion: "cypher-m23",
 			IrVersion:     "query-pipeline-v1",
-			Payload:       []byte("MATCH (n:Seed) RETURN n.id AS id"),
+			Payload:       []byte("MATCH (n:Seed) RETURN id(n) AS id"),
 		}}},
 	})
 	if err != nil {
@@ -279,7 +282,7 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 		Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: &v1.PreparedQuery{
 			ParserVersion: "cypher-m99",
 			IrVersion:     "query-pipeline-v99",
-			Payload:       []byte("MATCH (n:Seed) RETURN n.id AS id"),
+			Payload:       []byte("MATCH (n:Seed) RETURN id(n) AS id"),
 		}}},
 	})
 	if err == nil {
@@ -295,8 +298,8 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 		Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: &v1.PreparedQuery{
 			ParserVersion:  "cypher-m99",
 			IrVersion:      "query-pipeline-v99",
-			Payload:        []byte("MATCH (n:Never) RETURN n.id AS id"),
-			FallbackCypher: "MATCH (n:Seed) RETURN n.id AS id",
+			Payload:        []byte("MATCH (n:Never) RETURN id(n) AS id"),
+			FallbackCypher: "MATCH (n:Seed) RETURN id(n) AS id",
 		}}},
 		Options: &v1.RequestOptions{AllowFallbackToCypher: true},
 	})
@@ -306,6 +309,94 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	fallbackRowValue := fallbackResp.GetRows()[0].GetValues()["id"]
 	if fallbackRowValue == nil || fallbackRowValue.GetStringValue() != "seed" {
 		t.Fatalf("unexpected fallback row value: %#v", fallbackRowValue)
+	}
+}
+
+func TestGRPCQueryServiceExecuteRejectsReservedInternalParams(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+	_, err = client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
+		Parameters: map[string]*v1.Value{
+			"__ve_strict_variant_dispatch": {Kind: &v1.Value_BoolValue{BoolValue: true}},
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected invalid argument error for reserved internal parameter key")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected grpc status error, got %v", err)
+	}
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v (%v)", st.Code(), st.Message())
+	}
+	if !strings.Contains(st.Message(), "reserved internal prefix __ve_") {
+		t.Fatalf("expected reserved-prefix detail in error message, got %q", st.Message())
+	}
+}
+
+func TestGRPCQueryServiceExplainRejectsReservedInternalParams(t *testing.T) {
+	store := openTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+	defer grpcSrv.GracefulStop()
+	defer func() { _ = grpcLn.Close() }()
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	client := v1.NewQueryServiceClient(conn)
+	_, err = client.Explain(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
+		Parameters: map[string]*v1.Value{
+			"__ve_strict_variant_dispatch": {Kind: &v1.Value_BoolValue{BoolValue: true}},
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected invalid argument error for reserved internal parameter key")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected grpc status error, got %v", err)
+	}
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v (%v)", st.Code(), st.Message())
+	}
+	if !strings.Contains(st.Message(), "reserved internal prefix __ve_") {
+		t.Fatalf("expected reserved-prefix detail in error message, got %q", st.Message())
 	}
 }
 
@@ -354,6 +445,9 @@ func TestGRPCQueryServiceCapabilitiesReflectTunedMaxWriteBatch(t *testing.T) {
 	}
 	if !capResp.GetMaxWriteBatchBytesTuned() {
 		t.Fatalf("expected max_write_batch_bytes_tuned to be true")
+	}
+	if !capResp.GetStrictVariantDispatchSupported() {
+		t.Fatalf("expected strict variant dispatch capability to be true")
 	}
 	execResp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",

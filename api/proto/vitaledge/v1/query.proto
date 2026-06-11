@@ -39,6 +39,7 @@ message RequestOptions {
   bool include_stats = 2;
   bool include_warnings = 3;
   bool allow_fallback_to_cypher = 4;
+  bool strict_variant_dispatch = 5;
 }
 
 message ClientContext {
@@ -86,6 +87,7 @@ message CapabilitiesResponse {
   int64 configured_max_write_batch_bytes = 8;
   int64 effective_max_write_batch_bytes = 9;
   bool max_write_batch_bytes_tuned = 10;
+  bool strict_variant_dispatch_supported = 11;
 }
 
 message CreatePropertyIndexRequest {

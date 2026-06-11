@@ -500,10 +500,11 @@ Automated verification status (2026-06-05):
 
 Manual verification checklist (operator signoff):
 
-1. Confirm representative supported query families route and execute as expected in local interactive runs.
-2. Confirm EXPLAIN output for migrated recommendation and friend-suggestion shapes reports expected pipeline payload metadata.
-3. Confirm runtime counter visibility and naming remain stable in manual query sessions.
-4. Run project Python benchmark scripts and compare outcomes against latest baseline snapshots before declaring final closure.
+1. PASS: Confirm representative supported query families route and execute as expected in local interactive runs.
+2. PASS: Confirm EXPLAIN output for migrated recommendation and friend-suggestion shapes reports expected pipeline payload metadata.
+3. PASS: Confirm runtime counter visibility and naming remain stable in manual query sessions.
+4. PASS: Run project Python benchmark scripts and compare outcomes against latest baseline snapshots before declaring final closure.
+5. PASS: Remnants of "legacy" general-purpose row hydrating database design removed.
 
 Closure rule:
 

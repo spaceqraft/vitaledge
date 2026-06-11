@@ -93,6 +93,10 @@ func TestParseBatchCreateReturnSupported(t *testing.T) {
 	if stmt.Parts[0].Clauses[1].Kind != ast.ClauseKindReturn {
 		t.Fatalf("expected RETURN clause, got %s", stmt.Parts[0].Clauses[1].Kind)
 	}
+	createPattern := strings.ReplaceAll(strings.TrimSpace(stmt.Parts[0].Clauses[0].MatchPattern), " ", "")
+	if createPattern != "(n:Person{name:$name})" {
+		t.Fatalf("unexpected CREATE pattern metadata: %q", stmt.Parts[0].Clauses[0].MatchPattern)
+	}
 }
 
 func TestParseBatchMatchLabelAlternation(t *testing.T) {
@@ -263,6 +267,9 @@ func TestParseBatchMergeClauseMetadataForQueryStatement(t *testing.T) {
 	}
 	if strings.TrimSpace(mergeClause.MergePattern) != "(a)-[r:TYPE]->(b)" {
 		t.Fatalf("unexpected merge pattern metadata: %q", mergeClause.MergePattern)
+	}
+	if strings.TrimSpace(mergeClause.MatchPattern) != "(a)-[r:TYPE]->(b)" {
+		t.Fatalf("unexpected merge match-pattern metadata: %q", mergeClause.MatchPattern)
 	}
 	if strings.TrimSpace(mergeClause.MergeOnCreate) != "r.name='foo'" {
 		t.Fatalf("unexpected merge on-create metadata: %q", mergeClause.MergeOnCreate)
@@ -486,6 +493,103 @@ func TestParseStatementCreateAllowsBoundEndpointsInRelationshipPattern(t *testin
 	}
 }
 
+func TestParseStatementCreateRejectsUndirectedRelationship(t *testing.T) {
+	_, err := ParseStatement("CREATE (a)-[:KNOWS]-(b)")
+	if err == nil {
+		t.Fatalf("expected requires directed relationship parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "RequiresDirectedRelationship" {
+		t.Fatalf("expected RequiresDirectedRelationship unsupported parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementCreateRejectsTwoDirectedRelationship(t *testing.T) {
+	_, err := ParseStatement("CREATE (a)<-[:KNOWS]->(b)")
+	if err == nil {
+		t.Fatalf("expected requires directed relationship parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "RequiresDirectedRelationship" {
+		t.Fatalf("expected RequiresDirectedRelationship unsupported parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementCreateAllowsMixedDirectionDirectedRelationshipChain(t *testing.T) {
+	_, err := ParseStatement("CREATE (a)<-[:KNOWS]-(b)-[:FOLLOWS]->(c)")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
+func TestParseStatementCreateRejectsRelationshipWithMultipleTypes(t *testing.T) {
+	_, err := ParseStatement("CREATE (a)-[:A|B]->(b)")
+	if err == nil {
+		t.Fatalf("expected no single relationship type parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "NoSingleRelationshipType" {
+		t.Fatalf("expected NoSingleRelationshipType unsupported parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementCreateRejectsVariableLengthRelationship(t *testing.T) {
+	_, err := ParseStatement("CREATE (a)-[:KNOWS*1..2]->(b)")
+	if err == nil {
+		t.Fatalf("expected creating var length parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "CreatingVarLength" {
+		t.Fatalf("expected CreatingVarLength unsupported parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementMergeRejectsRelationshipWithoutType(t *testing.T) {
+	_, err := ParseStatement("MERGE (a)-[r]->(b)")
+	if err == nil {
+		t.Fatalf("expected no single relationship type parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "NoSingleRelationshipType" {
+		t.Fatalf("expected NoSingleRelationshipType unsupported parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementMergeRejectsRelationshipWithMultipleTypes(t *testing.T) {
+	_, err := ParseStatement("MERGE (a)-[r:A|B]->(b)")
+	if err == nil {
+		t.Fatalf("expected no single relationship type parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "NoSingleRelationshipType" {
+		t.Fatalf("expected NoSingleRelationshipType unsupported parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
 func TestParseStatementRejectsSizeOnPatternPredicate(t *testing.T) {
 	_, err := ParseStatement("MATCH (a), (b), (c) RETURN size((a)-[:REL]->(b))")
 	if err == nil {
@@ -598,6 +702,36 @@ func TestParseStatementRejectsFloatLimitLiteralAtCompileTime(t *testing.T) {
 	}
 }
 
+func TestParseStatementRejectsAnyQuantifierPredicateTypeMismatchAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("RETURN any(x IN ['Clara'] WHERE x % 2 = 0) AS result")
+	if err == nil {
+		t.Fatalf("expected InvalidArgumentType parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "InvalidArgumentType" {
+		t.Fatalf("expected InvalidArgumentType parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsAllQuantifierPredicateTypeMismatchAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("RETURN all(x IN [false, true] WHERE x % 2 = 0) AS result")
+	if err == nil {
+		t.Fatalf("expected InvalidArgumentType parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "InvalidArgumentType" {
+		t.Fatalf("expected InvalidArgumentType parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
+	}
+}
+
 func TestParseStatementAllowsConstantSkipLimitExpressions(t *testing.T) {
 	_, err := ParseStatement("MATCH (n) WITH n SKIP toInteger(rand()*9) LIMIT toInteger(ceil(1.7)) RETURN count(*) AS count")
 	if err != nil {
@@ -647,6 +781,114 @@ func TestParseStatementRejectsUndefinedVariableInReturnProjection(t *testing.T) 
 	}
 	if parseErr.Kind != ParseErrorUnsupported {
 		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsOrderByVariableRemovedByDistinct(t *testing.T) {
+	_, err := ParseStatement("MATCH (a) RETURN DISTINCT a.name ORDER BY a.age")
+	if err == nil {
+		t.Fatalf("expected parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "UndefinedVariable" {
+		t.Fatalf("expected UndefinedVariable message, got %q", parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsOrderByAggregationUsingUnreturnedVariable(t *testing.T) {
+	_, err := ParseStatement("MATCH (me:Person)--(you:Person) RETURN count(you.age) AS agg ORDER BY me.age + count(you.age)")
+	if err == nil {
+		t.Fatalf("expected parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "UndefinedVariable" {
+		t.Fatalf("expected UndefinedVariable message, got %q", parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsOrderByAmbiguousAggregationExpression(t *testing.T) {
+	_, err := ParseStatement("MATCH (me:Person)--(you:Person) RETURN me.age + you.age, count(*) AS cnt ORDER BY me.age + you.age + count(*)")
+	if err == nil {
+		t.Fatalf("expected parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "AmbiguousAggregationExpression" {
+		t.Fatalf("expected AmbiguousAggregationExpression message, got %q", parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsPropertiesOnIntegerLiteral(t *testing.T) {
+	_, err := ParseStatement("RETURN properties(1)")
+	if err == nil {
+		t.Fatalf("expected parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "InvalidArgumentType" {
+		t.Fatalf("expected InvalidArgumentType message, got %q", parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsPropertiesOnStringLiteral(t *testing.T) {
+	_, err := ParseStatement("RETURN properties('Cypher')")
+	if err == nil {
+		t.Fatalf("expected parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "InvalidArgumentType" {
+		t.Fatalf("expected InvalidArgumentType message, got %q", parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsPropertiesOnListLiteral(t *testing.T) {
+	_, err := ParseStatement("RETURN properties([true, false])")
+	if err == nil {
+		t.Fatalf("expected parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "InvalidArgumentType" {
+		t.Fatalf("expected InvalidArgumentType message, got %q", parseErr.Message)
 	}
 }
 
@@ -701,6 +943,56 @@ func TestParseStatementRejectsUnaliasedWithExpression(t *testing.T) {
 	}
 }
 
+func TestParseStatementAllowsOrderByIncomingScopeVariableInWith(t *testing.T) {
+	_, err := ParseStatement("MATCH (a)-[:KNOWS]->(b) WITH a ORDER BY b RETURN a")
+	if err != nil {
+		t.Fatalf("expected query to parse, got error: %v", err)
+	}
+}
+
+func TestParseStatementRejectsUndefinedOrderByVariableNeverDefined(t *testing.T) {
+	_, err := ParseStatement("MATCH (a) RETURN a ORDER BY d")
+	if err == nil {
+		t.Fatalf("expected undefined variable parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "UndefinedVariable" {
+		t.Fatalf("expected UndefinedVariable message, got %q", parseErr.Message)
+	}
+}
+
+func TestParseStatementRejectsMultipleUndefinedOrderByVariables(t *testing.T) {
+	_, err := ParseStatement("MATCH (a) RETURN a ORDER BY a.id, c, d")
+	if err == nil {
+		t.Fatalf("expected undefined variable parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported {
+		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+	if parseErr.Message != "UndefinedVariable" {
+		t.Fatalf("expected UndefinedVariable message, got %q", parseErr.Message)
+	}
+}
+
+func TestParseStatementAllowsReturnOrderByNonProjectedBoundVariable(t *testing.T) {
+	_, err := ParseStatement("MATCH (a) RETURN a.id AS id ORDER BY a")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+}
+
 func TestParseStatementAllowsProjectedPropertyAccessWithAggregation(t *testing.T) {
 	_, err := ParseStatement("MATCH (me:Person)--(you:Person) WITH me.age AS age, me.age + count(you.age) AS agg RETURN *")
 	if err != nil {
@@ -750,6 +1042,21 @@ func TestParseStatementRejectsNestedAggregationAtCompileTime(t *testing.T) {
 	}
 	if parseErr.Kind != ParseErrorUnsupported {
 		t.Fatalf("expected unsupported parse error kind, got %s", parseErr.Kind)
+	}
+}
+
+func TestParseStatementRejectsNonConstantRandInsideAggregationAtCompileTime(t *testing.T) {
+	_, err := ParseStatement("RETURN count(rand())")
+	if err == nil {
+		t.Fatalf("expected non-constant expression parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorUnsupported || parseErr.Message != "NonConstantExpression" {
+		t.Fatalf("expected NonConstantExpression parse error, got kind=%s message=%q", parseErr.Kind, parseErr.Message)
 	}
 }
 

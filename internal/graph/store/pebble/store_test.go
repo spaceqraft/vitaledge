@@ -756,6 +756,122 @@ func TestHasDirectedEdgeBetweenWithParallelEdges(t *testing.T) {
 	}
 }
 
+func TestAdjacencyPrimitivesAndBatchEndpointProbes(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"Person"}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e3", Type: "KNOWS", SrcID: "u2", DstID: "u1"},
+			{Tenant: "acme", ID: "e4", Type: "KNOWS", SrcID: "u3", DstID: "u1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		out := []string{}
+		if err := tx.ScanAdjacencyLinks(ctx, "acme", "u1", graph.EdgeDirectionOut, "KNOWS", 0, func(edgeID, peerID string) error {
+			out = append(out, edgeID+"->"+peerID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(out)
+		if got := strings.Join(out, ","); got != "e1->u2,e2->u2" {
+			return fmt.Errorf("unexpected out adjacency links: %s", got)
+		}
+
+		in := []string{}
+		if err := tx.ScanAdjacencyLinks(ctx, "acme", "u1", graph.EdgeDirectionIn, "KNOWS", 0, func(edgeID, peerID string) error {
+			in = append(in, edgeID+"<-"+peerID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(in)
+		if got := strings.Join(in, ","); got != "e3<-u2,e4<-u3" {
+			return fmt.Errorf("unexpected in adjacency links: %s", got)
+		}
+
+		any := []string{}
+		if err := tx.ScanAdjacencyLinks(ctx, "acme", "u1", graph.EdgeDirectionAny, "KNOWS", 0, func(edgeID, peerID string) error {
+			any = append(any, edgeID+":"+peerID)
+			return nil
+		}); err != nil {
+			return err
+		}
+		sort.Strings(any)
+		if got := strings.Join(any, ","); got != "e1:u2,e2:u2,e3:u2,e4:u3" {
+			return fmt.Errorf("unexpected any-direction adjacency links: %s", got)
+		}
+
+		directedCount, err := tx.DirectedEdgePairCount(ctx, "acme", "u1", "u2", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if directedCount != 2 {
+			return fmt.Errorf("expected directed pair count 2 for u1->u2 KNOWS, got %d", directedCount)
+		}
+
+		undirectedCount, err := tx.UndirectedEdgePairCount(ctx, "acme", "u1", "u2", "KNOWS")
+		if err != nil {
+			return err
+		}
+		if undirectedCount != 3 {
+			return fmt.Errorf("expected undirected pair count 3 for u1/u2 KNOWS, got %d", undirectedCount)
+		}
+
+		directedBatch, err := tx.BatchHasDirectedEdgeBetween(ctx, "acme", []graph.DirectedEdgeProbe{
+			{SrcID: "u1", DstID: "u2", EdgeType: "KNOWS"},
+			{SrcID: "u2", DstID: "u1", EdgeType: "KNOWS"},
+			{SrcID: "u1", DstID: "u3", EdgeType: "KNOWS"},
+		})
+		if err != nil {
+			return err
+		}
+		if len(directedBatch) != 3 || !directedBatch[0] || !directedBatch[1] || directedBatch[2] {
+			return fmt.Errorf("unexpected directed batch result: %#v", directedBatch)
+		}
+
+		undirectedBatch, err := tx.BatchHasUndirectedEdgeBetween(ctx, "acme", []graph.UndirectedEdgeProbe{
+			{LeftID: "u1", RightID: "u2", EdgeType: "KNOWS"},
+			{LeftID: "u1", RightID: "u3", EdgeType: "KNOWS"},
+		})
+		if err != nil {
+			return err
+		}
+		if len(undirectedBatch) != 2 || !undirectedBatch[0] || !undirectedBatch[1] {
+			return fmt.Errorf("unexpected undirected batch result: %#v", undirectedBatch)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("view failed: %v", err)
+	}
+}
+
 func TestHasUndirectedEdgeBetweenTracksDirectionDeletes(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)
@@ -999,10 +1115,10 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 	}
 
 	err = storeWithMetrics.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.DeleteVertex(ctx, "acme", "u-metric"); err != nil {
+		if err := tx.DeleteEdge(ctx, "acme", "e-metric"); err != nil {
 			return err
 		}
-		return tx.DeleteEdge(ctx, "acme", "e-metric")
+		return tx.DeleteVertex(ctx, "acme", "u-metric")
 	})
 	if err != nil {
 		t.Fatalf("metric delete failed: %v", err)
@@ -1015,6 +1131,9 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.DeleteEdge(ctx, "acme", "e1"); err != nil {
+			return err
+		}
 		if err := tx.DeleteEdge(ctx, "acme", "e2"); err != nil {
 			return err
 		}
@@ -1032,8 +1151,8 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 		if snapshot.VertexTotal != 1 {
 			return fmt.Errorf("expected VertexTotal=1 after delete, got %d", snapshot.VertexTotal)
 		}
-		if snapshot.EdgeTotal != 1 {
-			return fmt.Errorf("expected EdgeTotal=1 after delete, got %d", snapshot.EdgeTotal)
+		if snapshot.EdgeTotal != 0 {
+			return fmt.Errorf("expected EdgeTotal=0 after delete, got %d", snapshot.EdgeTotal)
 		}
 		return nil
 	})
@@ -1096,10 +1215,16 @@ func TestStatsSnapshotLabelAndEdgeTypeCounters(t *testing.T) {
 		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "LIKED", SrcID: "v2", DstID: "v3"}); err != nil {
 			return err
 		}
+		if err := tx.DeleteEdge(ctx, "acme", "e2"); err != nil {
+			return err
+		}
+		if err := tx.DeleteEdge(ctx, "acme", "e3"); err != nil {
+			return err
+		}
 		if err := tx.DeleteVertex(ctx, "acme", "v3"); err != nil {
 			return err
 		}
-		return tx.DeleteEdge(ctx, "acme", "e3")
+		return nil
 	})
 	if err != nil {
 		t.Fatalf("mutation failed: %v", err)
@@ -1125,11 +1250,26 @@ func TestStatsSnapshotLabelAndEdgeTypeCounters(t *testing.T) {
 		if got := snapshot.EdgeCounts["RATED"]; got != 1 {
 			return fmt.Errorf("expected RATED edge count=1, got %d", got)
 		}
-		if got := snapshot.EdgeCounts["LIKED"]; got != 1 {
-			return fmt.Errorf("expected LIKED edge count=1, got %d", got)
+		if got := snapshot.EdgeCounts["LIKED"]; got != 0 {
+			return fmt.Errorf("expected LIKED edge count=0, got %d", got)
 		}
 		if got := snapshot.EdgeCounts["GENRED"]; got != 0 {
 			return fmt.Errorf("expected GENRED edge count=0, got %d", got)
+		}
+		if got := snapshot.EdgeSourceCounts["RATED"]; got != 1 {
+			return fmt.Errorf("expected RATED source count=1, got %d", got)
+		}
+		if got := snapshot.EdgeSourceCounts["LIKED"]; got != 0 {
+			return fmt.Errorf("expected LIKED source count=0, got %d", got)
+		}
+		if got := snapshot.EdgeSourceCounts["GENRED"]; got != 0 {
+			return fmt.Errorf("expected GENRED source count=0, got %d", got)
+		}
+		if got := snapshot.EdgeAvgOutDegree["RATED"]; got != 1.0 {
+			return fmt.Errorf("expected RATED avg out-degree=1.0, got %v", got)
+		}
+		if got := snapshot.EdgeAvgOutDegree["LIKED"]; got != 0.0 {
+			return fmt.Errorf("expected LIKED avg out-degree=0.0, got %v", got)
 		}
 		return nil
 	})
@@ -1179,6 +1319,124 @@ func TestDurabilityAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestStatsSnapshotPropertySummariesAndFreshness(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "u2"}); err != nil {
+			return err
+		}
+		entries := []*graph.PropertyIndexEntry{
+			{Tenant: "acme", Schema: "User", Property: "age", Value: []byte("20"), EntityID: "u1", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "User", Property: "age", Value: []byte("20"), EntityID: "u2", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "User", Property: "age", Value: []byte("30"), EntityID: "u3", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "User", Property: "active", Value: []byte("true"), EntityID: "u1", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "User", Property: "active", Value: []byte("false"), EntityID: "u2", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "User", Property: "country", Value: []byte("US"), EntityID: "u1", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "User", Property: "country", Value: []byte("US"), EntityID: "u2", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "User", Property: "country", Value: []byte("CA"), EntityID: "u3", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "RATED", Property: "createdAt", Value: []byte("map[__temporal_type:datetime year:2024 month:1 day:2 hour:3 minute:4 second:5 nanosecond:0 timezone:UTC]"), EntityID: "e1", EntityClass: "edge", EdgeSrcID: "u1", EdgeDstID: "u2"},
+			{Tenant: "acme", Schema: "RATED", Property: "createdAt", Value: []byte("map[__temporal_type:datetime year:2024 month:1 day:3 hour:3 minute:4 second:5 nanosecond:0 timezone:UTC]"), EntityID: "e2", EntityClass: "edge", EdgeSrcID: "u2", EdgeDstID: "u1"},
+		}
+		for _, entry := range entries {
+			if err := tx.PutPropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		snapshot, err := tx.GetStatsSnapshot(ctx, "acme")
+		if err != nil {
+			return err
+		}
+		if snapshot.StatsEpoch <= 0 {
+			return fmt.Errorf("expected positive stats epoch, got %d", snapshot.StatsEpoch)
+		}
+		if snapshot.SampleSize != 3 {
+			return fmt.Errorf("expected sample size 3, got %d", snapshot.SampleSize)
+		}
+		if snapshot.LastRefreshTS.IsZero() {
+			return fmt.Errorf("expected non-zero last refresh timestamp")
+		}
+		vertexAge := snapshot.VertexPropertyStats["User"]["age"]
+		if vertexAge.DistinctValues != 2 || vertexAge.IndexedEntries != 3 {
+			return fmt.Errorf("unexpected vertex property stats: %#v", vertexAge)
+		}
+		if vertexAge.EstimatedSelectivity != 0.5 {
+			return fmt.Errorf("expected vertex property selectivity 0.5, got %v", vertexAge.EstimatedSelectivity)
+		}
+		if vertexAge.Histogram == nil || vertexAge.Histogram.Kind != "numeric" {
+			return fmt.Errorf("expected numeric histogram for vertex age, got %#v", vertexAge.Histogram)
+		}
+		if vertexAge.StatsEpoch <= 0 || vertexAge.SampleSize != 3 || vertexAge.LastRefreshTS.IsZero() {
+			return fmt.Errorf("expected property freshness metadata for vertex age, got epoch=%d sample=%d refresh=%v", vertexAge.StatsEpoch, vertexAge.SampleSize, vertexAge.LastRefreshTS)
+		}
+		if got := vertexAge.DistinctValuesByKind["numeric"]; got != 2 {
+			return fmt.Errorf("expected numeric distinct count 2 for vertex age, got %d", got)
+		}
+		if got := vertexAge.IndexedEntriesByKind["numeric"]; got != 3 {
+			return fmt.Errorf("expected numeric entries 3 for vertex age, got %d", got)
+		}
+		if got := vertexAge.EstimatedSelectivityByKind["numeric"]; got != 0.5 {
+			return fmt.Errorf("expected numeric selectivity 0.5 for vertex age, got %v", got)
+		}
+		if vertexAge.Histograms["numeric"] == nil {
+			return fmt.Errorf("expected numeric histogram in histogram map for vertex age")
+		}
+		vertexHistogramCount := 0
+		for _, bucket := range vertexAge.Histogram.Buckets {
+			vertexHistogramCount += bucket.Count
+		}
+		if vertexHistogramCount != 3 {
+			return fmt.Errorf("expected vertex histogram count 3, got %d", vertexHistogramCount)
+		}
+		vertexActive := snapshot.VertexPropertyStats["User"]["active"]
+		if vertexActive.Histograms["boolean"] == nil {
+			return fmt.Errorf("expected boolean histogram for vertex active, got %#v", vertexActive.Histograms)
+		}
+		if got := vertexActive.DistinctValuesByKind["boolean"]; got != 2 {
+			return fmt.Errorf("expected boolean distinct count 2 for active, got %d", got)
+		}
+		vertexCountry := snapshot.VertexPropertyStats["User"]["country"]
+		if vertexCountry.Histograms["categorical"] == nil {
+			return fmt.Errorf("expected categorical histogram for vertex country, got %#v", vertexCountry.Histograms)
+		}
+		if got := vertexCountry.DistinctValuesByKind["categorical"]; got != 2 {
+			return fmt.Errorf("expected categorical distinct count 2 for country, got %d", got)
+		}
+		edgeCreatedAt := snapshot.EdgePropertyStats["RATED"]["createdAt"]
+		if edgeCreatedAt.DistinctValues != 2 || edgeCreatedAt.IndexedEntries != 2 {
+			return fmt.Errorf("unexpected edge property stats: %#v", edgeCreatedAt)
+		}
+		if edgeCreatedAt.Histogram == nil || edgeCreatedAt.Histogram.Kind != "datetime" {
+			return fmt.Errorf("expected datetime histogram for edge createdAt, got %#v", edgeCreatedAt.Histogram)
+		}
+		if edgeCreatedAt.Histograms["datetime"] == nil {
+			return fmt.Errorf("expected datetime histogram in histogram map for edge createdAt")
+		}
+		if edgeCreatedAt.StatsEpoch <= 0 || edgeCreatedAt.SampleSize != 2 || edgeCreatedAt.LastRefreshTS.IsZero() {
+			return fmt.Errorf("expected property freshness metadata for edge createdAt, got epoch=%d sample=%d refresh=%v", edgeCreatedAt.StatsEpoch, edgeCreatedAt.SampleSize, edgeCreatedAt.LastRefreshTS)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("property stats snapshot validation failed: %v", err)
+	}
+}
+
 func TestOpenRunsStatsMigrationForLegacyData(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
@@ -1202,7 +1460,20 @@ func TestOpenRunsStatsMigrationForLegacyData(t *testing.T) {
 		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1"}); err != nil {
 			return err
 		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "TAGGED", SrcID: "m1", DstID: "x1"})
+		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "TAGGED", SrcID: "m1", DstID: "x1"}); err != nil {
+			return err
+		}
+		entries := []*graph.PropertyIndexEntry{
+			{Tenant: "acme", Schema: "Movie", Property: "score", Value: []byte("9.5"), EntityID: "m1", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "Movie", Property: "score", Value: []byte("7.0"), EntityID: "m2", EntityClass: "vertex"},
+			{Tenant: "acme", Schema: "RATED", Property: "createdAt", Value: []byte("map[__temporal_type:datetime year:2024 month:2 day:1 hour:10 minute:0 second:0 nanosecond:0 timezone:UTC]"), EntityID: "e1", EntityClass: "edge", EdgeSrcID: "u1", EdgeDstID: "m1"},
+		}
+		for _, entry := range entries {
+			if err := tx.PutPropertyIndex(ctx, entry); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		t.Fatalf("seed failed: %v", err)
@@ -1239,6 +1510,17 @@ func TestOpenRunsStatsMigrationForLegacyData(t *testing.T) {
 		}
 		if snapshot.EdgeCounts["RATED"] != 1 || snapshot.EdgeCounts["TAGGED"] != 1 {
 			return fmt.Errorf("unexpected edge counts: %#v", snapshot.EdgeCounts)
+		}
+		if snapshot.StatsEpoch <= 0 || snapshot.LastRefreshTS.IsZero() {
+			return fmt.Errorf("expected migrated freshness metadata, got epoch=%d refresh=%v", snapshot.StatsEpoch, snapshot.LastRefreshTS)
+		}
+		vertexScore := snapshot.VertexPropertyStats["Movie"]["score"]
+		if vertexScore.DistinctValues != 2 || vertexScore.IndexedEntries != 2 {
+			return fmt.Errorf("unexpected migrated vertex property stats: %#v", vertexScore)
+		}
+		edgeCreatedAt := snapshot.EdgePropertyStats["RATED"]["createdAt"]
+		if edgeCreatedAt.DistinctValues != 1 || edgeCreatedAt.IndexedEntries != 1 {
+			return fmt.Errorf("unexpected migrated edge property stats: %#v", edgeCreatedAt)
 		}
 		return nil
 	})

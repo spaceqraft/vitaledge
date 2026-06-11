@@ -227,8 +227,14 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 			if containsForbiddenPatternExpression(item.Expression.Raw) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
 			}
+			if hasInvalidLogicalLiteralArgumentType(item.Expression.Raw) {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+			}
 			if hasInvalidInLiteralRHS(item.Expression.Raw) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+			}
+			if hasInvalidQuantifierArgumentType(item.Expression.Raw) {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
 			}
 			if hasInvalidAggregationInListComprehension(item.Expression.Raw) {
 				return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
@@ -267,6 +273,9 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 		if err := validateProjectionSemanticsFromItems(typed.Return.Items, ast.ClauseKindReturn, bound, seg); err != nil {
 			return err
 		}
+		if err := validateOrderByScope(&typed.Return, ast.ClauseKindReturn, bound, seg); err != nil {
+			return err
+		}
 	case *ast.QueryStatement:
 		bound := map[string]patternVarRole{}
 		valueKinds := map[string]projectionValueKind{}
@@ -286,16 +295,32 @@ func validateUnexpectedSyntax(stmt ast.Statement, seg statementSegment) error {
 					if err := validateProjectionSemanticsFromRaw(clause.Raw, clause.Kind, bound, seg); err != nil {
 						return err
 					}
+					if err := validateOrderByScope(clause.Projection, clause.Kind, bound, seg); err != nil {
+						return err
+					}
 					if err := validateStaticPropertyAccessTypesFromRaw(clause.Raw, clause.Kind, valueKinds, seg); err != nil {
 						return err
+					}
+					if clause.Projection != nil {
+						for _, item := range clause.Projection.Items {
+							if hasInvalidLogicalLiteralArgumentType(item.Expression.Raw) {
+								return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+							}
+						}
 					}
 					expressions := extractProjectionExpressions(clause.Raw, clause.Kind)
 					for _, expr := range expressions {
 						if containsForbiddenPatternExpression(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "unexpected syntax", Statement: seg.index}
 						}
+						if hasInvalidLogicalLiteralArgumentType(expr) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+						}
 						if hasInvalidInLiteralRHS(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+						}
+						if hasInvalidQuantifierArgumentType(expr) {
+							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
 						}
 						if hasInvalidAggregationInListComprehension(expr) {
 							return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
@@ -457,6 +482,9 @@ func validateSetAssignmentsAndExpressions(raw string, bound map[string]patternVa
 		}
 		if hasInvalidInLiteralRHS(expr) {
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "invalid argument type", Statement: seg.index}
+		}
+		if hasInvalidQuantifierArgumentType(expr) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
 		}
 		if hasInvalidAggregationInListComprehension(expr) {
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
@@ -861,6 +889,11 @@ func validateProjectionSemanticItems(items []projectionSemanticItem, kind ast.Cl
 		if hasNestedAggregateFunctionCall(expr) {
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "NestedAggregation", Statement: seg.index}
 		}
+		for _, call := range findAggregateFunctionCalls(expr) {
+			if containsFunctionCallNamed(call.args, "rand") {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "NonConstantExpression", Statement: seg.index}
+			}
+		}
 
 		if hasUndefinedInlineMapValueIdentifier(expr, bound) {
 			return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
@@ -918,6 +951,159 @@ func validateProjectionSemanticItems(items []projectionSemanticItem, kind ast.Cl
 	}
 
 	return nil
+}
+
+func validateOrderByScope(projection *ast.ReturnClause, kind ast.ClauseKind, bound map[string]patternVarRole, seg statementSegment) error {
+	if projection == nil || len(projection.OrderBy) == 0 {
+		return nil
+	}
+
+	allowed := map[string]struct{}{}
+	boundAllowed := map[string]struct{}{}
+	projectedNonAggRefs := map[string]struct{}{}
+	projectedComplexNonAggRefs := map[string]struct{}{}
+	projectedAggCalls := map[string]struct{}{}
+	projectionHasAggregate := false
+
+	for name := range bound {
+		boundAllowed[name] = struct{}{}
+	}
+	for _, item := range projection.Items {
+		expr := strings.TrimSpace(item.Expression.Raw)
+		if expr != "" {
+			if containsAggregateFunctionCall(expr) {
+				projectionHasAggregate = true
+				for _, call := range findAggregateFunctionCalls(stripExistsSubqueryBodies(expr)) {
+					callText := strings.TrimSpace(expr[call.start:call.end])
+					if callText != "" {
+						projectedAggCalls[canonicalizeOrderByAggregateCall(callText)] = struct{}{}
+					}
+				}
+			} else if ref, ok := normalizeAllowedGroupingReference(expr); ok {
+				projectedNonAggRefs[ref] = struct{}{}
+			} else {
+				for _, ref := range extractNonAggregateReferences(stripExistsSubqueryBodies(expr)) {
+					ref = strings.TrimSpace(ref)
+					if ref == "" || isCypherLiteralKeyword(ref) {
+						continue
+					}
+					projectedComplexNonAggRefs[ref] = struct{}{}
+				}
+			}
+		}
+
+		if item.Alias != "" {
+			allowed[item.Alias] = struct{}{}
+			continue
+		}
+		if name := projectionOutputNameFromRaw(item.Expression.Raw); name != "" {
+			allowed[name] = struct{}{}
+		}
+	}
+
+	if !projection.Distinct && !projectionHasAggregate {
+		if kind == ast.ClauseKindReturn || (kind == ast.ClauseKindWith && projection.IncludeAll) {
+			for name := range bound {
+				allowed[name] = struct{}{}
+			}
+		}
+	}
+
+	for _, sortItem := range projection.OrderBy {
+		expr := strings.TrimSpace(sortItem.Expression.Raw)
+		if expr == "" {
+			continue
+		}
+		stripped := stripExistsSubqueryBodies(expr)
+		aggCalls := findAggregateFunctionCalls(stripped)
+		if len(aggCalls) > 0 {
+			if !projectionHasAggregate {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidAggregation", Statement: seg.index}
+			}
+			for _, call := range aggCalls {
+				callText := strings.TrimSpace(stripped[call.start:call.end])
+				if callText == "" {
+					continue
+				}
+				if _, ok := projectedAggCalls[canonicalizeOrderByAggregateCall(callText)]; !ok {
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+				}
+
+				for _, ref := range extractIdentifierPropertyReferences(stripExistsSubqueryBodies(call.args)) {
+					root := strings.TrimSpace(ref)
+					if idx := strings.Index(root, "."); idx >= 0 {
+						root = strings.TrimSpace(root[:idx])
+					}
+					if root == "" || isCypherLiteralKeyword(root) {
+						continue
+					}
+					if _, ok := expressionOperatorKeywords[strings.ToLower(root)]; ok {
+						continue
+					}
+					if _, ok := boundAllowed[root]; ok {
+						continue
+					}
+					if _, ok := allowed[root]; ok {
+						continue
+					}
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+				}
+			}
+		}
+
+		for _, ref := range extractNonAggregateReferences(stripped) {
+			root := strings.TrimSpace(ref)
+			if idx := strings.Index(root, "."); idx >= 0 {
+				root = strings.TrimSpace(root[:idx])
+			}
+			if root == "" || isCypherLiteralKeyword(root) {
+				continue
+			}
+			if _, ok := expressionOperatorKeywords[strings.ToLower(root)]; ok {
+				continue
+			}
+			if _, ok := allowed[root]; ok {
+				continue
+			}
+			if _, ok := projectedNonAggRefs[strings.TrimSpace(ref)]; ok {
+				continue
+			}
+			if len(aggCalls) > 0 {
+				if _, ok := projectedComplexNonAggRefs[strings.TrimSpace(ref)]; ok {
+					return &ParseError{Kind: ParseErrorUnsupported, Message: "AmbiguousAggregationExpression", Statement: seg.index}
+				}
+			}
+			if !projectionHasAggregate && kind == ast.ClauseKindWith {
+				if _, ok := boundAllowed[root]; ok {
+					continue
+				}
+			}
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "UndefinedVariable", Statement: seg.index}
+		}
+	}
+
+	return nil
+}
+
+func canonicalizeOrderByAggregateCall(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			b.WriteByte(ch + ('a' - 'A'))
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
 }
 
 func isSimpleReferenceExpression(expr string) bool {
@@ -1717,12 +1903,19 @@ func isSpace(ch byte) bool {
 
 func validateStaticPropertyAccessTypesFromRaw(raw string, kind ast.ClauseKind, kinds map[string]projectionValueKind, seg statementSegment) error {
 	for _, expr := range extractProjectionExpressions(raw, kind) {
-		base, ok := simplePropertyAccessBase(expr)
+		baseExpr, ok := simplePropertyAccessBaseExpression(expr)
 		if !ok {
 			continue
 		}
-		if kinds[base] == projectionValueKindNonMap {
-			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentType", Statement: seg.index}
+		if isNonMapLiteralExpression(baseExpr) {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentTypePropertyAccess", Statement: seg.index}
+		}
+		name, next, idOK := readIdentifier(baseExpr, 0)
+		if !idOK || strings.TrimSpace(baseExpr[next:]) != "" || name == "" {
+			continue
+		}
+		if kinds[baseExpr] == projectionValueKindNonMap {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "InvalidArgumentTypePropertyAccess", Statement: seg.index}
 		}
 	}
 	return nil
@@ -1778,6 +1971,9 @@ func inferProjectionValueKind(expr string, known map[string]projectionValueKind)
 	if expr == "" {
 		return projectionValueKindUnknown
 	}
+	if strings.EqualFold(expr, "null") {
+		return projectionValueKindUnknown
+	}
 	if kind, ok := known[expr]; ok {
 		return kind
 	}
@@ -1790,10 +1986,25 @@ func inferProjectionValueKind(expr string, known map[string]projectionValueKind)
 	return projectionValueKindUnknown
 }
 
-func simplePropertyAccessBase(expr string) (string, bool) {
+func simplePropertyAccessBaseExpression(expr string) (string, bool) {
 	trimmed := strings.TrimSpace(expr)
 	if trimmed == "" {
 		return "", false
+	}
+	if strings.HasPrefix(trimmed, "(") {
+		end := findMatchingParen(trimmed, 0)
+		if end <= 0 || end >= len(trimmed)-1 {
+			return "", false
+		}
+		next := skipSpaces(trimmed, end+1)
+		if next >= len(trimmed) || trimmed[next] != '.' {
+			return "", false
+		}
+		base := strings.TrimSpace(trimmed[1:end])
+		if base == "" {
+			return "", false
+		}
+		return base, true
 	}
 	name, next, ok := readIdentifier(trimmed, 0)
 	if !ok {
@@ -2008,9 +2219,8 @@ func extractProjectionExpressions(raw string, kind ast.ClauseKind) []string {
 		if entry == "" || entry == "*" {
 			continue
 		}
-		_, expr, ok := parseProjectionAlias(entry)
-		if ok {
-			entry = strings.TrimSpace(expr)
+		if idx := indexTopLevelAliasKeyword(entry); idx >= 0 {
+			entry = strings.TrimSpace(entry[:idx])
 		}
 		expressions = append(expressions, entry)
 	}
@@ -2355,6 +2565,429 @@ func hasInvalidInLiteralRHS(expr string) bool {
 		return false
 	}
 	return isNonListLiteralExpression(rhs)
+}
+
+func hasInvalidLogicalLiteralArgumentType(expr string) bool {
+	raw := stripWrappingParensForValidation(strings.TrimSpace(expr))
+	if raw == "" {
+		return false
+	}
+
+	if operand, ok := splitTopLevelNotOperandForValidation(raw); ok {
+		if isNonBooleanLiteralExpressionForValidation(operand) {
+			return true
+		}
+		return hasInvalidLogicalLiteralArgumentType(operand)
+	}
+
+	left, right, ok := splitTopLevelLogicalExpressionForValidation(raw)
+	if !ok {
+		return false
+	}
+	if isNonBooleanLiteralExpressionForValidation(left) || isNonBooleanLiteralExpressionForValidation(right) {
+		return true
+	}
+	return hasInvalidLogicalLiteralArgumentType(left) || hasInvalidLogicalLiteralArgumentType(right)
+}
+
+func splitTopLevelNotOperandForValidation(raw string) (string, bool) {
+	if len(raw) < 3 || !strings.EqualFold(raw[:3], "NOT") {
+		return "", false
+	}
+	if len(raw) > 3 {
+		next := rune(raw[3])
+		if !strings.ContainsRune(" (\t\n\r", next) {
+			return "", false
+		}
+	}
+	operand := strings.TrimSpace(raw[3:])
+	if operand == "" {
+		return "", false
+	}
+	return operand, true
+}
+
+func splitTopLevelLogicalExpressionForValidation(raw string) (string, string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", false
+	}
+	for _, op := range []string{"XOR", "AND", "OR"} {
+		idx := indexTopLevelLogicalOperator(raw, op)
+		if idx <= 0 {
+			continue
+		}
+		left := strings.TrimSpace(raw[:idx])
+		right := strings.TrimSpace(raw[idx+len(op):])
+		if left == "" || right == "" {
+			continue
+		}
+		return left, right, true
+	}
+	return "", "", false
+}
+
+func indexTopLevelLogicalOperator(raw, op string) int {
+	upper := strings.ToUpper(raw)
+	op = strings.ToUpper(op)
+	depthParen, depthBracket, depthBrace := 0, 0, 0
+	inSingle, inDouble, inBacktick := false, false, false
+
+	for i := 0; i <= len(raw)-len(op); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && !inBacktick && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && !inBacktick && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if ch == '`' && !inSingle && !inDouble {
+			inBacktick = !inBacktick
+			continue
+		}
+		if inSingle || inDouble || inBacktick {
+			continue
+		}
+
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+			continue
+		}
+		if !strings.HasPrefix(upper[i:], op) {
+			continue
+		}
+		end := i + len(op)
+		if i > 0 && isIdentifierPart(raw[i-1]) {
+			continue
+		}
+		if end < len(raw) && isIdentifierPart(raw[end]) {
+			continue
+		}
+		return i
+	}
+
+	return -1
+}
+
+func stripWrappingParensForValidation(raw string) string {
+	raw = strings.TrimSpace(raw)
+	for strings.HasPrefix(raw, "(") && strings.HasSuffix(raw, ")") {
+		end := findMatchingParen(raw, 0)
+		if end != len(raw)-1 {
+			break
+		}
+		raw = strings.TrimSpace(raw[1 : len(raw)-1])
+	}
+	return raw
+}
+
+func isNonBooleanLiteralExpressionForValidation(raw string) bool {
+	raw = stripWrappingParensForValidation(strings.TrimSpace(raw))
+	if raw == "" {
+		return false
+	}
+	if strings.EqualFold(raw, "true") || strings.EqualFold(raw, "false") || strings.EqualFold(raw, "null") {
+		return false
+	}
+	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		return true
+	}
+	if strings.HasPrefix(raw, "{") && strings.HasSuffix(raw, "}") {
+		return true
+	}
+	if (strings.HasPrefix(raw, "'") && strings.HasSuffix(raw, "'")) || (strings.HasPrefix(raw, `"`) && strings.HasSuffix(raw, `"`)) {
+		return true
+	}
+	if _, err := strconv.ParseFloat(raw, 64); err == nil {
+		return true
+	}
+	return false
+}
+
+func hasInvalidQuantifierArgumentType(expr string) bool {
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+
+	for i := 0; i < len(expr); i++ {
+		ch := expr[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || expr[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || expr[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		}
+
+		if !isIdentifierStart(ch) {
+			continue
+		}
+		if i > 0 && isIdentifierPart(expr[i-1]) {
+			continue
+		}
+
+		name, next, ok := readIdentifier(expr, i)
+		if !ok {
+			continue
+		}
+		lowerName := strings.ToLower(strings.TrimSpace(name))
+		if lowerName != "any" && lowerName != "all" && lowerName != "none" && lowerName != "single" {
+			i = next - 1
+			continue
+		}
+
+		open := skipSpaces(expr, next)
+		if open >= len(expr) || expr[open] != '(' {
+			i = next - 1
+			continue
+		}
+		end := findMatchingParen(expr, open)
+		if end < 0 {
+			i = next - 1
+			continue
+		}
+		arg := strings.TrimSpace(expr[open+1 : end])
+		if invalidQuantifierArithmeticPredicateType(arg) {
+			return true
+		}
+		if hasInvalidQuantifierArgumentType(arg) {
+			return true
+		}
+		i = end
+	}
+
+	return false
+}
+
+func invalidQuantifierArithmeticPredicateType(arg string) bool {
+	varName, listExpr, predicateExpr, ok := splitQuantifierArgumentForValidation(arg)
+	if !ok {
+		return false
+	}
+	if !predicateUsesArithmeticWithIdentifier(predicateExpr, varName) {
+		return false
+	}
+	elements, ok := parseLiteralListElementsForValidation(listExpr)
+	if !ok {
+		return false
+	}
+	hasNonNull := false
+	hasNumeric := false
+	for _, element := range elements {
+		kind := classifyLiteralValueKindForValidation(element)
+		switch kind {
+		case "null":
+			continue
+		case "numeric":
+			hasNumeric = true
+			hasNonNull = true
+		case "string", "bool":
+			hasNonNull = true
+		default:
+			return false
+		}
+	}
+	return hasNonNull && !hasNumeric
+}
+
+func splitQuantifierArgumentForValidation(arg string) (string, string, string, bool) {
+	text := strings.TrimSpace(arg)
+	if text == "" {
+		return "", "", "", false
+	}
+	inPos := findTopLevelInKeywordIndex(text)
+	if inPos <= 0 {
+		return "", "", "", false
+	}
+	varRaw := strings.TrimSpace(text[:inPos])
+	if varRaw == "" {
+		return "", "", "", false
+	}
+	name, next, ok := readIdentifier(varRaw, 0)
+	if !ok {
+		return "", "", "", false
+	}
+	next = skipSpaces(varRaw, next)
+	if next != len(varRaw) {
+		return "", "", "", false
+	}
+	rest := strings.TrimSpace(text[inPos+2:])
+	if rest == "" {
+		return "", "", "", false
+	}
+	wherePos := indexTopLevelKeyword(rest, "WHERE")
+	if wherePos <= 0 {
+		return "", "", "", false
+	}
+	listExpr := strings.TrimSpace(rest[:wherePos])
+	predicateExpr := strings.TrimSpace(rest[wherePos+len("WHERE"):])
+	if listExpr == "" || predicateExpr == "" {
+		return "", "", "", false
+	}
+	return name, listExpr, predicateExpr, true
+}
+
+func parseLiteralListElementsForValidation(raw string) ([]string, bool) {
+	text := strings.TrimSpace(raw)
+	for strings.HasPrefix(text, "(") && strings.HasSuffix(text, ")") {
+		end := findMatchingParen(text, 0)
+		if end != len(text)-1 {
+			break
+		}
+		text = strings.TrimSpace(text[1 : len(text)-1])
+	}
+	if !strings.HasPrefix(text, "[") || !strings.HasSuffix(text, "]") {
+		return nil, false
+	}
+	body := strings.TrimSpace(text[1 : len(text)-1])
+	if body == "" {
+		return []string{}, true
+	}
+	parts := splitTopLevelComma(body)
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		out = append(out, strings.TrimSpace(part))
+	}
+	return out, true
+}
+
+func classifyLiteralValueKindForValidation(raw string) string {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return "unknown"
+	}
+	if strings.EqualFold(text, "null") {
+		return "null"
+	}
+	if strings.EqualFold(text, "true") || strings.EqualFold(text, "false") {
+		return "bool"
+	}
+	if (strings.HasPrefix(text, "'") && strings.HasSuffix(text, "'")) || (strings.HasPrefix(text, "\"") && strings.HasSuffix(text, "\"")) {
+		return "string"
+	}
+	if _, err := strconv.ParseFloat(text, 64); err == nil {
+		return "numeric"
+	}
+	return "unknown"
+}
+
+func predicateUsesArithmeticWithIdentifier(predicate string, identifier string) bool {
+	ident := strings.TrimSpace(identifier)
+	if ident == "" {
+		return false
+	}
+
+	inSingle := false
+	inDouble := false
+	inBacktick := false
+
+	for i := 0; i < len(predicate); i++ {
+		ch := predicate[i]
+		if inSingle {
+			if ch == '\'' && (i == 0 || predicate[i-1] != '\\') {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' && (i == 0 || predicate[i-1] != '\\') {
+				inDouble = false
+			}
+			continue
+		}
+		if inBacktick {
+			if ch == '`' {
+				inBacktick = false
+			}
+			continue
+		}
+
+		switch ch {
+		case '\'':
+			inSingle = true
+			continue
+		case '"':
+			inDouble = true
+			continue
+		case '`':
+			inBacktick = true
+			continue
+		}
+
+		if !isIdentifierStart(ch) {
+			continue
+		}
+		if i > 0 && isIdentifierPart(predicate[i-1]) {
+			continue
+		}
+		name, next, ok := readIdentifier(predicate, i)
+		if !ok {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(name), ident) {
+			i = next - 1
+			continue
+		}
+		if prev, ok := previousNonSpaceChar(predicate, i); ok {
+			if prev == '+' || prev == '-' || prev == '*' || prev == '/' || prev == '%' {
+				return true
+			}
+		}
+		nextIdx := skipSpaces(predicate, next)
+		if nextIdx < len(predicate) {
+			nextCh := predicate[nextIdx]
+			if nextCh == '+' || nextCh == '-' || nextCh == '*' || nextCh == '/' || nextCh == '%' {
+				return true
+			}
+		}
+		i = next - 1
+	}
+
+	return false
 }
 
 func splitTopLevelInExpressionForValidation(raw string) (string, string, bool) {
@@ -2736,6 +3369,9 @@ func isInvalidSizeArgumentExpression(expr string, bound map[string]patternVarRol
 }
 
 func isInvalidTypeArgumentExpression(expr string, bound map[string]patternVarRole) bool {
+	if isInvalidPropertiesArgumentExpression(expr) {
+		return true
+	}
 	name, ok := typeSimpleIdentifierArg(expr)
 	if !ok {
 		return false
@@ -2745,6 +3381,42 @@ func isInvalidTypeArgumentExpression(expr string, bound map[string]patternVarRol
 		return false
 	}
 	return role == patternRoleVertex || role == patternRolePath || role == patternRoleValue
+}
+
+func isInvalidPropertiesArgumentExpression(expr string) bool {
+	text := strings.TrimSpace(expr)
+	if len(text) < len("properties(")+1 || !strings.HasSuffix(text, ")") {
+		return false
+	}
+	if !strings.EqualFold(text[:len("properties(")], "properties(") {
+		return false
+	}
+	inner := strings.TrimSpace(text[len("properties(") : len(text)-1])
+	if inner == "" {
+		return false
+	}
+	if strings.EqualFold(inner, "null") {
+		return false
+	}
+	if strings.HasPrefix(inner, "{") && strings.HasSuffix(inner, "}") {
+		return false
+	}
+	if strings.EqualFold(inner, "true") || strings.EqualFold(inner, "false") {
+		return true
+	}
+	if strings.HasPrefix(inner, "[") && strings.HasSuffix(inner, "]") {
+		return true
+	}
+	if (strings.HasPrefix(inner, "'") && strings.HasSuffix(inner, "'")) || (strings.HasPrefix(inner, "\"") && strings.HasSuffix(inner, "\"")) {
+		return true
+	}
+	if _, err := strconv.ParseInt(inner, 10, 64); err == nil {
+		return true
+	}
+	if _, err := strconv.ParseFloat(inner, 64); err == nil {
+		return true
+	}
+	return false
 }
 
 func isInvalidLabelsArgumentExpression(expr string, bound map[string]patternVarRole) bool {
@@ -3081,6 +3753,44 @@ func containsAggregateFunctionCall(raw string) bool {
 			if _, ok := aggFns[name]; ok {
 				return true
 			}
+		}
+		i = j - 1
+	}
+	return false
+}
+
+func containsFunctionCallNamed(raw string, target string) bool {
+	raw = strings.TrimSpace(raw)
+	target = strings.ToLower(strings.TrimSpace(target))
+	if raw == "" || target == "" {
+		return false
+	}
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble && (i == 0 || raw[i-1] != '\\') {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle && (i == 0 || raw[i-1] != '\\') {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble || !isFunctionIdentStart(ch) {
+			continue
+		}
+		if i > 0 && isFunctionIdentPart(raw[i-1]) {
+			continue
+		}
+		j := i + 1
+		for j < len(raw) && isFunctionIdentPart(raw[j]) {
+			j++
+		}
+		name := strings.ToLower(raw[i:j])
+		k := skipSpaces(raw, j)
+		if k < len(raw) && raw[k] == '(' && name == target {
+			return true
 		}
 		i = j - 1
 	}

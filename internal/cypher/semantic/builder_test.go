@@ -83,6 +83,9 @@ func TestBuildQueryStatementSemanticModelWithWrites(t *testing.T) {
 	if model.WriteActions[0].MergePattern == "" {
 		t.Fatalf("expected merge pattern metadata, got %#v", model.WriteActions[0])
 	}
+	if model.WriteActions[0].Pattern == "" {
+		t.Fatalf("expected write pattern metadata, got %#v", model.WriteActions[0])
+	}
 	if len(model.Projections) != 2 {
 		t.Fatalf("expected WITH and RETURN projection intents, got %d", len(model.Projections))
 	}
@@ -122,5 +125,30 @@ func TestBuildFromParseOutput(t *testing.T) {
 	}
 	if model.StatementKind == "" {
 		t.Fatalf("expected non-empty statement kind")
+	}
+}
+
+func TestBuildQueryStatementSemanticModelWithUnwindProjectionIntent(t *testing.T) {
+	stmt, err := parser.ParseStatement("UNWIND [1,2,3] AS x RETURN x")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	model, err := Build(stmt)
+	if err != nil {
+		t.Fatalf("build semantic model failed: %v", err)
+	}
+
+	if len(model.Projections) != 2 {
+		t.Fatalf("expected UNWIND and RETURN projection intents, got %d", len(model.Projections))
+	}
+	if model.Projections[0].Kind != ast.ClauseKindUnwind {
+		t.Fatalf("expected first projection kind UNWIND, got %#v", model.Projections[0])
+	}
+	if len(model.Projections[0].Items) != 1 {
+		t.Fatalf("expected one UNWIND projection item, got %#v", model.Projections[0].Items)
+	}
+	if model.Projections[0].Items[0].Expression != "[1,2,3]" || model.Projections[0].Items[0].Alias != "x" {
+		t.Fatalf("unexpected UNWIND projection item: %#v", model.Projections[0].Items[0])
 	}
 }

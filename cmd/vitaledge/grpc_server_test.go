@@ -4,15 +4,388 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
 	"github.com/paegun/vitaledge/internal/cypher/executor"
+	cypherruntime "github.com/paegun/vitaledge/internal/cypher/runtime"
 	"github.com/paegun/vitaledge/internal/graph"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
+
+type capturedGRPCExecution struct {
+	query  string
+	params executor.Params
+}
+
+func newGRPCTestClient(t *testing.T, handler v1.QueryServiceServer) (v1.QueryServiceClient, func()) {
+	t.Helper()
+
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", handler)
+	if err != nil {
+		t.Fatalf("startGRPCServer failed: %v", err)
+	}
+
+	conn, err := grpc.NewClient(grpcLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		grpcSrv.GracefulStop()
+		_ = grpcLn.Close()
+		t.Fatalf("grpc dial failed: %v", err)
+	}
+
+	cleanup := func() {
+		_ = conn.Close()
+		grpcSrv.GracefulStop()
+		_ = grpcLn.Close()
+	}
+
+	return v1.NewQueryServiceClient(conn), cleanup
+}
+
+func cloneExecutionParams(params executor.Params) executor.Params {
+	copied := make(executor.Params, len(params))
+	for key, value := range params {
+		copied[key] = value
+	}
+	return copied
+}
+
+func captureExecution(mu *sync.Mutex, captured *[]capturedGRPCExecution, query string, params executor.Params) {
+	mu.Lock()
+	*captured = append(*captured, capturedGRPCExecution{query: query, params: cloneExecutionParams(params)})
+	mu.Unlock()
+}
+
+type grpcBoundaryEndpointCase struct {
+	name          string
+	expectedQuery string
+	call          func(context.Context, v1.QueryServiceClient, map[string]*v1.Value, *v1.RequestOptions) error
+}
+
+type grpcBoundaryScenarioCase struct {
+	name               string
+	parameters         map[string]*v1.Value
+	options            *v1.RequestOptions
+	expectErrorCode    codes.Code
+	expectErrorMessage string
+	expectCaptureCount int
+	expectStrictExists *bool
+	expectStrictValue  *bool
+}
+
+func boolPtr(v bool) *bool {
+	return &v
+}
+
+func grpcExpectedQueryForEndpoint(endpoint, cypher string) string {
+	if endpoint == "explain" {
+		return "EXPLAIN " + cypher
+	}
+	return cypher
+}
+
+func buildGRPCBoundaryEndpoints(
+	cypher string,
+	buildRequest func(endpoint string, params map[string]*v1.Value, options *v1.RequestOptions) *v1.QueryRequest,
+) []grpcBoundaryEndpointCase {
+	endpoints := []string{"execute", "explain"}
+	result := make([]grpcBoundaryEndpointCase, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		endpoint := endpoint
+		result = append(result, grpcBoundaryEndpointCase{
+			name:          endpoint,
+			expectedQuery: grpcExpectedQueryForEndpoint(endpoint, cypher),
+			call: func(ctx context.Context, client v1.QueryServiceClient, params map[string]*v1.Value, options *v1.RequestOptions) error {
+				req := buildRequest(endpoint, params, options)
+				if req == nil {
+					return status.Error(codes.Internal, "boundary request builder returned nil")
+				}
+				if strings.TrimSpace(req.GetTenant()) == "" {
+					req.Tenant = "acme"
+				}
+				if endpoint == "execute" {
+					_, err := client.Execute(ctx, req)
+					return err
+				}
+				_, err := client.Explain(ctx, req)
+				return err
+			},
+		})
+	}
+	return result
+}
+
+func runGRPCBoundaryMatrix(
+	t *testing.T,
+	endpoints []grpcBoundaryEndpointCase,
+	scenarios []grpcBoundaryScenarioCase,
+) {
+	t.Helper()
+
+	for _, endpoint := range endpoints {
+		endpoint := endpoint
+		for _, scenario := range scenarios {
+			scenario := scenario
+			t.Run(endpoint.name+"/"+scenario.name, func(t *testing.T) {
+				var mu sync.Mutex
+				captured := make([]capturedGRPCExecution, 0, 1)
+				hook := func(_ context.Context, _ string, query string, params executor.Params) (*executor.Result, error) {
+					captureExecution(&mu, &captured, query, params)
+
+					if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "EXPLAIN") {
+						return &executor.Result{
+							Columns: []string{"explain"},
+							Rows:    []executor.Row{{"explain": map[string]any{"ok": true}}},
+						}, nil
+					}
+					return &executor.Result{
+						Columns: []string{"id"},
+						Rows:    []executor.Row{{"id": "seed"}},
+					}, nil
+				}
+
+				client, cleanup := newGRPCTestClient(t, &grpcQueryHandler{
+					defaultTenant:        "acme",
+					executeStatementHook: hook,
+				})
+				defer cleanup()
+
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+
+				err := endpoint.call(ctx, client, scenario.parameters, scenario.options)
+				if scenario.expectErrorCode == codes.OK {
+					if err != nil {
+						t.Fatalf("expected success, got %v", err)
+					}
+				} else {
+					if err == nil {
+						t.Fatalf("expected %v error", scenario.expectErrorCode)
+					}
+					st, ok := status.FromError(err)
+					if !ok {
+						t.Fatalf("expected grpc status error, got %v", err)
+					}
+					if st.Code() != scenario.expectErrorCode {
+						t.Fatalf("expected %v, got %v (%v)", scenario.expectErrorCode, st.Code(), st.Message())
+					}
+					if scenario.expectErrorMessage != "" && !strings.Contains(st.Message(), scenario.expectErrorMessage) {
+						t.Fatalf("expected error message to contain %q, got %q", scenario.expectErrorMessage, st.Message())
+					}
+				}
+
+				mu.Lock()
+				defer mu.Unlock()
+				if len(captured) != scenario.expectCaptureCount {
+					t.Fatalf("unexpected capture count: got %d want %d", len(captured), scenario.expectCaptureCount)
+				}
+				if scenario.expectCaptureCount == 0 {
+					return
+				}
+				if endpoint.expectedQuery != "" && strings.TrimSpace(captured[0].query) != endpoint.expectedQuery {
+					t.Fatalf("unexpected executed query: got %q want %q", captured[0].query, endpoint.expectedQuery)
+				}
+
+				value, exists := captured[0].params[cypherruntime.StrictVariantDispatchParam]
+				if scenario.expectStrictExists != nil && exists != *scenario.expectStrictExists {
+					t.Fatalf("strict param existence mismatch: got exists=%v, want %v (params=%#v)", exists, *scenario.expectStrictExists, captured[0].params)
+				}
+				if scenario.expectStrictValue == nil {
+					return
+				}
+				if !exists {
+					t.Fatalf("expected strict param value %v but parameter was absent", *scenario.expectStrictValue)
+				}
+				boolValue, ok := value.(bool)
+				if !ok {
+					t.Fatalf("strict param should be bool, got %#v", value)
+				}
+				if boolValue != *scenario.expectStrictValue {
+					t.Fatalf("strict param value mismatch: got %v, want %v", boolValue, *scenario.expectStrictValue)
+				}
+			})
+		}
+	}
+}
+
+func TestGRPCApplyRequestOptionsToParamsStrictVariantDispatch(t *testing.T) {
+	t.Run("nil options strips injected strict param", func(t *testing.T) {
+		params := executor.Params{"tenant": "acme", cypherruntime.StrictVariantDispatchParam: true}
+		out := grpcApplyRequestOptionsToParams(nil, params)
+		if got := out["tenant"]; got != "acme" {
+			t.Fatalf("expected tenant param preserved, got %#v", out)
+		}
+		if _, exists := out[cypherruntime.StrictVariantDispatchParam]; exists {
+			t.Fatalf("expected strict variant dispatch param to be stripped when options are nil, got %#v", out)
+		}
+	})
+
+	t.Run("nil options keeps unrelated params", func(t *testing.T) {
+		params := executor.Params{"tenant": "acme"}
+		out := grpcApplyRequestOptionsToParams(nil, params)
+		if got := out["tenant"]; got != "acme" {
+			t.Fatalf("expected tenant param preserved, got %#v", out)
+		}
+		if _, exists := out[cypherruntime.StrictVariantDispatchParam]; exists {
+			t.Fatalf("did not expect strict variant dispatch param when options are nil, got %#v", out)
+		}
+	})
+
+	t.Run("explicit true sets strict param true", func(t *testing.T) {
+		params := executor.Params{"tenant": "acme"}
+		out := grpcApplyRequestOptionsToParams(&v1.RequestOptions{StrictVariantDispatch: true}, params)
+		if got, _ := out[cypherruntime.StrictVariantDispatchParam].(bool); !got {
+			t.Fatalf("expected strict variant dispatch param true, got %#v", out)
+		}
+	})
+
+	t.Run("explicit false sets strict param false", func(t *testing.T) {
+		params := executor.Params{"tenant": "acme", cypherruntime.StrictVariantDispatchParam: true}
+		out := grpcApplyRequestOptionsToParams(&v1.RequestOptions{StrictVariantDispatch: false}, params)
+		if got, _ := out[cypherruntime.StrictVariantDispatchParam].(bool); got {
+			t.Fatalf("expected strict variant dispatch param false override, got %#v", out)
+		}
+	})
+}
+
+func TestGRPCRequestOptionsStrictVariantDispatchRPCMatrix(t *testing.T) {
+	cypher := "MATCH (n:Seed) RETURN n.id AS id"
+	endpoints := buildGRPCBoundaryEndpoints(cypher, func(_ string, _ map[string]*v1.Value, options *v1.RequestOptions) *v1.QueryRequest {
+		return &v1.QueryRequest{
+			Tenant:  "acme",
+			Input:   &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: cypher}},
+			Options: options,
+		}
+	})
+
+	scenarios := []grpcBoundaryScenarioCase{
+		{name: "strict-unset", options: nil, expectErrorCode: codes.OK, expectCaptureCount: 1, expectStrictExists: boolPtr(false)},
+		{name: "strict-true", options: &v1.RequestOptions{StrictVariantDispatch: true}, expectErrorCode: codes.OK, expectCaptureCount: 1, expectStrictExists: boolPtr(true), expectStrictValue: boolPtr(true)},
+		{name: "strict-false", options: &v1.RequestOptions{StrictVariantDispatch: false}, expectErrorCode: codes.OK, expectCaptureCount: 1, expectStrictExists: boolPtr(true), expectStrictValue: boolPtr(false)},
+	}
+
+	runGRPCBoundaryMatrix(t, endpoints, scenarios)
+}
+
+func runGRPCReservedInternalParamsBoundaryMatrix(
+	t *testing.T,
+	endpoints []grpcBoundaryEndpointCase,
+) {
+	t.Helper()
+
+	scenarios := []grpcBoundaryScenarioCase{
+		{
+			name:               "reserved-param-rejected",
+			parameters:         map[string]*v1.Value{"__ve_strict_variant_dispatch": {Kind: &v1.Value_BoolValue{BoolValue: true}}},
+			options:            &v1.RequestOptions{StrictVariantDispatch: true},
+			expectErrorCode:    codes.InvalidArgument,
+			expectErrorMessage: "reserved internal prefix __ve_",
+			expectCaptureCount: 0,
+		},
+		{
+			name:               "reserved-valid-strict-true",
+			parameters:         map[string]*v1.Value{"limit": {Kind: &v1.Value_IntValue{IntValue: 1}}},
+			options:            &v1.RequestOptions{StrictVariantDispatch: true},
+			expectErrorCode:    codes.OK,
+			expectCaptureCount: 1,
+			expectStrictExists: boolPtr(true),
+			expectStrictValue:  boolPtr(true),
+		},
+	}
+
+	runGRPCBoundaryMatrix(t, endpoints, scenarios)
+}
+
+func TestGRPCReservedInternalParamsRejectedBeforeExecutionHook(t *testing.T) {
+	cypher := "MATCH (n:Seed) RETURN n.id AS id"
+	endpoints := buildGRPCBoundaryEndpoints(cypher, func(_ string, parameters map[string]*v1.Value, options *v1.RequestOptions) *v1.QueryRequest {
+		return &v1.QueryRequest{
+			Tenant:     "acme",
+			Input:      &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: cypher}},
+			Parameters: parameters,
+			Options:    options,
+		}
+	})
+
+	runGRPCReservedInternalParamsBoundaryMatrix(t, endpoints)
+}
+
+func TestGRPCExecutePreparedFallbackStrictVariantDispatchMatrix(t *testing.T) {
+	cypher := "MATCH (n:Seed) RETURN n.id AS id"
+	endpoints := buildGRPCBoundaryEndpoints(cypher, func(endpoint string, _ map[string]*v1.Value, options *v1.RequestOptions) *v1.QueryRequest {
+		if endpoint != "execute" {
+			return nil
+		}
+		prepared := &v1.PreparedQuery{ParserVersion: "cypher-m99", IrVersion: "query-pipeline-v99", Payload: []byte(cypher)}
+		if options != nil && options.GetAllowFallbackToCypher() {
+			prepared = &v1.PreparedQuery{
+				ParserVersion:  "cypher-m99",
+				IrVersion:      "query-pipeline-v99",
+				Payload:        []byte("MATCH (n:Never) RETURN n.id AS id"),
+				FallbackCypher: cypher,
+			}
+		}
+		return &v1.QueryRequest{Tenant: "acme", Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: prepared}}, Options: options}
+	})[:1]
+
+	scenarios := []grpcBoundaryScenarioCase{
+		{name: "prepared-mismatch-no-fallback", options: &v1.RequestOptions{StrictVariantDispatch: true}, expectErrorCode: codes.FailedPrecondition, expectCaptureCount: 0},
+		{name: "prepared-fallback-strict-true", options: &v1.RequestOptions{AllowFallbackToCypher: true, StrictVariantDispatch: true}, expectErrorCode: codes.OK, expectCaptureCount: 1, expectStrictExists: boolPtr(true), expectStrictValue: boolPtr(true)},
+		{name: "prepared-fallback-strict-false", options: &v1.RequestOptions{AllowFallbackToCypher: true, StrictVariantDispatch: false}, expectErrorCode: codes.OK, expectCaptureCount: 1, expectStrictExists: boolPtr(true), expectStrictValue: boolPtr(false)},
+	}
+
+	runGRPCBoundaryMatrix(t, endpoints, scenarios)
+}
+
+func TestGRPCExplainPreparedFallbackStrictVariantDispatchMatrix(t *testing.T) {
+	cypher := "MATCH (n:Seed) RETURN n.id AS id"
+	endpoints := buildGRPCBoundaryEndpoints(cypher, func(endpoint string, _ map[string]*v1.Value, options *v1.RequestOptions) *v1.QueryRequest {
+		if endpoint != "explain" {
+			return nil
+		}
+		prepared := &v1.PreparedQuery{ParserVersion: "cypher-m99", IrVersion: "query-pipeline-v99", Payload: []byte(cypher)}
+		if options != nil && options.GetAllowFallbackToCypher() {
+			prepared = &v1.PreparedQuery{
+				ParserVersion:  "cypher-m99",
+				IrVersion:      "query-pipeline-v99",
+				Payload:        []byte("MATCH (n:Never) RETURN n.id AS id"),
+				FallbackCypher: cypher,
+			}
+		}
+		return &v1.QueryRequest{Tenant: "acme", Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: prepared}}, Options: options}
+	})[1:]
+
+	scenarios := []grpcBoundaryScenarioCase{
+		{name: "prepared-mismatch-no-fallback", options: &v1.RequestOptions{StrictVariantDispatch: true}, expectErrorCode: codes.FailedPrecondition, expectCaptureCount: 0},
+		{name: "prepared-fallback-strict-true", options: &v1.RequestOptions{AllowFallbackToCypher: true, StrictVariantDispatch: true}, expectErrorCode: codes.OK, expectCaptureCount: 1, expectStrictExists: boolPtr(true), expectStrictValue: boolPtr(true)},
+		{name: "prepared-fallback-strict-false", options: &v1.RequestOptions{AllowFallbackToCypher: true, StrictVariantDispatch: false}, expectErrorCode: codes.OK, expectCaptureCount: 1, expectStrictExists: boolPtr(true), expectStrictValue: boolPtr(false)},
+	}
+
+	runGRPCBoundaryMatrix(t, endpoints, scenarios)
+}
+
+func TestGRPCPreparedRequestsRejectReservedInternalParamsBeforeExecutionHookMatrix(t *testing.T) {
+	cypher := "MATCH (n:Seed) RETURN n.id AS id"
+	endpoints := buildGRPCBoundaryEndpoints(cypher, func(_ string, params map[string]*v1.Value, options *v1.RequestOptions) *v1.QueryRequest {
+		return &v1.QueryRequest{
+			Tenant: "acme",
+			Input: &v1.QueryInput{Kind: &v1.QueryInput_Prepared{Prepared: &v1.PreparedQuery{
+				ParserVersion: "cypher-m23",
+				IrVersion:     "query-pipeline-v1",
+				Payload:       []byte(cypher),
+			}}},
+			Parameters: params,
+			Options:    options,
+		}
+	})
+
+	runGRPCReservedInternalParamsBoundaryMatrix(t, endpoints)
+}
 
 func TestGRPCDurationMs(t *testing.T) {
 	tests := []struct {
@@ -125,6 +498,15 @@ func TestGRPCAnyToProtoValueJSONNumberInvalid(t *testing.T) {
 }
 
 func TestGRPCProtoParamsToExecutorParamsBoundaryIDValidation(t *testing.T) {
+	t.Run("rejects reserved internal key prefix", func(t *testing.T) {
+		_, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
+			"__ve_strict_variant_dispatch": {Kind: &v1.Value_BoolValue{BoolValue: true}},
+		})
+		if err == nil || !strings.Contains(err.Error(), "reserved internal prefix __ve_") {
+			t.Fatalf("expected reserved internal prefix validation error, got %v", err)
+		}
+	})
+
 	t.Run("rejects empty edgeId", func(t *testing.T) {
 		_, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
 			"edgeId": {Kind: &v1.Value_StringValue{StringValue: ""}},
@@ -218,7 +600,7 @@ func TestGRPCExecuteIntegrationSerializesNumericAggregatesAndProperties(t *testi
 		t.Fatalf("seed metrics vertices failed: %v", err)
 	}
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(),})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
@@ -329,7 +711,7 @@ func TestGRPCExecuteIntegrationSerializesIntegerOnlyAggregatesAndProperties(t *t
 		t.Fatalf("seed integer metrics vertices failed: %v", err)
 	}
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(),})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
@@ -443,7 +825,7 @@ func TestGRPCExecuteIntegrationParameterizedThresholdAndLimit(t *testing.T) {
 		t.Fatalf("seed host/flow graph failed: %v", err)
 	}
 
-	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(),})
+	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)

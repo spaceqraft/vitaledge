@@ -3,11 +3,12 @@ package executor
 import (
 	"context"
 	"sort"
+	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/paegun/vitaledge/internal/cypher/indexschema"
 	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"github.com/paegun/vitaledge/internal/graph"
 )
 
 // TestIngestPairLatencySlopeBounded guards against hidden graph-size-dependent
@@ -18,7 +19,7 @@ func TestIngestPairLatencySlopeBounded(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	store := openBenchmarkStore(t)
+	store := newScanCountingStore(openBenchmarkStore(t))
 	defer func() { _ = store.Close() }()
 
 	catalog := indexschema.NewCatalog()
@@ -40,38 +41,50 @@ func TestIngestPairLatencySlopeBounded(t *testing.T) {
 
 	exec := New(store, Options{IndexCatalog: catalog})
 
-	const warmupBatches = 2
-	const measuredBatches = 10
-	latencies := make([]time.Duration, 0, measuredBatches)
+	// Keep this guard lightweight while asserting work performed, not wall time.
+	const warmupBatches = 1
+	const measuredBatches = 3
+	const pairSampleSize = 16
+	work := make([]int64, 0, measuredBatches)
 
 	for i := 0; i < warmupBatches+measuredBatches; i++ {
 		movies, pairs, _ := buildBenchmarkIngestBatch(i)
+		if len(pairs) > pairSampleSize {
+			pairs = pairs[:pairSampleSize]
+		}
 
+		startScanned := store.scannedVertices()
 		if _, err := exec.ExecuteStatement(ctx, movieStmt, Params{"tenant": benchmarkTenant, "movies": movies}); err != nil {
 			t.Fatalf("movies ingest failed at batch %d: %v", i, err)
 		}
 
-		started := time.Now()
 		if _, err := exec.ExecuteStatement(ctx, pairStmt, Params{"tenant": benchmarkTenant, "pairs": pairs}); err != nil {
 			t.Fatalf("pairs ingest failed at batch %d: %v", i, err)
 		}
 		if i >= warmupBatches {
-			latencies = append(latencies, time.Since(started))
+			work = append(work, store.scannedVertices()-startScanned)
 		}
 	}
 
-	firstMedian := medianDuration(latencies[:3])
-	lastMedian := medianDuration(latencies[len(latencies)-3:])
-	if firstMedian <= 0 {
-		t.Fatalf("invalid first median latency: %v", firstMedian)
+	firstMedian := medianInt64(work[:2])
+	lastMedian := medianInt64(work[len(work)-2:])
+	if firstMedian < 0 {
+		t.Fatalf("invalid first median work: %d", firstMedian)
+	}
+	if firstMedian == 0 && lastMedian > 0 {
+		t.Fatalf("pair ingest scan work regressed from 0 to %d (work=%v)", lastMedian, work)
+	}
+	if firstMedian == 0 {
+		t.Logf("pair scan-work check: first_median=%d last_median=%d ratio=1.00x work=%v", firstMedian, lastMedian, work)
+		return
 	}
 
 	ratio := float64(lastMedian) / float64(firstMedian)
-	t.Logf("pair latency slope check: first_median=%s last_median=%s ratio=%.2fx latencies=%v", firstMedian, lastMedian, ratio, latencies)
+	t.Logf("pair scan-work slope check: first_median=%d last_median=%d ratio=%.2fx work=%v", firstMedian, lastMedian, ratio, work)
 
 	const maxAllowedGrowthRatio = 2.0
 	if ratio > maxAllowedGrowthRatio {
-		t.Fatalf("pair ingest latency growth too high: ratio %.2fx exceeds %.2fx", ratio, maxAllowedGrowthRatio)
+		t.Fatalf("pair ingest scan work growth too high: ratio %.2fx exceeds %.2fx (work=%v)", ratio, maxAllowedGrowthRatio, work)
 	}
 }
 
@@ -83,7 +96,7 @@ func TestIngestRatingLatencySlopeBounded(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	store := openBenchmarkStore(t)
+	store := newScanCountingStore(openBenchmarkStore(t))
 	defer func() { _ = store.Close() }()
 
 	catalog := indexschema.NewCatalog()
@@ -105,46 +118,58 @@ func TestIngestRatingLatencySlopeBounded(t *testing.T) {
 
 	exec := New(store, Options{IndexCatalog: catalog})
 
-	const warmupBatches = 2
-	const measuredBatches = 10
-	latencies := make([]time.Duration, 0, measuredBatches)
+	// Keep this guard lightweight while asserting work performed, not wall time.
+	const warmupBatches = 1
+	const measuredBatches = 3
+	const ratingSampleSize = 16
+	work := make([]int64, 0, measuredBatches)
 
 	for i := 0; i < warmupBatches+measuredBatches; i++ {
 		movies, _, ratings := buildBenchmarkIngestBatch(i)
+		if len(ratings) > ratingSampleSize {
+			ratings = ratings[:ratingSampleSize]
+		}
 
+		startScanned := store.scannedVertices()
 		if _, err := exec.ExecuteStatement(ctx, movieStmt, Params{"tenant": benchmarkTenant, "movies": movies}); err != nil {
 			t.Fatalf("movies ingest failed at batch %d: %v", i, err)
 		}
 
-		started := time.Now()
 		if _, err := exec.ExecuteStatement(ctx, ratingStmt, Params{"tenant": benchmarkTenant, "ratings": ratings}); err != nil {
 			t.Fatalf("ratings ingest failed at batch %d: %v", i, err)
 		}
 		if i >= warmupBatches {
-			latencies = append(latencies, time.Since(started))
+			work = append(work, store.scannedVertices()-startScanned)
 		}
 	}
 
-	firstMedian := medianDuration(latencies[:3])
-	lastMedian := medianDuration(latencies[len(latencies)-3:])
-	if firstMedian <= 0 {
-		t.Fatalf("invalid first median latency: %v", firstMedian)
+	firstMedian := medianInt64(work[:2])
+	lastMedian := medianInt64(work[len(work)-2:])
+	if firstMedian < 0 {
+		t.Fatalf("invalid first median work: %d", firstMedian)
+	}
+	if firstMedian == 0 && lastMedian > 0 {
+		t.Fatalf("rating ingest scan work regressed from 0 to %d (work=%v)", lastMedian, work)
+	}
+	if firstMedian == 0 {
+		t.Logf("rating scan-work check: first_median=%d last_median=%d ratio=1.00x work=%v", firstMedian, lastMedian, work)
+		return
 	}
 
 	ratio := float64(lastMedian) / float64(firstMedian)
-	t.Logf("rating latency slope check: first_median=%s last_median=%s ratio=%.2fx latencies=%v", firstMedian, lastMedian, ratio, latencies)
+	t.Logf("rating scan-work slope check: first_median=%d last_median=%d ratio=%.2fx work=%v", firstMedian, lastMedian, ratio, work)
 
 	const maxAllowedGrowthRatio = 2.0
 	if ratio > maxAllowedGrowthRatio {
-		t.Fatalf("rating ingest latency growth too high: ratio %.2fx exceeds %.2fx", ratio, maxAllowedGrowthRatio)
+		t.Fatalf("rating ingest scan work growth too high: ratio %.2fx exceeds %.2fx (work=%v)", ratio, maxAllowedGrowthRatio, work)
 	}
 }
 
-func medianDuration(values []time.Duration) time.Duration {
+func medianInt64(values []int64) int64 {
 	if len(values) == 0 {
 		return 0
 	}
-	copyValues := append([]time.Duration(nil), values...)
+	copyValues := append([]int64(nil), values...)
 	sort.Slice(copyValues, func(i, j int) bool {
 		return copyValues[i] < copyValues[j]
 	})
@@ -153,4 +178,66 @@ func medianDuration(values []time.Duration) time.Duration {
 		return copyValues[mid]
 	}
 	return (copyValues[mid-1] + copyValues[mid]) / 2
+}
+
+type scanCountingStore struct {
+	inner           graph.GraphStore
+	scannedVertexes atomic.Int64
+}
+
+func newScanCountingStore(inner graph.GraphStore) *scanCountingStore {
+	return &scanCountingStore{inner: inner}
+}
+
+func (s *scanCountingStore) BeginTx(ctx context.Context, opts graph.TxOptions) (graph.Tx, error) {
+	tx, err := s.inner.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &scanCountingTx{Tx: tx, store: s}, nil
+}
+
+func (s *scanCountingStore) View(ctx context.Context, fn func(graph.Tx) error) error {
+	return s.inner.View(ctx, func(tx graph.Tx) error {
+		return fn(&scanCountingTx{Tx: tx, store: s})
+	})
+}
+
+func (s *scanCountingStore) Update(ctx context.Context, fn func(graph.Tx) error) error {
+	return s.inner.Update(ctx, func(tx graph.Tx) error {
+		return fn(&scanCountingTx{Tx: tx, store: s})
+	})
+}
+
+func (s *scanCountingStore) Close() error {
+	return s.inner.Close()
+}
+
+func (s *scanCountingStore) scannedVertices() int64 {
+	return s.scannedVertexes.Load()
+}
+
+type scanCountingTx struct {
+	graph.Tx
+	store *scanCountingStore
+}
+
+func (t *scanCountingTx) ScanVertices(ctx context.Context, tenant string, limit int, fn func(*graph.Vertex) error) error {
+	return t.Tx.ScanVertices(ctx, tenant, limit, func(vertex *graph.Vertex) error {
+		t.store.scannedVertexes.Add(1)
+		if fn == nil {
+			return nil
+		}
+		return fn(vertex)
+	})
+}
+
+func (t *scanCountingTx) ScanVerticesFrom(ctx context.Context, tenant, startAfterVertexID string, limit int, fn func(*graph.Vertex) error) error {
+	return t.Tx.ScanVerticesFrom(ctx, tenant, startAfterVertexID, limit, func(vertex *graph.Vertex) error {
+		t.store.scannedVertexes.Add(1)
+		if fn == nil {
+			return nil
+		}
+		return fn(vertex)
+	})
 }

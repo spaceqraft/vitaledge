@@ -41,8 +41,10 @@ func buildFromMatchQuery(stmt *ast.MatchQueryStatement) Model {
 		Projections:   []ProjectionIntent{},
 		Ordering:      []OrderingIntent{},
 		Patterns:      []PatternIntent{},
+		Calls:         []CallIntent{},
 		WriteActions:  []WriteActionIntent{},
 	}
+	ordinal := 0
 
 	for _, match := range stmt.MatchClauses {
 		whereRaw := ""
@@ -50,14 +52,16 @@ func buildFromMatchQuery(stmt *ast.MatchQueryStatement) Model {
 			whereRaw = strings.TrimSpace(match.Where.Raw)
 		}
 		model.Patterns = append(model.Patterns, PatternIntent{
+			Ordinal:  ordinal,
 			Kind:     ast.ClauseKindMatch,
 			Optional: match.Optional,
 			Pattern:  strings.TrimSpace(match.Pattern),
 			Where:    whereRaw,
 		})
+		ordinal++
 	}
 
-	appendProjection(&model, ast.ClauseKindReturn, stmt.Return, nil)
+	appendProjection(&model, ordinal, ast.ClauseKindReturn, stmt.Return, nil)
 	return model
 }
 
@@ -67,8 +71,10 @@ func buildFromQueryStatement(stmt *ast.QueryStatement) Model {
 		Projections:   []ProjectionIntent{},
 		Ordering:      []OrderingIntent{},
 		Patterns:      []PatternIntent{},
+		Calls:         []CallIntent{},
 		WriteActions:  []WriteActionIntent{},
 	}
+	ordinal := 0
 
 	for _, part := range stmt.Parts {
 		for _, clause := range part.Clauses {
@@ -79,6 +85,7 @@ func buildFromQueryStatement(stmt *ast.QueryStatement) Model {
 					whereRaw = strings.TrimSpace(clause.Where.Raw)
 				}
 				model.Patterns = append(model.Patterns, PatternIntent{
+					Ordinal:  ordinal,
 					Kind:     clause.Kind,
 					Optional: clause.Kind == ast.ClauseKindOptionalMatch || clause.MatchOptional,
 					Pattern:  strings.TrimSpace(clause.MatchPattern),
@@ -86,24 +93,37 @@ func buildFromQueryStatement(stmt *ast.QueryStatement) Model {
 				})
 			case ast.ClauseKindWith, ast.ClauseKindReturn:
 				if clause.Projection != nil {
-					appendProjection(&model, clause.Kind, *clause.Projection, clause.Where)
+					appendProjection(&model, ordinal, clause.Kind, *clause.Projection, clause.Where)
 				}
+			case ast.ClauseKindUnwind:
+				if projection, ok := projectionFromUnwindClauseRaw(clause.Raw); ok {
+					appendProjection(&model, ordinal, clause.Kind, projection, nil)
+				}
+			case ast.ClauseKindInQueryCall:
+				model.Calls = append(model.Calls, CallIntent{
+					Ordinal:    ordinal,
+					ClauseKind: clause.Kind,
+					Raw:        strings.TrimSpace(clause.Raw),
+				})
 			case ast.ClauseKindCreate, ast.ClauseKindMerge, ast.ClauseKindDelete, ast.ClauseKindSet, ast.ClauseKindRemove:
 				model.WriteActions = append(model.WriteActions, WriteActionIntent{
+					Ordinal:       ordinal,
 					ClauseKind:    clause.Kind,
 					Raw:           strings.TrimSpace(clause.Raw),
+					Pattern:       strings.TrimSpace(clause.MatchPattern),
 					MergePattern:  strings.TrimSpace(clause.MergePattern),
 					MergeOnCreate: strings.TrimSpace(clause.MergeOnCreate),
 					MergeOnMatch:  strings.TrimSpace(clause.MergeOnMatch),
 				})
 			}
+			ordinal++
 		}
 	}
 
 	return model
 }
 
-func appendProjection(model *Model, kind ast.ClauseKind, projection ast.ReturnClause, where *ast.Expression) {
+func appendProjection(model *Model, ordinal int, kind ast.ClauseKind, projection ast.ReturnClause, where *ast.Expression) {
 	if model == nil {
 		return
 	}
@@ -141,6 +161,7 @@ func appendProjection(model *Model, kind ast.ClauseKind, projection ast.ReturnCl
 	}
 
 	model.Projections = append(model.Projections, ProjectionIntent{
+		Ordinal:    ordinal,
 		Kind:       kind,
 		Distinct:   projection.Distinct,
 		IncludeAll: projection.IncludeAll,
@@ -157,4 +178,115 @@ func expressionRaw(expr *ast.Expression) string {
 		return ""
 	}
 	return strings.TrimSpace(expr.Raw)
+}
+
+func projectionFromUnwindClauseRaw(raw string) (ast.ReturnClause, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ast.ReturnClause{}, false
+	}
+	upper := strings.ToUpper(raw)
+	if !strings.HasPrefix(upper, "UNWIND ") {
+		return ast.ReturnClause{}, false
+	}
+	body := strings.TrimSpace(raw[len("UNWIND"):])
+	if body == "" {
+		return ast.ReturnClause{}, false
+	}
+	asPos := topLevelAsKeywordIndex(body)
+	if asPos <= 0 {
+		return ast.ReturnClause{}, false
+	}
+	expr := strings.TrimSpace(body[:asPos])
+	alias := strings.TrimSpace(body[asPos+2:])
+	if expr == "" || alias == "" {
+		return ast.ReturnClause{}, false
+	}
+	if !isUnwindAliasIdentifier(alias) {
+		return ast.ReturnClause{}, false
+	}
+	return ast.ReturnClause{
+		Items: []ast.ProjectionItem{{
+			Expression: ast.Expression{Raw: expr},
+			Alias:      alias,
+		}},
+	}, true
+}
+
+func topLevelAsKeywordIndex(raw string) int {
+	depthParen := 0
+	depthBracket := 0
+	depthBrace := 0
+	inSingle := false
+	inDouble := false
+	for i := 0; i+1 < len(raw); i++ {
+		ch := raw[i]
+		if ch == '\'' && !inDouble {
+			if i+1 < len(raw) && raw[i+1] == '\'' {
+				i++
+				continue
+			}
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			if i > 0 && raw[i-1] == '\\' {
+				continue
+			}
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(':
+			depthParen++
+		case ')':
+			if depthParen > 0 {
+				depthParen--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		}
+		if depthParen != 0 || depthBracket != 0 || depthBrace != 0 {
+			continue
+		}
+		if !strings.EqualFold(raw[i:i+2], "AS") {
+			continue
+		}
+		leftBoundary := i == 0 || raw[i-1] == ' ' || raw[i-1] == '\t' || raw[i-1] == '\n' || raw[i-1] == '\r'
+		right := i + 2
+		rightBoundary := right >= len(raw) || raw[right] == ' ' || raw[right] == '\t' || raw[right] == '\n' || raw[right] == '\r'
+		if leftBoundary && rightBoundary {
+			return i
+		}
+	}
+	return -1
+}
+
+func isUnwindAliasIdentifier(alias string) bool {
+	if alias == "" {
+		return false
+	}
+	for i, ch := range alias {
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
+			continue
+		}
+		if i > 0 && ch >= '0' && ch <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }

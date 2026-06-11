@@ -18,6 +18,29 @@ type TxOptions struct {
 	Mode TxMode
 }
 
+// EdgeDirection controls adjacency scan direction from an anchor vertex.
+type EdgeDirection int
+
+const (
+	EdgeDirectionOut EdgeDirection = iota
+	EdgeDirectionIn
+	EdgeDirectionAny
+)
+
+// DirectedEdgeProbe defines one directed endpoint existence probe.
+type DirectedEdgeProbe struct {
+	SrcID    string
+	DstID    string
+	EdgeType string
+}
+
+// UndirectedEdgeProbe defines one undirected endpoint existence probe.
+type UndirectedEdgeProbe struct {
+	LeftID   string
+	RightID  string
+	EdgeType string
+}
+
 // Tx defines graph operations within a transactional boundary.
 type Tx interface {
 	GetVertex(ctx context.Context, tenant, vertexID string) (*Vertex, error)
@@ -31,14 +54,25 @@ type Tx interface {
 	GetEdge(ctx context.Context, tenant, edgeID string) (*Edge, error)
 	PutEdge(ctx context.Context, edge *Edge) error
 	DeleteEdge(ctx context.Context, tenant, edgeID string) error
+	PutVertexBatch(ctx context.Context, vertexes []*Vertex) error
+	PutEdgeBatch(ctx context.Context, edges []*Edge) error
+	DeleteVertexDetach(ctx context.Context, tenant, vertexID string) error
+	PatchVertexProperties(ctx context.Context, tenant, vertexID string, set PropertyMap, removeKeys []string) error
+	PatchEdgeProperties(ctx context.Context, tenant, edgeID string, set PropertyMap, removeKeys []string) error
+	EnsureEdge(ctx context.Context, edge *Edge) (created bool, err error)
 
 	ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(*Edge) error) error
 	ScanOutEdgeLinks(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(edgeID, dstID string) error) error
+	ScanAdjacencyLinks(ctx context.Context, tenant, vertexID string, direction EdgeDirection, edgeType string, limit int, fn func(edgeID, peerID string) error) error
 	ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string, limit int, fn func(srcID, edgeID, dstID string) error) error
 	ScanOutEdgeProperty(ctx context.Context, tenant, srcID, edgeType, property string, encodedValue []byte, limit int, fn func(*PropertyIndexEntry) error) error
 	ScanOutEdgePropertyNumericRange(ctx context.Context, tenant, srcID, edgeType, property string, lower float64, lowerSet bool, lowerInclusive bool, upper float64, upperSet bool, upperInclusive bool, limit int, fn func(*PropertyIndexEntry) error) error
 	HasDirectedEdgeBetween(ctx context.Context, tenant, srcID, dstID, edgeType string) (bool, error)
 	HasUndirectedEdgeBetween(ctx context.Context, tenant, leftID, rightID, edgeType string) (bool, error)
+	BatchHasDirectedEdgeBetween(ctx context.Context, tenant string, probes []DirectedEdgeProbe) ([]bool, error)
+	BatchHasUndirectedEdgeBetween(ctx context.Context, tenant string, probes []UndirectedEdgeProbe) ([]bool, error)
+	DirectedEdgePairCount(ctx context.Context, tenant, srcID, dstID, edgeType string) (int, error)
+	UndirectedEdgePairCount(ctx context.Context, tenant, leftID, rightID, edgeType string) (int, error)
 	ScanOutEdgeSourceIDs(ctx context.Context, tenant, edgeType string, limit int, fn func(string) error) error
 	ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(*Edge) error) error
 	ScanPropertyIndex(ctx context.Context, tenant, schema, property string, encodedValue []byte, limit int, fn func(*PropertyIndexEntry) error) error

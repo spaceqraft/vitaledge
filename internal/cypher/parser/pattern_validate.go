@@ -63,6 +63,9 @@ func validatePatternVariableScoping(stmt ast.Statement, seg statementSegment) er
 
 				clauseIntroduced := map[string]struct{}{}
 				for _, pattern := range splitTopLevelComma(patternRaw) {
+					if err := validateWriteRelationshipConstraints(pattern, clause.Kind, seg); err != nil {
+						return err
+					}
 					if err := validatePatternBindings(pattern, bound, seg, clause.Kind, clauseIntroduced); err != nil {
 						return err
 					}
@@ -897,6 +900,269 @@ func skipSpaces(raw string, start int) int {
 		i++
 	}
 	return i
+}
+
+func validateWriteRelationshipConstraints(pattern string, clauseKind ast.ClauseKind, seg statementSegment) error {
+	if clauseKind != ast.ClauseKindCreate && clauseKind != ast.ClauseKindMerge {
+		return nil
+	}
+	if clauseKind == ast.ClauseKindMerge && hasUnbracketedRelationship(pattern) {
+		return &ParseError{Kind: ParseErrorUnsupported, Message: "NoSingleRelationshipType", Statement: seg.index}
+	}
+
+	for _, rel := range scanBracketedRelationships(pattern) {
+		if clauseKind == ast.ClauseKindCreate {
+			if !rel.directed {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "RequiresDirectedRelationship", Statement: seg.index}
+			}
+			if rel.variableLength {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "CreatingVarLength", Statement: seg.index}
+			}
+			if rel.typeCount > 1 {
+				return &ParseError{Kind: ParseErrorUnsupported, Message: "NoSingleRelationshipType", Statement: seg.index}
+			}
+		}
+
+		if clauseKind == ast.ClauseKindMerge && rel.typeCount != 1 {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "NoSingleRelationshipType", Statement: seg.index}
+		}
+		if clauseKind == ast.ClauseKindMerge && rel.variableLength {
+			return &ParseError{Kind: ParseErrorUnsupported, Message: "CreatingVarLength", Statement: seg.index}
+		}
+	}
+
+	return nil
+}
+
+type bracketedRelationship struct {
+	directed       bool
+	variableLength bool
+	typeCount      int
+}
+
+func scanBracketedRelationships(pattern string) []bracketedRelationship {
+	rels := []bracketedRelationship{}
+	inString := false
+
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '\'' && (i == 0 || pattern[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString || pattern[i] != '[' {
+			continue
+		}
+
+		close := indexRelationshipBracketClose(pattern, i+1)
+		if close < 0 {
+			continue
+		}
+
+		left := relationshipHasLeftArrow(pattern, i)
+		right := relationshipHasRightArrow(pattern, close)
+		if !relationshipBracketHasPatternDash(pattern, i, close) {
+			i = close
+			continue
+		}
+		detail := pattern[i+1 : close]
+		rels = append(rels, bracketedRelationship{
+			directed:       left != right,
+			variableLength: relationshipHasVariableLength(detail),
+			typeCount:      relationshipTypeCount(detail),
+		})
+
+		i = close
+	}
+
+	return rels
+}
+
+func indexRelationshipBracketClose(raw string, start int) int {
+	inString := false
+	depthBrace := 0
+	for i := start; i < len(raw); i++ {
+		if raw[i] == '\'' && (i == start || raw[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch raw[i] {
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case ']':
+			if depthBrace == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func relationshipHasLeftArrow(raw string, bracketOpen int) bool {
+	i := bracketOpen - 1
+	for i >= 0 && isSpaceByte(raw[i]) {
+		i--
+	}
+	if i >= 0 && raw[i] == '-' {
+		j := i - 1
+		for j >= 0 && isSpaceByte(raw[j]) {
+			j--
+		}
+		return j >= 0 && raw[j] == '<'
+	}
+	return false
+}
+
+func relationshipHasRightArrow(raw string, bracketClose int) bool {
+	i := bracketClose + 1
+	for i < len(raw) && isSpaceByte(raw[i]) {
+		i++
+	}
+	if i < len(raw) && raw[i] == '-' {
+		j := i + 1
+		for j < len(raw) && isSpaceByte(raw[j]) {
+			j++
+		}
+		return j < len(raw) && raw[j] == '>'
+	}
+	return false
+}
+
+func relationshipBracketHasPatternDash(raw string, bracketOpen, bracketClose int) bool {
+	i := bracketOpen - 1
+	for i >= 0 && isSpaceByte(raw[i]) {
+		i--
+	}
+	if i >= 0 && raw[i] == '-' {
+		return true
+	}
+
+	j := bracketClose + 1
+	for j < len(raw) && isSpaceByte(raw[j]) {
+		j++
+	}
+	return j < len(raw) && raw[j] == '-'
+}
+
+func relationshipHasVariableLength(detail string) bool {
+	inString := false
+	depthBrace := 0
+	for i := 0; i < len(detail); i++ {
+		if detail[i] == '\'' && (i == 0 || detail[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch detail[i] {
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '*':
+			if depthBrace == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func relationshipTypeCount(detail string) int {
+	inString := false
+	depthBrace := 0
+	colon := -1
+	end := len(detail)
+
+	for i := 0; i < len(detail); i++ {
+		if detail[i] == '\'' && (i == 0 || detail[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch detail[i] {
+		case '{':
+			if depthBrace == 0 && end == len(detail) {
+				end = i
+			}
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '*':
+			if depthBrace == 0 && end == len(detail) {
+				end = i
+			}
+		case ':':
+			if depthBrace == 0 && colon < 0 {
+				colon = i
+			}
+		}
+	}
+
+	if colon < 0 || colon >= end {
+		return 0
+	}
+
+	rawTypes := strings.TrimSpace(detail[colon+1 : end])
+	if rawTypes == "" {
+		return 0
+	}
+
+	count := 0
+	for _, part := range strings.Split(rawTypes, "|") {
+		name := strings.TrimSpace(part)
+		name = strings.TrimPrefix(name, ":")
+		if name != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func isSpaceByte(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+func hasUnbracketedRelationship(pattern string) bool {
+	inString := false
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '\'' && (i == 0 || pattern[i-1] != '\\') {
+			inString = !inString
+			continue
+		}
+		if inString || pattern[i] != '-' {
+			continue
+		}
+		j := i + 1
+		for j < len(pattern) && isSpaceByte(pattern[j]) {
+			j++
+		}
+		if j >= len(pattern) || pattern[j] != '-' {
+			continue
+		}
+		k := j + 1
+		for k < len(pattern) && isSpaceByte(pattern[k]) {
+			k++
+		}
+		if k < len(pattern) && pattern[k] == '[' {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func isIdentifierStart(ch byte) bool {

@@ -11,6 +11,7 @@ import (
 	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
 	"github.com/paegun/vitaledge/internal/cypher"
 	"github.com/paegun/vitaledge/internal/cypher/executor"
+	cypherruntime "github.com/paegun/vitaledge/internal/cypher/runtime"
 	"github.com/paegun/vitaledge/internal/graph"
 	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
 	"google.golang.org/grpc"
@@ -29,6 +30,7 @@ type grpcQueryHandler struct {
 	configuredMaxWriteBatchBytes int64
 	maxWriteBatchBytes           int64
 	maxWriteBatchBytesTuned      bool
+	executeStatementHook         func(context.Context, string, string, executor.Params) (*executor.Result, error)
 }
 
 func startGRPCServer(listenAddress string, handler v1.QueryServiceServer) (*grpc.Server, net.Listener, error) {
@@ -56,6 +58,7 @@ func (h *grpcQueryHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid parameter value: %v", err)
 	}
+	params = grpcApplyRequestOptionsToParams(req.GetOptions(), params)
 
 	result, err := h.executeStatement(ctx, tenant, query, params)
 	if err != nil {
@@ -108,6 +111,7 @@ func (h *grpcQueryHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid parameter value: %v", err)
 	}
+	params = grpcApplyRequestOptionsToParams(req.GetOptions(), params)
 
 	result, err := h.executeStatement(ctx, tenant, query, params)
 	if err != nil {
@@ -176,16 +180,17 @@ func (h *grpcQueryHandler) GetCapabilities(_ context.Context, _ *v1.Capabilities
 	configuredMaxWriteBatchBytes := grpcConfiguredWriteBatchBytes(h.configuredMaxWriteBatchBytes, maxWriteBatchBytes)
 	maxWriteBatchBytes = grpcEffectiveWriteBatchBytes(maxWriteBatchBytes)
 	return &v1.CapabilitiesResponse{
-		ProtocolVersion:              "v1",
-		ParserVersions:               []string{grpcSupportedParserVersion},
-		IrVersions:                   []string{grpcSupportedIRVersion},
-		PreparedQuerySupported:       true,
-		ParameterBinding:             "server_side",
-		IndexDdlSupported:            true,
-		MaxWriteBatchBytes:           maxWriteBatchBytes,
-		ConfiguredMaxWriteBatchBytes: configuredMaxWriteBatchBytes,
-		EffectiveMaxWriteBatchBytes:  maxWriteBatchBytes,
-		MaxWriteBatchBytesTuned:      h.maxWriteBatchBytesTuned,
+		ProtocolVersion:                "v1",
+		ParserVersions:                 []string{grpcSupportedParserVersion},
+		IrVersions:                     []string{grpcSupportedIRVersion},
+		PreparedQuerySupported:         true,
+		ParameterBinding:               "server_side",
+		IndexDdlSupported:              true,
+		MaxWriteBatchBytes:             maxWriteBatchBytes,
+		ConfiguredMaxWriteBatchBytes:   configuredMaxWriteBatchBytes,
+		EffectiveMaxWriteBatchBytes:    maxWriteBatchBytes,
+		MaxWriteBatchBytesTuned:        h.maxWriteBatchBytesTuned,
+		StrictVariantDispatchSupported: true,
 	}, nil
 }
 
@@ -229,6 +234,9 @@ func (h *grpcQueryHandler) CreatePropertyIndex(ctx context.Context, req *v1.Crea
 }
 
 func (h *grpcQueryHandler) executeStatement(ctx context.Context, tenant, query string, params executor.Params) (*executor.Result, error) {
+	if h != nil && h.executeStatementHook != nil {
+		return h.executeStatementHook(ctx, tenant, query, params)
+	}
 	if h == nil || h.executor == nil {
 		return nil, status.Error(codes.FailedPrecondition, "executor is not configured")
 	}
@@ -384,6 +392,9 @@ func grpcProtoParamsToExecutorParams(protoParams map[string]*v1.Value) (executor
 	}
 	params := make(executor.Params, len(protoParams))
 	for k, v := range protoParams {
+		if grpcParamKeyIsReserved(k) {
+			return nil, fmt.Errorf("parameter %q uses reserved internal prefix __ve_", k)
+		}
 		converted, err := grpcProtoValueToAny(v)
 		if err != nil {
 			return nil, fmt.Errorf("parameter %q: %w", k, err)
@@ -394,6 +405,18 @@ func grpcProtoParamsToExecutorParams(protoParams map[string]*v1.Value) (executor
 		params[k] = converted
 	}
 	return params, nil
+}
+
+func grpcApplyRequestOptionsToParams(options *v1.RequestOptions, params executor.Params) executor.Params {
+	if params == nil {
+		params = executor.Params{}
+	}
+	delete(params, cypherruntime.StrictVariantDispatchParam)
+	if options == nil {
+		return params
+	}
+	params[cypherruntime.StrictVariantDispatchParam] = options.GetStrictVariantDispatch()
+	return params
 }
 
 func grpcValidateBoundaryParam(path, key string, value any) error {
@@ -456,6 +479,10 @@ func grpcParamKeyLooksLikeID(key string) bool {
 	lower = strings.ReplaceAll(lower, "-", "")
 	lower = strings.ReplaceAll(lower, ".", "")
 	return lower == "id" || strings.HasSuffix(lower, "id") || strings.HasSuffix(lower, "ids")
+}
+
+func grpcParamKeyIsReserved(key string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(key)), "__ve_")
 }
 
 func grpcProtoValueToAny(v *v1.Value) (any, error) {

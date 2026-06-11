@@ -47,18 +47,6 @@ func (e *Executor) executeStandaloneCallStatement(ctx context.Context, stmt *ast
 	return &Result{Columns: columns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}, nil
 }
 
-func (e *Executor) applyInQueryCallClause(ctx context.Context, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
-	spec, err := parseCallClauseRaw(clause.Raw)
-	if err != nil {
-		return nil, err
-	}
-	resultRows, _, err := e.executeProcedureCall(ctx, rows, spec, params, true)
-	if err != nil {
-		return nil, err
-	}
-	return resultRows, nil
-}
-
 func (e *Executor) executeProcedureCall(ctx context.Context, inputRows []Row, spec callSpec, params Params, inQuery bool) ([]Row, []string, error) {
 	resolved, ok := e.resolveProcedure(spec.Name, params)
 	if !ok {

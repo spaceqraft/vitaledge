@@ -109,17 +109,116 @@ func TestStatsKeys(t *testing.T) {
 	if got := string(StatsEdgeTotalKey("t1")); got != "s/t1/edge_total" {
 		t.Fatalf("unexpected edge total stats key: %s", got)
 	}
+	if got := string(StatsEpochKey("t1")); got != "s/t1/epoch" {
+		t.Fatalf("unexpected stats epoch key: %s", got)
+	}
+	if got := string(StatsSampleSizeKey("t1")); got != "s/t1/sample_size" {
+		t.Fatalf("unexpected stats sample size key: %s", got)
+	}
+	if got := string(StatsLastRefreshKey("t1")); got != "s/t1/last_refresh_ts" {
+		t.Fatalf("unexpected stats last refresh key: %s", got)
+	}
 	if got := string(StatsVertexLabelCountKey("t1", "Movie")); got != "s/t1/label/Movie" {
 		t.Fatalf("unexpected label stats key: %s", got)
 	}
 	if got := string(StatsEdgeTypeCountKey("t1", "RATED")); got != "s/t1/edge_type/RATED" {
 		t.Fatalf("unexpected edge type stats key: %s", got)
 	}
+	if got := string(StatsVertexPropertyDistinctCountKey("t1", "User", "email")); got != "s/t1/vertex_property_ndv/User/email" {
+		t.Fatalf("unexpected vertex property ndv key: %s", got)
+	}
+	if got := string(StatsVertexPropertyDistinctCountByKindKey("t1", "User", "email", "boolean")); got != "s/t1/vertex_property_ndv_kind/User/email/boolean" {
+		t.Fatalf("unexpected vertex property ndv-by-kind key: %s", got)
+	}
+	if got := string(StatsVertexPropertyEntryCountKey("t1", "User", "email")); got != "s/t1/vertex_property_entries/User/email" {
+		t.Fatalf("unexpected vertex property entry count key: %s", got)
+	}
+	if got := string(StatsVertexPropertyEntryCountByKindKey("t1", "User", "email", "categorical")); got != "s/t1/vertex_property_entries_kind/User/email/categorical" {
+		t.Fatalf("unexpected vertex property entry-by-kind key: %s", got)
+	}
+	if got := string(StatsVertexPropertyEpochKey("t1", "User", "email")); got != "s/t1/vertex_property_epoch/User/email" {
+		t.Fatalf("unexpected vertex property epoch key: %s", got)
+	}
+	if got := string(StatsVertexPropertySampleSizeKey("t1", "User", "email")); got != "s/t1/vertex_property_sample_size/User/email" {
+		t.Fatalf("unexpected vertex property sample-size key: %s", got)
+	}
+	if got := string(StatsVertexPropertyLastRefreshKey("t1", "User", "email")); got != "s/t1/vertex_property_last_refresh_ts/User/email" {
+		t.Fatalf("unexpected vertex property refresh key: %s", got)
+	}
+	if got := string(StatsEdgePropertyDistinctCountKey("t1", "RATED", "score")); got != "s/t1/edge_property_ndv/RATED/score" {
+		t.Fatalf("unexpected edge property ndv key: %s", got)
+	}
+	if got := string(StatsEdgePropertyDistinctCountByKindKey("t1", "RATED", "score", "numeric")); got != "s/t1/edge_property_ndv_kind/RATED/score/numeric" {
+		t.Fatalf("unexpected edge property ndv-by-kind key: %s", got)
+	}
+	if got := string(StatsEdgePropertyEntryCountKey("t1", "RATED", "score")); got != "s/t1/edge_property_entries/RATED/score" {
+		t.Fatalf("unexpected edge property entry count key: %s", got)
+	}
+	if got := string(StatsEdgePropertyEntryCountByKindKey("t1", "RATED", "score", "datetime")); got != "s/t1/edge_property_entries_kind/RATED/score/datetime" {
+		t.Fatalf("unexpected edge property entry-by-kind key: %s", got)
+	}
+	if got := string(StatsEdgePropertyEpochKey("t1", "RATED", "score")); got != "s/t1/edge_property_epoch/RATED/score" {
+		t.Fatalf("unexpected edge property epoch key: %s", got)
+	}
+	if got := string(StatsEdgePropertySampleSizeKey("t1", "RATED", "score")); got != "s/t1/edge_property_sample_size/RATED/score" {
+		t.Fatalf("unexpected edge property sample-size key: %s", got)
+	}
+	if got := string(StatsEdgePropertyLastRefreshKey("t1", "RATED", "score")); got != "s/t1/edge_property_last_refresh_ts/RATED/score" {
+		t.Fatalf("unexpected edge property refresh key: %s", got)
+	}
+	if got := string(StatsVertexPropertyHistogramKey("t1", "User", "age", "numeric", 7)); got != "s/t1/vertex_property_hist/User/age/numeric/00000007" {
+		t.Fatalf("unexpected vertex property histogram key: %s", got)
+	}
+	if got := string(StatsEdgePropertyHistogramKey("t1", "RATED", "createdAt", "datetime", 12)); got != "s/t1/edge_property_hist/RATED/createdAt/datetime/0000000C" {
+		t.Fatalf("unexpected edge property histogram key: %s", got)
+	}
 	if got := string(StatsVertexLabelPrefix("t1")); got != "s/t1/label/" {
 		t.Fatalf("unexpected label stats prefix: %s", got)
 	}
 	if got := string(StatsEdgeTypePrefix("t1")); got != "s/t1/edge_type/" {
 		t.Fatalf("unexpected edge type stats prefix: %s", got)
+	}
+	if got := string(StatsVertexPropertyDistinctCountPrefix("t1")); got != "s/t1/vertex_property_ndv/" {
+		t.Fatalf("unexpected vertex property ndv prefix: %s", got)
+	}
+	if got := string(StatsVertexPropertyDistinctCountByKindPrefix("t1")); got != "s/t1/vertex_property_ndv_kind/" {
+		t.Fatalf("unexpected vertex property ndv-by-kind prefix: %s", got)
+	}
+	if got := string(StatsVertexPropertyEntryCountByKindPrefix("t1")); got != "s/t1/vertex_property_entries_kind/" {
+		t.Fatalf("unexpected vertex property entries-by-kind prefix: %s", got)
+	}
+	if got := string(StatsVertexPropertyEpochPrefix("t1")); got != "s/t1/vertex_property_epoch/" {
+		t.Fatalf("unexpected vertex property epoch prefix: %s", got)
+	}
+	if got := string(StatsVertexPropertySampleSizePrefix("t1")); got != "s/t1/vertex_property_sample_size/" {
+		t.Fatalf("unexpected vertex property sample-size prefix: %s", got)
+	}
+	if got := string(StatsVertexPropertyLastRefreshPrefix("t1")); got != "s/t1/vertex_property_last_refresh_ts/" {
+		t.Fatalf("unexpected vertex property refresh prefix: %s", got)
+	}
+	if got := string(StatsEdgePropertyEntryCountPrefix("t1")); got != "s/t1/edge_property_entries/" {
+		t.Fatalf("unexpected edge property entry count prefix: %s", got)
+	}
+	if got := string(StatsEdgePropertyDistinctCountByKindPrefix("t1")); got != "s/t1/edge_property_ndv_kind/" {
+		t.Fatalf("unexpected edge property ndv-by-kind prefix: %s", got)
+	}
+	if got := string(StatsEdgePropertyEntryCountByKindPrefix("t1")); got != "s/t1/edge_property_entries_kind/" {
+		t.Fatalf("unexpected edge property entries-by-kind prefix: %s", got)
+	}
+	if got := string(StatsEdgePropertyEpochPrefix("t1")); got != "s/t1/edge_property_epoch/" {
+		t.Fatalf("unexpected edge property epoch prefix: %s", got)
+	}
+	if got := string(StatsEdgePropertySampleSizePrefix("t1")); got != "s/t1/edge_property_sample_size/" {
+		t.Fatalf("unexpected edge property sample-size prefix: %s", got)
+	}
+	if got := string(StatsEdgePropertyLastRefreshPrefix("t1")); got != "s/t1/edge_property_last_refresh_ts/" {
+		t.Fatalf("unexpected edge property refresh prefix: %s", got)
+	}
+	if got := string(StatsVertexPropertyHistogramPrefix("t1")); got != "s/t1/vertex_property_hist/" {
+		t.Fatalf("unexpected vertex property histogram prefix: %s", got)
+	}
+	if got := string(StatsEdgePropertyHistogramPrefix("t1")); got != "s/t1/edge_property_hist/" {
+		t.Fatalf("unexpected edge property histogram prefix: %s", got)
 	}
 	if got := string(SchemaVersionKey()); got != "m/schema_version" {
 		t.Fatalf("unexpected schema version key: %s", got)

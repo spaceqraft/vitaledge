@@ -9,6 +9,8 @@ import (
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"github.com/paegun/vitaledge/internal/cypher/physical"
+	"github.com/paegun/vitaledge/internal/cypher/runtime"
 	"github.com/paegun/vitaledge/internal/graph"
 )
 
@@ -114,6 +116,48 @@ func TestExecuteStatementRuntimePipelineCreateReverseEdgeWriteOnly(t *testing.T)
 	}
 }
 
+func TestExecuteStatementRuntimePipelineSetPropertyWithParenthesizedTargetPersists(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:A)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:A) SET (n).name = 'neo4j' RETURN n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 0, func(vertex *graph.Vertex) error {
+			if vertex == nil {
+				return nil
+			}
+			for _, label := range vertex.Labels {
+				if label != "A" {
+					continue
+				}
+				if got := string(vertex.Properties["name"]); got != "neo4j" {
+					t.Fatalf("expected persisted name=neo4j, got %#v", vertex)
+				}
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("store verification failed: %v", err)
+	}
+}
+
 func TestExecuteStatementRuntimePipelineCreateWithReturn(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -149,6 +193,29 @@ func TestExecuteStatementRuntimePipelineCreateWithReturn(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("store verification failed: %v", err)
+	}
+}
+
+func TestExecuteStatementRuntimePipelinePreservesReturnColumnOrder(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS z_col, u.id AS a_col")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
+		"tenant": "acme",
+		"src":    "u-order",
+	})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if !reflect.DeepEqual(res.Columns, []string{"z_col", "a_col"}) {
+		t.Fatalf("expected runtime RETURN column order to be preserved, got %#v", res.Columns)
 	}
 }
 
@@ -298,6 +365,27 @@ func TestExecuteStatementRuntimePipelineCreateWithDistinctWithReturn(t *testing.
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	branchParams := Params{
+		"tenant": "acme",
+		"src":    "u51"}
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, branchParams)
+	if runtimeErr != nil {
+		t.Fatalf("runtime branch execution failed: %v", runtimeErr)
+	}
+	if !runtimeOK || runtimeRes == nil {
+		t.Fatalf("expected WITH DISTINCT query to execute via runtime branch, got ok=%v res=%#v", runtimeOK, runtimeRes)
+	}
+	if len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one row from runtime branch execution, got %#v", runtimeRes.Rows)
+	}
+	if got := runtimeRes.Rows[0]["out"]; got != "u51" {
+		t.Fatalf("expected runtime branch out value u51, got %#v", runtimeRes.Rows[0])
+	}
 
 	res, err := exec.ExecuteStatement(ctx, stmt, Params{
 		"tenant": "acme",
@@ -313,28 +401,287 @@ func TestExecuteStatementRuntimePipelineCreateWithDistinctWithReturn(t *testing.
 	}
 }
 
-type runtimeAcceptedGuardCase struct {
-	name  string
-	query string
-}
+func TestCollectRuntimePlannerStatsHintsIncludesSnapshotTotalsAndEdgeTypeCounts(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
 
-func acceptedRuntimeWhereGuardCases() []runtimeAcceptedGuardCase {
-	return []runtimeAcceptedGuardCase{
-		{name: "accept simple with where", query: "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src RETURN uid AS out"},
-		{name: "accept starts with where", query: "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid STARTS WITH 'u' RETURN uid AS out"},
-		{name: "accept is not null where", query: "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid IS NOT NULL RETURN uid AS out"},
-		{name: "accept simple or where", query: "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src OR uid = 'x' RETURN uid AS out"},
-		{name: "accept parenthesized where", query: "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE (uid = $src) RETURN uid AS out"},
-		{name: "accept parenthesized or-group where", query: "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE (uid = $src OR uid = 'x') OR uid = 'y' RETURN uid AS out"},
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"})
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	hints := exec.collectRuntimePlannerStatsHints(ctx, "acme")
+	if !hints.HasEdgeTotal {
+		t.Fatalf("expected snapshot edge total presence in hints")
+	}
+	if hints.EdgeTotal != 1 {
+		t.Fatalf("expected edge total 1 in hints, got %#v", hints)
+	}
+	if got := hints.EdgeTypeCounts["KNOWS"]; got != 1 {
+		t.Fatalf("expected KNOWS edge type count 1, got %#v", hints.EdgeTypeCounts)
+	}
+	if got := hints.EdgeSourceCounts["KNOWS"]; got != 1 {
+		t.Fatalf("expected KNOWS edge source count 1, got %#v", hints.EdgeSourceCounts)
+	}
+	if got := hints.EdgeAvgOutDegree["KNOWS"]; got != 1.0 {
+		t.Fatalf("expected KNOWS avg out-degree 1.0, got %#v", hints.EdgeAvgOutDegree)
 	}
 }
 
-func rejectedRuntimeWhereGuardCases() []runtimeAcceptedGuardCase {
-	return []runtimeAcceptedGuardCase{
-		{name: "reject string predicate numeric literal", query: "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid STARTS WITH 10 RETURN uid AS out"},
-		{name: "reject where identifier rhs", query: "CREATE (u:User {id:$src}) WITH u.id AS uid, u.id AS other WHERE uid = other RETURN uid AS out"},
-		{name: "reject string predicate identifier rhs", query: "CREATE (u:User {id:$src}) WITH u.id AS uid, 'u' AS prefix WHERE uid STARTS WITH prefix RETURN uid AS out"},
-		{name: "reject mixed boolean where", query: "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src AND uid = 'u80' OR uid = 'u81' RETURN uid AS out"},
+func TestBuildRuntimePhysicalPlanUsesStatsHintsForZeroEdgeTenant(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("MATCH (u:User)-[:BLOCKED]->(v:User) RETURN v.id AS vid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+	if len(physicalPlan.Nodes) == 0 {
+		t.Fatalf("expected physical plan nodes")
+	}
+	if physicalPlan.Nodes[0].Op != "PHY_EMPTY" {
+		t.Fatalf("expected first runtime physical node PHY_EMPTY from zero-edge stats, got %#v", physicalPlan.Nodes[0])
+	}
+}
+
+func TestExecuteRuntimePhysicalPlanStrictVariantDispatchFromExecutorOptions(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{StrictRuntimeVariantDispatch: true})
+	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	plan := physical.Plan{
+		RootNodeID: "p1",
+		Nodes: []physical.Node{{
+			ID:    "p1",
+			Op:    "PHY_SORT",
+			Attrs: map[string]any{"variant": "sort_unknown_variant"},
+		}},
+	}
+
+	_, err = exec.executeRuntimePhysicalPlan(ctx, query, Params{"tenant": "acme", "src": "u901"}, plan)
+	if err == nil {
+		t.Fatalf("expected strict runtime variant dispatch option to reject unsupported variant")
+	}
+}
+
+func TestExecuteRuntimePhysicalPlanNonStrictVariantDispatchAllowsFallback(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	plan := physical.Plan{
+		RootNodeID: "p1",
+		Nodes: []physical.Node{{
+			ID:    "p1",
+			Op:    "PHY_SORT",
+			Attrs: map[string]any{"variant": "sort_unknown_variant"},
+		}},
+	}
+
+	res, err := exec.executeRuntimePhysicalPlan(ctx, query, Params{"tenant": "acme", "src": "u902"}, plan)
+	if err != nil {
+		t.Fatalf("expected non-strict runtime variant dispatch to allow fallback, got %v", err)
+	}
+	if res == nil {
+		t.Fatalf("expected result object from non-strict fallback path")
+	}
+}
+
+func TestExecuteRuntimePhysicalPlanStrictOptionCanBeOverriddenFalseByParams(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{StrictRuntimeVariantDispatch: true})
+	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	plan := physical.Plan{
+		RootNodeID: "p1",
+		Nodes: []physical.Node{{
+			ID:    "p1",
+			Op:    "PHY_SORT",
+			Attrs: map[string]any{"variant": "sort_unknown_variant"},
+		}},
+	}
+
+	res, err := exec.executeRuntimePhysicalPlan(ctx, query, Params{
+		"tenant":                           "acme",
+		"src":                              "u903",
+		runtime.StrictVariantDispatchParam: false,
+	}, plan)
+	if err != nil {
+		t.Fatalf("expected params strict=false to override strict option, got %v", err)
+	}
+	if res == nil {
+		t.Fatalf("expected non-strict fallback result after override")
+	}
+}
+
+func TestExecuteRuntimePhysicalPlanStrictParamTrueOverridesNonStrictOption(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (u:User {id:$src}) RETURN u.id AS uid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	plan := physical.Plan{
+		RootNodeID: "p1",
+		Nodes: []physical.Node{{
+			ID:    "p1",
+			Op:    "PHY_SORT",
+			Attrs: map[string]any{"variant": "sort_unknown_variant"},
+		}},
+	}
+
+	_, err = exec.executeRuntimePhysicalPlan(ctx, query, Params{
+		"tenant":                           "acme",
+		"src":                              "u904",
+		runtime.StrictVariantDispatchParam: true,
+	}, plan)
+	if err == nil {
+		t.Fatalf("expected params strict=true to enforce strict rejection")
+	}
+}
+
+func TestCollectRuntimePlannerStatsHintsDerivesAntiProbeSelectivityFromSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"User"}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"User"}},
+			{Tenant: "acme", ID: "u4", Labels: []string{"User"}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "BLOCKED", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e2", Type: "BLOCKED", SrcID: "u2", DstID: "u3"},
+			{Tenant: "acme", ID: "e3", Type: "BLOCKED", SrcID: "u3", DstID: "u4"},
+			{Tenant: "acme", ID: "e4", Type: "MUTED", SrcID: "u4", DstID: "u1"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	hints := exec.collectRuntimePlannerStatsHints(ctx, "acme")
+	if got := hints.AntiProbeHitRateBy["BLOCKED"]; got != 0.75 {
+		t.Fatalf("expected BLOCKED anti-probe hit rate 0.75, got %#v", hints.AntiProbeHitRateBy)
+	}
+	if got := hints.AntiProbeHitRateBy["MUTED"]; got != 0.25 {
+		t.Fatalf("expected MUTED anti-probe hit rate 0.25, got %#v", hints.AntiProbeHitRateBy)
+	}
+	if got := hints.EdgeSourceCounts["BLOCKED"]; got != 3 {
+		t.Fatalf("expected BLOCKED edge source count 3, got %#v", hints.EdgeSourceCounts)
+	}
+	if got := hints.EdgeSourceCounts["MUTED"]; got != 1 {
+		t.Fatalf("expected MUTED edge source count 1, got %#v", hints.EdgeSourceCounts)
+	}
+	if got := hints.EdgeAvgOutDegree["BLOCKED"]; got != 1.0 {
+		t.Fatalf("expected BLOCKED avg out-degree 1.0, got %#v", hints.EdgeAvgOutDegree)
+	}
+	if got := hints.EdgeAvgOutDegree["MUTED"]; got != 1.0 {
+		t.Fatalf("expected MUTED avg out-degree 1.0, got %#v", hints.EdgeAvgOutDegree)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (u:User)-[:FRIEND]->(f:User) WHERE NOT ((u)-[:BLOCKED]->(f)) AND NOT ((u)-[:MUTED]->(f)) RETURN f.id AS vid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+	antiOps := make([]string, 0, 2)
+	for _, node := range physicalPlan.Nodes {
+		if node.Op != "PHY_ANTI_PROBE" {
+			continue
+		}
+		edgeType, _ := node.Attrs["edgeType"].(string)
+		antiOps = append(antiOps, edgeType)
+	}
+	if !reflect.DeepEqual(antiOps, []string{"BLOCKED", "MUTED"}) {
+		t.Fatalf("expected anti-probes ordered by snapshot selectivity, got %#v", antiOps)
 	}
 }
 
@@ -514,9 +861,10 @@ func TestParseRuntimeWhereAtoms(t *testing.T) {
 			wantAtoms: []wantAtom{{leftName: "uid", op: "=", rightParamName: "src"}},
 		},
 		{
-			name:   "rejects mixed boolean form",
-			raw:    "uid = $src AND uid = 'u80' OR uid = 'u81'",
-			wantOK: false,
+			name:      "accepts mixed boolean form",
+			raw:       "uid = $src AND uid = 'u80' OR uid = 'u81'",
+			wantOK:    true,
+			wantAtoms: []wantAtom{{leftName: "uid", op: "=", rightParamName: "src"}, {leftName: "uid", op: "=", rightAny: "u80"}, {leftName: "uid", op: "=", rightAny: "u81"}},
 		},
 		{
 			name:      "accepts lowercase and comparator conjunction",
@@ -624,9 +972,10 @@ func TestParseRuntimeWhereAtoms(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name:   "rejects mixed parenthesized boolean form",
-			raw:    "(uid = $src OR uid = 'x') AND uid = 'y'",
-			wantOK: false,
+			name:      "accepts mixed parenthesized boolean form",
+			raw:       "(uid = $src OR uid = 'x') AND uid = 'y'",
+			wantOK:    true,
+			wantAtoms: []wantAtom{{leftName: "uid", op: "=", rightParamName: "src"}, {leftName: "uid", op: "=", rightAny: "x"}, {leftName: "uid", op: "=", rightAny: "y"}},
 		},
 	}
 
@@ -787,14 +1136,17 @@ func TestExecuteStatementRuntimePipelineCreateWithEscapedQuoteBooleanTokenLitera
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	_, err = exec.ExecuteStatement(ctx, stmt, Params{
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
 		"tenant": "acme",
 		"src":    "A' OR B"})
-	if err == nil {
-		t.Fatalf("expected escaped-quote literal filter shape to be rejected")
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "UNSUPPORTED") {
-		t.Fatalf("expected unsupported error, got %v", err)
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row after escaped-quote literal filter, got %#v", res.Rows)
+	}
+	if got := res.Rows[0]["out"]; got != "A' OR B" {
+		t.Fatalf("expected projected out value %#v, got %#v", "A' OR B", res.Rows[0])
 	}
 }
 
@@ -809,14 +1161,17 @@ func TestExecuteStatementRuntimePipelineCreateWithDoubleQuotedEscapedQuoteBoolea
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	_, err = exec.ExecuteStatement(ctx, stmt, Params{
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
 		"tenant": "acme",
 		"src":    `A" OR B`})
-	if err == nil {
-		t.Fatalf("expected double-quoted escaped literal filter shape to be rejected")
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "UNSUPPORTED") {
-		t.Fatalf("expected unsupported error, got %v", err)
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row after double-quoted escaped literal filter, got %#v", res.Rows)
+	}
+	if got := res.Rows[0]["out"]; got != `A" OR B` {
+		t.Fatalf("expected projected out value %#v, got %#v", `A" OR B`, res.Rows[0])
 	}
 }
 
@@ -845,26 +1200,11 @@ func TestExecuteStatementRuntimePipelineCreateWithEscapedBackslashBeforeClosingQ
 	}
 }
 
-func TestRuntimeCompareWhereNumericTruthTable(t *testing.T) {
-	if !runtimeCompareWhere(10, ">", 2) {
-		t.Fatalf("expected 10 > 2")
-	}
-	if !runtimeCompareWhere("10", ">=", int64(10)) {
-		t.Fatalf("expected string numeric compare to coerce")
-	}
-	if runtimeCompareWhere(1, "<", 0) {
-		t.Fatalf("expected 1 < 0 to be false")
-	}
-	if runtimeCompareWhere(1, "=", 2) {
-		t.Fatalf("expected 1 = 2 to be false")
-	}
-}
-
 func TestExecuteStatementRuntimePipelineCreateWithWhereComparatorMatrix(t *testing.T) {
 	tests := []struct {
 		name     string
 		whereRaw string
-		src      string
+		src      interface{}
 		wantRows int
 	}{
 		{name: "equal true", whereRaw: "uid = $src", src: "u62", wantRows: 1},
@@ -875,8 +1215,8 @@ func TestExecuteStatementRuntimePipelineCreateWithWhereComparatorMatrix(t *testi
 		{name: "greater false", whereRaw: "uid > 'zzz'", src: "u61", wantRows: 0},
 		{name: "greater equal true", whereRaw: "uid >= 'u70'", src: "u70", wantRows: 1},
 		{name: "greater equal false", whereRaw: "uid >= 'u99'", src: "u70", wantRows: 0},
-		{name: "less true numeric", whereRaw: "uid < 20", src: "10", wantRows: 1},
-		{name: "less false numeric", whereRaw: "uid < 2", src: "10", wantRows: 0},
+		{name: "less true numeric", whereRaw: "uid < 20", src: 10, wantRows: 1},
+		{name: "less false numeric", whereRaw: "uid < 2", src: 10, wantRows: 0},
 		{name: "less equal true", whereRaw: "uid <= $src", src: "u71", wantRows: 1},
 		{name: "less equal false", whereRaw: "uid <= 'u10'", src: "u71", wantRows: 0},
 	}
@@ -904,8 +1244,8 @@ func TestExecuteStatementRuntimePipelineCreateWithWhereComparatorMatrix(t *testi
 				t.Fatalf("unexpected row count: where=%q src=%q got=%d want=%d rows=%#v", tc.whereRaw, tc.src, len(res.Rows), tc.wantRows, res.Rows)
 			}
 			if tc.wantRows == 1 {
-				if got := res.Rows[0]["out"]; strings.TrimSpace(fmt.Sprint(got)) != tc.src {
-					t.Fatalf("expected out column to match src when row is returned: got=%#v src=%q row=%#v", got, tc.src, res.Rows[0])
+				if got := res.Rows[0]["out"]; !reflect.DeepEqual(got, tc.src) {
+					t.Fatalf("expected out column to match src when row is returned: got=%#v src=%#v row=%#v", got, tc.src, res.Rows[0])
 				}
 			}
 		})
@@ -1154,175 +1494,17 @@ func TestExecuteStatementRuntimePipelineWithEscapedQuoteCompoundWhere(t *testing
 		t.Fatalf("parse failed: %v", err)
 	}
 
-	_, err = exec.ExecuteStatement(ctx, stmt, Params{
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{
 		"tenant": "acme",
 		"src":    `A" OR B`})
-	if err == nil {
-		t.Fatalf("expected escaped-quote compound WHERE shape to be rejected")
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "UNSUPPORTED") {
-		t.Fatalf("expected unsupported error, got %v", err)
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected one row after escaped-quote compound WHERE filter, got %#v", res.Rows)
 	}
-}
-
-func TestApplyRuntimeWithWhereFilter(t *testing.T) {
-	tests := []struct {
-		name       string
-		query      string
-		rows       []Row
-		params     Params
-		wantRows   []Row
-		wantFilter bool
-	}{
-		{
-			name:       "filters rows using return alias mapping",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src RETURN uid AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "u2"}},
-			params:     Params{"src": "u1"},
-			wantRows:   []Row{{"out": "u1"}},
-			wantFilter: true,
-		},
-		{
-			name:       "returns original rows when where name not present in return",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid, u.id AS other WHERE uid = $src RETURN other AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "u2"}},
-			params:     Params{"src": "u1"},
-			wantRows:   []Row{{"out": "u1"}, {"out": "u2"}},
-			wantFilter: false,
-		},
-		{
-			name:       "returns original rows when where param is missing",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $missing RETURN uid AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "u2"}},
-			params:     Params{"src": "u1"},
-			wantRows:   []Row{{"out": "u1"}, {"out": "u2"}},
-			wantFilter: false,
-		},
-		{
-			name:       "no with where leaves rows unchanged",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid RETURN uid AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "u2"}},
-			params:     Params{"src": "u1"},
-			wantRows:   []Row{{"out": "u1"}, {"out": "u2"}},
-			wantFilter: false,
-		},
-		{
-			name:       "filters rows using OR disjunction",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src OR uid = 'u2' RETURN uid AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "u2"}, {"out": "u3"}},
-			params:     Params{"src": "u1"},
-			wantRows:   []Row{{"out": "u1"}, {"out": "u2"}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using parenthesized OR group",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE (uid = $src OR uid = 'u2') OR uid = 'u4' RETURN uid AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "u2"}, {"out": "u3"}, {"out": "u4"}},
-			params:     Params{"src": "u1"},
-			wantRows:   []Row{{"out": "u1"}, {"out": "u2"}, {"out": "u4"}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using escaped quote literal",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = 'A\\' OR B' RETURN uid AS out",
-			rows:       []Row{{"out": "A' OR B"}, {"out": "A'' OR B"}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": "A' OR B"}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using double quoted escaped quote literal",
-			query:      `CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = "A\" OR B" RETURN uid AS out`,
-			rows:       []Row{{"out": `A" OR B`}, {"out": `A\" OR B`}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": `A" OR B`}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using escaped backslash literal",
-			query:      `CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = 'C:\\path' RETURN uid AS out`,
-			rows:       []Row{{"out": `C:\path`}, {"out": `C:\\path`}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": `C:\path`}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using starts with",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid STARTS WITH 'u' RETURN uid AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "x1"}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": "u1"}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using ends with",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid ENDS WITH '2' RETURN uid AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "u2"}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": "u2"}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using contains",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid CONTAINS 'bc' RETURN uid AS out",
-			rows:       []Row{{"out": "abc"}, {"out": "def"}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": "abc"}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using starts with parameter rhs",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid STARTS WITH $prefix RETURN uid AS out",
-			rows:       []Row{{"out": "u1"}, {"out": "x1"}},
-			params:     Params{"prefix": "u"},
-			wantRows:   []Row{{"out": "u1"}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using grouped string predicate disjunction",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE (uid STARTS WITH 'x' OR uid ENDS WITH '2') OR uid CONTAINS 'bc' RETURN uid AS out",
-			rows:       []Row{{"out": "abc"}, {"out": "u2"}, {"out": "u1"}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": "abc"}, {"out": "u2"}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using is null",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid IS NULL RETURN uid AS out",
-			rows:       []Row{{"out": nil}, {"out": "u1"}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": nil}},
-			wantFilter: true,
-		},
-		{
-			name:       "filters rows using is not null",
-			query:      "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid IS NOT NULL RETURN uid AS out",
-			rows:       []Row{{"out": nil}, {"out": "u1"}},
-			params:     Params{"src": "ignored"},
-			wantRows:   []Row{{"out": "u1"}},
-			wantFilter: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			stmt, err := parser.ParseStatement(tc.query)
-			if err != nil {
-				t.Fatalf("parse failed: %v", err)
-			}
-			query, ok := stmt.(*ast.QueryStatement)
-			if !ok {
-				t.Fatalf("expected query statement, got %T", stmt)
-			}
-
-			gotRows, gotFilter := applyRuntimeWithWhereFilter(query, tc.rows, tc.params)
-			if gotFilter != tc.wantFilter {
-				t.Fatalf("unexpected filter applied flag: got=%v want=%v", gotFilter, tc.wantFilter)
-			}
-			if !reflect.DeepEqual(gotRows, tc.wantRows) {
-				t.Fatalf("unexpected filtered rows: got=%#v want=%#v", gotRows, tc.wantRows)
-			}
-		})
+	if got := res.Rows[0]["out"]; got != `A" OR B` {
+		t.Fatalf("expected projected out value %#v, got %#v", `A" OR B`, res.Rows[0])
 	}
 }
 
@@ -1621,6 +1803,1882 @@ func TestExecuteStatementRuntimePipelineParityWithReference(t *testing.T) {
 	}
 }
 
+func TestRuntimeNativeExecutionCandidateCreateWithReturnFamily(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		wantOK  bool
+		wantErr bool
+	}{
+		{
+			name:   "standalone anonymous create now native",
+			query:  "CREATE (:User)",
+			wantOK: true,
+		},
+		{
+			name:   "create with return no where",
+			query:  "CREATE (u:User {id:$src}) WITH u.id AS uid RETURN uid AS out",
+			wantOK: true,
+		},
+		{
+			name:   "create with literal projection return",
+			query:  "CREATE (u:User {id:$src}) WITH 'beta' AS uid RETURN uid AS out",
+			wantOK: true,
+		},
+		{
+			name:   "create with where now native",
+			query:  "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src RETURN uid AS out",
+			wantOK: true,
+		},
+		{
+			name:   "create with mixed where now native",
+			query:  "CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = $src AND uid = 'u1' OR uid = 'u2' RETURN uid AS out",
+			wantOK: true,
+		},
+		{
+			name:   "create with escaped where now native",
+			query:  `CREATE (u:User {id:$src}) WITH u.id AS uid WHERE uid = "A\" OR B" RETURN uid AS out`,
+			wantOK: true,
+		},
+		{
+			name:   "create with distinct now native",
+			query:  "CREATE (u:User {id:$src}) WITH DISTINCT u.id AS uid RETURN uid AS out",
+			wantOK: true,
+		},
+		{
+			name:   "create missing relationship type rejected by runtime pipeline",
+			query:  "CREATE ()-->()",
+			wantOK: false,
+		},
+		{
+			name:   "create temporal function property now native",
+			query:  "CREATE ({created: localtime({hour: 12})})",
+			wantOK: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := parser.ParseStatement(tc.query)
+			if err != nil {
+				if tc.wantErr {
+					return
+				}
+				t.Fatalf("parse failed: %v", err)
+			}
+			query, ok := stmt.(*ast.QueryStatement)
+			if !ok {
+				t.Fatalf("expected query statement, got %T", stmt)
+			}
+			if got := runtimeNativeExecutionCandidate(query); got != tc.wantOK {
+				t.Fatalf("unexpected runtime-native candidate decision for %q: got=%v want=%v", tc.query, got, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineRejectsMissingRelationshipTypeWithoutFallback(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE ()-->()")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr == nil {
+		t.Fatalf("expected runtime pipeline to reject missing relationship type")
+	}
+	parseErr, ok := runtimeErr.(*parser.ParseError)
+	if !ok {
+		t.Fatalf("expected parser parse error, got %T: %v", runtimeErr, runtimeErr)
+	}
+	if parseErr.Kind != parser.ParseErrorUnsupported || parseErr.Message != "NoSingleRelationshipType" {
+		t.Fatalf("unexpected runtime parse error: %#v", parseErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime pipeline to handle the rejection without legacy fallback")
+	}
+	if runtimeRes != nil {
+		t.Fatalf("expected no result for rejected CREATE, got %#v", runtimeRes)
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineExecutesMigratedCreateFamilyWithUnwind(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (a) WITH a UNWIND [0] AS i CREATE (b) CREATE (a)<-[:T]-(b)")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected migrated CREATE-family shape to execute in runtime pipeline, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime pipeline to handle migrated CREATE-family statement")
+	}
+	if runtimeRes != nil {
+		if len(runtimeRes.Rows) != 0 {
+			t.Fatalf("expected no result rows for write-only query, got %#v", runtimeRes.Rows)
+		}
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineExecutesMigratedUnwindCreateFamily(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("UNWIND range(0, 2) AS i CREATE (s:S) WITH s, i UNWIND range(0, i) AS j CREATE (s)-[:REL]->()")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected migrated UNWIND/CREATE-family shape to execute in runtime pipeline, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime pipeline to handle migrated UNWIND/CREATE-family statement")
+	}
+	if runtimeRes != nil && len(runtimeRes.Rows) != 0 {
+		t.Fatalf("expected no result rows for write-only query, got %#v", runtimeRes.Rows)
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineExecutesMigratedMatchSetFamily(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seed, err := parser.ParseStatement("CREATE (:A {id: 'n1', v: 1})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:A {id: 'n1'}) SET n.v = 2 RETURN n.v AS v")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected migrated MATCH+SET family to execute in runtime pipeline, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime pipeline to handle migrated MATCH+SET family statement")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from MATCH+SET query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["v"]); got != "2" {
+		t.Fatalf("expected projected value 2, got %#v", runtimeRes.Rows[0]["v"])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineExecutesMigratedMatchSetMapReplaceFamily(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seed, err := parser.ParseStatement("CREATE (:A {id: 'n1', name: 'A'})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:A {id: 'n1'}) SET n = {name: 'B'} RETURN n.name AS name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected MATCH+SET-map-replace family to execute in runtime pipeline, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime pipeline to handle MATCH+SET-map-replace family statement")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from MATCH+SET map replace query, got %#v", runtimeRes)
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineExecutesMigratedMatchSetMapAppendFamily(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seed, err := parser.ParseStatement("CREATE (:A {id: 'n1', name: 'A'})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:A {id: 'n1'}) SET n += {name: 'B'} RETURN n.name AS name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected MATCH+SET-map-append family to execute in runtime pipeline, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime pipeline to handle MATCH+SET-map-append family statement")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from MATCH+SET map append query, got %#v", runtimeRes)
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineUnwindReturnExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("UNWIND [1] AS x RETURN x")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute UNWIND query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one row for UNWIND query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["x"]); got != "1" {
+		t.Fatalf("expected x=1 for UNWIND query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineWithUnwindMatchReturnExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seed, err := parser.ParseStatement("CREATE (:Num {id: '0'})")
+	if err != nil {
+		t.Fatalf("parse seed failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seed, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("WITH collect([0, 0.0]) AS numbers UNWIND numbers AS arr WITH arr[0] AS expected MATCH (n) WHERE toInteger(n.id) = expected RETURN n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected WITH+UNWIND+MATCH+RETURN shape to execute in runtime pipeline, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil {
+		t.Fatalf("expected non-nil result for WITH+UNWIND+MATCH+RETURN query")
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineUnwindCreateReturnExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("UNWIND [1, 2] AS x CREATE (n:N {id: x}) RETURN n.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected UNWIND+CREATE+RETURN shape to execute in runtime pipeline, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 2 {
+		t.Fatalf("expected two rows for UNWIND+CREATE+RETURN query, got %#v", runtimeRes)
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineReturnOnlyScalarExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("RETURN 42 AS n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute RETURN-only scalar query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from RETURN-only runtime query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["n"]); got != "42" {
+		t.Fatalf("expected n=42 from runtime RETURN-only scalar query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineReturnOnlyFunctionExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("RETURN toString(42) AS s")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmt.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmt)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute RETURN-only function query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from RETURN-only function runtime query, got %#v", runtimeRes)
+	}
+	if _, ok := runtimeRes.Rows[0]["s"]; !ok {
+		t.Fatalf("expected function projection column s in runtime result row, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineWithReturnTemporalExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("WITH date('1984-10-11') AS other RETURN date({date: other, day: 28}) AS result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute WITH+RETURN temporal query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from WITH+RETURN temporal query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["result"]); got != "1984-10-28" {
+		t.Fatalf("expected result=1984-10-28 from runtime query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineWithMatchReturnTemporalExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:Duration {dur: duration({days: 1})})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("WITH date('1984-10-11') AS x MATCH (d:Duration) RETURN x AS result")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute WITH+MATCH+RETURN temporal query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from WITH+MATCH+RETURN temporal query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["result"]); got != "1984-10-11" {
+		t.Fatalf("expected result=1984-10-11 from runtime query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineMatchReturnDurationArithmeticExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:Duration1 {date: duration({years: 12, months: 5, days: 14, hours: 16, minutes: 12, seconds: 70, nanoseconds: 1})}) CREATE (:Duration2 {date: duration({years: 12, months: 5, days: 14, hours: 16, minutes: 12, seconds: 70, nanoseconds: 1})})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (dur:Duration1), (dur2: Duration2) RETURN dur.date + dur2.date AS sum, dur.date - dur2.date AS diff")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	inspectStmt, err := parser.ParseStatement("MATCH (dur:Duration1), (dur2: Duration2) RETURN toString(dur.date) AS left, toString(dur2.date) AS right")
+	if err != nil {
+		t.Fatalf("inspect parse failed: %v", err)
+	}
+	inspectRes, inspectOK, inspectErr := exec.tryExecuteViaRuntimePipeline(ctx, inspectStmt, Params{"tenant": "acme"})
+	if inspectErr != nil || !inspectOK || inspectRes == nil || len(inspectRes.Rows) == 0 {
+		t.Fatalf("expected inspect runtime query to succeed, ok=%v err=%v res=%#v", inspectOK, inspectErr, inspectRes)
+	}
+	for _, row := range inspectRes.Rows {
+		if got := fmt.Sprint(row["left"]); got != "P12Y5M14DT16H13M10.000000001S" {
+			t.Fatalf("expected left duration property hydration, got %#v", row)
+		}
+		if got := fmt.Sprint(row["right"]); got != "P12Y5M14DT16H13M10.000000001S" {
+			t.Fatalf("expected right duration property hydration, got %#v", row)
+		}
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute MATCH duration arithmetic query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) == 0 {
+		t.Fatalf("expected non-empty result rows from MATCH duration arithmetic query, got %#v", runtimeRes)
+	}
+	for _, row := range runtimeRes.Rows {
+		if got := fmt.Sprint(row["sum"]); got != "P24Y10M28DT32H26M20.000000002S" {
+			t.Fatalf("expected sum from runtime query, got %#v", row)
+		}
+		if got := fmt.Sprint(row["diff"]); got != "PT0S" {
+			t.Fatalf("expected diff from runtime query, got %#v", row)
+		}
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineMatchReturnExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:User {id:'u1'})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (u:User) RETURN u.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute MATCH+RETURN query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from MATCH+RETURN runtime query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["id"]); got != "u1" {
+		t.Fatalf("expected id=u1 from MATCH+RETURN runtime query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineOptionalMatchReturnExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:User {id:'u1'})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (u:User) OPTIONAL MATCH (u)-[:KNOWS]->(v:User) RETURN u.id AS uid, v.id AS vid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute MATCH+OPTIONAL MATCH+RETURN query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from MATCH+OPTIONAL MATCH+RETURN runtime query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["uid"]); got != "u1" {
+		t.Fatalf("expected uid=u1 from runtime query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineMergeExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("MERGE (u:User {id: 'u1'}) RETURN u.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute MERGE query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from MERGE runtime query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["id"]); got != "u1" {
+		t.Fatalf("expected id=u1 from MERGE runtime query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineMatchMergeOptionalMatchExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:A {id:'a1'}), (:B {id:'b1'})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a) MERGE (b) WITH * OPTIONAL MATCH (a)--(b) RETURN count(*) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute MATCH+MERGE+OPTIONAL MATCH query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from MATCH+MERGE+OPTIONAL MATCH runtime query, got %#v", runtimeRes)
+	}
+	if _, ok := runtimeRes.Rows[0]["c"]; !ok {
+		t.Fatalf("expected count projection column c in runtime result row, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineWithCallReturnExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("WITH 1 AS x CALL db.stats.vertexCount() YIELD vertexCount RETURN x, vertexCount")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute WITH+CALL+RETURN query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from WITH+CALL+RETURN runtime query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["x"]); got != "1" {
+		t.Fatalf("expected x=1 from runtime query, got %#v", runtimeRes.Rows[0])
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["vertexCount"]); got != "0" {
+		t.Fatalf("expected vertexCount=0 from runtime query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineDeleteReturnExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:A {id:'a1'}), (:A {id:'a2'})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:A) DELETE n RETURN count(*) AS c")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute MATCH+DELETE+RETURN query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one result row from MATCH+DELETE+RETURN runtime query, got %#v", runtimeRes)
+	}
+	if got := fmt.Sprint(runtimeRes.Rows[0]["c"]); got != "2" {
+		t.Fatalf("expected c=2 from runtime query, got %#v", runtimeRes.Rows[0])
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineDeleteWithPaginationPreservesSideEffects(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:A {id:'a1'}), (:A {id:'a2'}), (:A {id:'a3'})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (n:A) DELETE n RETURN n.id AS id ORDER BY id SKIP 1 LIMIT 1")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute paginated delete query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes == nil || len(runtimeRes.Rows) != 1 {
+		t.Fatalf("expected one paginated result row, got %#v", runtimeRes)
+	}
+
+	remaining := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 0, func(found *graph.Vertex) error {
+			if found != nil {
+				remaining++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("verify scan failed: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("expected all rows deleted despite pagination, got remaining=%d", remaining)
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineCreateAndDeleteSameQueryExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE ()")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH () CREATE (n) DELETE n")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	runtimeRes, runtimeOK, runtimeErr := exec.tryExecuteViaRuntimePipeline(ctx, stmt, Params{"tenant": "acme"})
+	if runtimeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute MATCH+CREATE+DELETE query, got %v", runtimeErr)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true")
+	}
+	if runtimeRes != nil && len(runtimeRes.Rows) != 0 {
+		t.Fatalf("expected no rows for write-only query, got %#v", runtimeRes.Rows)
+	}
+
+	remaining := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 0, func(found *graph.Vertex) error {
+			if found != nil {
+				remaining++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("verify scan failed: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("expected no net side effects (one seed vertex remains), got remaining=%d", remaining)
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineDeleteThenMergeRetainsSingleCreatedVertex(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:A {num: 1}), (:A {num: 2})")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmtText := "MATCH (a:A) DELETE a MERGE (a2:A) RETURN a2.num AS num"
+	stmtAny, err := parser.ParseStatement(stmtText)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, query, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+
+	engine := runtime.New()
+	input := runtime.ExecutionContext{
+		Plan:   physicalPlan,
+		Tenant: "acme",
+		Params: map[string]any{"tenant": "acme"},
+	}
+
+	var runtimeResult runtime.ExecutionResult
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		result, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		runtimeResult = result
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute-with-tx failed: %v", err)
+	}
+
+	if len(runtimeResult.Rows) != 2 {
+		t.Fatalf("expected two rows from delete+merge query, got %#v", runtimeResult.Rows)
+	}
+	for _, row := range runtimeResult.Rows {
+		if row["num"] != nil {
+			t.Fatalf("expected null num values after delete+merge, got %#v", runtimeResult.Rows)
+		}
+	}
+
+	if len(runtimeResult.WriteEvents) != 4 {
+		t.Fatalf("expected four write events (2 delete + 2 merge), got %#v", runtimeResult.WriteEvents)
+	}
+	if got := strings.ToUpper(strings.TrimSpace(runtimeResult.WriteEvents[0].Kind)); got != "DELETE" {
+		t.Fatalf("expected first write event DELETE, got kind=%q events=%#v", got, runtimeResult.WriteEvents)
+	}
+	if got := strings.ToUpper(strings.TrimSpace(runtimeResult.WriteEvents[2].Kind)); got != "MERGE" {
+		t.Fatalf("expected third write event MERGE, got kind=%q events=%#v", got, runtimeResult.WriteEvents)
+	}
+
+	remaining := 0
+	remainingWithNum := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 0, func(found *graph.Vertex) error {
+			if found == nil {
+				return nil
+			}
+			remaining++
+			if _, ok := found.Properties["num"]; ok {
+				remainingWithNum++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("verify scan failed: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("expected one remaining vertex after delete+merge, got %d", remaining)
+	}
+	if remainingWithNum != 0 {
+		t.Fatalf("expected merged replacement vertex without num property, got %d with num", remainingWithNum)
+	}
+}
+
+func TestRuntimePipelineUnwindMultipleMergeSurfacesEdgeWriteBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmtAny, err := parser.ParseStatement("UNWIND ['Keanu Reeves', 'Hugo Weaving', 'Carrie-Anne Moss', 'Laurence Fishburne'] AS actor MERGE (m:Movie {name: 'The Matrix'}) MERGE (p:Person {name: actor}) MERGE (p)-[:ACTED_IN]->(m)")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, query, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+
+	engine := runtime.New()
+	input := runtime.ExecutionContext{Plan: physicalPlan, Tenant: "acme", Params: map[string]any{"tenant": "acme"}}
+
+	var runtimeResult runtime.ExecutionResult
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		result, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		runtimeResult = result
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute-with-tx failed: %v", err)
+	}
+
+	edgeEvents := 0
+	for _, event := range runtimeResult.WriteEvents {
+		if event.Edge == nil {
+			continue
+		}
+		edgeEvents++
+		if got := strings.TrimSpace(fmt.Sprint(event.Bindings["p"])); got == "" {
+			t.Fatalf("expected edge event binding p, got event=%#v", event)
+		}
+		if got := strings.TrimSpace(fmt.Sprint(event.Bindings["m"])); got == "" {
+			t.Fatalf("expected edge event binding m, got event=%#v", event)
+		}
+	}
+	if edgeEvents == 0 {
+		t.Fatalf("expected edge write events, got %#v", runtimeResult.WriteEvents)
+	}
+
+	relCount := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanOutEdgeLinksByType(ctx, "acme", "ACTED_IN", 0, func(srcID, edgeID, dstID string) error {
+			relCount++
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("relationship scan failed: %v", err)
+	}
+	if relCount != 4 {
+		t.Fatalf("expected 4 ACTED_IN relationships, got %d", relCount)
+	}
+
+	snapshotStyleRelCount := 0
+	seen := map[string]struct{}{}
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 0, func(v *graph.Vertex) error {
+			if v == nil {
+				return nil
+			}
+			return tx.ScanOutEdges(ctx, "acme", v.ID, "", 0, func(e *graph.Edge) error {
+				if e == nil {
+					return nil
+				}
+				if _, ok := seen[e.ID]; ok {
+					return nil
+				}
+				seen[e.ID] = struct{}{}
+				snapshotStyleRelCount++
+				return nil
+			})
+		})
+	}); err != nil {
+		t.Fatalf("snapshot-style relationship scan failed: %v", err)
+	}
+	if snapshotStyleRelCount != 4 {
+		t.Fatalf("expected snapshot-style count 4, got %d", snapshotStyleRelCount)
+	}
+}
+
+func TestRuntimePipelineDeleteThenMergeEdgeWriteEventPayloads(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (a:A), (b:B) CREATE (a)-[:T {name: 'rel1'}]->(b), (a)-[:T {name: 'rel2'}]->(b)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmtAny, err := parser.ParseStatement("MATCH (a)-[t:T]->(b) DELETE t MERGE (a)-[t2:T {name: 'rel3'}]->(b) RETURN t2.name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, query, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+
+	engine := runtime.New()
+	input := runtime.ExecutionContext{Plan: physicalPlan, Tenant: "acme", Params: map[string]any{"tenant": "acme"}}
+
+	var runtimeResult runtime.ExecutionResult
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		result, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		runtimeResult = result
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute-with-tx failed: %v", err)
+	}
+
+	deleteEvents := 0
+	mergeEdgeEvents := 0
+	deletedEdgeIDs := map[string]struct{}{}
+	for _, event := range runtimeResult.WriteEvents {
+		kind := strings.ToUpper(strings.TrimSpace(event.Kind))
+		if kind == "DELETE" {
+			deleteEvents++
+			if strings.TrimSpace(event.Raw) == "" && strings.TrimSpace(event.Pattern) == "" {
+				t.Fatalf("expected delete event to carry raw or pattern, got %#v", event)
+			}
+			if id := strings.TrimSpace(fmt.Sprint(event.Bindings["t"])); id != "" {
+				deletedEdgeIDs[id] = struct{}{}
+			}
+			if id := strings.TrimSpace(fmt.Sprint(event.Bindings["t.id"])); id != "" {
+				deletedEdgeIDs[id] = struct{}{}
+			}
+		}
+		if kind == "MERGE" && event.Edge != nil {
+			mergeEdgeEvents++
+		}
+	}
+	if deleteEvents == 0 || mergeEdgeEvents == 0 {
+		t.Fatalf("expected delete and merge-edge write events, got %#v", runtimeResult.WriteEvents)
+	}
+	if len(deletedEdgeIDs) != 2 {
+		t.Fatalf("expected delete events bound to two distinct edge IDs, got %#v", deletedEdgeIDs)
+	}
+
+	relCount := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanOutEdgeLinksByType(ctx, "acme", "T", 0, func(srcID, edgeID, dstID string) error {
+			relCount++
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("relationship scan failed: %v", err)
+	}
+	if relCount != 1 {
+		t.Fatalf("expected exactly one T relationship after delete+merge, got %d", relCount)
+	}
+
+	snapshotStyleRelCount := 0
+	seen := map[string]struct{}{}
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 0, func(v *graph.Vertex) error {
+			if v == nil {
+				return nil
+			}
+			return tx.ScanOutEdges(ctx, "acme", v.ID, "", 0, func(e *graph.Edge) error {
+				if e == nil {
+					return nil
+				}
+				if _, ok := seen[e.ID]; ok {
+					return nil
+				}
+				seen[e.ID] = struct{}{}
+				snapshotStyleRelCount++
+				return nil
+			})
+		})
+	}); err != nil {
+		t.Fatalf("snapshot-style relationship scan failed: %v", err)
+	}
+	if snapshotStyleRelCount != 1 {
+		t.Fatalf("expected snapshot-style relationship count 1, got %d", snapshotStyleRelCount)
+	}
+}
+
+func TestRuntimePipelineMergeThenCreateEdgePreservesBoundVertexes(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmtAny, err := parser.ParseStatement("MERGE (t:T {id: 42}) CREATE (f:R) CREATE (t)-[:REL]->(f)")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, query, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+
+	engine := runtime.New()
+	input := runtime.ExecutionContext{Plan: physicalPlan, Tenant: "acme", Params: map[string]any{"tenant": "acme"}}
+
+	var runtimeResult runtime.ExecutionResult
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		result, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		runtimeResult = result
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute-with-tx failed: %v", err)
+	}
+
+	vertexCount := 0
+	relCount := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		if err := tx.ScanVertices(ctx, "acme", 0, func(v *graph.Vertex) error {
+			if v != nil {
+				vertexCount++
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.ScanOutEdgeLinksByType(ctx, "acme", "REL", 0, func(srcID, edgeID, dstID string) error {
+			relCount++
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("store verification failed: %v", err)
+	}
+
+	if vertexCount != 2 || relCount != 1 {
+		t.Fatalf("expected 2 vertexes and 1 relationship, got vertexes=%d relationships=%d writeEvents=%#v", vertexCount, relCount, runtimeResult.WriteEvents)
+	}
+}
+
+func TestRuntimePipelineMatchEdgeReturnsDistinctParallelRelationships(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (a:A), (b:B) CREATE (a)-[:T {name: 'rel1'}]->(b), (a)-[:T {name: 'rel2'}]->(b)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a)-[t:T]->(b) RETURN t.name AS name")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows for parallel relationships, got %#v", res.Rows)
+	}
+}
+
+func TestRuntimePipelineBatchCreateCarriesVariablesAcrossCreateClauses(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	batch, err := parser.ParseBatch("CREATE (a:A), (b:B)\nCREATE (a)-[:T {name: 'rel1'}]->(b), (a)-[:T {name: 'rel2'}]->(b)")
+	if err != nil {
+		t.Fatalf("parse batch failed: %v", err)
+	}
+	for _, stmt := range batch.Statements {
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"}); err != nil {
+			t.Fatalf("batch execute failed: %v", err)
+		}
+	}
+
+	relCount := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanOutEdgeLinksByType(ctx, "acme", "T", 0, func(srcID, edgeID, dstID string) error {
+			relCount++
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("relationship scan failed: %v", err)
+	}
+	if relCount != 2 {
+		t.Fatalf("expected 2 seeded T relationships, got %d", relCount)
+	}
+}
+
+func TestRuntimePipelineScenario21SideEffects(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedBatch, err := parser.ParseBatch("CREATE (a:A), (b:B)\nCREATE (a)-[:T {name: 'rel1'}]->(b), (a)-[:T {name: 'rel2'}]->(b)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	for _, stmt := range seedBatch.Statements {
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "tck"}); err != nil {
+			t.Fatalf("seed execute failed: %v", err)
+		}
+	}
+
+	beforeRels := 0
+	beforeSnapshotRels := 0
+	beforeSeen := map[string]struct{}{}
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		if err := tx.ScanOutEdgeLinksByType(ctx, "tck", "T", 0, func(srcID, edgeID, dstID string) error {
+			beforeRels++
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.ScanVertices(ctx, "tck", 0, func(v *graph.Vertex) error {
+			if v == nil {
+				return nil
+			}
+			return tx.ScanOutEdges(ctx, "tck", v.ID, "", 0, func(e *graph.Edge) error {
+				if e == nil {
+					return nil
+				}
+				if _, ok := beforeSeen[e.ID]; ok {
+					return nil
+				}
+				beforeSeen[e.ID] = struct{}{}
+				beforeSnapshotRels++
+				return nil
+			})
+		})
+	}); err != nil {
+		t.Fatalf("before relationship scan failed: %v", err)
+	}
+
+	queryBatch, err := parser.ParseBatch("MATCH (a)-[t:T]->(b)\nDELETE t\nMERGE (a)-[t2:T {name: 'rel3'}]->(b)\nRETURN t2.name")
+	if err != nil {
+		t.Fatalf("query parse failed: %v", err)
+	}
+	var res *Result
+	for _, stmt := range queryBatch.Statements {
+		res, err = exec.ExecuteStatement(ctx, stmt, Params{"tenant": "tck"})
+		if err != nil {
+			t.Fatalf("query execute failed: %v", err)
+		}
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows from scenario 21 query, got %#v", res.Rows)
+	}
+
+	afterRels := 0
+	storedNames := []string{}
+	afterSnapshotRels := 0
+	afterSeen := map[string]struct{}{}
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		if err := tx.ScanOutEdgeLinksByType(ctx, "tck", "T", 0, func(srcID, edgeID, dstID string) error {
+			afterRels++
+			edge, err := tx.GetEdge(ctx, "tck", edgeID)
+			if err == nil && edge != nil {
+				storedNames = append(storedNames, strings.TrimSpace(string(edge.Properties["name"])))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return tx.ScanVertices(ctx, "tck", 0, func(v *graph.Vertex) error {
+			if v == nil {
+				return nil
+			}
+			return tx.ScanOutEdges(ctx, "tck", v.ID, "", 0, func(e *graph.Edge) error {
+				if e == nil {
+					return nil
+				}
+				if _, ok := afterSeen[e.ID]; ok {
+					return nil
+				}
+				afterSeen[e.ID] = struct{}{}
+				afterSnapshotRels++
+				return nil
+			})
+		})
+	}); err != nil {
+		t.Fatalf("after relationship scan failed: %v", err)
+	}
+	if beforeRels != 2 || afterRels != 1 {
+		t.Fatalf("expected scenario21 relationship counts before=2 after=1, got before=%d after=%d", beforeRels, afterRels)
+	}
+	if len(storedNames) != 1 || storedNames[0] != "rel3" {
+		t.Fatalf("expected remaining relationship name rel3, got %#v", storedNames)
+	}
+	if beforeSnapshotRels != 2 || afterSnapshotRels != 1 {
+		t.Fatalf("expected snapshot-style relationship counts before=2 after=1, got before=%d after=%d", beforeSnapshotRels, afterSnapshotRels)
+	}
+	for edgeID := range afterSeen {
+		if _, existedBefore := beforeSeen[edgeID]; existedBefore {
+			t.Fatalf("expected MERGE-created relationship to use a fresh id after DELETE, got reused id %q (before=%#v after=%#v)", edgeID, beforeSeen, afterSeen)
+		}
+	}
+}
+
+func TestRuntimePipelineScenario20DeleteBindingsCoverBothChains(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedBatch, err := parser.ParseBatch("CREATE (a:A)\nCREATE (b1:B {num: 0}), (b2:B {num: 1})\nCREATE (c1:C), (c2:C)\nCREATE (a)-[:REL]->(b1), (a)-[:REL]->(b2), (b1)-[:REL]->(c1), (b2)-[:REL]->(c2)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	for _, stmt := range seedBatch.Statements {
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "tck"}); err != nil {
+			t.Fatalf("seed execute failed: %v", err)
+		}
+	}
+
+	stmtAny, err := parser.ParseStatement("MATCH (a:A)-[ab]->(b:B)-[bc]->(c:C) DELETE ab, bc, b, c MERGE (newB:B {num: 1}) MERGE (a)-[:REL]->(newB) MERGE (newC:C) MERGE (newB)-[:REL]->(newC)")
+	if err != nil {
+		t.Fatalf("query parse failed: %v", err)
+	}
+	query, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, query, Params{"tenant": "tck"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+
+	engine := runtime.New()
+	input := runtime.ExecutionContext{Plan: physicalPlan, Tenant: "tck", Params: map[string]any{"tenant": "tck"}}
+
+	var runtimeResult runtime.ExecutionResult
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		result, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		runtimeResult = result
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute-with-tx failed: %v", err)
+	}
+
+	deleteB := map[string]struct{}{}
+	for _, event := range runtimeResult.WriteEvents {
+		if strings.ToUpper(strings.TrimSpace(event.Kind)) != "DELETE" {
+			continue
+		}
+		if id := strings.TrimSpace(fmt.Sprint(event.Bindings["b"])); id != "" {
+			deleteB[id] = struct{}{}
+		}
+		if id := strings.TrimSpace(fmt.Sprint(event.Bindings["b.id"])); id != "" {
+			deleteB[id] = struct{}{}
+		}
+	}
+	if len(deleteB) != 2 {
+		t.Fatalf("expected delete bindings to include both B vertices, got %#v (events=%#v)", deleteB, runtimeResult.WriteEvents)
+	}
+}
+
+func TestRuntimePipelineDetachDeleteConnectedNodeWriteBindings(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedBatch, err := parser.ParseBatch("CREATE (x:X) CREATE (x)-[:R]->() CREATE (x)-[:R]->() CREATE (x)-[:R]->()")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	for _, stmt := range seedBatch.Statements {
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "tck"}); err != nil {
+			t.Fatalf("seed execute failed: %v", err)
+		}
+	}
+
+	stmtAny, err := parser.ParseStatement("MATCH (n:X) DETACH DELETE n")
+	if err != nil {
+		t.Fatalf("query parse failed: %v", err)
+	}
+	query, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, query, Params{"tenant": "tck"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+
+	engine := runtime.New()
+	input := runtime.ExecutionContext{Plan: physicalPlan, Tenant: "tck", Params: map[string]any{"tenant": "tck"}}
+
+	var runtimeResult runtime.ExecutionResult
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		result, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		runtimeResult = result
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute-with-tx failed: %v", err)
+	}
+	if len(runtimeResult.WriteEvents) == 0 {
+		t.Fatalf("expected delete write event, got none")
+	}
+	event := runtimeResult.WriteEvents[0]
+	if strings.ToUpper(strings.TrimSpace(event.Kind)) != "DELETE" {
+		t.Fatalf("expected DELETE write event, got %#v", runtimeResult.WriteEvents)
+	}
+	if _, ok := event.Bindings["n"]; !ok {
+		t.Fatalf("expected n binding in delete event, got %#v", event.Bindings)
+	}
+}
+
+func TestRuntimePipelineScenario20VertexSetDelta(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedBatch, err := parser.ParseBatch("CREATE (a:A)\nCREATE (b1:B {num: 0}), (b2:B {num: 1})\nCREATE (c1:C), (c2:C)\nCREATE (a)-[:REL]->(b1), (a)-[:REL]->(b2), (b1)-[:REL]->(c1), (b2)-[:REL]->(c2)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	for _, stmt := range seedBatch.Statements {
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "tck"}); err != nil {
+			t.Fatalf("seed execute failed: %v", err)
+		}
+	}
+
+	before := map[string]struct{}{}
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "tck", 0, func(v *graph.Vertex) error {
+			if v != nil {
+				before[v.ID] = struct{}{}
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("before vertex scan failed: %v", err)
+	}
+
+	batch, err := parser.ParseBatch("MATCH (a:A)-[ab]->(b:B)-[bc]->(c:C)\nDELETE ab, bc, b, c\nMERGE (newB:B {num: 1})\nMERGE (a)-[:REL]->(newB)\nMERGE (newC:C)\nMERGE (newB)-[:REL]->(newC)")
+	if err != nil {
+		t.Fatalf("query parse failed: %v", err)
+	}
+	for _, stmt := range batch.Statements {
+		if _, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "tck"}); err != nil {
+			t.Fatalf("query execute failed: %v", err)
+		}
+	}
+
+	after := map[string]struct{}{}
+	afterDetails := map[string]string{}
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "tck", 0, func(v *graph.Vertex) error {
+			if v != nil {
+				after[v.ID] = struct{}{}
+				afterDetails[v.ID] = fmt.Sprintf("labels=%v props=%v", v.Labels, v.Properties)
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("after vertex scan failed: %v", err)
+	}
+
+	added := 0
+	for id := range after {
+		if _, ok := before[id]; !ok {
+			added++
+		}
+	}
+	if added != 2 {
+		t.Fatalf("expected scenario20 added vertex IDs=2, got %d (before=%#v after=%#v details=%#v)", added, before, after, afterDetails)
+	}
+}
+
+func TestTryExecuteViaRuntimePipelineDeleteListIndexParamExecutesInRuntimeOnlyMode(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (u:User) CREATE (u)-[:FRIEND]->() CREATE (u)-[:FRIEND]->() CREATE (u)-[:FRIEND]->() CREATE (u)-[:FRIEND]->()")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	nodeDeleteStmt, err := parser.ParseStatement("MATCH (:User)-[:FRIEND]->(n) WITH collect(n) AS friends DETACH DELETE friends[$friendIndex]")
+	if err != nil {
+		t.Fatalf("node delete parse failed: %v", err)
+	}
+	nodeRes, nodeOK, nodeErr := exec.tryExecuteViaRuntimePipeline(ctx, nodeDeleteStmt, Params{"tenant": "acme", "friendIndex": 1})
+	if nodeErr != nil {
+		t.Fatalf("expected runtime-only mode to execute list-index node delete, got %v", nodeErr)
+	}
+	if !nodeOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true for node delete")
+	}
+	if nodeRes != nil && len(nodeRes.Rows) != 0 {
+		t.Fatalf("expected empty result for node delete query, got %#v", nodeRes.Rows)
+	}
+
+	relDeleteStmt, err := parser.ParseStatement("MATCH (:User)-[r:FRIEND]->() WITH collect(r) AS friendships DETACH DELETE friendships[$friendIndex]")
+	if err != nil {
+		t.Fatalf("relationship delete parse failed: %v", err)
+	}
+	relRes, relOK, relErr := exec.tryExecuteViaRuntimePipeline(ctx, relDeleteStmt, Params{"tenant": "acme", "friendIndex": 1})
+	if relErr != nil {
+		t.Fatalf("expected runtime-only mode to execute list-index relationship delete, got %v", relErr)
+	}
+	if !relOK {
+		t.Fatalf("expected runtime routing entrypoint to report handled=true for relationship delete")
+	}
+	if relRes != nil && len(relRes.Rows) != 0 {
+		t.Fatalf("expected empty result for relationship delete query, got %#v", relRes.Rows)
+	}
+
+	friendCountStmt, err := parser.ParseStatement("MATCH (:User)-[r:FRIEND]->() RETURN count(r) AS c")
+	if err != nil {
+		t.Fatalf("friend count parse failed: %v", err)
+	}
+	friendCountRes, err := exec.ExecuteStatement(ctx, friendCountStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("friend count execute failed: %v", err)
+	}
+	if friendCountRes == nil || len(friendCountRes.Rows) != 1 {
+		t.Fatalf("expected one friend count row, got %#v", friendCountRes)
+	}
+	if got := fmt.Sprint(friendCountRes.Rows[0]["c"]); got != "2" {
+		t.Fatalf("expected 2 FRIEND relationships after one node and one relationship delete, got %#v", friendCountRes.Rows[0])
+	}
+
+	vertexCountStmt, err := parser.ParseStatement("MATCH (n) RETURN count(n) AS c")
+	if err != nil {
+		t.Fatalf("vertex count parse failed: %v", err)
+	}
+	vertexCountRes, err := exec.ExecuteStatement(ctx, vertexCountStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("vertex count execute failed: %v", err)
+	}
+	if vertexCountRes == nil || len(vertexCountRes.Rows) != 1 {
+		t.Fatalf("expected one vertex count row, got %#v", vertexCountRes)
+	}
+	if got := fmt.Sprint(vertexCountRes.Rows[0]["c"]); got != "4" {
+		t.Fatalf("expected 4 vertexes after deleting one friend vertex and one relationship, got %#v", vertexCountRes.Rows[0])
+	}
+}
+
+func TestExecuteStatementRuntimePipelineCreateTemporalProperties(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("CREATE (:Event {created: localtime({hour: 12}), span: duration({minutes: 2, seconds: 30})})")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 0 {
+		t.Fatalf("expected no result rows for write-only runtime pipeline query, got %#v", res.Rows)
+	}
+
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		var vertex *graph.Vertex
+		if err := tx.ScanVertices(ctx, "acme", 10, func(found *graph.Vertex) error {
+			vertex = found
+			return nil
+		}); err != nil {
+			return err
+		}
+		if vertex == nil {
+			t.Fatalf("expected anonymous vertex to be written")
+		}
+		if got := string(vertex.Properties["created"]); got != "12:00" {
+			t.Fatalf("expected localtime property to be stored natively, got %q", got)
+		}
+		if got := string(vertex.Properties["span"]); got != "PT2M30S" {
+			t.Fatalf("expected duration property to be stored natively, got %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("store verification failed: %v", err)
+	}
+}
+
+func TestRuntimePipelineCreate2EndLabelWriteEventInstrumentation(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:Begin)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmtAny, err := parser.ParseStatement("MATCH (x:Begin) CREATE (x)-[:TYPE]->(:End)")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, query, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+
+	engine := runtime.New()
+	input := runtime.ExecutionContext{
+		Plan:   physicalPlan,
+		Tenant: "acme",
+		Params: map[string]any{"tenant": "acme"},
+	}
+
+	var runtimeResult runtime.ExecutionResult
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		result, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		runtimeResult = result
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute-with-tx failed: %v", err)
+	}
+
+	if len(runtimeResult.WriteEvents) != 1 {
+		t.Fatalf("expected one write event, got %#v", runtimeResult.WriteEvents)
+	}
+	event := runtimeResult.WriteEvents[0]
+	t.Logf("Create2[11] write event payload: kind=%s pattern=%q raw=%q mutation=%s edge=%#v bindings=%#v", event.Kind, event.Pattern, event.Raw, event.MutationType, event.Edge, event.Bindings)
+	if event.Edge == nil {
+		t.Fatalf("expected edge mutation payload, got %#v", event)
+	}
+	if len(event.Edge.RightLabels) == 0 {
+		t.Fatalf("expected end-node label metadata in event payload, got edge=%#v", event.Edge)
+	}
+
+	hasLabel := func(labels []string, label string) bool {
+		for _, l := range labels {
+			if strings.EqualFold(strings.TrimSpace(l), strings.TrimSpace(label)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	beginCount := 0
+	endCount := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 100, func(found *graph.Vertex) error {
+			if found == nil {
+				return nil
+			}
+			if hasLabel(found.Labels, "Begin") {
+				beginCount++
+			}
+			if hasLabel(found.Labels, "End") {
+				endCount++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("store verification failed: %v", err)
+	}
+	t.Logf("Create2[11] post-apply label counts: Begin=%d End=%d", beginCount, endCount)
+	if endCount != 1 {
+		t.Fatalf("expected one End-labeled vertex after apply, got Begin=%d End=%d", beginCount, endCount)
+	}
+}
+
+func TestExecuteStatementCreate2RuntimeOnlyExecutesMigratedMatchCreateShape(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:Begin)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmtAny, err := parser.ParseStatement("MATCH (x:Begin) CREATE (x)-[:TYPE]->(:End)")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	query, ok := stmtAny.(*ast.QueryStatement)
+	if !ok {
+		t.Fatalf("expected query statement, got %T", stmtAny)
+	}
+	runtimeRes, runtimeOK, err := exec.tryExecuteViaRuntimePipeline(ctx, query, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("expected runtime-only mode to execute migrated MATCH+CREATE shape, got %v", err)
+	}
+	if !runtimeOK {
+		t.Fatalf("expected runtime-only routing path to report handled=true")
+	}
+	if runtimeRes != nil && len(runtimeRes.Rows) != 0 {
+		t.Fatalf("expected no result rows for write-only runtime query, got %#v", runtimeRes.Rows)
+	}
+
+	beginCount := 0
+	endCount := 0
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		return tx.ScanVertices(ctx, "acme", 100, func(found *graph.Vertex) error {
+			if found == nil {
+				return nil
+			}
+			for _, label := range found.Labels {
+				switch strings.ToUpper(strings.TrimSpace(label)) {
+				case "BEGIN":
+					beginCount++
+				case "END":
+					endCount++
+				}
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("store verification failed: %v", err)
+	}
+	if beginCount != 1 || endCount != 1 {
+		t.Fatalf("expected Begin=1 and End=1 after runtime MATCH+CREATE, got Begin=%d End=%d", beginCount, endCount)
+	}
+}
+func TestRuntimePipelineVertexOnlyMatchExpansionBindsVariable(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:Begin)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	plan := physical.Plan{
+		RootNodeID: "p1",
+		Nodes: []physical.Node{{
+			ID:    "p1",
+			Op:    "PHY_EXPAND_MATCH",
+			Attrs: map[string]any{"pattern": "(x:Begin)", "variant": "expand_default", "accessPath": "adjacency_expand"},
+		}},
+	}
+	engine := runtime.New()
+	input := runtime.ExecutionContext{Plan: plan, Tenant: "acme", Params: map[string]any{"tenant": "acme"}}
+
+	var result runtime.ExecutionResult
+	if err := store.View(ctx, func(tx graph.Tx) error {
+		res, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		result = res
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute failed: %v", err)
+	}
+	t.Logf("vertex-only match expansion rows=%#v", result.Rows)
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected one row from vertex-only match expansion, got %#v", result.Rows)
+	}
+	if got := result.Rows[0]["x"]; got == nil || strings.TrimSpace(fmt.Sprint(got)) == "" {
+		t.Fatalf("expected x binding from vertex-only match expansion, got %#v", result.Rows[0])
+	}
+}
+
+func TestRuntimePipelineVertexOnlyMatchExpansionBindsVariableInUpdateTx(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement("CREATE (:Begin)")
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	plan := physical.Plan{
+		RootNodeID: "p1",
+		Nodes: []physical.Node{{
+			ID:    "p1",
+			Op:    "PHY_EXPAND_MATCH",
+			Attrs: map[string]any{"pattern": "(x:Begin)", "variant": "expand_default", "accessPath": "adjacency_expand"},
+		}},
+	}
+	engine := runtime.New()
+	input := runtime.ExecutionContext{Plan: plan, Tenant: "acme", Params: map[string]any{"tenant": "acme"}}
+
+	var result runtime.ExecutionResult
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		res, err := engine.ExecuteWithTx(ctx, input, tx)
+		if err != nil {
+			return err
+		}
+		result = res
+		return nil
+	}); err != nil {
+		t.Fatalf("runtime execute failed: %v", err)
+	}
+	t.Logf("vertex-only match expansion rows in update tx=%#v", result.Rows)
+	if len(result.Rows) != 1 {
+		t.Fatalf("expected one row from vertex-only match expansion in update tx, got %#v", result.Rows)
+	}
+	if got := result.Rows[0]["x"]; got == nil || strings.TrimSpace(fmt.Sprint(got)) == "" {
+		t.Fatalf("expected x binding from vertex-only match expansion in update tx, got %#v", result.Rows[0])
+	}
+}
 func TestExecuteStatementRuntimePipelineWriteOnlyEdgeCreateParity(t *testing.T) {
 	const referenceShouldCreateDirectedEdge = true
 

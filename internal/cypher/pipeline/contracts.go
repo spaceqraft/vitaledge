@@ -21,6 +21,7 @@ type SemanticModel struct {
 	Ordering      []OrderingIntent
 	Pagination    PaginationIntent
 	Patterns      []PatternIntent
+	Calls         []CallIntent
 	WriteActions  []WriteActionIntent
 }
 
@@ -32,6 +33,7 @@ type ProjectionItemIntent struct {
 
 // ProjectionIntent carries semantic projection details for WITH/RETURN forms.
 type ProjectionIntent struct {
+	Ordinal    int
 	Kind       ast.ClauseKind
 	Distinct   bool
 	IncludeAll bool
@@ -55,16 +57,26 @@ type PaginationIntent struct {
 
 // PatternIntent carries semantic MATCH/OPTIONAL MATCH pattern details.
 type PatternIntent struct {
+	Ordinal  int
 	Kind     ast.ClauseKind
 	Optional bool
 	Pattern  string
 	Where    string
 }
 
+// CallIntent carries semantic in-query CALL sequencing details.
+type CallIntent struct {
+	Ordinal    int
+	ClauseKind ast.ClauseKind
+	Raw        string
+}
+
 // WriteActionIntent carries semantic write action sequencing details.
 type WriteActionIntent struct {
+	Ordinal       int
 	ClauseKind    ast.ClauseKind
 	Raw           string
+	Pattern       string
 	MergePattern  string
 	MergeOnCreate string
 	MergeOnMatch  string

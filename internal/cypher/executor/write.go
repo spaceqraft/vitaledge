@@ -15,7 +15,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -23,62 +22,18 @@ import (
 
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"github.com/paegun/vitaledge/internal/cypher/physical"
 	"github.com/paegun/vitaledge/internal/graph"
 )
 
 var (
-	createVertexPatternRE            = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-	createEdgePatternRE              = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]->\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-	createEdgePatternReverseRE       = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)<-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-	createEdgePatternUndirectedRE    = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)$`)
-	createEdgePatternTwoDirectionsRE = regexp.MustCompile(`\)<-\[[^\]]*\]->\(`)
-	createChainVertexTokenRE         = regexp.MustCompile(`^\((?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\)`)
-	createChainRelForwardTokenRE     = regexp.MustCompile(`^-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]->`)
-	createChainRelReverseTokenRE     = regexp.MustCompile(`^<-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-`)
-	createChainRelUndirTokenRE       = regexp.MustCompile(`^-\[(?:([A-Za-z_][A-Za-z0-9_]*))?(?::([A-Za-z_][A-Za-z0-9_]*(?:\|:?[A-Za-z_][A-Za-z0-9_]*)*))?(?:\{([^{}]*)\})?\]-`)
-	createMissingRelTypeForwardRE    = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)--?>\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
-	createMissingRelTypeReverseRE    = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)<--\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
-	createMissingRelTypeUndirRE      = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)--\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
-	createVariableLengthRelRE        = regexp.MustCompile(`\[[^\]]*\*[^\]]*\]`)
-	setClauseRE                      = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)=(.+)$`)
-	setMapReplaceClauseRE            = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)=(.+)$`)
-	setMapAppendClauseRE             = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\+=(.+)$`)
-	setLabelClauseRE                 = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)$`)
-	removeClauseRE                   = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$`)
-	removeLabelClauseRE              = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)$`)
+	createMissingRelTypeForwardRE = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)--?>\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
+	createMissingRelTypeReverseRE = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)<--\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
+	createMissingRelTypeUndirRE   = regexp.MustCompile(`^\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)--\((?:[A-Za-z_][A-Za-z0-9_]*)?(?::[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)?(?:\{[^{}]*\})?\)$`)
+	setLabelClauseRE              = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)$`)
+	removeClauseRE                = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$`)
+	removeLabelClauseRE           = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*):([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)*)$`)
 )
-
-type createEdgeDirection string
-
-const (
-	createEdgeDirectionForward    createEdgeDirection = "forward"
-	createEdgeDirectionReverse    createEdgeDirection = "reverse"
-	createEdgeDirectionUndirected createEdgeDirection = "undirected"
-)
-
-type createChainVertexPattern struct {
-	Var      string
-	Labels   []string
-	PropsRaw string
-}
-
-type createVertexPatternSpec struct {
-	Var      string
-	Labels   []string
-	PropsRaw string
-}
-
-type createChainRelPattern struct {
-	Var       string
-	Type      string
-	PropsRaw  string
-	Direction createEdgeDirection
-}
-
-type createChainPattern struct {
-	Vertexes []createChainVertexPattern
-	Rels     []createChainRelPattern
-}
 
 type deletedVertexBinding struct {
 	Tenant string
@@ -92,7 +47,6 @@ type deletedEdgeBinding struct {
 	Type   string
 }
 
-const mergeCreatedMarkerKey = "__ve_merge_created"
 const projectionEvalExecutorParam = "__ve_projection_eval_executor"
 const projectionEvalTxParam = "__ve_projection_eval_tx"
 const projectionEvalCtxParam = "__ve_projection_eval_ctx"
@@ -129,6 +83,706 @@ type queryAdjacencyCache struct {
 type queryOutEdgeLink struct {
 	edgeID string
 	dstID  string
+}
+
+type stage2HintPolicy struct {
+	hints         physical.StatsHints
+	pattern       directedRelationshipPattern
+	whereRaw      string
+	edgeType      string
+	edgeTypeAnyOf []string
+	stage2OperatorPolicySignals
+	indexPushdownHintPolicy stage2IndexPushdownHintPolicyInput
+}
+
+type stage2OperatorPolicySignals struct {
+	predicateShapeEligible       bool
+	predicateShapeDecisive       bool
+	oneSidedNumericRangeEligible bool
+	sourcePeerCount              int
+	maxPushdownCandidates        int
+	useSharedSourceProbeFilter   bool
+	usePerPeerSourceProbe        bool
+	skipWideNonRangeWhenNoRange  bool
+	indexProbeLimit              int
+	probeLimitAdaptiveTightened  bool
+}
+
+type stage2PlannerPolicyInput struct {
+	pattern                      directedRelationshipPattern
+	whereRaw                     string
+	edgeType                     string
+	edgeTypeAnyOf                []string
+	predicateShapeEligible       bool
+	predicateShapeDecisive       bool
+	oneSidedNumericRangeEligible bool
+}
+
+type stage2IndexLookupContext struct {
+	lookupCacheKey    string
+	probeSourceFilter map[string]struct{}
+	perPeerScoped     bool
+}
+
+type stage2IndexLookupDecision struct {
+	lookupByIndex bool
+	indexedEdges  []*graph.Edge
+}
+
+type stage2FirstHitBookkeeping struct {
+	indexPushdownUsed            bool
+	predicateShapeSkipNoted      bool
+	perPeerSourceProbeScopeNoted bool
+	wideNonRangeSkipNoted        bool
+}
+
+type stage2CollectOrchestrationState struct {
+	earlyStopEnabled        bool
+	totalRemainingPotential float64
+}
+
+func newStage2CollectOrchestrationState(earlyStopEnabled bool) stage2CollectOrchestrationState {
+	return stage2CollectOrchestrationState{earlyStopEnabled: earlyStopEnabled}
+}
+
+func (s *stage2CollectOrchestrationState) noteCollectedEdges(indexedEdges bool) {
+	if s == nil {
+		return
+	}
+	if !indexedEdges {
+		s.earlyStopEnabled = false
+	}
+}
+
+func (s *stage2CollectOrchestrationState) remainingPotential(similarityNumeric float64, similarityNumericOK bool, edgeCount int) float64 {
+	if !similarityNumericOK || similarityNumeric <= 0 || edgeCount <= 0 {
+		return 0
+	}
+	return similarityNumeric * float64(edgeCount)
+}
+
+func (s *stage2CollectOrchestrationState) addRemainingPotential(remainingPotential float64) {
+	if s == nil || remainingPotential <= 0 {
+		return
+	}
+	s.totalRemainingPotential += remainingPotential
+}
+
+func (s *stage2CollectOrchestrationState) consumeRemainingPotential(remainingPotential float64) {
+	if s == nil || remainingPotential <= 0 {
+		return
+	}
+	s.totalRemainingPotential -= remainingPotential
+	if s.totalRemainingPotential < 0 {
+		s.totalRemainingPotential = 0
+	}
+}
+
+func (s *stage2CollectOrchestrationState) shouldSkipEdgeByFrontier(frontierGroupIDs map[string]struct{}, groupID string, e *Executor, params Params) bool {
+	if s == nil || len(frontierGroupIDs) == 0 {
+		return false
+	}
+	if _, keep := frontierGroupIDs[groupID]; keep {
+		return false
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_edges_skipped", 1)
+	return true
+}
+
+func (s *stage2CollectOrchestrationState) tryActivateEarlyStopFrontier(boundaryScore float64, maxOutsideScore float64, activeFrontier map[string]struct{}, frontierGroupIDs map[string]struct{}, e *Executor, params Params) map[string]struct{} {
+	if boundaryScore > maxOutsideScore && len(activeFrontier) == 0 {
+		e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_triggers", 1)
+		return frontierGroupIDs
+	}
+	return activeFrontier
+}
+
+func (s *stage2CollectOrchestrationState) maxOutsideScore(maxNonFrontierScore float64) float64 {
+	if s == nil {
+		return 0
+	}
+	maxOutsideScore := s.totalRemainingPotential
+	if maxNonFrontierScore > math.Inf(-1) {
+		nonFrontierUpperBound := maxNonFrontierScore + s.totalRemainingPotential
+		if nonFrontierUpperBound > maxOutsideScore {
+			maxOutsideScore = nonFrontierUpperBound
+		}
+	}
+	return maxOutsideScore
+}
+
+func (s *stage2CollectOrchestrationState) resolveEarlyStopFrontier(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, keep int, activeFrontier map[string]struct{}, e *Executor, params Params) map[string]struct{} {
+	boundaryScore, maxNonFrontierScore, frontierGroupIDs, ready := stage2TopKFrontierBoundary(aggs, groupOrder, keep, true)
+	if !ready {
+		return activeFrontier
+	}
+	maxOutsideScore := s.maxOutsideScore(maxNonFrontierScore)
+	return s.tryActivateEarlyStopFrontier(boundaryScore, maxOutsideScore, activeFrontier, frontierGroupIDs, e, params)
+}
+
+func (s *stage2CollectOrchestrationState) advanceEarlyStopAfterWorkItem(remainingPotential float64, aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, keep int, activeFrontier map[string]struct{}, e *Executor, params Params) map[string]struct{} {
+	if s == nil || !s.earlyStopEnabled {
+		return activeFrontier
+	}
+	s.consumeRemainingPotential(remainingPotential)
+	e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_checks", 1)
+	return s.resolveEarlyStopFrontier(aggs, groupOrder, keep, activeFrontier, e, params)
+}
+
+func stage2AdjacencyScanType(pattern directedRelationshipPattern) string {
+	if len(pattern.EdgeAnyOf) > 0 {
+		return ""
+	}
+	return pattern.EdgeType
+}
+
+func (b *stage2FirstHitBookkeeping) notePredicateShapeSkipped(e *Executor, params Params) {
+	if b == nil || b.predicateShapeSkipNoted {
+		return
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_predicate_shape", 1)
+	b.predicateShapeSkipNoted = true
+}
+
+func (b *stage2FirstHitBookkeeping) noteWideNonRangeSkipped(e *Executor, params Params) {
+	if b == nil || b.wideNonRangeSkipNoted {
+		return
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_wide_non_range", 1)
+	b.wideNonRangeSkipNoted = true
+}
+
+func (b *stage2FirstHitBookkeeping) notePerPeerSourceProbeScoped(e *Executor, params Params) {
+	if b == nil || b.perPeerSourceProbeScopeNoted {
+		return
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_source_scoped_per_peer", 1)
+	b.perPeerSourceProbeScopeNoted = true
+}
+
+func (b *stage2FirstHitBookkeeping) noteIndexPushdownApplied(e *Executor, params Params) {
+	if b == nil || b.indexPushdownUsed {
+		return
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_applied", 1)
+	b.indexPushdownUsed = true
+}
+
+type stage2RowPushdownAssessment struct {
+	predicateShapeEligible bool
+	hasOneSidedNumeric     bool
+	hasNumericRangeShape   bool
+	skipWideNonRange       bool
+}
+
+type stage2RowPushdownInput struct {
+	assessment stage2RowPushdownAssessment
+	cacheKey   string
+	cacheable  bool
+}
+
+type stage2PeerInput struct {
+	row  Row
+	peer *graph.Vertex
+}
+
+type stage2PeerWorkItem struct {
+	row                   Row
+	peer                  *graph.Vertex
+	numericConstraints    map[string]edgeNumericRangeConstraint
+	hasNumericConstraints bool
+	excludedRightIDs      map[string]struct{}
+	hasExcludedRightIDs   bool
+	skipWhereEval         bool
+	similarityNumeric     float64
+	similarityNumericOK   bool
+	edges                 []*graph.Edge
+	indexedEdges          bool
+	remainingPotential    float64
+}
+
+type stage2CollectPeerEdgesFunc func(row Row, peer *graph.Vertex) ([]*graph.Edge, bool, error)
+
+type stage2CandidateEdgeEvalContext struct {
+	pattern               directedRelationshipPattern
+	whereRaw              string
+	row                   Row
+	peer                  *graph.Vertex
+	numericConstraints    map[string]edgeNumericRangeConstraint
+	hasNumericConstraints bool
+	excludedRightIDs      map[string]struct{}
+	hasExcludedRightIDs   bool
+	collectState          *stage2CollectOrchestrationState
+	earlyStopFrontier     map[string]struct{}
+	skipWhereEval         bool
+	hydrationPolicy       *deferredHydrationPolicy
+	projection            fastPeerCandidateReturnProjection
+	similarityNumeric     float64
+	similarityNumericOK   bool
+}
+
+type stage2CandidateScopeEvalContext struct {
+	pattern       directedRelationshipPattern
+	whereRaw      string
+	row           Row
+	peer          *graph.Vertex
+	edge          *graph.Edge
+	skipWhereEval bool
+}
+
+type stage2AggregationDecisionContext struct {
+	aggs                map[string]*fastPeerCandidateAggregate
+	groupOrder          *[]string
+	groupID             string
+	pattern             directedRelationshipPattern
+	whereRaw            string
+	row                 Row
+	peer                *graph.Vertex
+	edge                *graph.Edge
+	skipWhereEval       bool
+	hydrationPolicy     *deferredHydrationPolicy
+	projection          fastPeerCandidateReturnProjection
+	similarityNumeric   float64
+	similarityNumericOK bool
+}
+
+type stage2IndexLookupResolutionContext struct {
+	lookup           stage2IndexLookupContext
+	peerID           string
+	decisionCache    map[string]bool
+	indexedEdgeCache map[string]map[string][]*graph.Edge
+}
+
+type stage2IndexLookupFlowInput struct {
+	tenant     string
+	pattern    directedRelationshipPattern
+	whereRaw   string
+	row        Row
+	policy     stage2HintPolicy
+	lookup     stage2IndexLookupContext
+	peerID     string
+	probeLimit int
+}
+
+type stage2IndexLookupFlowContext struct {
+	input      stage2IndexLookupFlowInput
+	resolution stage2IndexLookupResolutionContext
+}
+
+type stage2WorkItemProcessingContext struct {
+	item              stage2PeerWorkItem
+	aggs              map[string]*fastPeerCandidateAggregate
+	groupOrder        *[]string
+	pattern           directedRelationshipPattern
+	whereRaw          string
+	projection        fastPeerCandidateReturnProjection
+	collectState      *stage2CollectOrchestrationState
+	earlyStopFrontier map[string]struct{}
+	earlyStopKeep     int
+	hydrationPolicy   *deferredHydrationPolicy
+}
+
+type stage2PeerWorkItemLoopContext struct {
+	ctx           context.Context
+	tx            graph.Tx
+	tenant        string
+	aggs          map[string]*fastPeerCandidateAggregate
+	groupOrder    *[]string
+	pattern       directedRelationshipPattern
+	whereRaw      string
+	projection    fastPeerCandidateReturnProjection
+	collectState  *stage2CollectOrchestrationState
+	earlyStopKeep int
+	params        Params
+}
+
+type stage2CandidatePrefilterDecisionContext struct {
+	edge                  *graph.Edge
+	numericConstraints    map[string]edgeNumericRangeConstraint
+	hasNumericConstraints bool
+	excludedRightIDs      map[string]struct{}
+	hasExcludedRightIDs   bool
+}
+
+type stage2CandidateGroupVisitDecisionContext struct {
+	edge              *graph.Edge
+	collectState      *stage2CollectOrchestrationState
+	earlyStopFrontier map[string]struct{}
+}
+
+type stage2IndexedEdgeIterationContext struct {
+	edges                []*graph.Edge
+	params               Params
+	processCandidateEdge func(*graph.Edge) error
+}
+
+type stage2WorkItemEdgePathDecisionContext struct {
+	ctx                  context.Context
+	tx                   graph.Tx
+	tenant               string
+	peerID               string
+	pattern              directedRelationshipPattern
+	edges                []*graph.Edge
+	indexedEdges         bool
+	params               Params
+	processCandidateEdge func(*graph.Edge) error
+}
+
+type stage2ProcessableCandidateGroupDecisionContext struct {
+	edge                  *graph.Edge
+	pattern               directedRelationshipPattern
+	row                   Row
+	numericConstraints    map[string]edgeNumericRangeConstraint
+	hasNumericConstraints bool
+	excludedRightIDs      map[string]struct{}
+	hasExcludedRightIDs   bool
+	collectState          *stage2CollectOrchestrationState
+	earlyStopFrontier     map[string]struct{}
+}
+
+type stage2CandidateWhereGateDecisionContext struct {
+	whereRaw      string
+	merged        Row
+	skipWhereEval bool
+}
+
+type stage2CandidateScopeHydrationDecisionContext struct {
+	evalCtx         stage2CandidateScopeEvalContext
+	mergedBase      Row
+	hydrationPolicy *deferredHydrationPolicy
+}
+
+type stage2ReusableAggregateDecisionContext struct {
+	aggs                map[string]*fastPeerCandidateAggregate
+	groupID             string
+	skipWhereEval       bool
+	edge                *graph.Edge
+	projection          fastPeerCandidateReturnProjection
+	similarityNumeric   float64
+	similarityNumericOK bool
+}
+
+type stage2EnsureCandidateAggregateDecisionContext struct {
+	aggs       map[string]*fastPeerCandidateAggregate
+	groupOrder *[]string
+	groupID    string
+	projection fastPeerCandidateReturnProjection
+	merged     Row
+	candidate  *graph.Vertex
+}
+
+type stage2MaxPushdownDecisionContext struct {
+	oneSidedNumericRangeEligible bool
+	hints                        physical.StatsHints
+	edgeType                     string
+	edgeTypeAnyOf                []string
+	maxPushdownCandidates        int
+}
+
+type stage2SourceProbeStrategyDecisionContext struct {
+	sourcePeerCount int
+	hints           physical.StatsHints
+	edgeType        string
+	edgeTypeAnyOf   []string
+}
+
+type stage2SourceProbePolicyInput struct {
+	hasSourcePeers         bool
+	withinScopedProbeLimit bool
+	coverageResolved       bool
+	observedSourceCoverage float64
+	avgOutDegree           float64
+	preferSharedMode       bool
+	useSharedMode          bool
+	usePerPeerMode         bool
+	skipWideNonRange       bool
+}
+
+type stage2IndexPushdownHintPolicyInput struct {
+	hintSelectivityResolved bool
+	sourceCount             int
+	avgOutDegree            float64
+}
+
+type stage2IndexPushdownEligibilityDecisionContext struct {
+	indexedEdgesBySource map[string][]*graph.Edge
+	hintPolicy           stage2IndexPushdownHintPolicyInput
+	indexedSourceCount   int
+	totalCandidates      int
+	averagePerSource     float64
+}
+
+type stage2FinalizeOutputRowsDecisionContext struct {
+	aggs       map[string]*fastPeerCandidateAggregate
+	groupOrder []string
+	useTopK    bool
+	projection fastPeerCandidateReturnProjection
+	topKSpec   fastPeerCandidateTopKSpec
+	retSpec    projectionClauseSpec
+	params     Params
+}
+
+type stage2TopKRowsDecisionContext struct {
+	aggs       map[string]*fastPeerCandidateAggregate
+	groupOrder []string
+	projection fastPeerCandidateReturnProjection
+	spec       fastPeerCandidateTopKSpec
+	params     Params
+	keep       int
+	top        *fastPeerCandidateTopKHeap
+}
+
+type stage2FastTargetSharedPeerTopKRowsDecisionContext struct {
+	aggs           map[string]*fastTargetSharedPeerAggregate
+	projection     fastTargetSharedPeerProjection
+	withSpec       projectionClauseSpec
+	topKProjection fastTargetSharedPeerTopKProjection
+	spec           fastTargetSharedPeerTopKSpec
+	ctx            context.Context
+	tx             graph.Tx
+	params         Params
+	exec           *Executor
+	keep           int
+	top            *fastTargetSharedPeerTopKHeap
+	inputIndex     int
+}
+
+type stage2FastTargetSharedPeerTopKRowsResolveDecisionContext struct {
+	rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext
+	rows            []Row
+	returnEmpty     bool
+}
+
+type stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext struct {
+	resolveCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext
+	err        error
+	hasError   bool
+}
+
+type stage2TopKSpecFromProjectionDecisionContext struct {
+	retSpec    projectionClauseSpec
+	projection fastPeerCandidateReturnProjection
+	params     Params
+}
+
+type stage2ProjectionTailDecisionContext struct {
+	rows         []Row
+	projection   fastPeerCandidateReturnProjection
+	priorColumns []string
+	params       Params
+	columns      []string
+}
+
+type stage2ResultRowDecisionContext struct {
+	agg        *fastPeerCandidateAggregate
+	projection fastPeerCandidateReturnProjection
+	params     Params
+	result     Row
+	scope      Row
+}
+
+type stage2FastTargetSharedPeerTopKSpecDecisionContext struct {
+	withSpec     projectionClauseSpec
+	projection   fastTargetSharedPeerTopKProjection
+	params       Params
+	orderExpr    string
+	orderMatch   bool
+	skip         int
+	limit        int
+	paginationOK bool
+}
+
+type stage2FastTargetSharedPeerTopKSpecResolveDecisionContext struct {
+	decisionCtx stage2FastTargetSharedPeerTopKSpecDecisionContext
+	spec        fastTargetSharedPeerTopKSpec
+	hasSpec     bool
+}
+
+type stage2FastTargetSharedPeerTopKWithClauseDecisionContext struct {
+	withSpec      projectionClauseSpec
+	prior         fastTargetSharedPeerProjection
+	params        Params
+	items         []projectionSpec
+	projection    fastTargetSharedPeerTopKProjection
+	spec          fastTargetSharedPeerTopKSpec
+	hasItems      bool
+	hasProjection bool
+	hasSpec       bool
+}
+
+type stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext struct {
+	decisionCtx stage2FastTargetSharedPeerTopKWithClauseDecisionContext
+	projection  fastTargetSharedPeerTopKProjection
+	spec        fastTargetSharedPeerTopKSpec
+	ok          bool
+}
+
+type stage2FastTargetSharedPeerTopKWithClauseParseDecisionContext struct {
+	clause      ast.Clause
+	prior       fastTargetSharedPeerProjection
+	params      Params
+	withSpec    projectionClauseSpec
+	hasWithSpec bool
+	eligible    bool
+}
+
+type stage2FastTargetSharedPeerTopKProjectionDecisionContext struct {
+	items       []projectionSpec
+	prior       fastTargetSharedPeerProjection
+	projection  fastTargetSharedPeerTopKProjection
+	hasBindings bool
+}
+
+type stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext struct {
+	projection fastTargetSharedPeerTopKProjection
+	prior      fastTargetSharedPeerProjection
+	item       projectionSpec
+	key        string
+	expr       string
+	updated    fastTargetSharedPeerTopKProjection
+	handled    bool
+	applied    bool
+}
+
+type stage2FastTargetSharedPeerTopKCandidateRowDecisionContext struct {
+	agg             *fastTargetSharedPeerAggregate
+	projection      fastTargetSharedPeerProjection
+	withSpec        projectionClauseSpec
+	topKProjection  fastTargetSharedPeerTopKProjection
+	ctx             context.Context
+	tx              graph.Tx
+	params          Params
+	exec            *Executor
+	row             Row
+	similarityValue any
+	score           float64
+	trimmed         Row
+}
+
+type stage2FastTargetSharedPeerTopKCandidateDecisionContext struct {
+	agg            *fastTargetSharedPeerAggregate
+	projection     fastTargetSharedPeerProjection
+	withSpec       projectionClauseSpec
+	topKProjection fastTargetSharedPeerTopKProjection
+	inputIndex     int
+	ctx            context.Context
+	tx             graph.Tx
+	params         Params
+	exec           *Executor
+	trimmed        Row
+	score          float64
+	candidate      fastTargetSharedPeerRankedRow
+	nextInputIndex int
+}
+
+type stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext struct {
+	decisionCtx    stage2FastTargetSharedPeerTopKCandidateDecisionContext
+	include        bool
+	candidate      fastTargetSharedPeerRankedRow
+	nextInputIndex int
+}
+
+type stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext struct {
+	resolveCtx stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext
+	err        error
+	hasError   bool
+}
+
+type stage2FastTargetSharedPeerTopKAggregateDecisionContext struct {
+	rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext
+	agg             *fastTargetSharedPeerAggregate
+	candidate       fastTargetSharedPeerRankedRow
+	nextInputIndex  int
+	include         bool
+}
+
+type stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext struct {
+	decisionCtx      stage2FastTargetSharedPeerTopKAggregateDecisionContext
+	shouldApply      bool
+	updatedRowsCtx   stage2FastTargetSharedPeerTopKRowsDecisionContext
+	rowsCtxPrepared  bool
+	candidateApplied bool
+}
+
+type stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext struct {
+	decisionCtx    stage2FastTargetSharedPeerTopKAggregateDecisionContext
+	eligible       bool
+	include        bool
+	candidate      fastTargetSharedPeerRankedRow
+	nextInputIndex int
+}
+
+type stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext struct {
+	resolveCtx          stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext
+	resolvedDecisionCtx stage2FastTargetSharedPeerTopKAggregateDecisionContext
+	hasResolvedDecision bool
+	err                 error
+	hasError            bool
+}
+
+type stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext struct {
+	rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext
+	sortedAggs      []*fastTargetSharedPeerAggregate
+}
+
+type stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext struct {
+	rowsDecisionCtx    stage2FastTargetSharedPeerTopKRowsDecisionContext
+	agg                *fastTargetSharedPeerAggregate
+	decisionCtx        stage2FastTargetSharedPeerTopKAggregateDecisionContext
+	resolvedRowsCtx    stage2FastTargetSharedPeerTopKRowsDecisionContext
+	hasResolvedRowsCtx bool
+	err                error
+	hasError           bool
+}
+
+type stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext struct {
+	resolveCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext
+	err        error
+	hasError   bool
+}
+
+type stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext struct {
+	resolveCtx                 stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext
+	agg                        *fastTargetSharedPeerAggregate
+	resolvedRowsDecisionCtx    stage2FastTargetSharedPeerTopKRowsDecisionContext
+	hasResolvedRowsDecisionCtx bool
+	err                        error
+	hasError                   bool
+}
+
+type stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext struct {
+	resolveCtx                 stage2FastTargetSharedPeerTopKRowsResolveDecisionContext
+	resolvedRowsDecisionCtx    stage2FastTargetSharedPeerTopKRowsDecisionContext
+	hasResolvedRowsDecisionCtx bool
+	err                        error
+	hasError                   bool
+}
+
+type stage2FastTargetSharedPeerTopKFinalizeDecisionContext struct {
+	top    *fastTargetSharedPeerTopKHeap
+	spec   fastTargetSharedPeerTopKSpec
+	ranked []fastTargetSharedPeerRankedRow
+	window []fastTargetSharedPeerRankedRow
+	rows   []Row
+}
+
+type stage2SharedPeerTopKCandidateApplyDecisionContext struct {
+	top           *fastTargetSharedPeerTopKHeap
+	candidate     fastTargetSharedPeerRankedRow
+	keep          int
+	shouldPush    bool
+	shouldReplace bool
+	pushApplied   bool
+}
+
+type stage2HintDegreeSelectivityDecisionContext struct {
+	hints            physical.StatsHints
+	edgeType         string
+	edgeTypeAnyOf    []string
+	types            []string
+	seen             map[string]struct{}
+	totalEdgeCount   int
+	totalSourceCount int
 }
 
 type runtimeCounterState struct {
@@ -230,7 +884,6 @@ func (p *deferredHydrationPolicy) resolveAndMatch(vertexID string, pattern verte
 	}
 
 	if !vertexBindingMatches(scope, pattern.Var, v) {
-		p.matched[key] = false
 		return nil, false, nil
 	}
 	if !vertexPatternMatches(v, pattern, p.params, scope) {
@@ -241,83 +894,6 @@ func (p *deferredHydrationPolicy) resolveAndMatch(vertexID string, pattern verte
 	p.matched[key] = true
 	p.vertex[key] = v
 	return v, true, nil
-}
-
-func (p *deferredHydrationPolicy) resolveAndMatchIDLabelProbe(vertexID string, pattern vertexPattern, baseRow Row, hydrationCounter string) (bool, error) {
-	if p == nil {
-		return false, nil
-	}
-	vertexID = strings.TrimSpace(vertexID)
-	if vertexID == "" {
-		return false, nil
-	}
-	if strings.TrimSpace(pattern.PropertiesRaw) != "" {
-		_, matched, err := p.resolveAndMatch(vertexID, pattern, baseRow, hydrationCounter)
-		return matched, err
-	}
-	key := deferredHydrationCacheKey(vertexID, pattern)
-	if _, ok := p.idChecked[key]; ok {
-		return p.idMatched[key], nil
-	}
-	p.idChecked[key] = struct{}{}
-
-	if !vertexBindingMatchesID(baseRow, pattern.Var, vertexID) {
-		p.idMatched[key] = false
-		return false, nil
-	}
-
-	checkLabel := func(label string) (bool, error) {
-		return p.tx.HasVertexLabel(p.ctx, p.tenant, vertexID, strings.TrimSpace(label))
-	}
-
-	if len(pattern.AnyOfLabels) > 0 {
-		anyMatched := false
-		for _, want := range pattern.AnyOfLabels {
-			hasLabel, err := checkLabel(want)
-			if err != nil {
-				_, matched, fallbackErr := p.resolveAndMatch(vertexID, pattern, baseRow, hydrationCounter)
-				return matched, fallbackErr
-			}
-			if hasLabel {
-				anyMatched = true
-				break
-			}
-		}
-		if !anyMatched {
-			p.idMatched[key] = false
-			return false, nil
-		}
-	}
-
-	for _, want := range pattern.AllOfLabels {
-		hasLabel, err := checkLabel(want)
-		if err != nil {
-			_, matched, fallbackErr := p.resolveAndMatch(vertexID, pattern, baseRow, hydrationCounter)
-			return matched, fallbackErr
-		}
-		if !hasLabel {
-			p.idMatched[key] = false
-			return false, nil
-		}
-	}
-
-	for _, want := range pattern.ExcludedLabels {
-		hasLabel, err := checkLabel(want)
-		if err != nil {
-			_, matched, fallbackErr := p.resolveAndMatch(vertexID, pattern, baseRow, hydrationCounter)
-			return matched, fallbackErr
-		}
-		if hasLabel {
-			p.idMatched[key] = false
-			return false, nil
-		}
-	}
-
-	p.idMatched[key] = true
-	if p.e != nil {
-		p.e.observeRuntimeCounter(p.params, "runtime.vertex.label_probe_shortcut_applied", 1)
-	}
-	return true, nil
 }
 
 func ensureRuntimeCounterState(params Params) *runtimeCounterState {
@@ -333,28 +909,6 @@ func ensureRuntimeCounterState(params Params) *runtimeCounterState {
 	state := &runtimeCounterState{counters: map[string]int64{}}
 	params[runtimeCounterStateParam] = state
 	return state
-}
-
-func resetRuntimeCounterState(params Params) {
-	if params == nil {
-		return
-	}
-	delete(params, runtimeCounterStateParam)
-}
-
-func buildRuntimeCounterDiagnostic(params Params) (Diagnostic, bool) {
-	if params == nil {
-		return Diagnostic{}, false
-	}
-	state, ok := params[runtimeCounterStateParam].(*runtimeCounterState)
-	if !ok || state == nil || len(state.counters) == 0 {
-		return Diagnostic{}, false
-	}
-	encoded, err := json.Marshal(state.counters)
-	if err != nil {
-		return Diagnostic{}, false
-	}
-	return Diagnostic{Code: "RUNTIME_COUNTERS", Message: string(encoded)}, true
 }
 
 func (e *Executor) observeRuntimeCounter(params Params, name string, delta int64) {
@@ -380,19 +934,8 @@ func (e *Executor) observeRuntimeDurationMicros(params Params, name string, star
 	e.observeRuntimeCounter(params, name, elapsed)
 }
 
-type fastDirectedEndpointProbeTx interface {
-	HasDirectedEdgeBetweenFast(ctx context.Context, tenant, srcID, dstID, edgeType string) (bool, error)
-}
-
 type fastUndirectedEndpointProbeTx interface {
 	HasUndirectedEdgeBetweenFast(ctx context.Context, tenant, leftID, rightID, edgeType string) (bool, error)
-}
-
-func hasDirectedEdgeBetweenProbe(ctx context.Context, tx graph.Tx, tenant, srcID, dstID, edgeType string) (bool, error) {
-	if fastTx, ok := tx.(fastDirectedEndpointProbeTx); ok {
-		return fastTx.HasDirectedEdgeBetweenFast(ctx, tenant, srcID, dstID, edgeType)
-	}
-	return tx.HasDirectedEdgeBetween(ctx, tenant, srcID, dstID, edgeType)
 }
 
 func hasUndirectedEdgeBetweenProbe(ctx context.Context, tx graph.Tx, tenant, leftID, rightID, edgeType string) (bool, error) {
@@ -414,229 +957,6 @@ func withProjectionEvalRuntime(ctx context.Context, tx graph.Tx, params Params, 
 	runtime[projectionEvalTxParam] = tx
 	runtime[projectionEvalCtxParam] = ctx
 	return runtime
-}
-
-var autoVertexIDSeq uint64
-var autoEdgeIDSeq uint64
-
-func (e *Executor) executeQueryStatement(ctx context.Context, stmt *ast.QueryStatement, params Params) (_ *Result, err error) {
-	if stmt == nil {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "query statement is required", nil)
-	}
-	if len(stmt.Parts) == 0 {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "at least one query part is required", nil)
-	}
-	if len(stmt.Unions) != 0 && len(stmt.Unions) != len(stmt.Parts)-1 {
-		return nil, &parser.ParseError{Kind: parser.ParseErrorInternal, Message: "invalid union boundaries", Statement: 1}
-	}
-	if err := validateUnionKinds(stmt.Unions); err != nil {
-		return nil, err
-	}
-	resetRuntimeCounterState(params)
-	_ = ensureRuntimeCounterState(params)
-	defer resetRuntimeCounterState(params)
-
-	writeQuery := false
-	for _, part := range stmt.Parts {
-		if hasWriteClause(part) {
-			writeQuery = true
-			break
-		}
-	}
-
-	if !writeQuery {
-		if fastResult, ok, fastErr := e.tryFastTypedCollectDistinctReturnQuery(ctx, stmt, params); fastErr != nil {
-			return nil, fastErr
-		} else if ok {
-			return fastResult, nil
-		}
-		if fastResult, ok, fastErr := e.tryFastEdgeCountQuery(ctx, stmt, params); fastErr != nil {
-			return nil, fastErr
-		} else if ok {
-			return fastResult, nil
-		}
-		if fastResult, ok, fastErr := e.tryFastVertexCountQuery(ctx, stmt, params); fastErr != nil {
-			return nil, fastErr
-		} else if ok {
-			return fastResult, nil
-		}
-		if fastResult, ok, fastErr := e.tryFastLabelHistogramQuery(ctx, stmt, params); fastErr != nil {
-			return nil, fastErr
-		} else if ok {
-			return fastResult, nil
-		}
-	} else {
-		if fastResult, ok, fastErr := e.tryFastEdgeDeleteQuery(ctx, stmt, params); fastErr != nil {
-			return nil, fastErr
-		} else if ok {
-			return fastResult, nil
-		}
-	}
-
-	resultRows := []Row{}
-	resultColumns := []string{}
-	hasAnyReturn := false
-
-	withTx := func(tx graph.Tx) error {
-		for idx, part := range stmt.Parts {
-			partRows, partColumns, returnSeen, stepErr := e.executeQueryPart(ctx, tx, part, params)
-			if stepErr != nil {
-				return stepErr
-			}
-			if !returnSeen {
-				if len(stmt.Parts) > 1 {
-					return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "InvalidClauseComposition", Statement: 1}
-				}
-				continue
-			}
-
-			hasAnyReturn = true
-			if idx == 0 {
-				resultRows = append(resultRows, partRows...)
-				resultColumns = append([]string(nil), partColumns...)
-				continue
-			}
-
-			if !equalStringSlices(resultColumns, partColumns) {
-				return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "DifferentColumnsInUnion", Statement: 1}
-			}
-
-			op := stmt.Unions[idx-1]
-			if op == ast.UnionKindAll {
-				resultRows = append(resultRows, partRows...)
-				continue
-			}
-			resultRows = append(resultRows, partRows...)
-			resultRows = distinctProjectionRows(resultRows)
-		}
-		return nil
-	}
-
-	if writeQuery {
-		err = e.store.Update(ctx, withTx)
-	} else {
-		err = e.store.View(ctx, withTx)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if !hasAnyReturn {
-		resultColumns = nil
-		resultRows = nil
-	}
-
-	result := &Result{Columns: resultColumns, Rows: resultRows, Stats: Stats{RowsReturned: len(resultRows)}}
-	result.Rows = normalizeResultRows(result.Rows)
-	if diagnostic, ok := buildRuntimeCounterDiagnostic(params); ok {
-		result.Warnings = append(result.Warnings, diagnostic)
-	}
-	return result, nil
-}
-
-func (e *Executor) executeQueryPart(ctx context.Context, tx graph.Tx, part ast.QueryPart, params Params) ([]Row, []string, bool, error) {
-	rows := []Row{{}}
-	resultColumns := []string{}
-	returnSeen := false
-
-	for idx := 0; idx < len(part.Clauses); idx++ {
-		clause := part.Clauses[idx]
-		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindCreate {
-			hasDownstreamClauses := idx+3 < len(part.Clauses)
-			if fastRows, fastColumns, ok, fastErr := e.tryFastTwoHopDistinctCreateClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns, hasDownstreamClauses); fastErr != nil {
-				return nil, nil, false, fastErr
-			} else if ok {
-				rows = fastRows
-				resultColumns = fastColumns
-				idx += 2
-				continue
-			}
-		}
-		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindMerge {
-			hasDownstreamClauses := idx+3 < len(part.Clauses)
-			if fastRows, fastColumns, ok, fastErr := e.tryFastTwoHopDistinctMergeClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns, hasDownstreamClauses); fastErr != nil {
-				return nil, nil, false, fastErr
-			} else if ok {
-				rows = fastRows
-				resultColumns = fastColumns
-				idx += 2
-				continue
-			}
-		}
-		if idx+2 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith && part.Clauses[idx+2].Kind == ast.ClauseKindWith {
-			if fastRows, fastColumns, ok, fastErr := e.tryFastTargetSharedPeerAggregationWithTopKClauses(ctx, tx, rows, clause, part.Clauses[idx+1], part.Clauses[idx+2], params, resultColumns); fastErr != nil {
-				return nil, nil, false, fastErr
-			} else if ok {
-				rows = fastRows
-				resultColumns = fastColumns
-				idx += 2
-				continue
-			}
-		}
-		if idx+1 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindWith {
-			if fastRows, fastColumns, ok, fastErr := e.tryFastTargetSharedPeerAggregationClausePair(ctx, tx, rows, clause, part.Clauses[idx+1], params, resultColumns); fastErr != nil {
-				return nil, nil, false, fastErr
-			} else if ok {
-				rows = fastRows
-				resultColumns = fastColumns
-				idx++
-				continue
-			}
-		}
-		if idx+1 < len(part.Clauses) && clause.Kind == ast.ClauseKindMatch && part.Clauses[idx+1].Kind == ast.ClauseKindReturn {
-			if fastRows, fastColumns, ok, fastErr := e.tryFastPeerCandidateReturnAggregationClausePair(ctx, tx, rows, clause, part.Clauses[idx+1], params, resultColumns); fastErr != nil {
-				return nil, nil, false, fastErr
-			} else if ok {
-				return fastRows, fastColumns, true, nil
-			}
-		}
-
-		var stepErr error
-		switch clause.Kind {
-		case ast.ClauseKindMatch:
-			rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
-			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumnsForClause(clause)...)
-		case ast.ClauseKindOptionalMatch:
-			rows, stepErr = e.applyMatchClause(ctx, tx, rows, clause, params)
-			resultColumns = appendUniqueColumns(resultColumns, inferMatchScopeColumnsForClause(clause)...)
-		case ast.ClauseKindUnwind:
-			rows, stepErr = e.applyUnwindClause(rows, clause, params)
-			resultColumns = appendUniqueColumns(resultColumns, inferColumnsFromRows(rows)...)
-		case ast.ClauseKindWith:
-			rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns)
-		case ast.ClauseKindCreate:
-			rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, false)
-		case ast.ClauseKindMerge:
-			rows, stepErr = e.applyCreateClause(ctx, tx, rows, clause, params, true)
-		case ast.ClauseKindSet:
-			rows, stepErr = e.applySetClause(ctx, tx, rows, clause, params)
-		case ast.ClauseKindRemove:
-			rows, stepErr = e.applyRemoveClause(ctx, tx, rows, clause)
-		case ast.ClauseKindDelete:
-			rows, stepErr = e.applyDeleteClause(ctx, tx, rows, clause, params)
-		case ast.ClauseKindReturn:
-			rows, resultColumns, stepErr = e.applyProjectionClause(ctx, tx, rows, clause, params, resultColumns)
-			returnSeen = true
-			if stepErr != nil {
-				return nil, nil, false, stepErr
-			}
-			return rows, resultColumns, true, nil
-		case ast.ClauseKindInQueryCall:
-			rows, stepErr = e.applyInQueryCallClause(ctx, rows, clause, params)
-		default:
-			return nil, nil, false, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("clause %s is not yet supported", clause.Kind), nil)
-		}
-		if stepErr != nil {
-			return nil, nil, false, stepErr
-		}
-		if isWriteClauseKind(clause.Kind) {
-			resetQueryEntityCache(params)
-			resetQueryAdjacencyCache(params)
-			resetWherePatternPredicateCache(params)
-		}
-	}
-
-	return rows, resultColumns, returnSeen, nil
 }
 
 type fastTargetSharedPeerProjection struct {
@@ -674,14 +994,6 @@ type fastTargetSharedPeerAggregate struct {
 	sumAbsDiff float64
 }
 
-type firstHopSeed struct {
-	target                    *graph.Vertex
-	firstValue                float64
-	midRow                    Row
-	secondWhereConstraints    map[string]edgeNumericRangeConstraint
-	hasSecondWhereConstraints bool
-}
-
 type stage1WhereShortcutPlan struct {
 	enabled                bool
 	requirePeerNotTarget   bool
@@ -703,552 +1015,236 @@ type fastTargetSharedPeerRankedRow struct {
 	inputIndex int
 }
 
-func (e *Executor) tryFastTargetSharedPeerAggregationWithTopKClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, topKWithClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
-	if feedback, ok := e.fastPathFeedbackSnapshot(stage1TopKPushdownImplementation); ok && stage1TopKPushdownShouldDisableFromFeedback(feedback) {
-		e.observeRuntimeCounter(params, "fast_path.stage1.topk_pushdown_skipped_adaptive", 1)
-		return nil, nil, false, nil
-	}
-	aggs, projection, withSpec, ok, err := e.collectFastTargetSharedPeerAggregates(ctx, tx, rows, matchClause, withClause, params)
-	if err != nil || !ok {
-		return nil, nil, false, err
-	}
-	if !withSpecHasWhereRaw(withSpec) && len(aggs) == 0 {
-		return []Row{}, []string{projection.targetKey, projection.peerKey, projection.sharedCountKey, projection.avgDiffKey}, true, nil
-	}
-	topKProjection, topKSpec, ok, err := parseFastTargetSharedPeerTopKWithClause(topKWithClause, projection, params)
-	if err != nil || !ok {
-		return nil, nil, false, err
-	}
-	out, err := fastTargetSharedPeerTopKRows(aggs, projection, withSpec, topKProjection, topKSpec, ctx, tx, params, e)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	e.observeRuntimeCounter(params, "fast_path.stage1.topk_pushdown_applied", 1)
-	e.observeRuntimeCounter(params, "fast_path.stage1.rows_output", int64(len(out)))
-	columns := []string{topKProjection.targetKey, topKProjection.peerKey, topKProjection.similarityKey}
-	if len(columns) == 0 && len(priorColumns) > 0 {
-		columns = append([]string(nil), priorColumns...)
-	}
-	e.recordFastPathFeedback(stage1TopKPushdownImplementation, int64(len(aggs)), int64(len(out)))
-	return out, columns, true, nil
-}
-
 func withSpecHasWhereRaw(withSpec projectionClauseSpec) bool {
 	return strings.TrimSpace(withSpec.WhereRaw) != ""
 }
 
-func (e *Executor) collectFastTargetSharedPeerAggregates(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, params Params) (map[string]*fastTargetSharedPeerAggregate, fastTargetSharedPeerProjection, projectionClauseSpec, bool, error) {
-	if len(rows) != 1 || len(rows[0]) != 0 {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
-	}
-	if tx == nil {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
-	}
+func stage1ShouldReturnEmptyFastTargetSharedPeerTopKResult(withSpec projectionClauseSpec, aggs map[string]*fastTargetSharedPeerAggregate) bool {
+	return !withSpecHasWhereRaw(withSpec) && len(aggs) == 0
+}
 
+func stage1BuildFastTargetSharedPeerAggregateColumns(projection fastTargetSharedPeerProjection) []string {
+	return []string{projection.targetKey, projection.peerKey, projection.sharedCountKey, projection.avgDiffKey}
+}
+
+func stage1BuildFastTargetSharedPeerTopKColumns(topKProjection fastTargetSharedPeerTopKProjection, priorColumns []string) []string {
+	columns := []string{topKProjection.targetKey, topKProjection.peerKey, topKProjection.similarityKey}
+	if len(columns) == 0 && len(priorColumns) > 0 {
+		return append([]string(nil), priorColumns...)
+	}
+	return columns
+}
+
+func stage1HasMatchWhereClause(matchWhere string) bool {
+	return strings.TrimSpace(matchWhere) != ""
+}
+
+func stage1ResolveFirstHopScanType(chain twoHopDirectedChainPattern) string {
+	if len(chain.FirstEdgeAnyOf) > 0 {
+		return ""
+	}
+	return chain.FirstEdgeType
+}
+
+func stage1ResolveSecondHopScanType(chain twoHopDirectedChainPattern) string {
+	if len(chain.SecondEdgeAnyOf) > 0 {
+		return ""
+	}
+	return chain.SecondEdgeType
+}
+
+func (e *Executor) stage1EvaluateSharedPeerMatchWhere(ctx context.Context, tx graph.Tx, params Params, matchWhere string, whereShortcut stage1WhereShortcutPlan, target *graph.Vertex, peer *graph.Vertex, hasSecondWhereConstraints bool, merged Row) (bool, error) {
+	if !stage1HasMatchWhereClause(matchWhere) {
+		return true, nil
+	}
+	bypassWhereEval, droppedByShortcut := stage1WhereShortcutDecision(whereShortcut, target, peer, hasSecondWhereConstraints)
+	if droppedByShortcut {
+		e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
+		return false, nil
+	}
+	if bypassWhereEval {
+		e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_shortcuts", 1)
+		return true, nil
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_checks", 1)
+	ok, err := e.evalWhereExpression(ctx, tx, matchWhere, merged, params)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
+		return false, nil
+	}
+	return true, nil
+}
+
+func stage1CanCollectFastTargetSharedPeerAggregates(rows []Row, tx graph.Tx) bool {
+	return len(rows) == 1 && len(rows[0]) == 0 && tx != nil
+}
+
+func stage1ResolveFastTargetSharedPeerMatchAndChain(matchClause ast.Clause) (anchoredMatchSpec, twoHopDirectedChainPattern, bool) {
 	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
 	if err != nil || matchSpec.Optional {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
+		return anchoredMatchSpec{}, twoHopDirectedChainPattern{}, false
 	}
-
 	chain, err := parseTwoHopDirectedChainPattern(matchSpec.Pattern)
 	if err != nil || chain.SecondForward {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
+		return anchoredMatchSpec{}, twoHopDirectedChainPattern{}, false
 	}
+	return matchSpec, chain, true
+}
 
+func stage1IsFastTargetSharedPeerWithSpecEligible(withSpec projectionClauseSpec) bool {
+	return !withSpec.Distinct && len(withSpec.OrderBy) == 0 && strings.TrimSpace(withSpec.SkipRaw) == "" && strings.TrimSpace(withSpec.LimitRaw) == ""
+}
+
+func stage1ResolveFastTargetSharedPeerWithProjection(withClause ast.Clause, chain twoHopDirectedChainPattern) (projectionClauseSpec, fastTargetSharedPeerProjection, bool) {
 	withSpec, err := projectionClauseSpecFromClause(withClause)
 	if err != nil {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
+		return projectionClauseSpec{}, fastTargetSharedPeerProjection{}, false
 	}
-	if withSpec.Distinct || len(withSpec.OrderBy) != 0 || strings.TrimSpace(withSpec.SkipRaw) != "" || strings.TrimSpace(withSpec.LimitRaw) != "" {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
+	if !stage1IsFastTargetSharedPeerWithSpecEligible(withSpec) {
+		return projectionClauseSpec{}, fastTargetSharedPeerProjection{}, false
 	}
 	items, err := parseProjectionItems(withSpec.ProjectionRaw)
 	if err != nil {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
+		return projectionClauseSpec{}, fastTargetSharedPeerProjection{}, false
 	}
 	projection, ok := parseFastTargetSharedPeerProjection(items, chain)
 	if !ok {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, nil
+		return projectionClauseSpec{}, fastTargetSharedPeerProjection{}, false
 	}
-
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
-	}
-
-	targetCandidates, err := e.resolveVertexPatternCandidates(ctx, tx, tenant, rows[0], chain.Left, params)
-	if err != nil {
-		return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
-	}
-	e.observeRuntimeCounter(params, "fast_path.stage1.target_candidates", int64(len(targetCandidates)))
-
-	aggs := map[string]*fastTargetSharedPeerAggregate{}
-	whereShortcut := buildStage1WhereShortcutPlan(matchSpec.Where, chain)
-	accumulate := func(target *graph.Vertex, peer *graph.Vertex, firstValue, secondValue float64) {
-		if target == nil || peer == nil {
-			return
-		}
-		key := target.ID + "|" + peer.ID
-		agg, exists := aggs[key]
-		if !exists {
-			agg = &fastTargetSharedPeerAggregate{target: target, peer: peer}
-			aggs[key] = agg
-		}
-		agg.shared++
-		agg.sumAbsDiff += math.Abs(firstValue - secondValue)
-	}
-
-	if len(targetCandidates) <= 1 {
-		for _, target := range targetCandidates {
-			if target == nil {
-				continue
-			}
-			baseRow := cloneRow(rows[0])
-			if chain.Left.Var != "" {
-				baseRow[chain.Left.Var] = target
-			}
-
-			firstScanType := chain.FirstEdgeType
-			if len(chain.FirstEdgeAnyOf) > 0 {
-				firstScanType = ""
-			}
-			if err := scanOutEdgesQueryCached(ctx, tx, tenant, target.ID, firstScanType, params, func(edge1 *graph.Edge) error {
-				e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.edges_visited", 1)
-				if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
-					return nil
-				}
-				if !edgePatternMatches(edge1, chain.FirstEdgeProps, params, baseRow) {
-					return nil
-				}
-
-				shared, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
-				if err != nil {
-					return err
-				}
-				if shared == nil {
-					return nil
-				}
-
-				midRow := cloneRow(baseRow)
-				if chain.FirstEdgeVar != "" {
-					midRow[chain.FirstEdgeVar] = edge1
-				}
-				if chain.Mid.Var != "" {
-					midRow[chain.Mid.Var] = shared
-				}
-				if !vertexPatternMatches(shared, chain.Mid, params, midRow) {
-					return nil
-				}
-
-				secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, chain.SecondEdgeVar, midRow, params)
-				secondScanType := chain.SecondEdgeType
-				if len(chain.SecondEdgeAnyOf) > 0 {
-					secondScanType = ""
-				}
-				return scanInEdgesQueryCached(ctx, tx, tenant, shared.ID, secondScanType, params, func(edge2 *graph.Edge) error {
-					e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.edges_visited", 1)
-					if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
-						return nil
-					}
-					if !edgePatternMatches(edge2, chain.SecondEdgeProps, params, midRow) {
-						return nil
-					}
-					if hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, secondWhereConstraints) {
-						e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.numeric_prefilter_drops", 1)
-						return nil
-					}
-
-					peer, err := getVertexQueryCached(ctx, tx, tenant, edge2.SrcID, params)
-					if err != nil {
-						return err
-					}
-					if peer == nil || !vertexBindingMatches(midRow, chain.Right.Var, peer) {
-						return nil
-					}
-
-					merged := cloneRow(midRow)
-					if chain.Right.Var != "" {
-						merged[chain.Right.Var] = peer
-					}
-					if chain.SecondEdgeVar != "" {
-						merged[chain.SecondEdgeVar] = edge2
-					}
-					if !vertexPatternMatches(peer, chain.Right, params, merged) {
-						return nil
-					}
-					if strings.TrimSpace(matchSpec.Where) != "" {
-						bypassWhereEval, droppedByShortcut := stage1WhereShortcutDecision(whereShortcut, target, peer, hasSecondWhereConstraints)
-						if droppedByShortcut {
-							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
-							return nil
-						}
-						if bypassWhereEval {
-							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_shortcuts", 1)
-						} else {
-							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_checks", 1)
-							ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
-							if err != nil {
-								return err
-							}
-							if !ok {
-								e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
-								return nil
-							}
-						}
-					}
-
-					firstValue, firstOK := edgeNumericProperty(edge1, projection.firstEdgeProperty)
-					secondValue, secondOK := edgeNumericProperty(edge2, projection.secondEdgeProperty)
-					if !firstOK || !secondOK {
-						return nil
-					}
-
-					accumulate(target, peer, firstValue, secondValue)
-					return nil
-				})
-			}); err != nil {
-				return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
-			}
-		}
-	} else {
-		type rangedSeed struct {
-			seed       firstHopSeed
-			constraint edgeNumericRangeConstraint
-		}
-		type sharedSeedBuckets struct {
-			unconstrained []firstHopSeed
-			exactByValue  map[float64][]firstHopSeed
-			ranged        []rangedSeed
-		}
-		sharedSeeds := map[string][]firstHopSeed{}
-		sharedSeedBucketsByID := map[string]sharedSeedBuckets{}
-		for _, target := range targetCandidates {
-			if target == nil {
-				continue
-			}
-			baseRow := cloneRow(rows[0])
-			if chain.Left.Var != "" {
-				baseRow[chain.Left.Var] = target
-			}
-			firstScanType := chain.FirstEdgeType
-			if len(chain.FirstEdgeAnyOf) > 0 {
-				firstScanType = ""
-			}
-			if err := scanOutEdgesQueryCached(ctx, tx, tenant, target.ID, firstScanType, params, func(edge1 *graph.Edge) error {
-				e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.edges_visited", 1)
-				if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
-					return nil
-				}
-				if !edgePatternMatches(edge1, chain.FirstEdgeProps, params, baseRow) {
-					return nil
-				}
-				shared, err := getVertexQueryCached(ctx, tx, tenant, edge1.DstID, params)
-				if err != nil {
-					return err
-				}
-				if shared == nil {
-					return nil
-				}
-				midRow := cloneRow(baseRow)
-				if chain.FirstEdgeVar != "" {
-					midRow[chain.FirstEdgeVar] = edge1
-				}
-				if chain.Mid.Var != "" {
-					midRow[chain.Mid.Var] = shared
-				}
-				if !vertexPatternMatches(shared, chain.Mid, params, midRow) {
-					return nil
-				}
-				firstValue, firstOK := edgeNumericProperty(edge1, projection.firstEdgeProperty)
-				if !firstOK {
-					return nil
-				}
-				secondWhereConstraints, hasSecondWhereConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, chain.SecondEdgeVar, midRow, params)
-				seed := firstHopSeed{target: target, firstValue: firstValue, midRow: midRow, secondWhereConstraints: secondWhereConstraints, hasSecondWhereConstraints: hasSecondWhereConstraints}
-				sharedID := strings.TrimSpace(shared.ID)
-				if sharedID == "" {
-					return nil
-				}
-				sharedSeeds[sharedID] = append(sharedSeeds[sharedID], seed)
-				buckets := sharedSeedBucketsByID[sharedID]
-				targetConstraint, hasTargetConstraint := seed.secondWhereConstraints[projection.secondEdgeProperty]
-				switch {
-				case !seed.hasSecondWhereConstraints || len(seed.secondWhereConstraints) == 0 || !hasTargetConstraint:
-					buckets.unconstrained = append(buckets.unconstrained, seed)
-				case targetConstraint.isContradictory():
-					e.observeRuntimeCounter(params, "fast_path.stage1.seed_rows_bucket_dropped", 1)
-				case targetConstraint.lowerSet && targetConstraint.upperSet && targetConstraint.lower == targetConstraint.upper && targetConstraint.lowerInclusive && targetConstraint.upperInclusive:
-					if buckets.exactByValue == nil {
-						buckets.exactByValue = map[float64][]firstHopSeed{}
-					}
-					buckets.exactByValue[targetConstraint.lower] = append(buckets.exactByValue[targetConstraint.lower], seed)
-				default:
-					buckets.ranged = append(buckets.ranged, rangedSeed{seed: seed, constraint: targetConstraint})
-				}
-				sharedSeedBucketsByID[sharedID] = buckets
-				e.observeRuntimeCounter(params, "fast_path.stage1.first_hop.shared_seed_rows", 1)
-				return nil
-			}); err != nil {
-				return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
-			}
-		}
-
-		e.observeRuntimeCounter(params, "fast_path.stage1.shared_vertices_seeded", int64(len(sharedSeeds)))
-		secondScanType := chain.SecondEdgeType
-		if len(chain.SecondEdgeAnyOf) > 0 {
-			secondScanType = ""
-		}
-		for sharedID := range sharedSeeds {
-			buckets := sharedSeedBucketsByID[sharedID]
-			e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.shared_vertices_expanded", 1)
-			if err := scanInEdgesQueryCached(ctx, tx, tenant, sharedID, secondScanType, params, func(edge2 *graph.Edge) error {
-				e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.edges_visited", 1)
-				if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
-					return nil
-				}
-				peer, err := getVertexQueryCached(ctx, tx, tenant, edge2.SrcID, params)
-				if err != nil {
-					return err
-				}
-				if peer == nil {
-					return nil
-				}
-				secondValue, secondOK := edgeNumericProperty(edge2, projection.secondEdgeProperty)
-				if !secondOK {
-					return nil
-				}
-				applySeed := func(seed firstHopSeed) error {
-					e.observeRuntimeCounter(params, "fast_path.stage1.seed_rows_considered", 1)
-					if seed.target == nil {
-						return nil
-					}
-					if !edgePatternMatches(edge2, chain.SecondEdgeProps, params, seed.midRow) {
-						return nil
-					}
-					if seed.hasSecondWhereConstraints && !edgeMatchesNumericConstraints(edge2, seed.secondWhereConstraints) {
-						e.observeRuntimeCounter(params, "fast_path.stage1.second_hop.numeric_prefilter_drops", 1)
-						return nil
-					}
-					if !vertexBindingMatches(seed.midRow, chain.Right.Var, peer) {
-						return nil
-					}
-					merged := cloneRow(seed.midRow)
-					if chain.Right.Var != "" {
-						merged[chain.Right.Var] = peer
-					}
-					if chain.SecondEdgeVar != "" {
-						merged[chain.SecondEdgeVar] = edge2
-					}
-					if !vertexPatternMatches(peer, chain.Right, params, merged) {
-						return nil
-					}
-					if strings.TrimSpace(matchSpec.Where) != "" {
-						bypassWhereEval, droppedByShortcut := stage1WhereShortcutDecision(whereShortcut, seed.target, peer, seed.hasSecondWhereConstraints)
-						if droppedByShortcut {
-							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
-							return nil
-						}
-						if bypassWhereEval {
-							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_shortcuts", 1)
-						} else {
-							e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_checks", 1)
-							ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
-							if err != nil {
-								return err
-							}
-							if !ok {
-								e.observeRuntimeCounter(params, "fast_path.stage1.where_eval_drops", 1)
-								return nil
-							}
-						}
-					}
-					accumulate(seed.target, peer, seed.firstValue, secondValue)
-					return nil
-				}
-				for _, seed := range buckets.unconstrained {
-					if err := applySeed(seed); err != nil {
-						return err
-					}
-				}
-				if exactSeeds, ok := buckets.exactByValue[secondValue]; ok {
-					for _, seed := range exactSeeds {
-						if err := applySeed(seed); err != nil {
-							return err
-						}
-					}
-				}
-				for _, ranged := range buckets.ranged {
-					if !ranged.constraint.matchesValue(secondValue) {
-						e.observeRuntimeCounter(params, "fast_path.stage1.seed_rows_bucket_dropped", 1)
-						continue
-					}
-					if err := applySeed(ranged.seed); err != nil {
-						return err
-					}
-				}
-				return nil
-			}); err != nil {
-				return nil, fastTargetSharedPeerProjection{}, projectionClauseSpec{}, false, err
-			}
-		}
-	}
-
-	return aggs, projection, withSpec, true, nil
+	return withSpec, projection, true
 }
 
-func (e *Executor) tryFastTargetSharedPeerAggregationClausePair(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
-	aggs, projection, withSpec, ok, err := e.collectFastTargetSharedPeerAggregates(ctx, tx, rows, matchClause, withClause, params)
-	if err != nil || !ok {
-		return nil, nil, false, err
-	}
-	out := make([]Row, 0, len(aggs))
-	e.observeRuntimeCounter(params, "fast_path.stage1.peer_groups_before_with_filter", int64(len(aggs)))
-	for _, agg := range sortedFastTargetSharedPeerAggregates(aggs) {
-		if agg == nil || agg.shared <= 0 {
-			continue
-		}
-		row := Row{}
-		row[projection.targetKey] = agg.target
-		row[projection.peerKey] = agg.peer
-		row[projection.sharedCountKey] = agg.shared
-		row[projection.avgDiffKey] = agg.sumAbsDiff / float64(agg.shared)
-		out = append(out, row)
-	}
+func stage1ShouldIncludeFastTargetSharedPeerWithRow(agg *fastTargetSharedPeerAggregate) bool {
+	return agg != nil && agg.shared > 0
+}
 
-	if withSpec.WhereRaw != "" {
-		before := len(out)
-		filtered := make([]Row, 0, len(out))
-		for _, row := range out {
-			ok, err := e.evalWhereExpression(ctx, tx, withSpec.WhereRaw, row, params)
-			if err != nil {
-				return nil, nil, false, err
-			}
-			if ok {
-				filtered = append(filtered, row)
-			}
-		}
-		out = filtered
-		e.observeRuntimeCounter(params, "fast_path.stage1.with_filter_drops", int64(before-len(out)))
-	}
-	e.observeRuntimeCounter(params, "fast_path.stage1.rows_output", int64(len(out)))
+func stage1BuildFastTargetSharedPeerWithRow(agg *fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection) Row {
+	row := Row{}
+	row[projection.targetKey] = agg.target
+	row[projection.peerKey] = agg.peer
+	row[projection.sharedCountKey] = agg.shared
+	row[projection.avgDiffKey] = agg.sumAbsDiff / float64(agg.shared)
+	return row
+}
 
+func (e *Executor) stage1ApplyFastTargetSharedPeerWithFilter(ctx context.Context, tx graph.Tx, rows []Row, withSpec projectionClauseSpec, params Params) ([]Row, error) {
+	if strings.TrimSpace(withSpec.WhereRaw) == "" {
+		return rows, nil
+	}
+	before := len(rows)
+	filtered := make([]Row, 0, len(rows))
+	for _, row := range rows {
+		ok, err := e.evalWhereExpression(ctx, tx, withSpec.WhereRaw, row, params)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			filtered = append(filtered, row)
+		}
+	}
+	e.observeRuntimeCounter(params, "fast_path.stage1.with_filter_drops", int64(before-len(filtered)))
+	return filtered, nil
+}
+
+func stage1BuildFastTargetSharedPeerWithColumns(projection fastTargetSharedPeerProjection, priorColumns []string) []string {
 	columns := []string{projection.targetKey, projection.peerKey, projection.sharedCountKey, projection.avgDiffKey}
 	if len(columns) == 0 && len(priorColumns) > 0 {
-		columns = append([]string(nil), priorColumns...)
+		return append([]string(nil), priorColumns...)
 	}
-	return out, columns, true, nil
+	return columns
 }
 
-func (e *Executor) tryFastTwoHopDistinctCreateClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, createClause ast.Clause, params Params, priorColumns []string, emitCreatedRows bool) ([]Row, []string, bool, error) {
-	return e.tryFastTwoHopDistinctWriteClauses(ctx, tx, rows, matchClause, withClause, createClause, params, priorColumns, emitCreatedRows, false)
+func stage1CanTryFastTwoHopDistinctWrite(rows []Row, tx graph.Tx) bool {
+	return len(rows) == 1 && len(rows[0]) == 0 && tx != nil
 }
 
-func (e *Executor) tryFastTwoHopDistinctMergeClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, mergeClause ast.Clause, params Params, priorColumns []string, emitMergedRows bool) ([]Row, []string, bool, error) {
-	return e.tryFastTwoHopDistinctWriteClauses(ctx, tx, rows, matchClause, withClause, mergeClause, params, priorColumns, emitMergedRows, true)
+func stage1IsFastTwoHopDistinctWriteChainEligible(chain twoHopDirectedChainPattern) bool {
+	if strings.TrimSpace(chain.Left.Var) == "" || strings.TrimSpace(chain.Right.Var) == "" || strings.TrimSpace(chain.Mid.Var) == "" {
+		return false
+	}
+	if strings.TrimSpace(chain.Left.PropertiesRaw) != "" || strings.TrimSpace(chain.Mid.PropertiesRaw) != "" || strings.TrimSpace(chain.Right.PropertiesRaw) != "" {
+		return false
+	}
+	if strings.TrimSpace(chain.FirstEdgeProps) != "" || strings.TrimSpace(chain.SecondEdgeProps) != "" {
+		return false
+	}
+	if strings.TrimSpace(chain.FirstEdgeType) == "" || len(chain.FirstEdgeAnyOf) > 0 {
+		return false
+	}
+	return true
 }
 
-func (e *Executor) tryFastTwoHopDistinctWriteClauses(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, withClause ast.Clause, writeClause ast.Clause, params Params, priorColumns []string, emitWriteRows bool, mergeSemantics bool) ([]Row, []string, bool, error) {
-	if len(rows) != 1 || len(rows[0]) != 0 {
-		return nil, nil, false, nil
-	}
-	if tx == nil {
-		return nil, nil, false, nil
-	}
-
+func stage1ResolveFastTwoHopDistinctWriteMatchAndChain(matchClause ast.Clause) (anchoredMatchSpec, twoHopDirectedChainPattern, bool) {
 	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
 	if err != nil || matchSpec.Optional {
-		return nil, nil, false, nil
+		return anchoredMatchSpec{}, twoHopDirectedChainPattern{}, false
 	}
 	chain, err := parseTwoHopDirectedChainPattern(matchSpec.Pattern)
 	if err != nil {
-		return nil, nil, false, nil
+		return anchoredMatchSpec{}, twoHopDirectedChainPattern{}, false
 	}
-	if strings.TrimSpace(chain.Left.Var) == "" || strings.TrimSpace(chain.Right.Var) == "" || strings.TrimSpace(chain.Mid.Var) == "" {
-		return nil, nil, false, nil
+	if !stage1IsFastTwoHopDistinctWriteChainEligible(chain) {
+		return anchoredMatchSpec{}, twoHopDirectedChainPattern{}, false
 	}
-	if strings.TrimSpace(chain.Left.PropertiesRaw) != "" || strings.TrimSpace(chain.Mid.PropertiesRaw) != "" || strings.TrimSpace(chain.Right.PropertiesRaw) != "" {
-		return nil, nil, false, nil
-	}
-	if strings.TrimSpace(chain.FirstEdgeProps) != "" || strings.TrimSpace(chain.SecondEdgeProps) != "" {
-		return nil, nil, false, nil
-	}
-	if strings.TrimSpace(chain.FirstEdgeType) == "" || len(chain.FirstEdgeAnyOf) > 0 {
-		return nil, nil, false, nil
-	}
+	return matchSpec, chain, true
+}
 
+func stage1IsFastTwoHopDistinctWriteWithSpecEligible(withSpec projectionClauseSpec) bool {
+	return withSpec.Distinct && strings.TrimSpace(withSpec.WhereRaw) == "" && len(withSpec.OrderBy) == 0 && strings.TrimSpace(withSpec.SkipRaw) == "" && strings.TrimSpace(withSpec.LimitRaw) == ""
+}
+
+func stage1ResolveFastTwoHopDistinctWriteWithItems(withClause ast.Clause) (projectionClauseSpec, []projectionSpec, bool) {
 	withSpec, err := projectionClauseSpecFromClause(withClause)
-	if err != nil {
-		return nil, nil, false, nil
-	}
-	if !withSpec.Distinct || strings.TrimSpace(withSpec.WhereRaw) != "" || len(withSpec.OrderBy) != 0 || strings.TrimSpace(withSpec.SkipRaw) != "" || strings.TrimSpace(withSpec.LimitRaw) != "" {
-		return nil, nil, false, nil
+	if err != nil || !stage1IsFastTwoHopDistinctWriteWithSpecEligible(withSpec) {
+		return projectionClauseSpec{}, nil, false
 	}
 	items, err := parseProjectionItems(withSpec.ProjectionRaw)
 	if err != nil || len(items) != 2 {
-		return nil, nil, false, nil
+		return projectionClauseSpec{}, nil, false
 	}
+	return withSpec, items, true
+}
 
+func stage1ResolveFastTwoHopDistinctWritePatternRaw(writeClause ast.Clause) string {
 	writeRaw := normalizeClauseBody(stripCypherLineComments(writeClause.MergePattern))
 	if writeRaw == "" {
 		writeRaw = normalizeClauseBody(stripCypherLineComments(stripLeadingClauseKeyword(writeClause.Raw, string(writeClause.Kind))))
 	}
-	mergeLeftVar, mergeEdgeType, mergeRightVar, ok := parseFastDirectedWriteEdgePattern(writeRaw)
-	if !ok {
-		return nil, nil, false, nil
-	}
-	if mergeSemantics && (strings.TrimSpace(writeClause.MergeOnCreate) != "" || strings.TrimSpace(writeClause.MergeOnMatch) != "") {
-		return nil, nil, false, nil
-	}
-	if !projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Left.Var), mergeLeftVar) || !projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Right.Var), mergeRightVar) {
-		return nil, nil, false, nil
-	}
+	return writeRaw
+}
 
-	shortcut := buildTwoHopDirectedAntiJoinShortcutPlan(matchSpec.Where, chain)
-	if !shortcut.enabled {
-		return nil, nil, false, nil
-	}
+func stage1CanUseFastTwoHopDistinctMergeSemantics(writeClause ast.Clause, mergeSemantics bool) bool {
+	return !mergeSemantics || (strings.TrimSpace(writeClause.MergeOnCreate) == "" && strings.TrimSpace(writeClause.MergeOnMatch) == "")
+}
 
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, nil, false, err
-	}
-	performNoDirectEdgeChecks := shortcut.requireNoDirectEdge
-	if performNoDirectEdgeChecks && !mergeSemantics {
-		directType := strings.TrimSpace(shortcut.directEdgeType)
-		if directType != "" && len(shortcut.directEdgeAnyOf) == 0 {
-			snapshot, statsErr := tx.GetStatsSnapshot(ctx, tenant)
-			if statsErr != nil {
-				return nil, nil, false, statsErr
-			}
-			if snapshot != nil {
-				if count := snapshot.EdgeCounts[directType]; count == 0 {
-					performNoDirectEdgeChecks = false
-					e.observeRuntimeCounter(params, "runtime.antijoin.zero_type_shortcut_applied", 1)
-				}
-			}
-		}
-	}
+func stage1HasFastTwoHopDistinctWriteProjectionBindings(items []projectionSpec, chain twoHopDirectedChainPattern, mergeLeftVar string, mergeRightVar string) bool {
+	return projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Left.Var), mergeLeftVar) && projectionContainsExactVarWithKey(items, strings.TrimSpace(chain.Right.Var), mergeRightVar)
+}
 
-	sourceIDs, usedSourceAccessPath, err := e.resolveTwoHopLeftCandidatesByFirstEdgeType(ctx, tx, tenant, rows[0], chain, params)
-	if err != nil {
-		return nil, nil, false, err
+func stage1ResolveAntiJoinZeroTypeShortcutEligibility(performNoDirectEdgeChecks bool, mergeSemantics bool, shortcut twoHopAntiJoinShortcutPlan) (directType string, ok bool) {
+	if !performNoDirectEdgeChecks || mergeSemantics {
+		return "", false
 	}
-	if !usedSourceAccessPath {
-		return nil, nil, false, nil
+	directType = strings.TrimSpace(shortcut.directEdgeType)
+	if directType == "" || len(shortcut.directEdgeAnyOf) != 0 {
+		return "", false
 	}
+	return directType, true
+}
 
-	type cachedFastCandidate struct {
-		edge    *graph.Edge
-		rightID string
-	}
-	secondHopCache := map[string][]cachedFastCandidate{}
-	pairSeen := map[string]struct{}{}
-	pairRows := make([]Row, 0)
-	hydrationPolicy := newDeferredHydrationPolicy(e, ctx, tx, tenant, params)
+func stage1ResolveAntiJoinEndpointPrefetchPolicy(performNoDirectEdgeChecks bool, shortcut twoHopAntiJoinShortcutPlan, chain twoHopDirectedChainPattern) (probeEdgeType string, canUseTypedEndpointProbe bool, canPrebuildAntiJoinNeighbors bool, canReusePrefetchedFirstHop bool, usePrefetchedAntiJoinNeighborSets bool) {
+	probeEdgeType, canUseTypedEndpointProbe = concreteEdgeTypeForEndpointProbe(shortcut.directEdgeType, shortcut.directEdgeAnyOf)
+	canPrebuildAntiJoinNeighbors = performNoDirectEdgeChecks && !canUseTypedEndpointProbe
+	canReusePrefetchedFirstHop = performNoDirectEdgeChecks && strings.TrimSpace(shortcut.directEdgeType) == strings.TrimSpace(chain.FirstEdgeType) && len(chain.FirstEdgeAnyOf) == 0
+	usePrefetchedAntiJoinNeighborSets = performNoDirectEdgeChecks && canReusePrefetchedFirstHop
+	return probeEdgeType, canUseTypedEndpointProbe, canPrebuildAntiJoinNeighbors, canReusePrefetchedFirstHop, usePrefetchedAntiJoinNeighborSets
+}
+
+func stage1CollectLeftCandidateSet(sourceIDs []string) map[string]struct{} {
 	leftCandidateSet := map[string]struct{}{}
-	firstHopMidCandidates := int64(0)
-	firstHopMidUnique := int64(0)
-	firstHopMidDedupSkips := int64(0)
 	for _, sourceID := range sourceIDs {
 		sourceID = strings.TrimSpace(sourceID)
 		if sourceID == "" {
@@ -1256,589 +1252,7 @@ func (e *Executor) tryFastTwoHopDistinctWriteClauses(ctx context.Context, tx gra
 		}
 		leftCandidateSet[sourceID] = struct{}{}
 	}
-	var prebuiltAntiJoinNeighbors map[string]map[string]struct{}
-	prebuiltAntiJoinNeighborsReady := false
-	prebuiltAntiJoinNeighborCountersObserved := false
-	probeEdgeType, canUseTypedEndpointProbe := concreteEdgeTypeForEndpointProbe(shortcut.directEdgeType, shortcut.directEdgeAnyOf)
-	canPrebuildAntiJoinNeighbors := performNoDirectEdgeChecks && !canUseTypedEndpointProbe
-	canReusePrefetchedFirstHop := performNoDirectEdgeChecks && strings.TrimSpace(shortcut.directEdgeType) == strings.TrimSpace(chain.FirstEdgeType) && len(chain.FirstEdgeAnyOf) == 0
-	usePrefetchedAntiJoinNeighborSets := performNoDirectEdgeChecks && canReusePrefetchedFirstHop
-	prefetchedFirstHopLinks := map[string][]queryOutEdgeLink{}
-	prefetchOutLinkItems := int64(0)
-	prefetchOutLinkScans := int64(0)
-	directProbeCache := map[string]bool{}
-	directProbe := func(leftID, rightID string) (bool, error) {
-		if !canUseTypedEndpointProbe {
-			return false, nil
-		}
-		key := undirectedTypedPairCacheKey(leftID, rightID, probeEdgeType)
-		if connected, ok := directProbeCache[key]; ok {
-			e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_cache_hits", 1)
-			return connected, nil
-		}
-		e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_checks", 1)
-		connected, err := hasUndirectedEdgeBetweenProbe(ctx, tx, tenant, leftID, rightID, probeEdgeType)
-		if err != nil {
-			return false, err
-		}
-		directProbeCache[key] = connected
-		return connected, nil
-	}
-	ensurePrebuiltAntiJoinNeighbors := func() error {
-		if !canPrebuildAntiJoinNeighbors && !canReusePrefetchedFirstHop {
-			return nil
-		}
-		if prebuiltAntiJoinNeighborsReady {
-			return nil
-		}
-		prebuiltAntiJoinNeighborsReady = true
-		if canPrebuildAntiJoinNeighbors || usePrefetchedAntiJoinNeighborSets {
-			prebuiltAntiJoinNeighbors = map[string]map[string]struct{}{}
-			for leftID := range leftCandidateSet {
-				prebuiltAntiJoinNeighbors[leftID] = map[string]struct{}{}
-			}
-		}
-
-		prefetchOutLinkScans = 1
-		if err := tx.ScanOutEdgeLinksByType(ctx, tenant, shortcut.directEdgeType, 0, func(srcID, edgeID, dstID string) error {
-			srcID = strings.TrimSpace(srcID)
-			dstID = strings.TrimSpace(dstID)
-			edgeID = strings.TrimSpace(edgeID)
-			if srcID == "" || dstID == "" || edgeID == "" {
-				return nil
-			}
-			srcTracked := false
-			if prebuiltAntiJoinNeighbors != nil {
-				if _, ok := prebuiltAntiJoinNeighbors[srcID]; ok {
-					srcTracked = true
-				}
-			} else {
-				if _, ok := leftCandidateSet[srcID]; ok {
-					srcTracked = true
-				}
-			}
-			dstTracked := false
-			if prebuiltAntiJoinNeighbors != nil {
-				if _, ok := prebuiltAntiJoinNeighbors[dstID]; ok {
-					dstTracked = true
-				}
-			}
-			if !srcTracked && !dstTracked {
-				return nil
-			}
-			prefetchOutLinkItems++
-			if canReusePrefetchedFirstHop && srcTracked {
-				prefetchedFirstHopLinks[srcID] = append(prefetchedFirstHopLinks[srcID], queryOutEdgeLink{edgeID: edgeID, dstID: dstID})
-			}
-			if srcTracked && prebuiltAntiJoinNeighbors != nil {
-				prebuiltAntiJoinNeighbors[srcID][dstID] = struct{}{}
-			}
-			if dstTracked && prebuiltAntiJoinNeighbors != nil {
-				prebuiltAntiJoinNeighbors[dstID][srcID] = struct{}{}
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		e.observeRuntimeCounter(params, "runtime.adjacency.out_links.prefetch_scans", prefetchOutLinkScans)
-		e.observeRuntimeCounter(params, "runtime.adjacency.out_links.prefetch_items_yielded", prefetchOutLinkItems)
-		e.observeRuntimeCounter(params, "runtime.antijoin.prefetch_applied", 1)
-		e.observeRuntimeCounter(params, "runtime.antijoin.prefetch_left_candidates", int64(len(leftCandidateSet)))
-		if prebuiltAntiJoinNeighbors != nil && !prebuiltAntiJoinNeighborCountersObserved {
-			prebuiltAntiJoinNeighborCountersObserved = true
-			neighborSetSizeTotal := int64(0)
-			for _, neighbors := range prebuiltAntiJoinNeighbors {
-				neighborSetSizeTotal += int64(len(neighbors))
-			}
-			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", int64(len(prebuiltAntiJoinNeighbors)))
-			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", neighborSetSizeTotal)
-		}
-		return nil
-	}
-	if canReusePrefetchedFirstHop {
-		if err := ensurePrebuiltAntiJoinNeighbors(); err != nil {
-			return nil, nil, false, err
-		}
-	}
-	ensureLeftPatternMatches := func(leftID string) (bool, error) {
-		matched, err := hydrationPolicy.resolveAndMatchIDLabelProbe(leftID, chain.Left, Row{}, "runtime.left.lazy_hydrated")
-		return matched, err
-	}
-	ensureMidPatternMatches := func(midID string) (bool, error) {
-		matched, err := hydrationPolicy.resolveAndMatchIDLabelProbe(midID, chain.Mid, Row{}, "runtime.mid.lazy_hydrated")
-		return matched, err
-	}
-	secondHopSourceSet := map[string]struct{}{}
-	secondHopSourcePrefilterReady := false
-	canPrefilterSecondHopSources := chain.SecondForward && strings.TrimSpace(chain.SecondEdgeType) != "" && len(chain.SecondEdgeAnyOf) == 0
-	ensureSecondHopSourcePrefilter := func() error {
-		if !canPrefilterSecondHopSources {
-			return nil
-		}
-		if secondHopSourcePrefilterReady {
-			return nil
-		}
-		secondHopSourcePrefilterReady = true
-
-		secondSources := sourceIDs
-		if strings.TrimSpace(chain.SecondEdgeType) != strings.TrimSpace(chain.FirstEdgeType) {
-			var err error
-			secondSources, err = scanOutEdgeSourceIDsQueryCached(ctx, tx, tenant, chain.SecondEdgeType, params)
-			if err != nil {
-				return err
-			}
-		}
-		for _, sourceID := range secondSources {
-			sourceID = strings.TrimSpace(sourceID)
-			if sourceID == "" {
-				continue
-			}
-			secondHopSourceSet[sourceID] = struct{}{}
-		}
-		e.observeRuntimeCounter(params, "runtime.adjacency.out_sources.second_prefilter_applied", 1)
-		e.observeRuntimeCounter(params, "runtime.adjacency.out_sources.second_prefilter_candidates", int64(len(secondHopSourceSet)))
-		return nil
-	}
-
-	for _, leftID := range sourceIDs {
-		leftID = strings.TrimSpace(leftID)
-		if leftID == "" {
-			continue
-		}
-		const antiJoinProbeToNeighborSetThreshold = 64
-		firstHopMidSeen := map[string]struct{}{}
-		var prefetchedAntiJoinNeighbors map[string]struct{}
-		if usePrefetchedAntiJoinNeighborSets {
-			if err := ensurePrebuiltAntiJoinNeighbors(); err != nil {
-				return nil, nil, false, err
-			}
-			if prebuiltAntiJoinNeighbors != nil {
-				prefetchedAntiJoinNeighbors = prebuiltAntiJoinNeighbors[leftID]
-			}
-		}
-
-		antiJoinNeighbors := map[string]struct{}{}
-		antiJoinNeighborsReady := false
-		preferTypedProbeNeighborSet := false
-		typedProbeChecksForLeft := 0
-		ensureAntiJoinNeighbors := func() error {
-			if antiJoinNeighborsReady {
-				return nil
-			}
-			if !shortcut.requireNoDirectEdge {
-				antiJoinNeighborsReady = true
-				return nil
-			}
-			if canUseTypedEndpointProbe && !preferTypedProbeNeighborSet {
-				return nil
-			}
-			if canPrebuildAntiJoinNeighbors {
-				if err := ensurePrebuiltAntiJoinNeighbors(); err != nil {
-					return err
-				}
-				if prebuiltAntiJoinNeighbors != nil {
-					if prefetched, ok := prebuiltAntiJoinNeighbors[leftID]; ok {
-						antiJoinNeighbors = prefetched
-					} else {
-						antiJoinNeighbors = map[string]struct{}{}
-					}
-				}
-				e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", 1)
-				e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", int64(len(antiJoinNeighbors)))
-				antiJoinNeighborsReady = true
-				return nil
-			}
-			scanType := shortcut.directEdgeType
-			if len(shortcut.directEdgeAnyOf) > 0 {
-				scanType = ""
-			}
-			if err := scanOutEdgesQueryCached(ctx, tx, tenant, leftID, scanType, params, func(edge *graph.Edge) error {
-				if edge == nil || !edgeTypeMatches(edge, shortcut.directEdgeType, shortcut.directEdgeAnyOf) {
-					return nil
-				}
-				antiJoinNeighbors[edge.DstID] = struct{}{}
-				return nil
-			}); err != nil {
-				return err
-			}
-			if err := scanInEdgesQueryCached(ctx, tx, tenant, leftID, scanType, params, func(edge *graph.Edge) error {
-				if edge == nil || !edgeTypeMatches(edge, shortcut.directEdgeType, shortcut.directEdgeAnyOf) {
-					return nil
-				}
-				antiJoinNeighbors[edge.SrcID] = struct{}{}
-				return nil
-			}); err != nil {
-				return err
-			}
-			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", 1)
-			e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", int64(len(antiJoinNeighbors)))
-			antiJoinNeighborsReady = true
-			return nil
-		}
-
-		consumeFirstHop := func(edge1 *graph.Edge) error {
-			if !edgeTypeMatches(edge1, chain.FirstEdgeType, chain.FirstEdgeAnyOf) {
-				return nil
-			}
-			firstHopMidCandidates++
-			midID := strings.TrimSpace(edge1.DstID)
-			if midID == "" {
-				return nil
-			}
-			if _, seen := firstHopMidSeen[midID]; seen {
-				firstHopMidDedupSkips++
-				return nil
-			}
-			firstHopMidUnique++
-			firstHopMidSeen[midID] = struct{}{}
-			if canPrefilterSecondHopSources {
-				if err := ensureSecondHopSourcePrefilter(); err != nil {
-					return err
-				}
-				if _, ok := secondHopSourceSet[midID]; !ok {
-					e.observeRuntimeCounter(params, "runtime.adjacency.out_sources.second_prefilter_skips", 1)
-					return nil
-				}
-			}
-
-			secondScanType := chain.SecondEdgeType
-			if len(chain.SecondEdgeAnyOf) > 0 {
-				secondScanType = ""
-			}
-			cacheKey := tenant + "|" + midID + "|"
-			if chain.SecondForward {
-				cacheKey += "out|"
-			} else {
-				cacheKey += "in|"
-			}
-			cacheKey += secondScanType
-
-			candidates, cacheHit := secondHopCache[cacheKey]
-			if !cacheHit {
-				candidates = make([]cachedFastCandidate, 0)
-				collect := func(edge2 *graph.Edge, rightID string) error {
-					rightID = strings.TrimSpace(rightID)
-					if rightID == "" {
-						return nil
-					}
-					candidates = append(candidates, cachedFastCandidate{edge: edge2, rightID: rightID})
-					return nil
-				}
-				if chain.SecondForward {
-					if err := scanOutEdgesQueryCached(ctx, tx, tenant, midID, secondScanType, params, func(edge2 *graph.Edge) error {
-						return collect(edge2, edge2.DstID)
-					}); err != nil {
-						return err
-					}
-				} else {
-					if err := scanInEdgesQueryCached(ctx, tx, tenant, midID, secondScanType, params, func(edge2 *graph.Edge) error {
-						return collect(edge2, edge2.SrcID)
-					}); err != nil {
-						return err
-					}
-				}
-				secondHopCache[cacheKey] = candidates
-			}
-			if len(candidates) == 0 {
-				return nil
-			}
-			midMatches, err := ensureMidPatternMatches(midID)
-			if err != nil {
-				return err
-			}
-			if !midMatches {
-				return nil
-			}
-
-			for _, candidate := range candidates {
-				edge2 := candidate.edge
-				rightID := candidate.rightID
-				if edge2 == nil || strings.TrimSpace(edge2.ID) == strings.TrimSpace(edge1.ID) {
-					continue
-				}
-				if !edgeTypeMatches(edge2, chain.SecondEdgeType, chain.SecondEdgeAnyOf) {
-					continue
-				}
-				if shortcut.requireRightNotLeft && leftID == rightID {
-					e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
-					continue
-				}
-				if performNoDirectEdgeChecks {
-					if usePrefetchedAntiJoinNeighborSets {
-						if _, connected := prefetchedAntiJoinNeighbors[rightID]; connected {
-							e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
-							continue
-						}
-					} else if canUseTypedEndpointProbe && !preferTypedProbeNeighborSet {
-						connected, err := directProbe(leftID, rightID)
-						if err != nil {
-							return err
-						}
-						typedProbeChecksForLeft++
-						if !preferTypedProbeNeighborSet && typedProbeChecksForLeft >= antiJoinProbeToNeighborSetThreshold {
-							preferTypedProbeNeighborSet = true
-							e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_neighbor_switches", 1)
-						}
-						if connected {
-							e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
-							continue
-						}
-						e.observeRuntimeCounter(params, "runtime.antijoin.endpoint_probe_applied", 1)
-					} else {
-						if err := ensureAntiJoinNeighbors(); err != nil {
-							return err
-						}
-						if _, connected := antiJoinNeighbors[rightID]; connected {
-							e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
-							continue
-						}
-					}
-				}
-				leftMatches, err := ensureLeftPatternMatches(leftID)
-				if err != nil {
-					return err
-				}
-				if !leftMatches {
-					continue
-				}
-				e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_applied", 1)
-
-				rightMatches, err := hydrationPolicy.resolveAndMatchIDLabelProbe(rightID, chain.Right, Row{}, "runtime.right.lazy_hydrated")
-				if err != nil {
-					return err
-				}
-				if !rightMatches {
-					continue
-				}
-
-				pairKey := leftID + "|" + rightID
-				if _, exists := pairSeen[pairKey]; exists {
-					continue
-				}
-				pairSeen[pairKey] = struct{}{}
-				e.observeRuntimeCounter(params, "runtime.id_first.pairs_emitted", 1)
-				pairRows = append(pairRows, Row{mergeLeftVar: leftID, mergeRightVar: rightID})
-			}
-			return nil
-		}
-		if canReusePrefetchedFirstHop {
-			for _, link := range prefetchedFirstHopLinks[leftID] {
-				edge1 := &graph.Edge{ID: link.edgeID, Type: chain.FirstEdgeType, SrcID: leftID, DstID: link.dstID}
-				if err := consumeFirstHop(edge1); err != nil {
-					return nil, nil, false, err
-				}
-			}
-		} else {
-			if err := scanOutEdgesQueryCached(ctx, tx, tenant, leftID, chain.FirstEdgeType, params, func(edge1 *graph.Edge) error {
-				return consumeFirstHop(edge1)
-			}); err != nil {
-				return nil, nil, false, err
-			}
-		}
-	}
-	e.observeRuntimeCounter(params, "runtime.id_first.first_hop_mid_dedup_applied", 1)
-	e.observeRuntimeCounter(params, "runtime.id_first.first_hop_mid_candidates", firstHopMidCandidates)
-	e.observeRuntimeCounter(params, "runtime.id_first.first_hop_mid_unique", firstHopMidUnique)
-	e.observeRuntimeCounter(params, "runtime.id_first.first_hop_mid_dedup_skips", firstHopMidDedupSkips)
-
-	e.observeRuntimeCounter(params, "runtime.id_first.fastpath_applied", 1)
-	e.observeRuntimeCounter(params, "runtime.id_first.pairs_distinct", int64(len(pairRows)))
-
-	createRows := make([]Row, 0, len(pairRows))
-	if mergeSemantics {
-		existingPairs := map[string]struct{}{}
-		remainingRows := make([]Row, 0, len(pairRows))
-		sourceTargets := map[string]map[string]struct{}{}
-		for _, row := range pairRows {
-			leftID, _ := row[mergeLeftVar].(string)
-			rightID, _ := row[mergeRightVar].(string)
-			leftID = strings.TrimSpace(leftID)
-			rightID = strings.TrimSpace(rightID)
-			if leftID == "" || rightID == "" {
-				continue
-			}
-			remainingRows = append(remainingRows, row)
-			targets := sourceTargets[leftID]
-			if targets == nil {
-				targets = map[string]struct{}{}
-				sourceTargets[leftID] = targets
-			}
-			targets[rightID] = struct{}{}
-		}
-		bulkScanApplied := int64(0)
-		bulkScanItems := int64(0)
-		bulkScanShortCircuitHit := int64(0)
-		bulkScanCapped := int64(0)
-		if len(remainingRows) >= 512 {
-			bulkScanApplied = 1
-			candidateCount := len(remainingRows)
-			maxBulkScanItems := candidateCount * 3
-			if maxBulkScanItems < 4096 {
-				maxBulkScanItems = 4096
-			}
-			stopBulkScan := errors.New("merge bulk scan stop")
-			err := tx.ScanOutEdgeLinksByType(ctx, tenant, mergeEdgeType, 0, func(srcID, edgeID, dstID string) error {
-				srcID = strings.TrimSpace(srcID)
-				dstID = strings.TrimSpace(dstID)
-				if srcID == "" || dstID == "" {
-					return nil
-				}
-				bulkScanItems++
-				if bulkScanItems > int64(maxBulkScanItems) {
-					bulkScanCapped = 1
-					return stopBulkScan
-				}
-				targets, ok := sourceTargets[srcID]
-				if !ok {
-					return nil
-				}
-				if _, ok := targets[dstID]; !ok {
-					return nil
-				}
-				key := directedTypedPairCacheKey(srcID, dstID, mergeEdgeType)
-				if _, seen := existingPairs[key]; seen {
-					return nil
-				}
-				existingPairs[key] = struct{}{}
-				if len(existingPairs) == candidateCount {
-					bulkScanShortCircuitHit = 1
-					return stopBulkScan
-				}
-				return nil
-			})
-			if err != nil && err != stopBulkScan {
-				return nil, nil, false, err
-			}
-		}
-
-		mergeEndpointProbeChecks := int64(0)
-		mergeEndpointProbeHits := int64(0)
-		for _, row := range remainingRows {
-			leftID, _ := row[mergeLeftVar].(string)
-			rightID, _ := row[mergeRightVar].(string)
-			leftID = strings.TrimSpace(leftID)
-			rightID = strings.TrimSpace(rightID)
-			if leftID == "" || rightID == "" {
-				continue
-			}
-			key := directedTypedPairCacheKey(leftID, rightID, mergeEdgeType)
-			if _, ok := existingPairs[key]; ok {
-				continue
-			}
-			mergeEndpointProbeChecks++
-			exists, err := hasDirectedEdgeBetweenProbe(ctx, tx, tenant, leftID, rightID, mergeEdgeType)
-			if err != nil {
-				return nil, nil, false, err
-			}
-			if !exists {
-				continue
-			}
-			mergeEndpointProbeHits++
-			existingPairs[key] = struct{}{}
-		}
-		e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_applied", bulkScanApplied)
-		e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_items_yielded", bulkScanItems)
-		e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_short_circuit_hit", bulkScanShortCircuitHit)
-		e.observeRuntimeCounter(params, "runtime.merge.bulk_scan_capped", bulkScanCapped)
-		e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_applied", 1)
-		e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_checks", mergeEndpointProbeChecks)
-		e.observeRuntimeCounter(params, "runtime.merge.endpoint_probe_hits", mergeEndpointProbeHits)
-		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_applied", 1)
-		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_candidates", int64(len(pairRows)))
-		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_source_scans", 0)
-		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_items_yielded", 0)
-		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_existing_hits", int64(len(existingPairs)))
-
-		for _, row := range pairRows {
-			leftID, _ := row[mergeLeftVar].(string)
-			rightID, _ := row[mergeRightVar].(string)
-			leftID = strings.TrimSpace(leftID)
-			rightID = strings.TrimSpace(rightID)
-			if leftID == "" || rightID == "" {
-				continue
-			}
-			key := directedTypedPairCacheKey(leftID, rightID, mergeEdgeType)
-			if _, exists := existingPairs[key]; exists {
-				continue
-			}
-			createRows = append(createRows, row)
-		}
-		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_pairs_to_create", int64(len(createRows)))
-	} else {
-		createRows = append(createRows, pairRows...)
-		e.observeRuntimeCounter(params, "runtime.create.fastpath_pairs_to_create", int64(len(createRows)))
-	}
-
-	for _, row := range createRows {
-		leftID, _ := row[mergeLeftVar].(string)
-		rightID, _ := row[mergeRightVar].(string)
-		leftID = strings.TrimSpace(leftID)
-		rightID = strings.TrimSpace(rightID)
-		if leftID == "" || rightID == "" {
-			continue
-		}
-		edge := &graph.Edge{
-			Tenant: tenant,
-			ID:     nextAutoEdgeID(tenant, leftID, mergeEdgeType, rightID),
-			Type:   mergeEdgeType,
-			SrcID:  leftID,
-			DstID:  rightID,
-		}
-		if err := e.putEdgeWithIndexes(ctx, tx, edge); err != nil {
-			return nil, nil, false, err
-		}
-	}
-
-	if !emitWriteRows {
-		if mergeSemantics {
-			e.observeRuntimeCounter(params, "runtime.merge.post_hydration_skipped", 1)
-		} else {
-			e.observeRuntimeCounter(params, "runtime.create.post_hydration_skipped", 1)
-		}
-		return nil, nil, true, nil
-	}
-
-	mergedRows := make([]Row, 0, len(pairRows))
-	for _, row := range pairRows {
-		leftID, _ := row[mergeLeftVar].(string)
-		rightID, _ := row[mergeRightVar].(string)
-		leftID = strings.TrimSpace(leftID)
-		rightID = strings.TrimSpace(rightID)
-		if leftID == "" || rightID == "" {
-			continue
-		}
-		leftVertex, err := getVertexQueryCached(ctx, tx, tenant, leftID, params)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		rightVertex, err := getVertexQueryCached(ctx, tx, tenant, rightID, params)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		mergedRows = append(mergedRows, Row{mergeLeftVar: leftVertex, mergeRightVar: rightVertex})
-	}
-	columns := []string{mergeLeftVar, mergeRightVar}
-	if len(columns) == 0 && len(priorColumns) > 0 {
-		columns = append([]string(nil), priorColumns...)
-	}
-	return mergedRows, columns, true, nil
-}
-
-func parseFastDirectedWriteEdgePattern(raw string) (leftVar string, edgeType string, rightVar string, ok bool) {
-	m := createEdgePatternRE.FindStringSubmatch(strings.TrimSpace(raw))
-	if len(m) != 10 {
-		return "", "", "", false
-	}
-	leftVar = strings.TrimSpace(m[1])
-	rightVar = strings.TrimSpace(m[7])
-	edgeType = strings.TrimSpace(m[5])
-	if leftVar == "" || rightVar == "" || edgeType == "" {
-		return "", "", "", false
-	}
-	if strings.TrimSpace(m[2]) != "" || strings.TrimSpace(m[3]) != "" || strings.TrimSpace(m[4]) != "" || strings.TrimSpace(m[6]) != "" || strings.TrimSpace(m[8]) != "" || strings.TrimSpace(m[9]) != "" {
-		return "", "", "", false
-	}
-	return leftVar, edgeType, rightVar, true
+	return leftCandidateSet
 }
 
 func projectionContainsExactVarWithKey(items []projectionSpec, sourceVar string, requiredKey string) bool {
@@ -2075,10 +1489,6 @@ func undirectedTypedPairCacheKey(leftID, rightID, edgeType string) string {
 		return leftID + "\x00" + rightID + "\x00" + edgeType
 	}
 	return rightID + "\x00" + leftID + "\x00" + edgeType
-}
-
-func directedTypedPairCacheKey(srcID, dstID, edgeType string) string {
-	return strings.TrimSpace(srcID) + "\x00" + strings.TrimSpace(dstID) + "\x00" + strings.TrimSpace(edgeType)
 }
 
 func isEdgeVarReferenced(expr, edgeVar string) bool {
@@ -2322,276 +1732,68 @@ func expressionReferencesVariable(expr, varName string) bool {
 	return false
 }
 
-func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.Context, tx graph.Tx, rows []Row, matchClause ast.Clause, returnClause ast.Clause, params Params, priorColumns []string) ([]Row, []string, bool, error) {
-	if tx == nil || len(rows) == 0 {
-		return nil, nil, false, nil
+func stage2ResolveEarlyStopSettings(useTopK bool, topKSpec fastPeerCandidateTopKSpec) (enabled bool, keep int) {
+	enabled = useTopK && topKSpec.descending && topKSpec.limit > 0
+	keep = topKSpec.skip + topKSpec.limit
+	if keep <= 0 {
+		keep = topKSpec.limit
 	}
-
-	matchSpec, err := anchoredMatchSpecFromClause(matchClause)
-	if err != nil || matchSpec.Optional {
-		return nil, nil, false, nil
+	if keep <= 0 {
+		enabled = false
 	}
+	return enabled, keep
+}
 
-	pattern, err := parseDirectedRelationshipPattern(matchSpec.Pattern)
+func stage2ResolveWorkItemPrefilters(ctx context.Context, tx graph.Tx, tenant string, whereRaw string, pattern directedRelationshipPattern, row Row, params Params) (numericConstraints map[string]edgeNumericRangeConstraint, hasNumericConstraints bool, excludedRightIDs map[string]struct{}, hasExcludedRightIDs bool, skipWhereEval bool, err error) {
+	numericConstraints, hasNumericConstraints = extractEdgeWhereNumericConstraints(whereRaw, pattern.EdgeVar, row, params)
+	excludedRightIDs, hasExcludedRightIDs, err = extractDirectedWhereRightExclusionSet(ctx, tx, tenant, whereRaw, pattern.Right.Var, row, params)
 	if err != nil {
-		return nil, nil, false, nil
+		return nil, false, nil, false, false, err
 	}
-	if strings.TrimSpace(pattern.Left.Var) == "" || strings.TrimSpace(pattern.Right.Var) == "" || strings.TrimSpace(pattern.EdgeVar) == "" {
-		return nil, nil, false, nil
-	}
+	skipWhereEval = directedWhereCoveredByExtractedPrefilters(whereRaw, pattern.EdgeVar, pattern.Right.Var, row, params, hasNumericConstraints, hasExcludedRightIDs)
+	return numericConstraints, hasNumericConstraints, excludedRightIDs, hasExcludedRightIDs, skipWhereEval, nil
+}
 
-	retSpec, err := projectionClauseSpecFromClause(returnClause)
+func stage2ResolveWorkItemSimilarity(sumSimilarityExpr string, row Row, params Params) (similarityNumeric float64, similarityNumericOK bool, resolved bool) {
+	similarityValue, err := evalExpressionWithScope(sumSimilarityExpr, row, params)
 	if err != nil {
-		return nil, nil, false, nil
+		return 0, false, false
 	}
-	if retSpec.Distinct || strings.TrimSpace(retSpec.WhereRaw) != "" {
-		return nil, nil, false, nil
-	}
+	similarityNumeric, similarityNumericOK = comparableNumericValue(similarityValue)
+	return similarityNumeric, similarityNumericOK, true
+}
 
-	items, err := parseProjectionItems(retSpec.ProjectionRaw)
-	if err != nil {
-		return nil, nil, false, nil
-	}
-	projection, ok := parseFastPeerCandidateReturnProjection(items, pattern)
-	if !ok {
-		return nil, nil, false, nil
-	}
-
-	topKSpec, useTopK, err := fastPeerCandidateTopKSpecFromProjection(retSpec, projection, params)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	earlyStopEnabled := useTopK && topKSpec.descending && topKSpec.limit > 0
-	earlyStopKeep := topKSpec.skip + topKSpec.limit
-	if earlyStopKeep <= 0 {
-		earlyStopKeep = topKSpec.limit
-	}
-	if earlyStopKeep <= 0 {
-		earlyStopEnabled = false
-	}
-
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, nil, false, err
-	}
-
-	params = withProjectionEvalRuntime(ctx, tx, params, e)
-	aggs := map[string]*fastPeerCandidateAggregate{}
-	groupOrder := make([]string, 0)
-	stage2IndexedEdgeCache := map[string]map[string][]*graph.Edge{}
-	stage2IndexPushdownDecisionCache := map[string]bool{}
-	stage2IndexPushdownUsed := false
-	stage2PredicateShapeSkipNoted := false
-	stage2SourceScopedPerPeerProbeNoted := false
-	stage2WideNonRangeProbeSkipNoted := false
-	stage2PredicateShapeEligible, stage2PredicateShapeDecisive := stage2IndexPushdownPredicateShapeDecision(pattern, matchSpec.Where, params)
-	stage2OneSidedNumericRangeEligible := stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, matchSpec.Where, nil, params)
-	stage2IndexProbeLimit := stage2IndexPushdownProbeCandidateLimit
-	if stage2OneSidedNumericRangeEligible && stage2IndexProbeLimit < stage2IndexPushdownProbeCandidateLimitOneSidedRange {
-		stage2IndexProbeLimit = stage2IndexPushdownProbeCandidateLimitOneSidedRange
-	}
-	maxPushdownCandidates := stage2IndexPushdownMaxIndexedCandidates + 1
-	if stage2OneSidedNumericRangeEligible {
-		if relaxedMax := stage2IndexPushdownMaxIndexedCandidatesOneSidedRange + 1; relaxedMax > maxPushdownCandidates {
-			maxPushdownCandidates = relaxedMax
-		}
-	}
-	if stage2IndexProbeLimit > maxPushdownCandidates {
-		stage2IndexProbeLimit = maxPushdownCandidates
-	}
-	type stage2PeerInput struct {
-		row  Row
-		peer *graph.Vertex
-	}
-	type stage2PeerWorkItem struct {
-		row                   Row
-		peer                  *graph.Vertex
-		numericConstraints    map[string]edgeNumericRangeConstraint
-		hasNumericConstraints bool
-		excludedRightIDs      map[string]struct{}
-		hasExcludedRightIDs   bool
-		skipWhereEval         bool
-		similarityNumeric     float64
-		similarityNumericOK   bool
-		edges                 []*graph.Edge
-		indexedEdges          bool
-		remainingPotential    float64
-	}
-	stage2Inputs := make([]stage2PeerInput, 0, len(rows))
-	stage2SourcePeerIDs := map[string]struct{}{}
-	for _, row := range rows {
-		peer, bound, err := resolveBoundPredicateVertex(ctx, tx, tenant, row, pattern.Left, params)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		if !bound {
-			return nil, nil, false, nil
-		}
-		if peer == nil {
-			continue
-		}
-		stage2Inputs = append(stage2Inputs, stage2PeerInput{row: row, peer: peer})
-		if peerID := strings.TrimSpace(peer.ID); peerID != "" {
-			stage2SourcePeerIDs[peerID] = struct{}{}
-		}
-	}
-	var stage2ProbeSourceFilter map[string]struct{}
-	if len(stage2SourcePeerIDs) > 0 && len(stage2SourcePeerIDs) <= stage2IndexPushdownSourceScopedProbeMaxSources {
-		stage2ProbeSourceFilter = stage2SourcePeerIDs
-	}
-	if len(stage2SourcePeerIDs) > 0 {
-		adaptiveProbeLimit := len(stage2SourcePeerIDs) * stage2IndexPushdownAdaptiveProbeEdgesPerSource
-		if adaptiveProbeLimit < stage2IndexPushdownSourceScopedProbeMaxSources {
-			adaptiveProbeLimit = stage2IndexPushdownSourceScopedProbeMaxSources
-		}
-		if adaptiveProbeLimit > 0 && adaptiveProbeLimit < stage2IndexProbeLimit {
-			stage2IndexProbeLimit = adaptiveProbeLimit
-			e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_limit_adaptive_tightened", 1)
-		}
-	}
-	e.observeRuntimeCounter(params, "fast_path.stage2.peer_rows_input", int64(len(rows)))
-
-	collectPeerEdges := func(row Row, peer *graph.Vertex) ([]*graph.Edge, bool, error) {
-		if peer == nil || strings.TrimSpace(peer.ID) == "" {
-			return nil, false, nil
-		}
-		peerID := strings.TrimSpace(peer.ID)
-		collectStarted := time.Now()
-		defer e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_collect_peer_edges_micros", collectStarted)
-
-		predicateShapeEligible := stage2PredicateShapeEligible
-		if !stage2PredicateShapeDecisive {
-			predicateShapeEligible = stage2IndexPushdownEligibleByPredicateShape(pattern, matchSpec.Where, row, params)
-		}
-		if !predicateShapeEligible {
-			if !stage2PredicateShapeSkipNoted {
-				e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_predicate_shape", 1)
-				stage2PredicateShapeSkipNoted = true
-			}
-		} else {
-			if stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, matchSpec.Where, row, params) {
-				e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_eligible_one_sided_range", 1)
-			}
-			rowHasNumericRangeShape := false
-			if constraints, ok := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params); ok {
-				for _, constraint := range constraints {
-					if constraint.isContradictory() {
-						rowHasNumericRangeShape = true
-						break
-					}
-					if constraint.lowerSet || constraint.upperSet {
-						rowHasNumericRangeShape = true
-						break
-					}
-				}
-			}
-			if len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources && !rowHasNumericRangeShape {
-				if !stage2WideNonRangeProbeSkipNoted {
-					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_wide_non_range", 1)
-					stage2WideNonRangeProbeSkipNoted = true
-				}
-				return nil, false, nil
-			}
-			cacheKey, cacheable := stage2IndexLookupCacheKey(pattern, matchSpec.Where, row, params)
-			if cacheable {
-				lookupCacheKey := cacheKey
-				probeSourceFilter := stage2ProbeSourceFilter
-				if probeSourceFilter == nil && len(stage2SourcePeerIDs) > stage2IndexPushdownSourceScopedProbeMaxSources {
-					if !stage2SourceScopedPerPeerProbeNoted {
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_source_scoped_per_peer", 1)
-						stage2SourceScopedPerPeerProbeNoted = true
-					}
-					lookupCacheKey = cacheKey + "|src=" + peerID
-					probeSourceFilter = map[string]struct{}{peerID: {}}
-				}
-				lookupByIndex := false
-				if cachedLookup, ok := stage2IndexPushdownDecisionCache[lookupCacheKey]; ok {
-					lookupByIndex = cachedLookup
-					e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_hits", 1)
-				} else {
-					e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_misses", 1)
-					edges, indexed, probeCapExceeded, err := e.resolveEdgesByIndexedProperty(ctx, tx, tenant, pattern.EdgeType, pattern.EdgeAnyOf, pattern.EdgeProps, pattern.EdgeVar, matchSpec.Where, "", row, params, probeSourceFilter, stage2IndexProbeLimit)
-					if err != nil {
-						return nil, false, err
-					}
-					applyPushdown := false
-					if probeCapExceeded {
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_cap_exceeded", 1)
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_probe_cap", 1)
-					}
-					if indexed {
-						edgesBySource := map[string][]*graph.Edge{}
-						for _, candidateEdge := range edges {
-							if candidateEdge == nil || strings.TrimSpace(candidateEdge.SrcID) == "" {
-								continue
-							}
-							edgesBySource[candidateEdge.SrcID] = append(edgesBySource[candidateEdge.SrcID], candidateEdge)
-						}
-						totalCandidates := 0
-						for _, sourceEdges := range edgesBySource {
-							totalCandidates += len(sourceEdges)
-						}
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_candidates_total", int64(totalCandidates))
-						applyPushdown = shouldApplyStage2IndexPushdown(edgesBySource)
-						if applyPushdown {
-							stage2IndexedEdgeCache[lookupCacheKey] = edgesBySource
-						} else {
-							e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_unselective", 1)
-						}
-					}
-					stage2IndexPushdownDecisionCache[lookupCacheKey] = applyPushdown
-					lookupByIndex = applyPushdown
-				}
-				if lookupByIndex {
-					if !stage2IndexPushdownUsed {
-						e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_applied", 1)
-						stage2IndexPushdownUsed = true
-					}
-					e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_rows", 1)
-					indexedEdges := stage2IndexedEdgeCache[lookupCacheKey][peerID]
-					return append([]*graph.Edge(nil), indexedEdges...), true, nil
-				}
-			}
-		}
-
-		return nil, false, nil
-	}
-
-	workItems := make([]stage2PeerWorkItem, 0, len(stage2Inputs))
-	totalRemainingPotential := 0.0
-	earlyStopFrontier := map[string]struct{}{}
-	for _, input := range stage2Inputs {
+func (e *Executor) stage2BuildPeerWorkItems(ctx context.Context, tx graph.Tx, tenant string, inputs []stage2PeerInput, matchSpec anchoredMatchSpec, pattern directedRelationshipPattern, projection fastPeerCandidateReturnProjection, collectPeerEdges stage2CollectPeerEdgesFunc, collectState *stage2CollectOrchestrationState, params Params) ([]stage2PeerWorkItem, bool, error) {
+	workItems := make([]stage2PeerWorkItem, 0, len(inputs))
+	for _, input := range inputs {
 		row := input.row
 		peer := input.peer
 
-		numericConstraints, hasNumericConstraints := extractEdgeWhereNumericConstraints(matchSpec.Where, pattern.EdgeVar, row, params)
-		excludedRightIDs, hasExcludedRightIDs, err := extractDirectedWhereRightExclusionSet(ctx, tx, tenant, matchSpec.Where, pattern.Right.Var, row, params)
+		numericConstraints, hasNumericConstraints, excludedRightIDs, hasExcludedRightIDs, skipWhereEval, err := stage2ResolveWorkItemPrefilters(ctx, tx, tenant, matchSpec.Where, pattern, row, params)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, false, err
 		}
-		skipWhereEval := directedWhereCoveredByExtractedPrefilters(matchSpec.Where, pattern.EdgeVar, pattern.Right.Var, row, params, hasNumericConstraints, hasExcludedRightIDs)
-		if skipWhereEval {
-			e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_bypass_rows", 1)
+		if strings.TrimSpace(matchSpec.Where) == "" {
+			skipWhereEval = true
 		}
 
-		similarityValue, err := evalExpressionWithScope(projection.sumSimilarityExpr, row, params)
-		if err != nil {
-			return nil, nil, false, nil
+		similarityNumeric := 0.0
+		similarityNumericOK := false
+		if skipWhereEval {
+			resolvedSimilarityNumeric, resolvedSimilarityNumericOK, resolved := stage2ResolveWorkItemSimilarity(projection.sumSimilarityExpr, row, params)
+			if !resolved {
+				return nil, false, nil
+			}
+			similarityNumeric = resolvedSimilarityNumeric
+			similarityNumericOK = resolvedSimilarityNumericOK
 		}
-		similarityNumeric, similarityNumericOK := comparableNumericValue(similarityValue)
 
 		edges, indexedEdges, err := collectPeerEdges(row, peer)
 		if err != nil {
-			return nil, nil, false, err
-		}
-		if !indexedEdges {
-			earlyStopEnabled = false
+			return nil, false, err
 		}
 
-		remainingPotential := 0.0
-		if similarityNumericOK && similarityNumeric > 0 && len(edges) > 0 {
-			remainingPotential = similarityNumeric * float64(len(edges))
-		}
+		remainingPotential := collectState.remainingPotential(similarityNumeric, similarityNumericOK, len(edges))
 		workItems = append(workItems, stage2PeerWorkItem{
 			row:                   row,
 			peer:                  peer,
@@ -2606,196 +1808,90 @@ func (e *Executor) tryFastPeerCandidateReturnAggregationClausePair(ctx context.C
 			indexedEdges:          indexedEdges,
 			remainingPotential:    remainingPotential,
 		})
-		totalRemainingPotential += remainingPotential
+		collectState.addRemainingPotential(remainingPotential)
+	}
+	return workItems, true, nil
+}
+
+func (e *Executor) stage2ProcessSinglePeerWorkItem(ctx context.Context, tx graph.Tx, tenant string, item stage2PeerWorkItem, aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, pattern directedRelationshipPattern, whereRaw string, projection fastPeerCandidateReturnProjection, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}, earlyStopKeep int, params Params) (map[string]struct{}, error) {
+	hydrationPolicy := newDeferredHydrationPolicy(e, ctx, tx, tenant, params)
+	processingCtx := stage2BuildWorkItemProcessingContext(item, aggs, groupOrder, pattern, whereRaw, projection, collectState, earlyStopFrontier, earlyStopKeep, hydrationPolicy)
+
+	if err := e.stage2ProcessWorkItemCandidateEdges(ctx, tx, tenant, processingCtx, params); err != nil {
+		return nil, err
 	}
 
+	nextFrontier := e.stage2AdvanceWorkItemFrontier(processingCtx, params)
+	return nextFrontier, nil
+}
+
+func stage2BuildWorkItemProcessingContext(item stage2PeerWorkItem, aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, pattern directedRelationshipPattern, whereRaw string, projection fastPeerCandidateReturnProjection, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}, earlyStopKeep int, hydrationPolicy *deferredHydrationPolicy) stage2WorkItemProcessingContext {
+	return stage2WorkItemProcessingContext{
+		item:              item,
+		aggs:              aggs,
+		groupOrder:        groupOrder,
+		pattern:           pattern,
+		whereRaw:          whereRaw,
+		projection:        projection,
+		collectState:      collectState,
+		earlyStopFrontier: earlyStopFrontier,
+		earlyStopKeep:     earlyStopKeep,
+		hydrationPolicy:   hydrationPolicy,
+	}
+}
+
+func (e *Executor) stage2ProcessWorkItemCandidateEdges(ctx context.Context, tx graph.Tx, tenant string, processingCtx stage2WorkItemProcessingContext, params Params) error {
+	item := processingCtx.item
+	row := item.row
+	peer := item.peer
+
+	processCandidateEdge := func(edge *graph.Edge) error {
+		return e.stage2ProcessCandidateEdgeAggregation(ctx, tx, edge, processingCtx.aggs, processingCtx.groupOrder, processingCtx.pattern, processingCtx.whereRaw, row, peer, item.numericConstraints, item.hasNumericConstraints, item.excludedRightIDs, item.hasExcludedRightIDs, processingCtx.collectState, processingCtx.earlyStopFrontier, item.skipWhereEval, processingCtx.hydrationPolicy, processingCtx.projection, item.similarityNumeric, item.similarityNumericOK, params)
+	}
+
+	return e.stage2ProcessWorkItemEdgePath(ctx, tx, tenant, peer.ID, processingCtx.pattern, item.edges, item.indexedEdges, params, processCandidateEdge)
+}
+
+func (e *Executor) stage2AdvanceWorkItemFrontier(processingCtx stage2WorkItemProcessingContext, params Params) map[string]struct{} {
+	item := processingCtx.item
+	return processingCtx.collectState.advanceEarlyStopAfterWorkItem(item.remainingPotential, processingCtx.aggs, *processingCtx.groupOrder, processingCtx.earlyStopKeep, processingCtx.earlyStopFrontier, e, params)
+}
+
+func (e *Executor) stage2ProcessPeerWorkItems(ctx context.Context, tx graph.Tx, tenant string, workItems []stage2PeerWorkItem, aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, pattern directedRelationshipPattern, whereRaw string, projection fastPeerCandidateReturnProjection, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}, earlyStopKeep int, params Params) (map[string]struct{}, error) {
+	loopCtx := stage2BuildPeerWorkItemLoopContext(ctx, tx, tenant, aggs, groupOrder, pattern, whereRaw, projection, collectState, earlyStopKeep, params)
 	for _, item := range workItems {
-		row := item.row
-		peer := item.peer
-		hydrationPolicy := newDeferredHydrationPolicy(e, ctx, tx, tenant, params)
-
-		processCandidateEdge := func(edge *graph.Edge) error {
-			if !edgeTypeMatches(edge, pattern.EdgeType, pattern.EdgeAnyOf) {
-				return nil
-			}
-			if !edgePatternMatches(edge, pattern.EdgeProps, params, row) {
-				return nil
-			}
-			if item.hasNumericConstraints && !edgeMatchesNumericConstraints(edge, item.numericConstraints) {
-				e.observeRuntimeCounter(params, "fast_path.stage2.numeric_prefilter_drops", 1)
-				return nil
-			}
-			if item.hasExcludedRightIDs {
-				if _, blocked := item.excludedRightIDs[edge.DstID]; blocked {
-					e.observeRuntimeCounter(params, "fast_path.stage2.antijoin_prefilter_drops", 1)
-					return nil
-				}
-			}
-
-			groupID := strings.TrimSpace(edge.DstID)
-			if groupID == "" {
-				return nil
-			}
-			if len(earlyStopFrontier) > 0 {
-				if _, keep := earlyStopFrontier[groupID]; !keep {
-					e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_edges_skipped", 1)
-					return nil
-				}
-			}
-			e.observeRuntimeCounter(params, "fast_path.stage2.edges_visited", 1)
-			if agg, exists := aggs[groupID]; exists && item.skipWhereEval {
-				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_group_reuse_hits", 1)
-				agg.edgeCount++
-				if rating, ok := edgeNumericProperty(edge, projection.avgEdgeProperty); ok {
-					agg.avgSum += rating
-					agg.avgCount++
-				}
-				if item.similarityNumericOK {
-					agg.similaritySum += item.similarityNumeric
-				}
-				return nil
-			}
-
-			mergedBase := cloneRow(row)
-			if pattern.Left.Var != "" {
-				mergedBase[pattern.Left.Var] = peer
-			}
-			if pattern.EdgeVar != "" {
-				mergedBase[pattern.EdgeVar] = edge
-			}
-			candidate, matchedRight, err := hydrationPolicy.resolveAndMatch(edge.DstID, pattern.Right, mergedBase, "runtime.right.lazy_hydrated")
-			if err != nil {
-				return err
-			}
-			if !matchedRight {
-				return nil
-			}
-
-			merged := cloneRow(mergedBase)
-			if pattern.Right.Var != "" {
-				merged[pattern.Right.Var] = candidate
-			}
-			if strings.TrimSpace(matchSpec.Where) != "" && !item.skipWhereEval {
-				ok, err := e.evalWhereExpression(ctx, tx, matchSpec.Where, merged, params)
-				if err != nil {
-					return err
-				}
-				if !ok {
-					e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_drops", 1)
-					return nil
-				}
-			}
-
-			agg, exists := aggs[groupID]
-			if !exists {
-				agg = &fastPeerCandidateAggregate{}
-				if projection.lateMaterializeNonAggregates {
-					agg.sampleCandidate = candidate
-				} else {
-					agg.sampleScope = cloneRow(merged)
-				}
-				aggs[groupID] = agg
-				groupOrder = append(groupOrder, groupID)
-				e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_created", 1)
-				if projection.lateMaterializeNonAggregates {
-					e.observeRuntimeCounter(params, "fast_path.stage2.late_materialization_candidates", 1)
-				}
-			}
-
-			agg.edgeCount++
-			if rating, ok := edgeNumericProperty(edge, projection.avgEdgeProperty); ok {
-				agg.avgSum += rating
-				agg.avgCount++
-			}
-			if item.similarityNumericOK {
-				agg.similaritySum += item.similarityNumeric
-			}
-			return nil
-		}
-
-		if item.indexedEdges {
-			phaseStarted := time.Now()
-			for _, edge := range item.edges {
-				if edge == nil {
-					continue
-				}
-				e.observeRuntimeCounter(params, "fast_path.stage2.index_edges_considered", 1)
-				if err := processCandidateEdge(edge); err != nil {
-					return nil, nil, false, err
-				}
-			}
-			e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_process_indexed_edges_micros", phaseStarted)
-		} else {
-			phaseStarted := time.Now()
-			scanType := pattern.EdgeType
-			if len(pattern.EdgeAnyOf) > 0 {
-				scanType = ""
-			}
-			if err := scanOutEdgesQueryCached(ctx, tx, tenant, peer.ID, scanType, params, processCandidateEdge); err != nil {
-				return nil, nil, false, err
-			}
-			e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_scan_adjacency_micros", phaseStarted)
-		}
-
-		if earlyStopEnabled {
-			totalRemainingPotential -= item.remainingPotential
-			if totalRemainingPotential < 0 {
-				totalRemainingPotential = 0
-			}
-			e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_checks", 1)
-			boundaryScore, maxNonFrontierScore, frontierGroupIDs, ready := stage2TopKFrontierBoundary(aggs, groupOrder, earlyStopKeep, true)
-			if ready {
-				maxOutsideScore := totalRemainingPotential
-				if maxNonFrontierScore > math.Inf(-1) {
-					nonFrontierUpperBound := maxNonFrontierScore + totalRemainingPotential
-					if nonFrontierUpperBound > maxOutsideScore {
-						maxOutsideScore = nonFrontierUpperBound
-					}
-				}
-				if boundaryScore > maxOutsideScore && len(earlyStopFrontier) == 0 {
-					e.observeRuntimeCounter(params, "fast_path.stage2.early_stop_triggers", 1)
-					earlyStopFrontier = frontierGroupIDs
-				}
-			}
-		}
-	}
-
-	finalizeStarted := time.Now()
-	out := make([]Row, 0, len(groupOrder))
-	e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_total", int64(len(groupOrder)))
-	if useTopK {
-		e.observeRuntimeCounter(params, "fast_path.stage2.topk_pushdown_applied", 1)
-		out, err = fastPeerCandidateTopKRows(aggs, groupOrder, projection, topKSpec, params)
+		nextFrontier, err := e.stage2ProcessPeerWorkItemLoopIteration(loopCtx, item, earlyStopFrontier)
 		if err != nil {
-			return nil, nil, false, err
+			return nil, err
 		}
-	} else {
-		for _, groupID := range groupOrder {
-			agg := aggs[groupID]
-			if agg == nil || agg.edgeCount == 0 {
-				continue
-			}
-			resultRow, err := buildFastPeerCandidateResultRow(agg, projection, params)
-			if err != nil {
-				return nil, nil, false, err
-			}
-			out = append(out, resultRow)
-		}
-		out, err = applyProjectionPostProcessing(out, retSpec, params)
-		if err != nil {
-			return nil, nil, false, err
-		}
+		earlyStopFrontier = stage2UpdatePeerWorkItemLoopFrontier(earlyStopFrontier, nextFrontier)
 	}
-	e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_finalize_output_micros", finalizeStarted)
-	e.recordFastPathFeedback("fast_peer_candidate_return_aggregation_clause_pair", int64(len(rows)), int64(len(out)))
+	return earlyStopFrontier, nil
+}
 
-	columns := append([]string(nil), projection.orderedOutputKeys...)
-	if len(columns) == 0 && len(priorColumns) > 0 {
-		columns = append([]string(nil), priorColumns...)
+func stage2BuildPeerWorkItemLoopContext(ctx context.Context, tx graph.Tx, tenant string, aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, pattern directedRelationshipPattern, whereRaw string, projection fastPeerCandidateReturnProjection, collectState *stage2CollectOrchestrationState, earlyStopKeep int, params Params) stage2PeerWorkItemLoopContext {
+	return stage2PeerWorkItemLoopContext{
+		ctx:           ctx,
+		tx:            tx,
+		tenant:        tenant,
+		aggs:          aggs,
+		groupOrder:    groupOrder,
+		pattern:       pattern,
+		whereRaw:      whereRaw,
+		projection:    projection,
+		collectState:  collectState,
+		earlyStopKeep: earlyStopKeep,
+		params:        params,
 	}
-	out = trimProjectionRows(out, columns)
-	e.observeRuntimeCounter(params, "fast_path.stage2.rows_output", int64(len(out)))
-	return out, columns, true, nil
+}
+
+func (e *Executor) stage2ProcessPeerWorkItemLoopIteration(loopCtx stage2PeerWorkItemLoopContext, item stage2PeerWorkItem, earlyStopFrontier map[string]struct{}) (map[string]struct{}, error) {
+	return e.stage2ProcessSinglePeerWorkItem(loopCtx.ctx, loopCtx.tx, loopCtx.tenant, item, loopCtx.aggs, loopCtx.groupOrder, loopCtx.pattern, loopCtx.whereRaw, loopCtx.projection, loopCtx.collectState, earlyStopFrontier, loopCtx.earlyStopKeep, loopCtx.params)
+}
+
+func stage2UpdatePeerWorkItemLoopFrontier(currentFrontier map[string]struct{}, nextFrontier map[string]struct{}) map[string]struct{} {
+	_ = currentFrontier
+	return nextFrontier
 }
 
 func stage2TopKFrontierBoundary(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, keep int, descending bool) (boundaryScore float64, maxNonFrontierScore float64, frontierGroupIDs map[string]struct{}, ready bool) {
@@ -2806,134 +1902,205 @@ func stage2TopKFrontierBoundary(aggs map[string]*fastPeerCandidateAggregate, gro
 	top := &fastPeerCandidateTopKHeap{descending: descending, rows: make([]fastPeerCandidateRankedRow, 0, keep)}
 	for idx, groupID := range groupOrder {
 		agg := aggs[groupID]
-		if agg == nil || agg.edgeCount == 0 {
+		if stage2ShouldSkipFrontierBoundaryAggregate(agg) {
 			continue
 		}
-		candidate := fastPeerCandidateRankedRow{agg: agg, score: agg.similaritySum, inputIndex: idx}
-		if top.Len() < keep {
+		candidate := stage2BuildFrontierBoundaryRankedCandidate(agg, idx)
+		if stage2ShouldPushFrontierBoundaryCandidate(top.Len(), keep) {
 			heap.Push(top, candidate)
 			continue
 		}
-		if compareFastPeerCandidateRank(candidate, top.rows[0], descending) < 0 {
+		if stage2ShouldReplaceFrontierBoundaryRoot(candidate, top.rows[0], descending) {
 			top.rows[0] = candidate
 			heap.Fix(top, 0)
 		}
 	}
-	if top.Len() < keep {
+	if !stage2IsFrontierBoundaryReady(top.Len(), keep) {
 		return 0, math.Inf(-1), nil, false
 	}
 
+	frontierIndexes, frontierGroupIDs := stage2BuildFrontierBoundaryIndexesAndGroups(top.rows, groupOrder)
+	maxNonFrontierScore = stage2ResolveFrontierBoundaryMaxNonFrontierScore(aggs, groupOrder, frontierIndexes)
+
+	return top.rows[0].score, maxNonFrontierScore, frontierGroupIDs, true
+}
+
+func stage2ShouldSkipFrontierBoundaryAggregate(agg *fastPeerCandidateAggregate) bool {
+	return agg == nil || agg.edgeCount == 0
+}
+
+func stage2BuildFrontierBoundaryRankedCandidate(agg *fastPeerCandidateAggregate, inputIndex int) fastPeerCandidateRankedRow {
+	return fastPeerCandidateRankedRow{agg: agg, score: agg.similaritySum, inputIndex: inputIndex}
+}
+
+func stage2ShouldPushFrontierBoundaryCandidate(currentLen int, keep int) bool {
+	return currentLen < keep
+}
+
+func stage2ShouldReplaceFrontierBoundaryRoot(candidate fastPeerCandidateRankedRow, root fastPeerCandidateRankedRow, descending bool) bool {
+	return compareFastPeerCandidateRank(candidate, root, descending) < 0
+}
+
+func stage2IsFrontierBoundaryReady(topLen int, keep int) bool {
+	return topLen >= keep
+}
+
+func stage2BuildFrontierBoundaryIndexesAndGroups(rankedRows []fastPeerCandidateRankedRow, groupOrder []string) (map[int]struct{}, map[string]struct{}) {
 	frontierIndexes := map[int]struct{}{}
-	frontierGroupIDs = map[string]struct{}{}
-	for _, ranked := range top.rows {
+	frontierGroupIDs := map[string]struct{}{}
+	for _, ranked := range rankedRows {
 		frontierIndexes[ranked.inputIndex] = struct{}{}
 		if ranked.inputIndex >= 0 && ranked.inputIndex < len(groupOrder) {
 			frontierGroupIDs[groupOrder[ranked.inputIndex]] = struct{}{}
 		}
 	}
+	return frontierIndexes, frontierGroupIDs
+}
 
-	maxNonFrontierScore = math.Inf(-1)
+func stage2ResolveFrontierBoundaryMaxNonFrontierScore(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, frontierIndexes map[int]struct{}) float64 {
+	maxNonFrontierScore := math.Inf(-1)
 	for idx, groupID := range groupOrder {
 		if _, ok := frontierIndexes[idx]; ok {
 			continue
 		}
 		agg := aggs[groupID]
-		if agg == nil || agg.edgeCount == 0 {
+		if stage2ShouldSkipFrontierBoundaryAggregate(agg) {
 			continue
 		}
 		if agg.similaritySum > maxNonFrontierScore {
 			maxNonFrontierScore = agg.similaritySum
 		}
 	}
-
-	return top.rows[0].score, maxNonFrontierScore, frontierGroupIDs, true
+	return maxNonFrontierScore
 }
 
-func stage2IndexLookupCacheKey(pattern directedRelationshipPattern, whereRaw string, row Row, params Params) (string, bool) {
-	types := edgePatternCandidateTypes(pattern.EdgeType, pattern.EdgeAnyOf)
-	if len(types) == 0 {
-		return "", false
-	}
+func stage2HasIndexLookupCacheCandidateTypes(types []string) bool {
+	return len(types) > 0
+}
 
-	parts := make([]string, 0, 4+len(types))
-	parts = append(parts, "types="+strings.Join(types, ","))
+func stage2AppendIndexLookupTypeCachePart(parts []string, types []string) []string {
+	return append(parts, "types="+strings.Join(types, ","))
+}
 
-	if prop, value, ok := edgePropertyEquality(pattern.EdgeProps, params, row); ok {
+func stage2AppendIndexLookupEqualityCachePart(parts []string, edgeProps string, params Params, row Row) []string {
+	if prop, value, ok := edgePropertyEquality(edgeProps, params, row); ok {
 		parts = append(parts, fmt.Sprintf("eq:%s:%x", prop, valueToBytes(value)))
 	}
+	return parts
+}
 
-	constraints, hasConstraints := extractEdgeWhereNumericConstraints(whereRaw, pattern.EdgeVar, row, params)
-	if hasConstraints {
-		keys := make([]string, 0, len(constraints))
-		for prop := range constraints {
-			keys = append(keys, prop)
-		}
-		sort.Strings(keys)
-		for _, prop := range keys {
-			parts = append(parts, "rng:"+prop+":"+edgeNumericRangeConstraintCacheKey(constraints[prop]))
-		}
+func stage2ResolveIndexLookupConstraintKeys(constraints map[string]edgeNumericRangeConstraint) []string {
+	keys := make([]string, 0, len(constraints))
+	for prop := range constraints {
+		keys = append(keys, prop)
 	}
+	sort.Strings(keys)
+	return keys
+}
 
-	if len(parts) <= 1 {
+func stage2AppendIndexLookupRangeCacheParts(parts []string, constraints map[string]edgeNumericRangeConstraint, hasConstraints bool) []string {
+	if !hasConstraints {
+		return parts
+	}
+	for _, prop := range stage2ResolveIndexLookupConstraintKeys(constraints) {
+		parts = append(parts, "rng:"+prop+":"+edgeNumericRangeConstraintCacheKey(constraints[prop]))
+	}
+	return parts
+}
+
+func stage2HasIndexLookupCacheKeyComponents(parts []string) bool {
+	return len(parts) > 1
+}
+
+func stage2BuildIndexLookupCacheKeyResult(parts []string) (string, bool) {
+	if !stage2HasIndexLookupCacheKeyComponents(parts) {
 		return "", false
 	}
 	return strings.Join(parts, "|"), true
 }
 
-func stage2IndexPushdownEligibleByPredicateShape(pattern directedRelationshipPattern, whereRaw string, row Row, params Params) bool {
-	if _, _, ok := edgePropertyEquality(pattern.EdgeProps, params, row); ok {
+func stage2IndexLookupCacheKeyFromResolvedConstraints(pattern directedRelationshipPattern, row Row, params Params, constraints map[string]edgeNumericRangeConstraint, hasConstraints bool) (string, bool) {
+	types := edgePatternCandidateTypes(pattern.EdgeType, pattern.EdgeAnyOf)
+	if !stage2HasIndexLookupCacheCandidateTypes(types) {
+		return "", false
+	}
+
+	parts := make([]string, 0, 4+len(types))
+	parts = stage2AppendIndexLookupTypeCachePart(parts, types)
+	parts = stage2AppendIndexLookupEqualityCachePart(parts, pattern.EdgeProps, params, row)
+	parts = stage2AppendIndexLookupRangeCacheParts(parts, constraints, hasConstraints)
+
+	return stage2BuildIndexLookupCacheKeyResult(parts)
+}
+
+func stage2IndexLookupCacheKey(pattern directedRelationshipPattern, whereRaw string, row Row, params Params) (string, bool) {
+	constraints, hasConstraints := extractEdgeWhereNumericConstraints(whereRaw, pattern.EdgeVar, row, params)
+	return stage2IndexLookupCacheKeyFromResolvedConstraints(pattern, row, params, constraints, hasConstraints)
+}
+
+func stage2ConstraintEnablesIndexPushdownPredicateShape(constraint edgeNumericRangeConstraint) bool {
+	if constraint.isContradictory() {
 		return true
 	}
-	constraints, hasConstraints := extractEdgeWhereNumericConstraints(whereRaw, pattern.EdgeVar, row, params)
+	return constraint.lowerSet || constraint.upperSet
+}
+
+func stage2HasConstraintEnablingIndexPushdownPredicateShape(constraints map[string]edgeNumericRangeConstraint, hasConstraints bool) bool {
 	if !hasConstraints {
 		return false
 	}
 	for _, constraint := range constraints {
-		if constraint.isContradictory() {
-			return true
-		}
-		if constraint.lowerSet || constraint.upperSet {
+		if stage2ConstraintEnablesIndexPushdownPredicateShape(constraint) {
 			return true
 		}
 	}
 	return false
 }
 
-func stage2IndexPushdownPredicateShapeDecision(pattern directedRelationshipPattern, whereRaw string, params Params) (eligible bool, decisive bool) {
-	if strings.TrimSpace(pattern.EdgeProps) != "" {
-		if _, _, ok := edgePropertyEquality(pattern.EdgeProps, params, nil); ok {
-			return true, true
+func stage2ConstraintHasOneSidedNumericRange(constraint edgeNumericRangeConstraint) bool {
+	if constraint.isContradictory() {
+		return false
+	}
+	return constraint.lowerSet != constraint.upperSet
+}
+
+func stage2HasOneSidedNumericRangeConstraint(constraints map[string]edgeNumericRangeConstraint, hasConstraints bool) bool {
+	if !hasConstraints {
+		return false
+	}
+	for _, constraint := range constraints {
+		if stage2ConstraintHasOneSidedNumericRange(constraint) {
+			return true
 		}
+	}
+	return false
+}
+
+func stage2CanResolvePredicateShapeByEdgePropertyEquality(edgeProps string, params Params) bool {
+	if strings.TrimSpace(edgeProps) == "" {
+		return false
+	}
+	_, _, ok := edgePropertyEquality(edgeProps, params, nil)
+	return ok
+}
+
+func stage2IndexPushdownPredicateShapeDecision(pattern directedRelationshipPattern, whereRaw string, params Params) (eligible bool, decisive bool) {
+	if stage2CanResolvePredicateShapeByEdgePropertyEquality(pattern.EdgeProps, params) {
+		return true, true
 	}
 	constraints, hasConstraints := extractEdgeWhereNumericConstraints(whereRaw, pattern.EdgeVar, nil, params)
 	if !hasConstraints {
 		return false, false
 	}
-	for _, constraint := range constraints {
-		if constraint.isContradictory() {
-			return true, true
-		}
-		if constraint.lowerSet || constraint.upperSet {
-			return true, true
-		}
+	if stage2HasConstraintEnablingIndexPushdownPredicateShape(constraints, hasConstraints) {
+		return true, true
 	}
 	return false, true
 }
 
 func stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern directedRelationshipPattern, whereRaw string, row Row, params Params) bool {
 	constraints, hasConstraints := extractEdgeWhereNumericConstraints(whereRaw, pattern.EdgeVar, row, params)
-	if !hasConstraints {
-		return false
-	}
-	for _, constraint := range constraints {
-		if constraint.isContradictory() {
-			continue
-		}
-		if constraint.lowerSet != constraint.upperSet {
-			return true
-		}
-	}
-	return false
+	return stage2HasOneSidedNumericRangeConstraint(constraints, hasConstraints)
 }
 
 func edgeNumericRangeConstraintCacheKey(constraint edgeNumericRangeConstraint) string {
@@ -2956,29 +2123,1544 @@ func edgeNumericRangeConstraintCacheKey(constraint edgeNumericRangeConstraint) s
 	return lower + "," + upper
 }
 
-func shouldApplyStage2IndexPushdown(indexedEdgesBySource map[string][]*graph.Edge) bool {
-	if len(indexedEdgesBySource) == 0 {
+func stage2AdaptiveProbeLimit(currentLimit int, sourcePeerCount int, hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) (limit int, tightened bool) {
+	if currentLimit <= 0 || sourcePeerCount <= 0 {
+		return currentLimit, false
+	}
+	limit = currentLimit
+
+	adaptiveBySourceCount := sourcePeerCount * stage2IndexPushdownAdaptiveProbeEdgesPerSource
+	if adaptiveBySourceCount < stage2IndexPushdownSourceScopedProbeMaxSources {
+		adaptiveBySourceCount = stage2IndexPushdownSourceScopedProbeMaxSources
+	}
+	if adaptiveBySourceCount > 0 && adaptiveBySourceCount < limit {
+		limit = adaptiveBySourceCount
+		tightened = true
+	}
+
+	if _, avgOutDegree, ok := stage2HintDegreeSelectivity(hints, edgeType, edgeTypeAnyOf); ok && avgOutDegree > 0 {
+		estimatedCandidates := int(math.Ceil(float64(sourcePeerCount) * avgOutDegree))
+		if estimatedCandidates < stage2IndexPushdownSourceScopedProbeMaxSources {
+			estimatedCandidates = stage2IndexPushdownSourceScopedProbeMaxSources
+		}
+		if estimatedCandidates > 0 && estimatedCandidates < limit {
+			limit = estimatedCandidates
+			tightened = true
+		}
+	}
+
+	return limit, tightened
+}
+
+func stage2BuildPlannerPolicyInput(pattern directedRelationshipPattern, whereRaw string, params Params) stage2PlannerPolicyInput {
+	predicateShapeEligible, predicateShapeDecisive := stage2IndexPushdownPredicateShapeDecision(pattern, whereRaw, params)
+	oneSidedNumericRangeEligible := stage2IndexPushdownPredicateShapeHasOneSidedNumericRange(pattern, whereRaw, nil, params)
+	return stage2PlannerPolicyInput{
+		pattern:                      pattern,
+		whereRaw:                     strings.TrimSpace(whereRaw),
+		edgeType:                     strings.TrimSpace(pattern.EdgeType),
+		edgeTypeAnyOf:                append([]string(nil), pattern.EdgeAnyOf...),
+		predicateShapeEligible:       predicateShapeEligible,
+		predicateShapeDecisive:       predicateShapeDecisive,
+		oneSidedNumericRangeEligible: oneSidedNumericRangeEligible,
+	}
+}
+
+func stage2BuildOperatorPolicySignals(plannerInput stage2PlannerPolicyInput, hints physical.StatsHints, sourcePeerCount int) stage2OperatorPolicySignals {
+	signals := stage2OperatorPolicySignals{
+		predicateShapeEligible:       plannerInput.predicateShapeEligible,
+		predicateShapeDecisive:       plannerInput.predicateShapeDecisive,
+		oneSidedNumericRangeEligible: plannerInput.oneSidedNumericRangeEligible,
+		sourcePeerCount:              sourcePeerCount,
+	}
+
+	signals.maxPushdownCandidates = stage2MaxPushdownCandidates(signals.oneSidedNumericRangeEligible, hints, plannerInput.edgeType, plannerInput.edgeTypeAnyOf)
+	sourceProbePolicy := stage2BuildSourceProbePolicyInput(stage2BuildSourceProbeStrategyDecisionContext(signals.sourcePeerCount, hints, plannerInput.edgeType, plannerInput.edgeTypeAnyOf))
+	signals.useSharedSourceProbeFilter = sourceProbePolicy.useSharedMode
+	signals.usePerPeerSourceProbe = sourceProbePolicy.usePerPeerMode
+	signals.skipWideNonRangeWhenNoRange = sourceProbePolicy.skipWideNonRange
+
+	probeLimit := stage2IndexPushdownProbeCandidateLimit
+	if signals.oneSidedNumericRangeEligible && probeLimit < stage2IndexPushdownProbeCandidateLimitOneSidedRange {
+		probeLimit = stage2IndexPushdownProbeCandidateLimitOneSidedRange
+	}
+	if signals.maxPushdownCandidates > 0 && probeLimit > signals.maxPushdownCandidates {
+		probeLimit = signals.maxPushdownCandidates
+	}
+	adaptiveLimit, adaptiveTightened := stage2AdaptiveProbeLimit(probeLimit, signals.sourcePeerCount, hints, plannerInput.edgeType, plannerInput.edgeTypeAnyOf)
+	if adaptiveTightened {
+		probeLimit = adaptiveLimit
+	}
+	signals.indexProbeLimit = probeLimit
+	signals.probeLimitAdaptiveTightened = adaptiveTightened
+
+	return signals
+}
+
+func buildStage2HintPolicyFromPlannerInput(hints physical.StatsHints, plannerInput stage2PlannerPolicyInput, sourcePeerCount int) stage2HintPolicy {
+	policy := stage2HintPolicy{
+		hints:                       hints,
+		pattern:                     plannerInput.pattern,
+		whereRaw:                    plannerInput.whereRaw,
+		edgeType:                    plannerInput.edgeType,
+		edgeTypeAnyOf:               append([]string(nil), plannerInput.edgeTypeAnyOf...),
+		stage2OperatorPolicySignals: stage2BuildOperatorPolicySignals(plannerInput, hints, sourcePeerCount),
+	}
+	policy.indexPushdownHintPolicy = stage2BuildIndexPushdownHintPolicyInput(policy.hints, policy.edgeType, policy.edgeTypeAnyOf)
+	return policy
+}
+
+func buildStage2HintPolicy(hints physical.StatsHints, pattern directedRelationshipPattern, whereRaw string, params Params, sourcePeerCount int) stage2HintPolicy {
+	plannerInput := stage2BuildPlannerPolicyInput(pattern, whereRaw, params)
+	return buildStage2HintPolicyFromPlannerInput(hints, plannerInput, sourcePeerCount)
+}
+
+func (p stage2HintPolicy) predicateShapeEligibleForRowWithResolvedConstraints(row Row, params Params, constraints map[string]edgeNumericRangeConstraint, hasConstraints bool) bool {
+	if p.predicateShapeDecisive {
+		return p.predicateShapeEligible
+	}
+	if _, _, ok := edgePropertyEquality(p.pattern.EdgeProps, params, row); ok {
 		return true
 	}
-	totalCandidates := 0
-	for _, edges := range indexedEdgesBySource {
-		totalCandidates += len(edges)
+	return stage2HasConstraintEnablingIndexPushdownPredicateShape(constraints, hasConstraints)
+}
+
+func stage2ResolveHintPolicyRowNumericConstraints(whereRaw string, edgeVar string, row Row, params Params) (map[string]edgeNumericRangeConstraint, bool) {
+	return extractEdgeWhereNumericConstraints(whereRaw, edgeVar, row, params)
+}
+
+func stage2HasHintPolicyNumericRangeShape(constraints map[string]edgeNumericRangeConstraint, hasConstraints bool) bool {
+	return stage2HasConstraintEnablingIndexPushdownPredicateShape(constraints, hasConstraints)
+}
+
+func stage2BuildInitialRowPushdownAssessment(predicateShapeEligible bool) stage2RowPushdownAssessment {
+	return stage2RowPushdownAssessment{predicateShapeEligible: predicateShapeEligible}
+}
+
+func stage2ShouldReturnRowPushdownAssessmentEarly(assessment stage2RowPushdownAssessment) bool {
+	return !assessment.predicateShapeEligible
+}
+
+func stage2CompleteRowPushdownAssessmentFromResolvedConstraints(policy stage2HintPolicy, assessment stage2RowPushdownAssessment, constraints map[string]edgeNumericRangeConstraint, hasConstraints bool) stage2RowPushdownAssessment {
+	assessment.hasOneSidedNumeric = stage2HasOneSidedNumericRangeConstraint(constraints, hasConstraints)
+	assessment.hasNumericRangeShape = stage2HasHintPolicyNumericRangeShape(constraints, hasConstraints)
+	assessment.skipWideNonRange = policy.shouldSkipWideNonRangePushdown(assessment.hasNumericRangeShape)
+	return assessment
+}
+
+func (p stage2HintPolicy) buildRowPushdownInput(row Row, params Params) stage2RowPushdownInput {
+	constraints, hasConstraints := stage2ResolveHintPolicyRowNumericConstraints(p.whereRaw, p.pattern.EdgeVar, row, params)
+	assessment := stage2BuildInitialRowPushdownAssessment(p.predicateShapeEligibleForRowWithResolvedConstraints(row, params, constraints, hasConstraints))
+	if stage2ShouldReturnRowPushdownAssessmentEarly(assessment) {
+		return stage2RowPushdownInput{assessment: assessment}
 	}
-	if totalCandidates <= 0 {
-		return true
+	assessment = stage2CompleteRowPushdownAssessmentFromResolvedConstraints(p, assessment, constraints, hasConstraints)
+	if assessment.skipWideNonRange {
+		return stage2RowPushdownInput{assessment: assessment}
 	}
-	if totalCandidates > stage2IndexPushdownMaxIndexedCandidates {
+	cacheKey, cacheable := stage2IndexLookupCacheKeyFromResolvedConstraints(p.pattern, row, params, constraints, hasConstraints)
+	return stage2RowPushdownInput{
+		assessment: assessment,
+		cacheKey:   cacheKey,
+		cacheable:  cacheable,
+	}
+}
+
+func (p stage2HintPolicy) shouldSkipWideNonRangePushdown(hasNumericRangeShape bool) bool {
+	if hasNumericRangeShape {
 		return false
 	}
-	averagePerSource := float64(totalCandidates) / float64(len(indexedEdgesBySource))
-	if averagePerSource > float64(stage2IndexPushdownMaxAverageEdgesPerSource) {
+	return p.skipWideNonRangeWhenNoRange
+}
+
+func (p stage2HintPolicy) shouldApplyPushdown(indexedEdgesBySource map[string][]*graph.Edge) bool {
+	decisionCtx := stage2BuildIndexPushdownEligibilityDecisionContextFromHintPolicy(indexedEdgesBySource, p.indexPushdownHintPolicy)
+	return stage2ResolveIndexPushdownEligibility(decisionCtx)
+}
+
+func stage2BuildDefaultIndexLookupContext(cacheKey string, sharedProbeSourceFilter map[string]struct{}) stage2IndexLookupContext {
+	return stage2IndexLookupContext{
+		lookupCacheKey:    cacheKey,
+		probeSourceFilter: sharedProbeSourceFilter,
+		perPeerScoped:     false,
+	}
+}
+
+func stage2ShouldUsePerPeerLookupContext(usePerPeerSourceProbe bool) bool {
+	return usePerPeerSourceProbe
+}
+
+func stage2ResolvePerPeerLookupPeerID(peerID string) string {
+	return strings.TrimSpace(peerID)
+}
+
+func stage2CanScopePerPeerLookup(peerID string) bool {
+	return peerID != ""
+}
+
+func stage2BuildPerPeerLookupContext(cacheKey string, peerID string) stage2IndexLookupContext {
+	return stage2IndexLookupContext{
+		lookupCacheKey:    cacheKey + "|src=" + peerID,
+		probeSourceFilter: map[string]struct{}{peerID: {}},
+		perPeerScoped:     true,
+	}
+}
+
+func (p stage2HintPolicy) lookupContext(cacheKey string, peerID string, sharedProbeSourceFilter map[string]struct{}) stage2IndexLookupContext {
+	lookup := stage2BuildDefaultIndexLookupContext(cacheKey, sharedProbeSourceFilter)
+	if !stage2ShouldUsePerPeerLookupContext(p.usePerPeerSourceProbe) {
+		return lookup
+	}
+	peerID = stage2ResolvePerPeerLookupPeerID(peerID)
+	if !stage2CanScopePerPeerLookup(peerID) {
+		return lookup
+	}
+	return stage2BuildPerPeerLookupContext(cacheKey, peerID)
+}
+
+func stage2ResolveIndexedCandidateSourceID(candidateEdge *graph.Edge) (string, bool) {
+	if candidateEdge == nil {
+		return "", false
+	}
+	sourceID := strings.TrimSpace(candidateEdge.SrcID)
+	if sourceID == "" {
+		return "", false
+	}
+	return sourceID, true
+}
+
+func stage2AppendIndexedEdgeForSource(edgesBySource map[string][]*graph.Edge, sourceID string, candidateEdge *graph.Edge) {
+	edgesBySource[sourceID] = append(edgesBySource[sourceID], candidateEdge)
+}
+
+func stage2IncrementIndexedCandidateTotal(totalCandidates int) int {
+	return totalCandidates + 1
+}
+
+func stage2IndexEdgesBySource(edges []*graph.Edge) (map[string][]*graph.Edge, int) {
+	edgesBySource := map[string][]*graph.Edge{}
+	totalCandidates := 0
+	for _, candidateEdge := range edges {
+		sourceID, include := stage2ResolveIndexedCandidateSourceID(candidateEdge)
+		if !include {
+			continue
+		}
+		stage2AppendIndexedEdgeForSource(edgesBySource, sourceID, candidateEdge)
+		totalCandidates = stage2IncrementIndexedCandidateTotal(totalCandidates)
+	}
+	return edgesBySource, totalCandidates
+}
+
+func stage2ShouldAttemptCollectPeerEdgesIndexLookup(cacheable bool) bool {
+	return cacheable
+}
+
+func stage2ShouldNotePerPeerSourceProbeScoped(lookup stage2IndexLookupContext) bool {
+	return lookup.perPeerScoped
+}
+
+func stage2ShouldUseCollectPeerEdgesIndexLookupDecision(decision stage2IndexLookupDecision) bool {
+	return decision.lookupByIndex
+}
+
+func stage2BuildCollectPeerEdgesIndexedResult(indexedEdges []*graph.Edge) ([]*graph.Edge, bool) {
+	return append([]*graph.Edge(nil), indexedEdges...), true
+}
+
+func stage2ShouldObserveIndexProbeCapExceeded(probeCapExceeded bool) bool {
+	return probeCapExceeded
+}
+
+func stage2ShouldEvaluateIndexedLookupCandidates(indexed bool) bool {
+	return indexed
+}
+
+func stage2ResolveIndexedLookupCandidates(edges []*graph.Edge, peerID string) (edgesBySource map[string][]*graph.Edge, indexedEdges []*graph.Edge, totalCandidates int) {
+	edgesBySource, totalCandidates = stage2IndexEdgesBySource(edges)
+	indexedEdges = edgesBySource[peerID]
+	return edgesBySource, indexedEdges, totalCandidates
+}
+
+func stage2ShouldCacheIndexLookupEdges(applyPushdown bool) bool {
+	return applyPushdown
+}
+
+func stage2BuildIndexLookupDecision(applyPushdown bool, indexedEdges []*graph.Edge) stage2IndexLookupDecision {
+	if !applyPushdown {
+		return stage2IndexLookupDecision{lookupByIndex: false}
+	}
+	return stage2IndexLookupDecision{lookupByIndex: true, indexedEdges: indexedEdges}
+}
+
+func stage2BuildIndexLookupResolutionContext(lookup stage2IndexLookupContext, peerID string, decisionCache map[string]bool, indexedEdgeCache map[string]map[string][]*graph.Edge) stage2IndexLookupResolutionContext {
+	return stage2IndexLookupResolutionContext{
+		lookup:           lookup,
+		peerID:           peerID,
+		decisionCache:    decisionCache,
+		indexedEdgeCache: indexedEdgeCache,
+	}
+}
+
+func stage2BuildIndexLookupFlowInput(tenant string, pattern directedRelationshipPattern, whereRaw string, row Row, policy stage2HintPolicy, lookup stage2IndexLookupContext, peerID string, probeLimit int) stage2IndexLookupFlowInput {
+	return stage2IndexLookupFlowInput{
+		tenant:     tenant,
+		pattern:    pattern,
+		whereRaw:   whereRaw,
+		row:        row,
+		policy:     policy,
+		lookup:     lookup,
+		peerID:     peerID,
+		probeLimit: probeLimit,
+	}
+}
+
+func stage2BuildIndexLookupFlowContext(input stage2IndexLookupFlowInput, decisionCache map[string]bool, indexedEdgeCache map[string]map[string][]*graph.Edge) stage2IndexLookupFlowContext {
+	return stage2IndexLookupFlowContext{
+		input:      input,
+		resolution: stage2BuildIndexLookupResolutionContext(input.lookup, input.peerID, decisionCache, indexedEdgeCache),
+	}
+}
+
+func (e *Executor) stage2ResolveCachedIndexLookupDecision(flowCtx stage2IndexLookupFlowContext, params Params) (decision stage2IndexLookupDecision, cached bool) {
+	resolutionCtx := flowCtx.resolution
+	if cachedLookup, ok := resolutionCtx.decisionCache[resolutionCtx.lookup.lookupCacheKey]; ok {
+		e.observeRuntimeCounter(params, "fast_path.stage2.index_lookup_cache_hits", 1)
+		if !cachedLookup {
+			return stage2BuildIndexLookupDecision(false, nil), true
+		}
+		indexedEdges := resolutionCtx.indexedEdgeCache[resolutionCtx.lookup.lookupCacheKey][resolutionCtx.peerID]
+		return stage2BuildIndexLookupDecision(true, indexedEdges), true
+	}
+	return stage2IndexLookupDecision{}, false
+}
+
+func (e *Executor) stage2ObserveIndexProbeCapDecision(probeCapExceeded bool, params Params) {
+	if stage2ShouldObserveIndexProbeCapExceeded(probeCapExceeded) {
+		e.observeRuntimeCounter(params, "fast_path.stage2.index_probe_cap_exceeded", 1)
+		e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_probe_cap", 1)
+	}
+}
+
+func (e *Executor) stage2ResolveIndexLookupCandidateDecision(edges []*graph.Edge, indexed bool, flowCtx stage2IndexLookupFlowContext, params Params) (applyPushdown bool, indexedEdges []*graph.Edge) {
+	resolutionCtx := flowCtx.resolution
+	if !stage2ShouldEvaluateIndexedLookupCandidates(indexed) {
+		return false, nil
+	}
+
+	edgesBySource, selectedIndexedEdges, totalCandidates := stage2ResolveIndexedLookupCandidates(edges, resolutionCtx.peerID)
+	e.observeRuntimeCounter(params, "fast_path.stage2.index_candidates_total", int64(totalCandidates))
+	applyPushdown = flowCtx.input.policy.shouldApplyPushdown(edgesBySource)
+	if stage2ShouldCacheIndexLookupEdges(applyPushdown) {
+		resolutionCtx.indexedEdgeCache[resolutionCtx.lookup.lookupCacheKey] = edgesBySource
+		indexedEdges = selectedIndexedEdges
+	} else {
+		e.observeRuntimeCounter(params, "fast_path.stage2.index_pushdown_skipped_unselective", 1)
+	}
+	return applyPushdown, indexedEdges
+}
+
+func stage2FinalizeIndexLookupDecision(flowCtx stage2IndexLookupFlowContext, applyPushdown bool, indexedEdges []*graph.Edge) stage2IndexLookupDecision {
+	resolutionCtx := flowCtx.resolution
+	resolutionCtx.decisionCache[resolutionCtx.lookup.lookupCacheKey] = applyPushdown
+	return stage2BuildIndexLookupDecision(applyPushdown, indexedEdges)
+}
+
+func stage2BuildCandidateMergedBase(row Row, pattern directedRelationshipPattern, peer *graph.Vertex, edge *graph.Edge) Row {
+	mergedBase := cloneRow(row)
+	if pattern.Left.Var != "" {
+		mergedBase[pattern.Left.Var] = peer
+	}
+	if pattern.EdgeVar != "" {
+		mergedBase[pattern.EdgeVar] = edge
+	}
+	return mergedBase
+}
+
+func stage2ShouldEvaluateWhere(whereRaw string, skipWhereEval bool) bool {
+	if skipWhereEval {
+		return false
+	}
+	return strings.TrimSpace(whereRaw) != ""
+}
+
+func stage2MatchesCandidateEdgeGate(edge *graph.Edge, edgeType string, edgeAnyOf []string, edgePropsRaw string, params Params, row Row) bool {
+	if !edgeTypeMatches(edge, edgeType, edgeAnyOf) {
+		return false
+	}
+	if !edgePatternMatches(edge, edgePropsRaw, params, row) {
 		return false
 	}
 	return true
 }
 
-func buildFastPeerCandidateResultRow(agg *fastPeerCandidateAggregate, projection fastPeerCandidateReturnProjection, params Params) (Row, error) {
-	result := Row{}
+func stage2BuildCandidatePrefilterDecisionContext(edge *graph.Edge, numericConstraints map[string]edgeNumericRangeConstraint, hasNumericConstraints bool, excludedRightIDs map[string]struct{}, hasExcludedRightIDs bool) stage2CandidatePrefilterDecisionContext {
+	return stage2CandidatePrefilterDecisionContext{
+		edge:                  edge,
+		numericConstraints:    numericConstraints,
+		hasNumericConstraints: hasNumericConstraints,
+		excludedRightIDs:      excludedRightIDs,
+		hasExcludedRightIDs:   hasExcludedRightIDs,
+	}
+}
+
+func stage2ShouldEvaluateNumericPrefilter(hasNumericConstraints bool) bool {
+	return hasNumericConstraints
+}
+
+func stage2ResolveNumericPrefilterDrop(edge *graph.Edge, numericConstraints map[string]edgeNumericRangeConstraint, hasNumericConstraints bool) bool {
+	if !stage2ShouldEvaluateNumericPrefilter(hasNumericConstraints) {
+		return false
+	}
+	return !edgeMatchesNumericConstraints(edge, numericConstraints)
+}
+
+func stage2ResolveAntijoinPrefilterDrop(edge *graph.Edge, excludedRightIDs map[string]struct{}, hasExcludedRightIDs bool) bool {
+	if !hasExcludedRightIDs || edge == nil {
+		return false
+	}
+	_, blocked := excludedRightIDs[edge.DstID]
+	return blocked
+}
+
+func (e *Executor) stage2ObserveCandidatePrefilterDrop(counterName string, params Params) {
+	if strings.TrimSpace(counterName) == "" {
+		return
+	}
+	e.observeRuntimeCounter(params, counterName, 1)
+}
+
+func (e *Executor) stage2ResolveCandidatePrefilterDrop(decisionCtx stage2CandidatePrefilterDecisionContext, params Params) bool {
+	if stage2ResolveNumericPrefilterDrop(decisionCtx.edge, decisionCtx.numericConstraints, decisionCtx.hasNumericConstraints) {
+		e.stage2ObserveCandidatePrefilterDrop("fast_path.stage2.numeric_prefilter_drops", params)
+		return true
+	}
+	if stage2ResolveAntijoinPrefilterDrop(decisionCtx.edge, decisionCtx.excludedRightIDs, decisionCtx.hasExcludedRightIDs) {
+		e.stage2ObserveCandidatePrefilterDrop("fast_path.stage2.antijoin_prefilter_drops", params)
+		return true
+	}
+	return false
+}
+
+func (e *Executor) stage2ShouldDropCandidateEdgeByPrefilters(edge *graph.Edge, numericConstraints map[string]edgeNumericRangeConstraint, hasNumericConstraints bool, excludedRightIDs map[string]struct{}, hasExcludedRightIDs bool, params Params) bool {
+	decisionCtx := stage2BuildCandidatePrefilterDecisionContext(edge, numericConstraints, hasNumericConstraints, excludedRightIDs, hasExcludedRightIDs)
+	return e.stage2ResolveCandidatePrefilterDrop(decisionCtx, params)
+}
+
+func stage2BuildCandidateGroupVisitDecisionContext(edge *graph.Edge, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}) stage2CandidateGroupVisitDecisionContext {
+	return stage2CandidateGroupVisitDecisionContext{
+		edge:              edge,
+		collectState:      collectState,
+		earlyStopFrontier: earlyStopFrontier,
+	}
+}
+
+func stage2ResolveCandidateGroupIDForVisit(edge *graph.Edge) (groupID string, ok bool) {
+	if edge == nil {
+		return "", false
+	}
+	groupID = strings.TrimSpace(edge.DstID)
+	if groupID == "" {
+		return "", false
+	}
+	return groupID, true
+}
+
+func (e *Executor) stage2ShouldSkipCandidateGroupVisit(decisionCtx stage2CandidateGroupVisitDecisionContext, groupID string, params Params) bool {
+	if decisionCtx.collectState == nil {
+		return false
+	}
+	return decisionCtx.collectState.shouldSkipEdgeByFrontier(decisionCtx.earlyStopFrontier, groupID, e, params)
+}
+
+func (e *Executor) stage2ObserveCandidateGroupVisit(params Params) {
+	e.observeRuntimeCounter(params, "fast_path.stage2.edges_visited", 1)
+}
+
+func (e *Executor) stage2ResolveCandidateGroupVisit(decisionCtx stage2CandidateGroupVisitDecisionContext, params Params) (groupID string, shouldVisit bool) {
+	groupID, ok := stage2ResolveCandidateGroupIDForVisit(decisionCtx.edge)
+	if !ok {
+		return "", false
+	}
+	if e.stage2ShouldSkipCandidateGroupVisit(decisionCtx, groupID, params) {
+		return "", false
+	}
+	e.stage2ObserveCandidateGroupVisit(params)
+	return groupID, true
+}
+
+func (e *Executor) stage2ResolveCandidateGroupVisitGate(edge *graph.Edge, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}, params Params) (groupID string, shouldVisit bool) {
+	decisionCtx := stage2BuildCandidateGroupVisitDecisionContext(edge, collectState, earlyStopFrontier)
+	return e.stage2ResolveCandidateGroupVisit(decisionCtx, params)
+}
+
+func stage2BuildProcessableCandidateGroupDecisionContext(edge *graph.Edge, pattern directedRelationshipPattern, row Row, numericConstraints map[string]edgeNumericRangeConstraint, hasNumericConstraints bool, excludedRightIDs map[string]struct{}, hasExcludedRightIDs bool, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}) stage2ProcessableCandidateGroupDecisionContext {
+	return stage2ProcessableCandidateGroupDecisionContext{
+		edge:                  edge,
+		pattern:               pattern,
+		row:                   row,
+		numericConstraints:    numericConstraints,
+		hasNumericConstraints: hasNumericConstraints,
+		excludedRightIDs:      excludedRightIDs,
+		hasExcludedRightIDs:   hasExcludedRightIDs,
+		collectState:          collectState,
+		earlyStopFrontier:     earlyStopFrontier,
+	}
+}
+
+func stage2ResolveEdgeGateForProcessableCandidateGroup(decisionCtx stage2ProcessableCandidateGroupDecisionContext, params Params) bool {
+	return stage2MatchesCandidateEdgeGate(decisionCtx.edge, decisionCtx.pattern.EdgeType, decisionCtx.pattern.EdgeAnyOf, decisionCtx.pattern.EdgeProps, params, decisionCtx.row)
+}
+
+func (e *Executor) stage2ResolvePrefilterGateForProcessableCandidateGroup(decisionCtx stage2ProcessableCandidateGroupDecisionContext, params Params) bool {
+	return e.stage2ShouldDropCandidateEdgeByPrefilters(decisionCtx.edge, decisionCtx.numericConstraints, decisionCtx.hasNumericConstraints, decisionCtx.excludedRightIDs, decisionCtx.hasExcludedRightIDs, params)
+}
+
+func (e *Executor) stage2ResolveVisitGateForProcessableCandidateGroup(decisionCtx stage2ProcessableCandidateGroupDecisionContext, params Params) (groupID string, process bool) {
+	return e.stage2ResolveCandidateGroupVisitGate(decisionCtx.edge, decisionCtx.collectState, decisionCtx.earlyStopFrontier, params)
+}
+
+func (e *Executor) stage2ResolveProcessableCandidateGroup(decisionCtx stage2ProcessableCandidateGroupDecisionContext, params Params) (groupID string, process bool) {
+	if !stage2ResolveEdgeGateForProcessableCandidateGroup(decisionCtx, params) {
+		return "", false
+	}
+	if e.stage2ResolvePrefilterGateForProcessableCandidateGroup(decisionCtx, params) {
+		return "", false
+	}
+	return e.stage2ResolveVisitGateForProcessableCandidateGroup(decisionCtx, params)
+}
+
+func (e *Executor) stage2ResolveProcessableCandidateGroupID(edge *graph.Edge, pattern directedRelationshipPattern, row Row, numericConstraints map[string]edgeNumericRangeConstraint, hasNumericConstraints bool, excludedRightIDs map[string]struct{}, hasExcludedRightIDs bool, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}, params Params) (groupID string, process bool) {
+	decisionCtx := stage2BuildProcessableCandidateGroupDecisionContext(edge, pattern, row, numericConstraints, hasNumericConstraints, excludedRightIDs, hasExcludedRightIDs, collectState, earlyStopFrontier)
+	return e.stage2ResolveProcessableCandidateGroup(decisionCtx, params)
+}
+
+func stage2BuildCandidateEdgeEvalContext(pattern directedRelationshipPattern, whereRaw string, row Row, peer *graph.Vertex, numericConstraints map[string]edgeNumericRangeConstraint, hasNumericConstraints bool, excludedRightIDs map[string]struct{}, hasExcludedRightIDs bool, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}, skipWhereEval bool, hydrationPolicy *deferredHydrationPolicy, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool) stage2CandidateEdgeEvalContext {
+	return stage2CandidateEdgeEvalContext{
+		pattern:               pattern,
+		whereRaw:              whereRaw,
+		row:                   row,
+		peer:                  peer,
+		numericConstraints:    numericConstraints,
+		hasNumericConstraints: hasNumericConstraints,
+		excludedRightIDs:      excludedRightIDs,
+		hasExcludedRightIDs:   hasExcludedRightIDs,
+		collectState:          collectState,
+		earlyStopFrontier:     earlyStopFrontier,
+		skipWhereEval:         skipWhereEval,
+		hydrationPolicy:       hydrationPolicy,
+		projection:            projection,
+		similarityNumeric:     similarityNumeric,
+		similarityNumericOK:   similarityNumericOK,
+	}
+}
+
+func (e *Executor) stage2ResolveProcessableCandidateGroupForEvalContext(edge *graph.Edge, evalCtx stage2CandidateEdgeEvalContext, params Params) (groupID string, process bool) {
+	return e.stage2ResolveProcessableCandidateGroupID(edge, evalCtx.pattern, evalCtx.row, evalCtx.numericConstraints, evalCtx.hasNumericConstraints, evalCtx.excludedRightIDs, evalCtx.hasExcludedRightIDs, evalCtx.collectState, evalCtx.earlyStopFrontier, params)
+}
+
+func (e *Executor) stage2ApplyCandidateAggregationDecisionForEvalContext(ctx context.Context, tx graph.Tx, edge *graph.Edge, aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, groupID string, evalCtx stage2CandidateEdgeEvalContext, params Params) error {
+	_, err := e.stage2ApplyCandidateAggregationDecision(ctx, tx, aggs, groupOrder, groupID, evalCtx.pattern, evalCtx.whereRaw, evalCtx.row, evalCtx.peer, edge, evalCtx.skipWhereEval, evalCtx.hydrationPolicy, evalCtx.projection, evalCtx.similarityNumeric, evalCtx.similarityNumericOK, params)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Executor) stage2ProcessCandidateEdgeAggregation(ctx context.Context, tx graph.Tx, edge *graph.Edge, aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, pattern directedRelationshipPattern, whereRaw string, row Row, peer *graph.Vertex, numericConstraints map[string]edgeNumericRangeConstraint, hasNumericConstraints bool, excludedRightIDs map[string]struct{}, hasExcludedRightIDs bool, collectState *stage2CollectOrchestrationState, earlyStopFrontier map[string]struct{}, skipWhereEval bool, hydrationPolicy *deferredHydrationPolicy, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool, params Params) error {
+	evalCtx := stage2BuildCandidateEdgeEvalContext(pattern, whereRaw, row, peer, numericConstraints, hasNumericConstraints, excludedRightIDs, hasExcludedRightIDs, collectState, earlyStopFrontier, skipWhereEval, hydrationPolicy, projection, similarityNumeric, similarityNumericOK)
+	groupID, process := e.stage2ResolveProcessableCandidateGroupForEvalContext(edge, evalCtx, params)
+	if !process {
+		return nil
+	}
+	return e.stage2ApplyCandidateAggregationDecisionForEvalContext(ctx, tx, edge, aggs, groupOrder, groupID, evalCtx, params)
+}
+
+func stage2ShouldProcessIndexedEdgePath(indexedEdges bool) bool {
+	return indexedEdges
+}
+
+func stage2ShouldSkipIndexedCandidateEdge(edge *graph.Edge) bool {
+	return edge == nil
+}
+
+func stage2BuildIndexedEdgeIterationContext(edges []*graph.Edge, params Params, processCandidateEdge func(*graph.Edge) error) stage2IndexedEdgeIterationContext {
+	return stage2IndexedEdgeIterationContext{
+		edges:                edges,
+		params:               params,
+		processCandidateEdge: processCandidateEdge,
+	}
+}
+
+func (e *Executor) stage2ObserveIndexedCandidateEdgeConsidered(params Params) {
+	e.observeRuntimeCounter(params, "fast_path.stage2.index_edges_considered", 1)
+}
+
+func (e *Executor) stage2ProcessIndexedCandidateEdgeIteration(iterationCtx stage2IndexedEdgeIterationContext, edge *graph.Edge) error {
+	if stage2ShouldSkipIndexedCandidateEdge(edge) {
+		return nil
+	}
+	e.stage2ObserveIndexedCandidateEdgeConsidered(iterationCtx.params)
+	if iterationCtx.processCandidateEdge == nil {
+		return nil
+	}
+	return iterationCtx.processCandidateEdge(edge)
+}
+
+func (e *Executor) stage2ProcessIndexedEdgePath(edges []*graph.Edge, params Params, processCandidateEdge func(*graph.Edge) error) error {
+	phaseStarted := time.Now()
+	iterationCtx := stage2BuildIndexedEdgeIterationContext(edges, params, processCandidateEdge)
+	for _, edge := range iterationCtx.edges {
+		if err := e.stage2ProcessIndexedCandidateEdgeIteration(iterationCtx, edge); err != nil {
+			return err
+		}
+	}
+	e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_process_indexed_edges_micros", phaseStarted)
+	return nil
+}
+
+func (e *Executor) stage2ProcessScannedEdgePath(ctx context.Context, tx graph.Tx, tenant string, peerID string, pattern directedRelationshipPattern, params Params, processCandidateEdge func(*graph.Edge) error) error {
+	phaseStarted := time.Now()
+	scanType := stage2AdjacencyScanType(pattern)
+	if err := scanOutEdgesQueryCached(ctx, tx, tenant, peerID, scanType, params, processCandidateEdge); err != nil {
+		return err
+	}
+	e.observeRuntimeDurationMicros(params, "fast_path.stage2.phase_scan_adjacency_micros", phaseStarted)
+	return nil
+}
+
+func stage2BuildWorkItemEdgePathDecisionContext(ctx context.Context, tx graph.Tx, tenant string, peerID string, pattern directedRelationshipPattern, edges []*graph.Edge, indexedEdges bool, params Params, processCandidateEdge func(*graph.Edge) error) stage2WorkItemEdgePathDecisionContext {
+	return stage2WorkItemEdgePathDecisionContext{
+		ctx:                  ctx,
+		tx:                   tx,
+		tenant:               tenant,
+		peerID:               peerID,
+		pattern:              pattern,
+		edges:                edges,
+		indexedEdges:         indexedEdges,
+		params:               params,
+		processCandidateEdge: processCandidateEdge,
+	}
+}
+
+func stage2ResolveWorkItemEdgePathStrategy(decisionCtx stage2WorkItemEdgePathDecisionContext) (useIndexedPath bool) {
+	return stage2ShouldProcessIndexedEdgePath(decisionCtx.indexedEdges)
+}
+
+func (e *Executor) stage2ProcessResolvedWorkItemEdgePath(decisionCtx stage2WorkItemEdgePathDecisionContext, useIndexedPath bool) error {
+	if useIndexedPath {
+		return e.stage2ProcessIndexedEdgePath(decisionCtx.edges, decisionCtx.params, decisionCtx.processCandidateEdge)
+	}
+	return e.stage2ProcessScannedEdgePath(decisionCtx.ctx, decisionCtx.tx, decisionCtx.tenant, decisionCtx.peerID, decisionCtx.pattern, decisionCtx.params, decisionCtx.processCandidateEdge)
+}
+
+func (e *Executor) stage2ProcessWorkItemEdgePath(ctx context.Context, tx graph.Tx, tenant string, peerID string, pattern directedRelationshipPattern, edges []*graph.Edge, indexedEdges bool, params Params, processCandidateEdge func(*graph.Edge) error) error {
+	decisionCtx := stage2BuildWorkItemEdgePathDecisionContext(ctx, tx, tenant, peerID, pattern, edges, indexedEdges, params, processCandidateEdge)
+	useIndexedPath := stage2ResolveWorkItemEdgePathStrategy(decisionCtx)
+	return e.stage2ProcessResolvedWorkItemEdgePath(decisionCtx, useIndexedPath)
+}
+
+func (e *Executor) stage2ApplyCandidateAggregationDecision(ctx context.Context, tx graph.Tx, aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, groupID string, pattern directedRelationshipPattern, whereRaw string, row Row, peer *graph.Vertex, edge *graph.Edge, skipWhereEval bool, hydrationPolicy *deferredHydrationPolicy, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool, params Params) (handled bool, err error) {
+	decisionCtx := stage2BuildAggregationDecisionContext(aggs, groupOrder, groupID, pattern, whereRaw, row, peer, edge, skipWhereEval, hydrationPolicy, projection, similarityNumeric, similarityNumericOK)
+	if e.stage2ShouldHandleByReuseAggregation(decisionCtx.aggs, decisionCtx.groupID, decisionCtx.skipWhereEval, decisionCtx.edge, decisionCtx.projection, decisionCtx.similarityNumeric, decisionCtx.similarityNumericOK, params) {
+		return true, nil
+	}
+
+	merged, candidate, matched, err := e.stage2ResolveAggregationDecisionCandidateScope(ctx, tx, decisionCtx, params)
+	if err != nil {
+		return false, err
+	}
+	handled = e.stage2ApplyResolvedAggregationDecision(decisionCtx, matched, merged, candidate, params)
+	return handled, nil
+}
+
+func stage2BuildAggregationDecisionContext(aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, groupID string, pattern directedRelationshipPattern, whereRaw string, row Row, peer *graph.Vertex, edge *graph.Edge, skipWhereEval bool, hydrationPolicy *deferredHydrationPolicy, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool) stage2AggregationDecisionContext {
+	return stage2AggregationDecisionContext{
+		aggs:                aggs,
+		groupOrder:          groupOrder,
+		groupID:             groupID,
+		pattern:             pattern,
+		whereRaw:            whereRaw,
+		row:                 row,
+		peer:                peer,
+		edge:                edge,
+		skipWhereEval:       skipWhereEval,
+		hydrationPolicy:     hydrationPolicy,
+		projection:          projection,
+		similarityNumeric:   similarityNumeric,
+		similarityNumericOK: similarityNumericOK,
+	}
+}
+
+func (e *Executor) stage2ResolveAggregationDecisionCandidateScope(ctx context.Context, tx graph.Tx, decisionCtx stage2AggregationDecisionContext, params Params) (merged Row, candidate *graph.Vertex, matched bool, err error) {
+	return e.resolveStage2CandidateScope(ctx, tx, decisionCtx.pattern, decisionCtx.whereRaw, decisionCtx.row, decisionCtx.peer, decisionCtx.edge, decisionCtx.skipWhereEval, decisionCtx.hydrationPolicy, params)
+}
+
+func (e *Executor) stage2ApplyResolvedAggregationDecision(decisionCtx stage2AggregationDecisionContext, matched bool, merged Row, candidate *graph.Vertex, params Params) bool {
+	return stage2ApplyResolvedCandidateAggregationIfMatched(decisionCtx.aggs, decisionCtx.groupOrder, decisionCtx.groupID, matched, merged, candidate, decisionCtx.edge, decisionCtx.projection, decisionCtx.similarityNumeric, decisionCtx.similarityNumericOK, e, params)
+}
+
+func (e *Executor) stage2ShouldHandleByReuseAggregation(aggs map[string]*fastPeerCandidateAggregate, groupID string, skipWhereEval bool, edge *graph.Edge, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool, params Params) bool {
+	return stage2ReuseExistingCandidateAggregateIfEligible(aggs, groupID, skipWhereEval, edge, projection, similarityNumeric, similarityNumericOK, e, params)
+}
+
+func stage2ApplyResolvedCandidateAggregationIfMatched(aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, groupID string, matched bool, merged Row, candidate *graph.Vertex, edge *graph.Edge, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool, e *Executor, params Params) bool {
+	if !matched {
+		return true
+	}
+	agg := stage2EnsureCandidateAggregate(aggs, groupOrder, groupID, projection, merged, candidate, e, params)
+	stage2AccumulateCandidateAggregate(agg, edge, projection.avgEdgeProperty, similarityNumeric, similarityNumericOK)
+	return true
+}
+
+func stage2BindRightCandidateIfNamed(merged Row, rightVar string, candidate *graph.Vertex) {
+	rightVar = strings.TrimSpace(rightVar)
+	if merged == nil || rightVar == "" {
+		return
+	}
+	merged[rightVar] = candidate
+}
+
+func stage2BuildCandidateWhereGateDecisionContext(whereRaw string, merged Row, skipWhereEval bool) stage2CandidateWhereGateDecisionContext {
+	return stage2CandidateWhereGateDecisionContext{
+		whereRaw:      whereRaw,
+		merged:        merged,
+		skipWhereEval: skipWhereEval,
+	}
+}
+
+func stage2ShouldBypassCandidateWhereGate(decisionCtx stage2CandidateWhereGateDecisionContext) bool {
+	return !stage2ShouldEvaluateWhere(decisionCtx.whereRaw, decisionCtx.skipWhereEval)
+}
+
+func (e *Executor) stage2EvaluateCandidateWhereGate(ctx context.Context, tx graph.Tx, decisionCtx stage2CandidateWhereGateDecisionContext, params Params) (ok bool, err error) {
+	return e.evalWhereExpression(ctx, tx, decisionCtx.whereRaw, decisionCtx.merged, params)
+}
+
+func (e *Executor) stage2ObserveCandidateWhereGateDrop(params Params) {
+	e.observeRuntimeCounter(params, "fast_path.stage2.where_eval_drops", 1)
+}
+
+func (e *Executor) stage2ResolveCandidateWhereGate(_ stage2CandidateWhereGateDecisionContext, whereMatched bool, params Params) (matched bool) {
+	if !whereMatched {
+		e.stage2ObserveCandidateWhereGateDrop(params)
+		return false
+	}
+	return true
+}
+
+func (e *Executor) stage2ApplyCandidateWhereGate(ctx context.Context, tx graph.Tx, whereRaw string, merged Row, skipWhereEval bool, params Params) (matched bool, err error) {
+	decisionCtx := stage2BuildCandidateWhereGateDecisionContext(whereRaw, merged, skipWhereEval)
+	if stage2ShouldBypassCandidateWhereGate(decisionCtx) {
+		return true, nil
+	}
+	ok, err := e.stage2EvaluateCandidateWhereGate(ctx, tx, decisionCtx, params)
+	if err != nil {
+		return false, err
+	}
+	return e.stage2ResolveCandidateWhereGate(decisionCtx, ok, params), nil
+}
+
+func stage2NormalizeRightCandidateMatch(candidate *graph.Vertex, matchedRight bool, resolveErr error) (normalizedCandidate *graph.Vertex, matched bool, err error) {
+	if resolveErr != nil {
+		return nil, false, resolveErr
+	}
+	if !matchedRight {
+		return nil, false, nil
+	}
+	return candidate, true, nil
+}
+
+func stage2NormalizeCandidateWhereGateResult(whereMatched bool, whereErr error) (matched bool, err error) {
+	if whereErr != nil {
+		return false, whereErr
+	}
+	if !whereMatched {
+		return false, nil
+	}
+	return true, nil
+}
+
+func stage2BuildCandidateScopeEvalContext(pattern directedRelationshipPattern, whereRaw string, row Row, peer *graph.Vertex, edge *graph.Edge, skipWhereEval bool) stage2CandidateScopeEvalContext {
+	return stage2CandidateScopeEvalContext{
+		pattern:       pattern,
+		whereRaw:      whereRaw,
+		row:           row,
+		peer:          peer,
+		edge:          edge,
+		skipWhereEval: skipWhereEval,
+	}
+}
+
+func stage2BuildCandidateScopeMergedRow(mergedBase Row, rightVar string, candidate *graph.Vertex) Row {
+	merged := cloneRow(mergedBase)
+	stage2BindRightCandidateIfNamed(merged, rightVar, candidate)
+	return merged
+}
+
+func (e *Executor) stage2ResolveCandidateScopeWhereMatch(ctx context.Context, tx graph.Tx, evalCtx stage2CandidateScopeEvalContext, merged Row, params Params) (matched bool, err error) {
+	whereMatched, err := e.stage2ApplyCandidateWhereGate(ctx, tx, evalCtx.whereRaw, merged, evalCtx.skipWhereEval, params)
+	return stage2NormalizeCandidateWhereGateResult(whereMatched, err)
+}
+
+func stage2BuildCandidateScopeHydrationDecisionContext(evalCtx stage2CandidateScopeEvalContext, mergedBase Row, hydrationPolicy *deferredHydrationPolicy) stage2CandidateScopeHydrationDecisionContext {
+	return stage2CandidateScopeHydrationDecisionContext{
+		evalCtx:         evalCtx,
+		mergedBase:      mergedBase,
+		hydrationPolicy: hydrationPolicy,
+	}
+}
+
+func (e *Executor) stage2ResolveCandidateScopeHydratedMatch(decisionCtx stage2CandidateScopeHydrationDecisionContext) (candidate *graph.Vertex, matched bool, err error) {
+	rawCandidate, matchedRight, resolveErr := decisionCtx.hydrationPolicy.resolveAndMatch(decisionCtx.evalCtx.edge.DstID, decisionCtx.evalCtx.pattern.Right, decisionCtx.mergedBase, "runtime.right.lazy_hydrated")
+	return stage2NormalizeRightCandidateMatch(rawCandidate, matchedRight, resolveErr)
+}
+
+func stage2ShouldAbortCandidateScopeResolution(matched bool, err error) (abort bool, abortErr error) {
+	if err != nil {
+		return true, err
+	}
+	if !matched {
+		return true, nil
+	}
+	return false, nil
+}
+
+func stage2BuildCandidateScopeAbortResult(abortErr error) (merged Row, candidate *graph.Vertex, matched bool, err error) {
+	if abortErr != nil {
+		return nil, nil, false, abortErr
+	}
+	return nil, nil, false, nil
+}
+
+func (e *Executor) stage2ResolveCandidateScopeMergedMatch(ctx context.Context, tx graph.Tx, evalCtx stage2CandidateScopeEvalContext, mergedBase Row, candidate *graph.Vertex, params Params) (merged Row, matched bool, err error) {
+	merged = stage2BuildCandidateScopeMergedRow(mergedBase, evalCtx.pattern.Right.Var, candidate)
+	matched, err = e.stage2ResolveCandidateScopeWhereMatch(ctx, tx, evalCtx, merged, params)
+	return merged, matched, err
+}
+
+func (e *Executor) resolveStage2CandidateScope(ctx context.Context, tx graph.Tx, pattern directedRelationshipPattern, whereRaw string, row Row, peer *graph.Vertex, edge *graph.Edge, skipWhereEval bool, hydrationPolicy *deferredHydrationPolicy, params Params) (merged Row, candidate *graph.Vertex, matched bool, err error) {
+	evalCtx := stage2BuildCandidateScopeEvalContext(pattern, whereRaw, row, peer, edge, skipWhereEval)
+	mergedBase := stage2BuildCandidateMergedBase(evalCtx.row, evalCtx.pattern, evalCtx.peer, evalCtx.edge)
+	hydrationDecisionCtx := stage2BuildCandidateScopeHydrationDecisionContext(evalCtx, mergedBase, hydrationPolicy)
+	candidate, matched, err = e.stage2ResolveCandidateScopeHydratedMatch(hydrationDecisionCtx)
+	if abort, abortErr := stage2ShouldAbortCandidateScopeResolution(matched, err); abort {
+		return stage2BuildCandidateScopeAbortResult(abortErr)
+	}
+
+	merged, matched, err = e.stage2ResolveCandidateScopeMergedMatch(ctx, tx, evalCtx, mergedBase, candidate, params)
+	if abort, abortErr := stage2ShouldAbortCandidateScopeResolution(matched, err); abort {
+		return stage2BuildCandidateScopeAbortResult(abortErr)
+	}
+	return merged, candidate, true, nil
+}
+
+func stage2CanAccumulateCandidateAggregate(agg *fastPeerCandidateAggregate) bool {
+	return agg != nil
+}
+
+func stage2AccumulateCandidateAggregate(agg *fastPeerCandidateAggregate, edge *graph.Edge, avgEdgeProperty string, similarityNumeric float64, similarityNumericOK bool) {
+	if !stage2CanAccumulateCandidateAggregate(agg) {
+		return
+	}
+	agg.edgeCount++
+	stage2AccumulateAverageIfEligible(agg, edge, avgEdgeProperty)
+	stage2AccumulateSimilarityIfEligible(agg, similarityNumeric, similarityNumericOK)
+}
+
+func stage2ResolveAverageContribution(edge *graph.Edge, avgEdgeProperty string) (rating float64, ok bool) {
+	return edgeNumericProperty(edge, avgEdgeProperty)
+}
+
+func stage2AccumulateAverageIfEligible(agg *fastPeerCandidateAggregate, edge *graph.Edge, avgEdgeProperty string) bool {
+	if agg == nil {
+		return false
+	}
+	rating, ok := stage2ResolveAverageContribution(edge, avgEdgeProperty)
+	if !ok {
+		return false
+	}
+	agg.avgSum += rating
+	agg.avgCount++
+	return true
+}
+
+func stage2CanAccumulateSimilarity(agg *fastPeerCandidateAggregate, similarityNumericOK bool) bool {
+	return agg != nil && similarityNumericOK
+}
+
+func stage2AccumulateSimilarityIfEligible(agg *fastPeerCandidateAggregate, similarityNumeric float64, similarityNumericOK bool) bool {
+	if !stage2CanAccumulateSimilarity(agg, similarityNumericOK) {
+		return false
+	}
+	agg.similaritySum += similarityNumeric
+	return true
+}
+
+func stage2CanReuseExistingAggregate(skipWhereEval bool) bool {
+	return skipWhereEval
+}
+
+func stage2ResolveReusableAggregate(aggs map[string]*fastPeerCandidateAggregate, groupID string, skipWhereEval bool) (agg *fastPeerCandidateAggregate, reusable bool) {
+	if !stage2CanReuseExistingAggregate(skipWhereEval) {
+		return nil, false
+	}
+	agg, exists := stage2LookupExistingCandidateAggregate(aggs, groupID)
+	if !exists {
+		return nil, false
+	}
+	return agg, true
+}
+
+func stage2ShouldApplyReusableAggregate(reusable bool) bool {
+	return reusable
+}
+
+func stage2ApplyReusableAggregateAccumulation(agg *fastPeerCandidateAggregate, edge *graph.Edge, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool) {
+	stage2AccumulateCandidateAggregate(agg, edge, projection.avgEdgeProperty, similarityNumeric, similarityNumericOK)
+}
+
+func stage2BuildReusableAggregateDecisionContext(aggs map[string]*fastPeerCandidateAggregate, groupID string, skipWhereEval bool, edge *graph.Edge, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool) stage2ReusableAggregateDecisionContext {
+	return stage2ReusableAggregateDecisionContext{
+		aggs:                aggs,
+		groupID:             groupID,
+		skipWhereEval:       skipWhereEval,
+		edge:                edge,
+		projection:          projection,
+		similarityNumeric:   similarityNumeric,
+		similarityNumericOK: similarityNumericOK,
+	}
+}
+
+func (e *Executor) stage2ObserveReusableAggregateHit(params Params) {
+	e.observeRuntimeCounter(params, "fast_path.stage2.candidate_group_reuse_hits", 1)
+}
+
+func stage2ResolveReusableAggregateForDecision(decisionCtx stage2ReusableAggregateDecisionContext) (agg *fastPeerCandidateAggregate, reusable bool) {
+	return stage2ResolveReusableAggregate(decisionCtx.aggs, decisionCtx.groupID, decisionCtx.skipWhereEval)
+}
+
+func (e *Executor) stage2ResolveReusableAggregateDecision(decisionCtx stage2ReusableAggregateDecisionContext, params Params) bool {
+	agg, reusable := stage2ResolveReusableAggregateForDecision(decisionCtx)
+	if !stage2ShouldApplyReusableAggregate(reusable) {
+		return false
+	}
+	e.stage2ObserveReusableAggregateHit(params)
+	stage2ApplyReusableAggregateAccumulation(agg, decisionCtx.edge, decisionCtx.projection, decisionCtx.similarityNumeric, decisionCtx.similarityNumericOK)
+	return true
+}
+
+func stage2ReuseExistingCandidateAggregateIfEligible(aggs map[string]*fastPeerCandidateAggregate, groupID string, skipWhereEval bool, edge *graph.Edge, projection fastPeerCandidateReturnProjection, similarityNumeric float64, similarityNumericOK bool, e *Executor, params Params) bool {
+	decisionCtx := stage2BuildReusableAggregateDecisionContext(aggs, groupID, skipWhereEval, edge, projection, similarityNumeric, similarityNumericOK)
+	return e.stage2ResolveReusableAggregateDecision(decisionCtx, params)
+}
+
+func stage2SeedCandidateAggregateSample(agg *fastPeerCandidateAggregate, projection fastPeerCandidateReturnProjection, merged Row, candidate *graph.Vertex) (lateMaterialized bool) {
+	if agg == nil {
+		return false
+	}
+	if stage2ShouldSeedSampleCandidate(projection) {
+		agg.sampleCandidate = candidate
+		return true
+	}
+	agg.sampleScope = cloneRow(merged)
+	return false
+}
+
+func stage2ShouldSeedSampleCandidate(projection fastPeerCandidateReturnProjection) bool {
+	return projection.lateMaterializeNonAggregates
+}
+
+func stage2HasUsableExistingCandidateAggregate(agg *fastPeerCandidateAggregate, exists bool) bool {
+	return exists && agg != nil
+}
+
+func stage2LookupExistingCandidateAggregate(aggs map[string]*fastPeerCandidateAggregate, groupID string) (agg *fastPeerCandidateAggregate, exists bool) {
+	agg, exists = aggs[groupID]
+	if !stage2HasUsableExistingCandidateAggregate(agg, exists) {
+		return nil, false
+	}
+	return agg, true
+}
+
+func stage2ShouldObserveLateMaterializationCandidate(lateMaterialized bool) bool {
+	return lateMaterialized
+}
+
+func (e *Executor) stage2ObserveCandidateAggregateCreation(lateMaterialized bool, params Params) {
+	e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_created", 1)
+	if stage2ShouldObserveLateMaterializationCandidate(lateMaterialized) {
+		e.observeRuntimeCounter(params, "fast_path.stage2.late_materialization_candidates", 1)
+	}
+}
+
+func stage2BuildNewCandidateAggregate(projection fastPeerCandidateReturnProjection, merged Row, candidate *graph.Vertex) (*fastPeerCandidateAggregate, bool) {
+	agg := &fastPeerCandidateAggregate{}
+	lateMaterialized := stage2SeedCandidateAggregateSample(agg, projection, merged, candidate)
+	return agg, lateMaterialized
+}
+
+func stage2RegisterCandidateAggregate(aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, groupID string, agg *fastPeerCandidateAggregate) {
+	aggs[groupID] = agg
+	*groupOrder = append(*groupOrder, groupID)
+}
+
+func stage2BuildEnsureCandidateAggregateDecisionContext(aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, groupID string, projection fastPeerCandidateReturnProjection, merged Row, candidate *graph.Vertex) stage2EnsureCandidateAggregateDecisionContext {
+	return stage2EnsureCandidateAggregateDecisionContext{
+		aggs:       aggs,
+		groupOrder: groupOrder,
+		groupID:    groupID,
+		projection: projection,
+		merged:     merged,
+		candidate:  candidate,
+	}
+}
+
+func stage2ResolveExistingCandidateAggregateForEnsure(decisionCtx stage2EnsureCandidateAggregateDecisionContext) (agg *fastPeerCandidateAggregate, reuse bool) {
+	agg, exists := stage2LookupExistingCandidateAggregate(decisionCtx.aggs, decisionCtx.groupID)
+	if !stage2ShouldReuseExistingCandidateAggregate(exists) {
+		return nil, false
+	}
+	return agg, true
+}
+
+func (e *Executor) stage2ResolveNewCandidateAggregateForEnsure(decisionCtx stage2EnsureCandidateAggregateDecisionContext, params Params) *fastPeerCandidateAggregate {
+	agg, lateMaterialized := stage2BuildNewCandidateAggregate(decisionCtx.projection, decisionCtx.merged, decisionCtx.candidate)
+	stage2RegisterCandidateAggregate(decisionCtx.aggs, decisionCtx.groupOrder, decisionCtx.groupID, agg)
+	e.stage2ObserveCandidateAggregateCreation(lateMaterialized, params)
+	return agg
+}
+
+func (e *Executor) stage2ResolveEnsuredCandidateAggregate(decisionCtx stage2EnsureCandidateAggregateDecisionContext, params Params) *fastPeerCandidateAggregate {
+	if agg, reuse := stage2ResolveExistingCandidateAggregateForEnsure(decisionCtx); reuse {
+		return agg
+	}
+	return e.stage2ResolveNewCandidateAggregateForEnsure(decisionCtx, params)
+}
+
+func stage2EnsureCandidateAggregate(aggs map[string]*fastPeerCandidateAggregate, groupOrder *[]string, groupID string, projection fastPeerCandidateReturnProjection, merged Row, candidate *graph.Vertex, e *Executor, params Params) *fastPeerCandidateAggregate {
+	decisionCtx := stage2BuildEnsureCandidateAggregateDecisionContext(aggs, groupOrder, groupID, projection, merged, candidate)
+	return e.stage2ResolveEnsuredCandidateAggregate(decisionCtx, params)
+}
+
+func stage2ShouldReuseExistingCandidateAggregate(exists bool) bool {
+	return exists
+}
+
+func stage2ResolveBaseMaxPushdownCandidates() int {
+	return stage2IndexPushdownMaxIndexedCandidates + 1
+}
+
+func stage2ResolveOneSidedRangeRelaxedMaxPushdownCandidates() int {
+	return stage2IndexPushdownMaxIndexedCandidatesOneSidedRange + 1
+}
+
+func stage2ShouldApplyOneSidedRangeRelaxedMaxPushdownCandidates(oneSidedNumericRangeEligible bool, relaxedMax int, currentMax int) bool {
+	return oneSidedNumericRangeEligible && relaxedMax > currentMax
+}
+
+func stage2ResolveHighDegreeThresholdForHintTightening() float64 {
+	return float64(stage2IndexPushdownMaxAverageEdgesPerSource) * 2
+}
+
+func stage2ResolveHintTightenedMaxPushdownCandidates() int {
+	return stage2IndexPushdownMaxIndexedCandidates/2 + 1
+}
+
+func stage2ShouldApplyHintTightenedMaxPushdownCandidates(avgOutDegree float64, highDegreeThreshold float64, tightened int, currentMax int) bool {
+	return avgOutDegree > highDegreeThreshold && stage2ShouldApplyTightenedMaxPushdownCandidates(tightened, currentMax)
+}
+
+func stage2BuildMaxPushdownDecisionContext(oneSidedNumericRangeEligible bool, hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) stage2MaxPushdownDecisionContext {
+	return stage2MaxPushdownDecisionContext{
+		oneSidedNumericRangeEligible: oneSidedNumericRangeEligible,
+		hints:                        hints,
+		edgeType:                     edgeType,
+		edgeTypeAnyOf:                edgeTypeAnyOf,
+		maxPushdownCandidates:        stage2ResolveBaseMaxPushdownCandidates(),
+	}
+}
+
+func stage2ApplyOneSidedRangeRelaxedMaxPushdownCandidates(decisionCtx stage2MaxPushdownDecisionContext) stage2MaxPushdownDecisionContext {
+	relaxedMax := stage2ResolveOneSidedRangeRelaxedMaxPushdownCandidates()
+	if stage2ShouldApplyOneSidedRangeRelaxedMaxPushdownCandidates(decisionCtx.oneSidedNumericRangeEligible, relaxedMax, decisionCtx.maxPushdownCandidates) {
+		decisionCtx.maxPushdownCandidates = relaxedMax
+	}
+	return decisionCtx
+}
+
+func stage2ResolveHintAvgOutDegreeForMaxPushdown(decisionCtx stage2MaxPushdownDecisionContext) (avgOutDegree float64, ok bool) {
+	_, avgOutDegree, ok = stage2HintDegreeSelectivity(decisionCtx.hints, decisionCtx.edgeType, decisionCtx.edgeTypeAnyOf)
+	return avgOutDegree, ok
+}
+
+func stage2ApplyHintTightenedMaxPushdownCandidates(decisionCtx stage2MaxPushdownDecisionContext, avgOutDegree float64) stage2MaxPushdownDecisionContext {
+	highDegreeThreshold := stage2ResolveHighDegreeThresholdForHintTightening()
+	tightened := stage2ResolveHintTightenedMaxPushdownCandidates()
+	if stage2ShouldApplyHintTightenedMaxPushdownCandidates(avgOutDegree, highDegreeThreshold, tightened, decisionCtx.maxPushdownCandidates) {
+		decisionCtx.maxPushdownCandidates = tightened
+	}
+	return decisionCtx
+}
+
+func stage2ResolveMaxPushdownDecision(decisionCtx stage2MaxPushdownDecisionContext) int {
+	decisionCtx = stage2ApplyOneSidedRangeRelaxedMaxPushdownCandidates(decisionCtx)
+	if avgOutDegree, ok := stage2ResolveHintAvgOutDegreeForMaxPushdown(decisionCtx); ok {
+		decisionCtx = stage2ApplyHintTightenedMaxPushdownCandidates(decisionCtx, avgOutDegree)
+	}
+	return decisionCtx.maxPushdownCandidates
+}
+
+func stage2MaxPushdownCandidates(oneSidedNumericRangeEligible bool, hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) int {
+	decisionCtx := stage2BuildMaxPushdownDecisionContext(oneSidedNumericRangeEligible, hints, edgeType, edgeTypeAnyOf)
+	return stage2ResolveMaxPushdownDecision(decisionCtx)
+}
+
+func stage2ShouldApplyTightenedMaxPushdownCandidates(tightened int, currentMax int) bool {
+	return tightened > 0 && tightened < currentMax
+}
+
+func stage2HasSourcePeers(sourcePeerCount int) bool {
+	return sourcePeerCount > 0
+}
+
+func stage2WithinSourceScopedProbeMaxSources(sourcePeerCount int) bool {
+	return sourcePeerCount <= stage2IndexPushdownSourceScopedProbeMaxSources
+}
+
+func stage2ResolveObservedSourceCoverage(observedCount int, sourceCount int) (float64, bool) {
+	if observedCount <= 0 || sourceCount <= 0 {
+		return 0, false
+	}
+	return float64(observedCount) / float64(sourceCount), true
+}
+
+func stage2ResolveSourceProbeCoverageAndDegree(sourcePeerCount int, hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) (observedSourceCoverage float64, avgOutDegree float64, ok bool) {
+	sourceCount, avgOutDegree, ok := stage2HintDegreeSelectivity(hints, edgeType, edgeTypeAnyOf)
+	if !ok {
+		return 0, 0, false
+	}
+	observedSourceCoverage, ok = stage2ResolveObservedSourceCoverage(sourcePeerCount, sourceCount)
+	if !ok {
+		return 0, 0, false
+	}
+	return observedSourceCoverage, avgOutDegree, true
+}
+
+func stage2BuildSourceProbeStrategyDecisionContext(sourcePeerCount int, hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) stage2SourceProbeStrategyDecisionContext {
+	return stage2SourceProbeStrategyDecisionContext{
+		sourcePeerCount: sourcePeerCount,
+		hints:           hints,
+		edgeType:        edgeType,
+		edgeTypeAnyOf:   edgeTypeAnyOf,
+	}
+}
+
+func stage2ResolveSourceProbeCoverageAndDegreeForDecision(decisionCtx stage2SourceProbeStrategyDecisionContext) (observedSourceCoverage float64, avgOutDegree float64, ok bool) {
+	return stage2ResolveSourceProbeCoverageAndDegree(decisionCtx.sourcePeerCount, decisionCtx.hints, decisionCtx.edgeType, decisionCtx.edgeTypeAnyOf)
+}
+
+func stage2BuildSourceProbePolicyInput(decisionCtx stage2SourceProbeStrategyDecisionContext) stage2SourceProbePolicyInput {
+	input := stage2SourceProbePolicyInput{
+		hasSourcePeers:         stage2HasSourcePeers(decisionCtx.sourcePeerCount),
+		withinScopedProbeLimit: stage2WithinSourceScopedProbeMaxSources(decisionCtx.sourcePeerCount),
+	}
+	if !input.hasSourcePeers {
+		return input
+	}
+	if input.withinScopedProbeLimit {
+		input.useSharedMode = true
+		return input
+	}
+	if observedSourceCoverage, avgOutDegree, ok := stage2ResolveSourceProbeCoverageAndDegreeForDecision(decisionCtx); ok {
+		input.coverageResolved = true
+		input.observedSourceCoverage = observedSourceCoverage
+		input.avgOutDegree = avgOutDegree
+		input.preferSharedMode = stage2ShouldPreferSharedSourceProbeForCoverageAndDegree(observedSourceCoverage, avgOutDegree)
+		input.skipWideNonRange = stage2ShouldSkipWideNonRangeForCoverageAndDegree(observedSourceCoverage, avgOutDegree)
+	}
+	input.useSharedMode = input.preferSharedMode
+	input.usePerPeerMode = !input.useSharedMode
+	return input
+}
+
+func stage2ResolveSharedSourceProbeDecision(decisionCtx stage2SourceProbeStrategyDecisionContext) bool {
+	return stage2BuildSourceProbePolicyInput(decisionCtx).useSharedMode
+}
+
+func stage2ResolvePerPeerSourceProbeDecision(decisionCtx stage2SourceProbeStrategyDecisionContext, hasSharedSourceProbeFilter bool) bool {
+	if hasSharedSourceProbeFilter {
+		return false
+	}
+	return stage2BuildSourceProbePolicyInput(decisionCtx).usePerPeerMode
+}
+
+func stage2ResolveWideNonRangePushdownSkipDecision(decisionCtx stage2SourceProbeStrategyDecisionContext, hasNumericRangeShape bool) bool {
+	if hasNumericRangeShape {
+		return false
+	}
+	return stage2BuildSourceProbePolicyInput(decisionCtx).skipWideNonRange
+}
+
+func stage2ShouldPreferSharedSourceProbeForCoverageAndDegree(observedSourceCoverage float64, avgOutDegree float64) bool {
+	return observedSourceCoverage <= 0.35 && avgOutDegree <= float64(stage2IndexPushdownAdaptiveProbeEdgesPerSource)
+}
+
+func stage2ShouldSkipWideNonRangeForCoverageAndDegree(observedSourceCoverage float64, avgOutDegree float64) bool {
+	return observedSourceCoverage > 0.90 && avgOutDegree > float64(stage2IndexPushdownMaxAverageEdgesPerSource)
+}
+
+func stage2CountIndexedCandidates(indexedEdgesBySource map[string][]*graph.Edge) int {
+	totalCandidates := 0
+	for _, edges := range indexedEdgesBySource {
+		totalCandidates += len(edges)
+	}
+	return totalCandidates
+}
+
+func stage2ResolveAverageCandidatesPerIndexedSource(totalCandidates int, indexedSourceCount int) float64 {
+	if indexedSourceCount <= 0 {
+		return 0
+	}
+	return float64(totalCandidates) / float64(indexedSourceCount)
+}
+
+func stage2ResolveIndexPushdownCandidateLoad(indexedEdgesBySource map[string][]*graph.Edge) (totalCandidates int, averagePerSource float64) {
+	totalCandidates = stage2CountIndexedCandidates(indexedEdgesBySource)
+	averagePerSource = stage2ResolveAverageCandidatesPerIndexedSource(totalCandidates, len(indexedEdgesBySource))
+	return totalCandidates, averagePerSource
+}
+
+func stage2ShouldRejectIndexPushdownForHintCoverageFromIndexedSources(indexedSourceCount int, sourceCount int, averagePerSource float64, avgOutDegree float64, totalCandidates int) bool {
+	observedSourceCoverage, coverageOK := stage2ResolveObservedSourceCoverage(indexedSourceCount, sourceCount)
+	if !coverageOK {
+		return false
+	}
+	return stage2ShouldRejectIndexPushdownForHintCoverage(observedSourceCoverage, averagePerSource, avgOutDegree, totalCandidates)
+}
+
+func stage2BuildIndexPushdownHintPolicyInput(hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) stage2IndexPushdownHintPolicyInput {
+	input := stage2IndexPushdownHintPolicyInput{}
+	sourceCount, avgOutDegree, ok := stage2HintDegreeSelectivity(hints, edgeType, edgeTypeAnyOf)
+	if !ok {
+		return input
+	}
+	input.hintSelectivityResolved = true
+	input.sourceCount = sourceCount
+	input.avgOutDegree = avgOutDegree
+	return input
+}
+
+func stage2ShouldRejectIndexPushdownForHintPolicyInput(indexedSourceCount int, averagePerSource float64, totalCandidates int, hintPolicy stage2IndexPushdownHintPolicyInput) bool {
+	if !hintPolicy.hintSelectivityResolved {
+		return false
+	}
+	if stage2ShouldRejectIndexPushdownForHintCoverageFromIndexedSources(indexedSourceCount, hintPolicy.sourceCount, averagePerSource, hintPolicy.avgOutDegree, totalCandidates) {
+		return true
+	}
+	if stage2ShouldRejectIndexPushdownForAvgOutDegreeOverload(averagePerSource, hintPolicy.avgOutDegree) {
+		return true
+	}
+	return false
+}
+
+func stage2ShouldRejectIndexPushdownForHintPolicies(indexedSourceCount int, averagePerSource float64, totalCandidates int, hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) bool {
+	hintPolicy := stage2BuildIndexPushdownHintPolicyInput(hints, edgeType, edgeTypeAnyOf)
+	return stage2ShouldRejectIndexPushdownForHintPolicyInput(indexedSourceCount, averagePerSource, totalCandidates, hintPolicy)
+}
+
+func stage2ShouldRejectIndexPushdownForHardCaps(totalCandidates int, averagePerSource float64) bool {
+	if stage2ShouldRejectIndexPushdownForCandidateCap(totalCandidates) {
+		return true
+	}
+	if stage2ShouldRejectIndexPushdownForAveragePerSourceCap(averagePerSource) {
+		return true
+	}
+	return false
+}
+
+func stage2BuildIndexPushdownEligibilityDecisionContextFromHintPolicy(indexedEdgesBySource map[string][]*graph.Edge, hintPolicy stage2IndexPushdownHintPolicyInput) stage2IndexPushdownEligibilityDecisionContext {
+	return stage2IndexPushdownEligibilityDecisionContext{
+		indexedEdgesBySource: indexedEdgesBySource,
+		hintPolicy:           hintPolicy,
+		indexedSourceCount:   len(indexedEdgesBySource),
+	}
+}
+
+func stage2ResolveIndexPushdownCandidateLoadForDecision(decisionCtx stage2IndexPushdownEligibilityDecisionContext) stage2IndexPushdownEligibilityDecisionContext {
+	decisionCtx.totalCandidates, decisionCtx.averagePerSource = stage2ResolveIndexPushdownCandidateLoad(decisionCtx.indexedEdgesBySource)
+	return decisionCtx
+}
+
+func stage2ShouldApplyIndexPushdownWithoutCandidates(decisionCtx stage2IndexPushdownEligibilityDecisionContext) bool {
+	return stage2ShouldApplyIndexPushdownForNoCandidates(decisionCtx.totalCandidates)
+}
+
+func stage2ShouldRejectIndexPushdownForHintPoliciesDecision(decisionCtx stage2IndexPushdownEligibilityDecisionContext) bool {
+	return stage2ShouldRejectIndexPushdownForHintPolicyInput(decisionCtx.indexedSourceCount, decisionCtx.averagePerSource, decisionCtx.totalCandidates, decisionCtx.hintPolicy)
+}
+
+func stage2ShouldRejectIndexPushdownForHardCapsDecision(decisionCtx stage2IndexPushdownEligibilityDecisionContext) bool {
+	return stage2ShouldRejectIndexPushdownForHardCaps(decisionCtx.totalCandidates, decisionCtx.averagePerSource)
+}
+
+func stage2ResolveIndexPushdownEligibility(decisionCtx stage2IndexPushdownEligibilityDecisionContext) bool {
+	if stage2ShouldApplyIndexPushdownForNoIndexedSources(decisionCtx.indexedEdgesBySource) {
+		return true
+	}
+	decisionCtx = stage2ResolveIndexPushdownCandidateLoadForDecision(decisionCtx)
+	if stage2ShouldApplyIndexPushdownWithoutCandidates(decisionCtx) {
+		return true
+	}
+	if stage2ShouldRejectIndexPushdownForHintPoliciesDecision(decisionCtx) {
+		return false
+	}
+	if stage2ShouldRejectIndexPushdownForHardCapsDecision(decisionCtx) {
+		return false
+	}
+	return true
+}
+
+func stage2ShouldRejectIndexPushdownForHintCoverage(observedSourceCoverage float64, averagePerSource float64, avgOutDegree float64, totalCandidates int) bool {
+	return observedSourceCoverage > 0.90 && averagePerSource > avgOutDegree*1.25 && totalCandidates > stage2IndexPushdownMaxIndexedCandidates/2
+}
+
+func stage2ShouldRejectIndexPushdownForAvgOutDegreeOverload(averagePerSource float64, avgOutDegree float64) bool {
+	return avgOutDegree > 0 && averagePerSource > avgOutDegree*2.0 && averagePerSource > float64(stage2IndexPushdownMaxAverageEdgesPerSource)
+}
+
+func stage2ShouldRejectIndexPushdownForCandidateCap(totalCandidates int) bool {
+	return totalCandidates > stage2IndexPushdownMaxIndexedCandidates
+}
+
+func stage2ShouldRejectIndexPushdownForAveragePerSourceCap(averagePerSource float64) bool {
+	return averagePerSource > float64(stage2IndexPushdownMaxAverageEdgesPerSource)
+}
+
+func stage2ShouldApplyIndexPushdownForNoCandidates(totalCandidates int) bool {
+	return totalCandidates <= 0
+}
+
+func stage2ShouldApplyIndexPushdownForNoIndexedSources(indexedEdgesBySource map[string][]*graph.Edge) bool {
+	return len(indexedEdgesBySource) == 0
+}
+
+func stage2CollectHintDegreeSelectivityTypes(edgeType string, edgeTypeAnyOf []string) []string {
+	types := make([]string, 0, 1+len(edgeTypeAnyOf))
+	edgeType = strings.TrimSpace(edgeType)
+	if edgeType != "" {
+		types = append(types, edgeType)
+	}
+	for _, candidate := range edgeTypeAnyOf {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		types = append(types, candidate)
+	}
+	return types
+}
+
+func stage2HasHintDegreeSelectivityTypes(types []string) bool {
+	return len(types) > 0
+}
+
+func stage2HasHintDegreeSelectivityCounts(totalSourceCount int, totalEdgeCount int) bool {
+	return totalSourceCount > 0 && totalEdgeCount > 0
+}
+
+func stage2ShouldSkipSeenHintDegreeSelectivityType(seen map[string]struct{}, typeName string) bool {
+	_, exists := seen[typeName]
+	return exists
+}
+
+func stage2NormalizeHintDegreeSelectivityType(typeName string) string {
+	return strings.ToUpper(strings.TrimSpace(typeName))
+}
+
+func stage2ResolveHintDegreeSelectivityTypeForAggregation(seen map[string]struct{}, typeName string) (string, bool) {
+	normalizedTypeName := stage2NormalizeHintDegreeSelectivityType(typeName)
+	if normalizedTypeName == "" {
+		return "", false
+	}
+	if stage2ShouldSkipSeenHintDegreeSelectivityType(seen, normalizedTypeName) {
+		return "", false
+	}
+	seen[normalizedTypeName] = struct{}{}
+	return normalizedTypeName, true
+}
+
+func stage2AccumulateHintDegreeSelectivityCounts(totalSourceCount int, totalEdgeCount int, hints physical.StatsHints, typeName string) (int, int) {
+	totalEdgeCount += hints.EdgeTypeCounts[typeName]
+	totalSourceCount += hints.EdgeSourceCounts[typeName]
+	return totalSourceCount, totalEdgeCount
+}
+
+func stage2ShouldUseDirectHintDegreeAverage(avg float64, edgeTypeAnyOf []string) bool {
+	return avg > 0 && len(edgeTypeAnyOf) == 0
+}
+
+func stage2ResolveDirectHintDegreeSelectivityAverage(hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) (float64, bool) {
+	normalizedEdgeType := stage2NormalizeHintDegreeSelectivityType(edgeType)
+	avg, ok := hints.EdgeAvgOutDegree[normalizedEdgeType]
+	if !ok || !stage2ShouldUseDirectHintDegreeAverage(avg, edgeTypeAnyOf) {
+		return 0, false
+	}
+	return avg, true
+}
+
+func stage2ResolveAggregatedHintDegreeSelectivityAverage(totalSourceCount int, totalEdgeCount int) (float64, bool) {
+	if !stage2HasHintDegreeSelectivityCounts(totalSourceCount, totalEdgeCount) {
+		return 0, false
+	}
+	return float64(totalEdgeCount) / float64(totalSourceCount), true
+}
+
+func stage2ResolveHintDegreeSelectivityAverage(hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string, totalSourceCount int, totalEdgeCount int) (float64, bool) {
+	if avg, ok := stage2ResolveDirectHintDegreeSelectivityAverage(hints, edgeType, edgeTypeAnyOf); ok {
+		return avg, true
+	}
+	return stage2ResolveAggregatedHintDegreeSelectivityAverage(totalSourceCount, totalEdgeCount)
+}
+
+func stage2BuildHintDegreeSelectivityDecisionContext(hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) stage2HintDegreeSelectivityDecisionContext {
+	return stage2HintDegreeSelectivityDecisionContext{
+		hints:            hints,
+		edgeType:         edgeType,
+		edgeTypeAnyOf:    edgeTypeAnyOf,
+		types:            stage2CollectHintDegreeSelectivityTypes(edgeType, edgeTypeAnyOf),
+		seen:             map[string]struct{}{},
+		totalEdgeCount:   0,
+		totalSourceCount: 0,
+	}
+}
+
+func stage2ResolveIncludedHintDegreeSelectivityType(decisionCtx stage2HintDegreeSelectivityDecisionContext, typeName string) (normalizedTypeName string, include bool) {
+	return stage2ResolveHintDegreeSelectivityTypeForAggregation(decisionCtx.seen, typeName)
+}
+
+func stage2AccumulateHintDegreeSelectivityForDecision(decisionCtx stage2HintDegreeSelectivityDecisionContext, typeName string) stage2HintDegreeSelectivityDecisionContext {
+	decisionCtx.totalSourceCount, decisionCtx.totalEdgeCount = stage2AccumulateHintDegreeSelectivityCounts(decisionCtx.totalSourceCount, decisionCtx.totalEdgeCount, decisionCtx.hints, typeName)
+	return decisionCtx
+}
+
+func stage2ResolveHintDegreeSelectivityAverageForDecision(decisionCtx stage2HintDegreeSelectivityDecisionContext) (avgOutDegree float64, ok bool) {
+	return stage2ResolveHintDegreeSelectivityAverage(decisionCtx.hints, decisionCtx.edgeType, decisionCtx.edgeTypeAnyOf, decisionCtx.totalSourceCount, decisionCtx.totalEdgeCount)
+}
+
+func stage2ResolveHintDegreeSelectivityDecision(decisionCtx stage2HintDegreeSelectivityDecisionContext) (sourceCount int, avgOutDegree float64, ok bool) {
+	if !stage2HasHintDegreeSelectivityTypes(decisionCtx.types) {
+		return 0, 0, false
+	}
+	for _, typeName := range decisionCtx.types {
+		normalizedTypeName, include := stage2ResolveIncludedHintDegreeSelectivityType(decisionCtx, typeName)
+		if !include {
+			continue
+		}
+		decisionCtx = stage2AccumulateHintDegreeSelectivityForDecision(decisionCtx, normalizedTypeName)
+	}
+	avgOutDegree, ok = stage2ResolveHintDegreeSelectivityAverageForDecision(decisionCtx)
+	if !ok {
+		return 0, 0, false
+	}
+	return decisionCtx.totalSourceCount, avgOutDegree, true
+}
+
+func stage2HintDegreeSelectivity(hints physical.StatsHints, edgeType string, edgeTypeAnyOf []string) (sourceCount int, avgOutDegree float64, ok bool) {
+	decisionCtx := stage2BuildHintDegreeSelectivityDecisionContext(hints, edgeType, edgeTypeAnyOf)
+	return stage2ResolveHintDegreeSelectivityDecision(decisionCtx)
+}
+
+func stage2ShouldFinalizeWithTopK(useTopK bool) bool {
+	return useTopK
+}
+
+func stage2ShouldIncludeAggregateInFinalRows(agg *fastPeerCandidateAggregate) bool {
+	return agg != nil && agg.edgeCount > 0
+}
+
+func stage2BuildFinalizeOutputRowsDecisionContext(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, useTopK bool, projection fastPeerCandidateReturnProjection, topKSpec fastPeerCandidateTopKSpec, retSpec projectionClauseSpec, params Params) stage2FinalizeOutputRowsDecisionContext {
+	return stage2FinalizeOutputRowsDecisionContext{
+		aggs:       aggs,
+		groupOrder: groupOrder,
+		useTopK:    useTopK,
+		projection: projection,
+		topKSpec:   topKSpec,
+		retSpec:    retSpec,
+		params:     params,
+	}
+}
+
+func (e *Executor) stage2ObserveFinalizeOutputRowsGroupTotal(groupOrder []string, params Params) {
+	e.observeRuntimeCounter(params, "fast_path.stage2.candidate_groups_total", int64(len(groupOrder)))
+}
+
+func (e *Executor) stage2ResolveTopKFinalOutputRows(decisionCtx stage2FinalizeOutputRowsDecisionContext) ([]Row, error) {
+	e.observeRuntimeCounter(decisionCtx.params, "fast_path.stage2.topk_pushdown_applied", 1)
+	return fastPeerCandidateTopKRows(decisionCtx.aggs, decisionCtx.groupOrder, decisionCtx.projection, decisionCtx.topKSpec, decisionCtx.params)
+}
+
+func (e *Executor) stage2ResolveNonTopKFinalOutputRows(decisionCtx stage2FinalizeOutputRowsDecisionContext) ([]Row, error) {
+	out := make([]Row, 0, len(decisionCtx.groupOrder))
+	for _, groupID := range decisionCtx.groupOrder {
+		agg := decisionCtx.aggs[groupID]
+		if !stage2ShouldIncludeAggregateInFinalRows(agg) {
+			continue
+		}
+		resultRow, err := buildFastPeerCandidateResultRow(agg, decisionCtx.projection, decisionCtx.params)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, resultRow)
+	}
+	return applyProjectionPostProcessing(out, decisionCtx.retSpec, decisionCtx.params)
+}
+
+func (e *Executor) stage2ResolveFinalOutputRows(decisionCtx stage2FinalizeOutputRowsDecisionContext) ([]Row, error) {
+	e.stage2ObserveFinalizeOutputRowsGroupTotal(decisionCtx.groupOrder, decisionCtx.params)
+	if stage2ShouldFinalizeWithTopK(decisionCtx.useTopK) {
+		return e.stage2ResolveTopKFinalOutputRows(decisionCtx)
+	}
+	return e.stage2ResolveNonTopKFinalOutputRows(decisionCtx)
+}
+
+func (e *Executor) finalizeStage2OutputRows(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, useTopK bool, projection fastPeerCandidateReturnProjection, topKSpec fastPeerCandidateTopKSpec, retSpec projectionClauseSpec, params Params) ([]Row, error) {
+	decisionCtx := stage2BuildFinalizeOutputRowsDecisionContext(aggs, groupOrder, useTopK, projection, topKSpec, retSpec, params)
+	return e.stage2ResolveFinalOutputRows(decisionCtx)
+}
+
+func (e *Executor) finalizeStage2ProjectionTail(rows []Row, projection fastPeerCandidateReturnProjection, priorColumns []string, params Params) ([]Row, []string) {
+	decisionCtx := stage2BuildProjectionTailDecisionContext(rows, projection, priorColumns, params)
+	return e.stage2ResolveProjectionTailDecision(decisionCtx)
+}
+
+func stage2BuildProjectionTailDecisionContext(rows []Row, projection fastPeerCandidateReturnProjection, priorColumns []string, params Params) stage2ProjectionTailDecisionContext {
+	return stage2ProjectionTailDecisionContext{rows: rows, projection: projection, priorColumns: priorColumns, params: params}
+}
+
+func stage2ResolveProjectionTailColumns(decisionCtx stage2ProjectionTailDecisionContext) []string {
+	columns := append([]string(nil), decisionCtx.projection.orderedOutputKeys...)
+	if len(columns) == 0 && len(decisionCtx.priorColumns) > 0 {
+		columns = append([]string(nil), decisionCtx.priorColumns...)
+	}
+	return columns
+}
+
+func stage2ResolveProjectionTailTrimmedRows(decisionCtx stage2ProjectionTailDecisionContext, columns []string) []Row {
+	return trimProjectionRows(decisionCtx.rows, columns)
+}
+
+func (e *Executor) stage2ObserveProjectionTailRowsOutput(params Params, rows []Row) {
+	e.observeRuntimeCounter(params, "fast_path.stage2.rows_output", int64(len(rows)))
+}
+
+func (e *Executor) stage2ResolveProjectionTailDecision(decisionCtx stage2ProjectionTailDecisionContext) ([]Row, []string) {
+	columns := stage2ResolveProjectionTailColumns(decisionCtx)
+	rows := stage2ResolveProjectionTailTrimmedRows(decisionCtx, columns)
+	e.stage2ObserveProjectionTailRowsOutput(decisionCtx.params, rows)
+	return rows, columns
+}
+
+func stage2BuildFastPeerCandidateResultScope(agg *fastPeerCandidateAggregate, projection fastPeerCandidateReturnProjection) Row {
 	scope := agg.sampleScope
 	if projection.lateMaterializeNonAggregates {
 		scope = Row{}
@@ -2986,96 +3668,215 @@ func buildFastPeerCandidateResultRow(agg *fastPeerCandidateAggregate, projection
 			scope[projection.rightVar] = agg.sampleCandidate
 		}
 	}
-	for _, item := range projection.nonAggregates {
-		key := item.Expression
-		if item.Alias != "" {
-			key = item.Alias
-		}
-		value, err := evalExpressionWithScope(item.Expression, scope, params)
-		if err != nil {
-			return nil, err
-		}
-		result[key] = value
+	return scope
+}
+
+func stage2ResolveFastPeerCandidateProjectionKey(item projectionSpec) string {
+	if item.Alias != "" {
+		return item.Alias
 	}
-	result[projection.countKey] = agg.edgeCount
+	return item.Expression
+}
+
+func stage2ResolveFastPeerCandidateAverageValue(agg *fastPeerCandidateAggregate) any {
 	if agg.avgCount == 0 {
-		result[projection.avgKey] = nil
-	} else {
-		result[projection.avgKey] = agg.avgSum / float64(agg.avgCount)
+		return nil
 	}
-	result[projection.sumSimilarityKey] = agg.similaritySum
-	return result, nil
+	return agg.avgSum / float64(agg.avgCount)
+}
+
+func stage2BuildFastPeerCandidateResultRowDecisionContext(agg *fastPeerCandidateAggregate, projection fastPeerCandidateReturnProjection, params Params) stage2ResultRowDecisionContext {
+	return stage2ResultRowDecisionContext{
+		agg:        agg,
+		projection: projection,
+		params:     params,
+		result:     Row{},
+		scope:      stage2BuildFastPeerCandidateResultScope(agg, projection),
+	}
+}
+
+func stage2ResolveFastPeerCandidateNonAggregateValue(decisionCtx stage2ResultRowDecisionContext, item projectionSpec) (key string, value any, err error) {
+	key = stage2ResolveFastPeerCandidateProjectionKey(item)
+	value, err = evalExpressionWithScope(item.Expression, decisionCtx.scope, decisionCtx.params)
+	if err != nil {
+		return "", nil, err
+	}
+	return key, value, nil
+}
+
+func stage2ResolveFastPeerCandidateResultRowNonAggregates(decisionCtx stage2ResultRowDecisionContext) (stage2ResultRowDecisionContext, error) {
+	for _, item := range decisionCtx.projection.nonAggregates {
+		key, value, err := stage2ResolveFastPeerCandidateNonAggregateValue(decisionCtx, item)
+		if err != nil {
+			return decisionCtx, err
+		}
+		decisionCtx.result[key] = value
+	}
+	return decisionCtx, nil
+}
+
+func stage2ResolveFastPeerCandidateResultRowAggregates(decisionCtx stage2ResultRowDecisionContext) stage2ResultRowDecisionContext {
+	decisionCtx.result[decisionCtx.projection.countKey] = decisionCtx.agg.edgeCount
+	decisionCtx.result[decisionCtx.projection.avgKey] = stage2ResolveFastPeerCandidateAverageValue(decisionCtx.agg)
+	decisionCtx.result[decisionCtx.projection.sumSimilarityKey] = decisionCtx.agg.similaritySum
+	return decisionCtx
+}
+
+func stage2ResolveFastPeerCandidateResultRowDecision(decisionCtx stage2ResultRowDecisionContext) (Row, error) {
+	resolvedCtx, err := stage2ResolveFastPeerCandidateResultRowNonAggregates(decisionCtx)
+	if err != nil {
+		return nil, err
+	}
+	resolvedCtx = stage2ResolveFastPeerCandidateResultRowAggregates(resolvedCtx)
+	return resolvedCtx.result, nil
+}
+
+func buildFastPeerCandidateResultRow(agg *fastPeerCandidateAggregate, projection fastPeerCandidateReturnProjection, params Params) (Row, error) {
+	decisionCtx := stage2BuildFastPeerCandidateResultRowDecisionContext(agg, projection, params)
+	return stage2ResolveFastPeerCandidateResultRowDecision(decisionCtx)
+}
+
+func stage2HasSingleTopKOrderBy(retSpec projectionClauseSpec) bool {
+	return len(retSpec.OrderBy) == 1
+}
+
+func stage2HasTopKLimitRaw(retSpec projectionClauseSpec) bool {
+	return strings.TrimSpace(retSpec.LimitRaw) != ""
+}
+
+func stage2MatchesTopKOrderExpression(orderExpr string, projection fastPeerCandidateReturnProjection) bool {
+	return strings.EqualFold(orderExpr, projection.sumSimilarityKey) || strings.EqualFold(orderExpr, projection.sumSimilarityExpr)
+}
+
+func stage2ResolveTopKOrderExpression(retSpec projectionClauseSpec) string {
+	if len(retSpec.OrderBy) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(retSpec.OrderBy[0].Expression)
+}
+
+func stage2ResolveTopKPagination(retSpec projectionClauseSpec, params Params) (skip int, limit int, err error) {
+	skip, err = evalOptionalInt(rawExpression(retSpec.SkipRaw), params)
+	if err != nil {
+		return 0, 0, err
+	}
+	limit, err = evalOptionalInt(rawExpression(retSpec.LimitRaw), params)
+	if err != nil {
+		return 0, 0, err
+	}
+	return skip, limit, nil
+}
+
+func stage2ResolveTopKSpecLimit(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	return limit
+}
+
+func stage2BuildFastPeerCandidateTopKSpec(retSpec projectionClauseSpec, skip int, limit int) fastPeerCandidateTopKSpec {
+	return fastPeerCandidateTopKSpec{descending: retSpec.OrderBy[0].Descending, skip: skip, limit: stage2ResolveTopKSpecLimit(limit)}
+}
+
+func stage2BuildTopKSpecFromProjectionDecisionContext(retSpec projectionClauseSpec, projection fastPeerCandidateReturnProjection, params Params) stage2TopKSpecFromProjectionDecisionContext {
+	return stage2TopKSpecFromProjectionDecisionContext{retSpec: retSpec, projection: projection, params: params}
+}
+
+func stage2IsTopKSpecFromProjectionEligible(decisionCtx stage2TopKSpecFromProjectionDecisionContext) bool {
+	if !stage2HasSingleTopKOrderBy(decisionCtx.retSpec) {
+		return false
+	}
+	if !stage2HasTopKLimitRaw(decisionCtx.retSpec) {
+		return false
+	}
+	return true
+}
+
+func stage2MatchesTopKSpecFromProjectionOrderExpression(decisionCtx stage2TopKSpecFromProjectionDecisionContext) bool {
+	orderExpr := stage2ResolveTopKOrderExpression(decisionCtx.retSpec)
+	return stage2MatchesTopKOrderExpression(orderExpr, decisionCtx.projection)
+}
+
+func stage2ResolveTopKSpecFromProjectionBuild(decisionCtx stage2TopKSpecFromProjectionDecisionContext) (fastPeerCandidateTopKSpec, error) {
+	skip, limit, err := stage2ResolveTopKPagination(decisionCtx.retSpec, decisionCtx.params)
+	if err != nil {
+		return fastPeerCandidateTopKSpec{}, err
+	}
+	return stage2BuildFastPeerCandidateTopKSpec(decisionCtx.retSpec, skip, limit), nil
+}
+
+func stage2ResolveTopKSpecFromProjectionDecision(decisionCtx stage2TopKSpecFromProjectionDecisionContext) (fastPeerCandidateTopKSpec, bool, error) {
+	if !stage2IsTopKSpecFromProjectionEligible(decisionCtx) {
+		return fastPeerCandidateTopKSpec{}, false, nil
+	}
+	if !stage2MatchesTopKSpecFromProjectionOrderExpression(decisionCtx) {
+		return fastPeerCandidateTopKSpec{}, false, nil
+	}
+	spec, err := stage2ResolveTopKSpecFromProjectionBuild(decisionCtx)
+	if err != nil {
+		return fastPeerCandidateTopKSpec{}, false, err
+	}
+	return spec, true, nil
 }
 
 func fastPeerCandidateTopKSpecFromProjection(retSpec projectionClauseSpec, projection fastPeerCandidateReturnProjection, params Params) (fastPeerCandidateTopKSpec, bool, error) {
-	if len(retSpec.OrderBy) != 1 {
-		return fastPeerCandidateTopKSpec{}, false, nil
-	}
-	if strings.TrimSpace(retSpec.LimitRaw) == "" {
-		return fastPeerCandidateTopKSpec{}, false, nil
-	}
-
-	orderExpr := strings.TrimSpace(retSpec.OrderBy[0].Expression)
-	if !strings.EqualFold(orderExpr, projection.sumSimilarityKey) && !strings.EqualFold(orderExpr, projection.sumSimilarityExpr) {
-		return fastPeerCandidateTopKSpec{}, false, nil
-	}
-
-	skip, err := evalOptionalInt(rawExpression(retSpec.SkipRaw), params)
-	if err != nil {
-		return fastPeerCandidateTopKSpec{}, false, err
-	}
-	limit, err := evalOptionalInt(rawExpression(retSpec.LimitRaw), params)
-	if err != nil {
-		return fastPeerCandidateTopKSpec{}, false, err
-	}
-	if limit <= 0 {
-		return fastPeerCandidateTopKSpec{descending: retSpec.OrderBy[0].Descending, skip: skip, limit: 0}, true, nil
-	}
-
-	return fastPeerCandidateTopKSpec{descending: retSpec.OrderBy[0].Descending, skip: skip, limit: limit}, true, nil
+	decisionCtx := stage2BuildTopKSpecFromProjectionDecisionContext(retSpec, projection, params)
+	return stage2ResolveTopKSpecFromProjectionDecision(decisionCtx)
 }
 
-func fastPeerCandidateTopKRows(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, projection fastPeerCandidateReturnProjection, spec fastPeerCandidateTopKSpec, params Params) ([]Row, error) {
-	if spec.limit <= 0 {
-		return []Row{}, nil
-	}
+func stage2ShouldReturnEmptyTopKRows(limit int) bool {
+	return limit <= 0
+}
 
-	keep := spec.skip + spec.limit
+func stage2ResolveTopKKeepSize(skip int, limit int) int {
+	keep := skip + limit
 	if keep <= 0 {
-		keep = spec.limit
+		keep = limit
 	}
-	top := &fastPeerCandidateTopKHeap{descending: spec.descending, rows: make([]fastPeerCandidateRankedRow, 0, keep)}
+	return keep
+}
 
-	for idx, groupID := range groupOrder {
-		agg := aggs[groupID]
-		if agg == nil || agg.edgeCount == 0 {
-			continue
-		}
-		candidate := fastPeerCandidateRankedRow{agg: agg, score: agg.similaritySum, inputIndex: idx}
-		if top.Len() < keep {
-			heap.Push(top, candidate)
-			continue
-		}
-		if compareFastPeerCandidateRank(candidate, top.rows[0], spec.descending) < 0 {
-			top.rows[0] = candidate
-			heap.Fix(top, 0)
-		}
-	}
-	ranked := top.rows
+func stage2ShouldIncludeAggregateInTopKRows(agg *fastPeerCandidateAggregate) bool {
+	return agg != nil && agg.edgeCount > 0
+}
 
-	sort.Slice(ranked, func(i, j int) bool {
-		return compareFastPeerCandidateRank(ranked[i], ranked[j], spec.descending) < 0
-	})
+func stage2ShouldReturnEmptyTopKRowsAfterSkip(skip int, rankedLen int) bool {
+	return skip >= rankedLen
+}
 
-	if spec.skip >= len(ranked) {
-		return []Row{}, nil
-	}
-	end := len(ranked)
-	if max := spec.skip + spec.limit; max < end {
+func stage2ResolveTopKWindowEnd(skip int, limit int, rankedLen int) int {
+	end := rankedLen
+	if max := skip + limit; max < end {
 		end = max
 	}
-	out := make([]Row, 0, end-spec.skip)
-	for _, rankedRow := range ranked[spec.skip:end] {
+	return end
+}
+
+func stage2ShouldPushTopKCandidate(currentLen int, keep int) bool {
+	return currentLen < keep
+}
+
+func stage2ShouldReplaceTopKRoot(candidate fastPeerCandidateRankedRow, root fastPeerCandidateRankedRow, descending bool) bool {
+	return compareFastPeerCandidateRank(candidate, root, descending) < 0
+}
+
+func stage2SortTopKRankedRows(ranked []fastPeerCandidateRankedRow, descending bool) {
+	sort.Slice(ranked, func(i, j int) bool {
+		return compareFastPeerCandidateRank(ranked[i], ranked[j], descending) < 0
+	})
+}
+
+func stage2ResolveTopKRankedWindow(ranked []fastPeerCandidateRankedRow, skip int, limit int) []fastPeerCandidateRankedRow {
+	if stage2ShouldReturnEmptyTopKRowsAfterSkip(skip, len(ranked)) {
+		return []fastPeerCandidateRankedRow{}
+	}
+	end := stage2ResolveTopKWindowEnd(skip, limit, len(ranked))
+	return ranked[skip:end]
+}
+
+func stage2BuildTopKOutputRows(window []fastPeerCandidateRankedRow, projection fastPeerCandidateReturnProjection, params Params) ([]Row, error) {
+	out := make([]Row, 0, len(window))
+	for _, rankedRow := range window {
 		row, err := buildFastPeerCandidateResultRow(rankedRow.agg, projection, params)
 		if err != nil {
 			return nil, err
@@ -3083,6 +3884,63 @@ func fastPeerCandidateTopKRows(aggs map[string]*fastPeerCandidateAggregate, grou
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+func stage2BuildTopKRowsDecisionContext(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, projection fastPeerCandidateReturnProjection, spec fastPeerCandidateTopKSpec, params Params) stage2TopKRowsDecisionContext {
+	keep := stage2ResolveTopKKeepSize(spec.skip, spec.limit)
+	return stage2TopKRowsDecisionContext{
+		aggs:       aggs,
+		groupOrder: groupOrder,
+		projection: projection,
+		spec:       spec,
+		params:     params,
+		keep:       keep,
+		top:        &fastPeerCandidateTopKHeap{descending: spec.descending, rows: make([]fastPeerCandidateRankedRow, 0, keep)},
+	}
+}
+
+func stage2BuildTopKCandidateForDecision(agg *fastPeerCandidateAggregate, inputIndex int) fastPeerCandidateRankedRow {
+	return fastPeerCandidateRankedRow{agg: agg, score: agg.similaritySum, inputIndex: inputIndex}
+}
+
+func stage2MaybePushOrReplaceTopKCandidateForDecision(top *fastPeerCandidateTopKHeap, candidate fastPeerCandidateRankedRow, keep int, descending bool) {
+	if stage2ShouldPushTopKCandidate(top.Len(), keep) {
+		heap.Push(top, candidate)
+		return
+	}
+	if stage2ShouldReplaceTopKRoot(candidate, top.rows[0], descending) {
+		top.rows[0] = candidate
+		heap.Fix(top, 0)
+	}
+}
+
+func stage2AccumulateTopKCandidatesForDecision(decisionCtx stage2TopKRowsDecisionContext) *fastPeerCandidateTopKHeap {
+	for idx, groupID := range decisionCtx.groupOrder {
+		agg := decisionCtx.aggs[groupID]
+		if !stage2ShouldIncludeAggregateInTopKRows(agg) {
+			continue
+		}
+		candidate := stage2BuildTopKCandidateForDecision(agg, idx)
+		stage2MaybePushOrReplaceTopKCandidateForDecision(decisionCtx.top, candidate, decisionCtx.keep, decisionCtx.spec.descending)
+	}
+	return decisionCtx.top
+}
+
+func stage2ResolveTopKRowsDecision(decisionCtx stage2TopKRowsDecisionContext) ([]Row, error) {
+	if stage2ShouldReturnEmptyTopKRows(decisionCtx.spec.limit) {
+		return []Row{}, nil
+	}
+
+	top := stage2AccumulateTopKCandidatesForDecision(decisionCtx)
+	ranked := top.rows
+	stage2SortTopKRankedRows(ranked, decisionCtx.spec.descending)
+	window := stage2ResolveTopKRankedWindow(ranked, decisionCtx.spec.skip, decisionCtx.spec.limit)
+	return stage2BuildTopKOutputRows(window, decisionCtx.projection, decisionCtx.params)
+}
+
+func fastPeerCandidateTopKRows(aggs map[string]*fastPeerCandidateAggregate, groupOrder []string, projection fastPeerCandidateReturnProjection, spec fastPeerCandidateTopKSpec, params Params) ([]Row, error) {
+	decisionCtx := stage2BuildTopKRowsDecisionContext(aggs, groupOrder, projection, spec, params)
+	return stage2ResolveTopKRowsDecision(decisionCtx)
 }
 
 type fastPeerCandidateTopKHeap struct {
@@ -3110,159 +3968,1417 @@ func (h *fastPeerCandidateTopKHeap) Pop() any {
 	return item
 }
 
-func compareFastPeerCandidateRank(left, right fastPeerCandidateRankedRow, descending bool) int {
-	if left.score != right.score {
-		if descending {
-			if left.score > right.score {
-				return -1
-			}
-			return 1
-		}
-		if left.score < right.score {
+func stage2CompareTopKScore(leftScore float64, rightScore float64, descending bool) int {
+	if leftScore == rightScore {
+		return 0
+	}
+	if descending {
+		if leftScore > rightScore {
 			return -1
 		}
 		return 1
 	}
-	if left.inputIndex < right.inputIndex {
+	if leftScore < rightScore {
 		return -1
 	}
-	if left.inputIndex > right.inputIndex {
+	return 1
+}
+
+func stage2CompareTopKInputIndex(leftInputIndex int, rightInputIndex int) int {
+	if leftInputIndex < rightInputIndex {
+		return -1
+	}
+	if leftInputIndex > rightInputIndex {
 		return 1
 	}
 	return 0
 }
 
-func parseFastTargetSharedPeerTopKWithClause(clause ast.Clause, prior fastTargetSharedPeerProjection, params Params) (fastTargetSharedPeerTopKProjection, fastTargetSharedPeerTopKSpec, bool, error) {
-	withSpec, err := projectionClauseSpecFromClause(clause)
-	if err != nil {
-		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+func compareFastPeerCandidateRank(left, right fastPeerCandidateRankedRow, descending bool) int {
+	if scoreCmp := stage2CompareTopKScore(left.score, right.score, descending); scoreCmp != 0 {
+		return scoreCmp
 	}
-	if withSpec.Distinct || strings.TrimSpace(withSpec.WhereRaw) != "" || len(withSpec.OrderBy) != 1 || strings.TrimSpace(withSpec.LimitRaw) == "" {
-		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
-	}
-
-	items, err := parseProjectionItems(withSpec.ProjectionRaw)
-	if err != nil {
-		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
-	}
-	if len(items) != 3 {
-		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
-	}
-
-	projection := fastTargetSharedPeerTopKProjection{}
-	for _, item := range items {
-		if item.Expression == "*" || item.CollectArg != "" || item.CountArg != "" || item.AggFunc != "" {
-			return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
-		}
-		key := item.Expression
-		if item.Alias != "" {
-			key = item.Alias
-		}
-		expr := strings.TrimSpace(item.Expression)
-		switch expr {
-		case prior.targetKey, prior.targetExpr:
-			projection.targetExpr = expr
-			projection.targetKey = key
-		case prior.peerKey, prior.peerExpr:
-			projection.peerExpr = expr
-			projection.peerKey = key
-		default:
-			if projection.similarityExpr != "" {
-				return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
-			}
-			projection.similarityExpr = expr
-			projection.similarityKey = key
-		}
-	}
-	if projection.targetKey == "" || projection.peerKey == "" || projection.similarityKey == "" || projection.similarityExpr == "" {
-		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
-	}
-
-	orderExpr := strings.TrimSpace(withSpec.OrderBy[0].Expression)
-	if !strings.EqualFold(orderExpr, projection.similarityKey) && !strings.EqualFold(orderExpr, projection.similarityExpr) {
-		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
-	}
-	skip, err := evalOptionalInt(rawExpression(withSpec.SkipRaw), params)
-	if err != nil {
-		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, err
-	}
-	limit, err := evalOptionalInt(rawExpression(withSpec.LimitRaw), params)
-	if err != nil {
-		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, err
-	}
-	return projection, fastTargetSharedPeerTopKSpec{descending: withSpec.OrderBy[0].Descending, skip: skip, limit: limit}, true, nil
+	return stage2CompareTopKInputIndex(left.inputIndex, right.inputIndex)
 }
 
-func fastTargetSharedPeerTopKRows(aggs map[string]*fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection, withSpec projectionClauseSpec, topKProjection fastTargetSharedPeerTopKProjection, spec fastTargetSharedPeerTopKSpec, ctx context.Context, tx graph.Tx, params Params, exec *Executor) ([]Row, error) {
-	if spec.limit <= 0 {
-		return []Row{}, nil
-	}
+func stage2IsFastTargetSharedPeerTopKWithSpecEligible(withSpec projectionClauseSpec) bool {
+	return !withSpec.Distinct && strings.TrimSpace(withSpec.WhereRaw) == "" && len(withSpec.OrderBy) == 1 && strings.TrimSpace(withSpec.LimitRaw) != ""
+}
 
-	params = withProjectionEvalRuntime(ctx, tx, params, exec)
-	keep := spec.skip + spec.limit
+func stage2IsFastTargetSharedPeerTopKProjectionItemEligible(item projectionSpec) bool {
+	return item.Expression != "*" && item.CollectArg == "" && item.CountArg == "" && item.AggFunc == ""
+}
+
+func stage2HasFastTargetSharedPeerTopKProjectionBindings(projection fastTargetSharedPeerTopKProjection) bool {
+	return projection.targetKey != "" && projection.peerKey != "" && projection.similarityKey != "" && projection.similarityExpr != ""
+}
+
+func stage2MatchesFastTargetSharedPeerTopKOrderExpression(orderExpr string, projection fastTargetSharedPeerTopKProjection) bool {
+	return strings.EqualFold(orderExpr, projection.similarityKey) || strings.EqualFold(orderExpr, projection.similarityExpr)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionItemKey(item projectionSpec) string {
+	if item.Alias != "" {
+		return item.Alias
+	}
+	return item.Expression
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionItemExpression(item projectionSpec) string {
+	return strings.TrimSpace(item.Expression)
+}
+
+func stage2HasFastTargetSharedPeerTopKProjectionItems(items []projectionSpec) bool {
+	return len(items) == 3
+}
+
+func stage2ResolveFastTargetSharedPeerTopKOrderExpression(withSpec projectionClauseSpec) string {
+	if len(withSpec.OrderBy) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(withSpec.OrderBy[0].Expression)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKPagination(withSpec projectionClauseSpec, params Params) (skip int, limit int, err error) {
+	skip, err = evalOptionalInt(rawExpression(withSpec.SkipRaw), params)
+	if err != nil {
+		return 0, 0, err
+	}
+	limit, err = evalOptionalInt(rawExpression(withSpec.LimitRaw), params)
+	if err != nil {
+		return 0, 0, err
+	}
+	return skip, limit, nil
+}
+
+func stage2BuildFastTargetSharedPeerTopKSpec(withSpec projectionClauseSpec, skip int, limit int) fastTargetSharedPeerTopKSpec {
+	return fastTargetSharedPeerTopKSpec{descending: withSpec.OrderBy[0].Descending, skip: skip, limit: limit}
+}
+
+func stage2ApplyFastTargetSharedPeerTopKProjectionItemBinding(projection fastTargetSharedPeerTopKProjection, prior fastTargetSharedPeerProjection, item projectionSpec) (fastTargetSharedPeerTopKProjection, bool) {
+	decisionCtx := stage2BuildFastTargetSharedPeerTopKProjectionItemBindingDecisionContext(projection, prior, item)
+	return stage2ResolveFastTargetSharedPeerTopKProjectionItemBindingDecision(decisionCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKProjectionItemBindingDecisionContext(projection fastTargetSharedPeerTopKProjection, prior fastTargetSharedPeerProjection, item projectionSpec) stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext {
+	return stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext{
+		projection: projection,
+		prior:      prior,
+		item:       item,
+		key:        stage2ResolveFastTargetSharedPeerTopKProjectionItemKey(item),
+		expr:       stage2ResolveFastTargetSharedPeerTopKProjectionItemExpression(item),
+		updated:    projection,
+	}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionItemTargetBindingDecision(decisionCtx stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext) stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext {
+	if decisionCtx.expr != decisionCtx.prior.targetKey && decisionCtx.expr != decisionCtx.prior.targetExpr {
+		return decisionCtx
+	}
+	decisionCtx.updated.targetExpr = decisionCtx.expr
+	decisionCtx.updated.targetKey = decisionCtx.key
+	decisionCtx.handled = true
+	decisionCtx.applied = true
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionItemPeerBindingDecision(decisionCtx stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext) stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext {
+	if decisionCtx.handled {
+		return decisionCtx
+	}
+	if decisionCtx.expr != decisionCtx.prior.peerKey && decisionCtx.expr != decisionCtx.prior.peerExpr {
+		return decisionCtx
+	}
+	decisionCtx.updated.peerExpr = decisionCtx.expr
+	decisionCtx.updated.peerKey = decisionCtx.key
+	decisionCtx.handled = true
+	decisionCtx.applied = true
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionItemSimilarityBindingDecision(decisionCtx stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext) stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext {
+	if decisionCtx.handled {
+		return decisionCtx
+	}
+	decisionCtx.handled = true
+	if decisionCtx.updated.similarityExpr != "" {
+		decisionCtx.applied = false
+		return decisionCtx
+	}
+	decisionCtx.updated.similarityExpr = decisionCtx.expr
+	decisionCtx.updated.similarityKey = decisionCtx.key
+	decisionCtx.applied = true
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionItemBindingDecision(decisionCtx stage2FastTargetSharedPeerTopKProjectionItemBindingDecisionContext) (fastTargetSharedPeerTopKProjection, bool) {
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKProjectionItemTargetBindingDecision(decisionCtx)
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKProjectionItemPeerBindingDecision(decisionCtx)
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKProjectionItemSimilarityBindingDecision(decisionCtx)
+	if !decisionCtx.applied {
+		return fastTargetSharedPeerTopKProjection{}, false
+	}
+	return decisionCtx.updated, true
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjection(items []projectionSpec, prior fastTargetSharedPeerProjection) (fastTargetSharedPeerTopKProjection, bool) {
+	decisionCtx := stage2BuildFastTargetSharedPeerTopKProjectionDecisionContext(items, prior)
+	return stage2ResolveFastTargetSharedPeerTopKProjectionDecision(decisionCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKProjectionDecisionContext(items []projectionSpec, prior fastTargetSharedPeerProjection) stage2FastTargetSharedPeerTopKProjectionDecisionContext {
+	return stage2FastTargetSharedPeerTopKProjectionDecisionContext{items: items, prior: prior}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionItemsDecision(decisionCtx stage2FastTargetSharedPeerTopKProjectionDecisionContext) (stage2FastTargetSharedPeerTopKProjectionDecisionContext, bool) {
+	for _, item := range decisionCtx.items {
+		if !stage2IsFastTargetSharedPeerTopKProjectionItemEligible(item) {
+			return decisionCtx, false
+		}
+		updatedProjection, applied := stage2ApplyFastTargetSharedPeerTopKProjectionItemBinding(decisionCtx.projection, decisionCtx.prior, item)
+		if !applied {
+			return decisionCtx, false
+		}
+		decisionCtx.projection = updatedProjection
+	}
+	return decisionCtx, true
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionBindingsDecision(decisionCtx stage2FastTargetSharedPeerTopKProjectionDecisionContext) stage2FastTargetSharedPeerTopKProjectionDecisionContext {
+	decisionCtx.hasBindings = stage2HasFastTargetSharedPeerTopKProjectionBindings(decisionCtx.projection)
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKProjectionDecision(decisionCtx stage2FastTargetSharedPeerTopKProjectionDecisionContext) (fastTargetSharedPeerTopKProjection, bool) {
+	decisionCtx, ok := stage2ResolveFastTargetSharedPeerTopKProjectionItemsDecision(decisionCtx)
+	if !ok {
+		return fastTargetSharedPeerTopKProjection{}, false
+	}
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKProjectionBindingsDecision(decisionCtx)
+	if !decisionCtx.hasBindings {
+		return fastTargetSharedPeerTopKProjection{}, false
+	}
+	return decisionCtx.projection, true
+}
+
+func stage2ResolveFastTargetSharedPeerTopKSpecFromWith(withSpec projectionClauseSpec, projection fastTargetSharedPeerTopKProjection, params Params) (fastTargetSharedPeerTopKSpec, bool, error) {
+	resolveCtx := stage2BuildFastTargetSharedPeerTopKSpecResolveDecisionContext(withSpec, projection, params)
+	return stage2ResolveFastTargetSharedPeerTopKSpecResolveDecision(resolveCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKSpecResolveDecisionContext(withSpec projectionClauseSpec, projection fastTargetSharedPeerTopKProjection, params Params) stage2FastTargetSharedPeerTopKSpecResolveDecisionContext {
+	decisionCtx := stage2BuildFastTargetSharedPeerTopKSpecDecisionContext(withSpec, projection, params)
+	return stage2FastTargetSharedPeerTopKSpecResolveDecisionContext{decisionCtx: decisionCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKSpecOrderDecision(resolveCtx stage2FastTargetSharedPeerTopKSpecResolveDecisionContext) stage2FastTargetSharedPeerTopKSpecResolveDecisionContext {
+	resolveCtx.decisionCtx = stage2ResolveFastTargetSharedPeerTopKOrderMatchDecision(resolveCtx.decisionCtx)
+	return resolveCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKSpecPaginationDecision(resolveCtx stage2FastTargetSharedPeerTopKSpecResolveDecisionContext) (stage2FastTargetSharedPeerTopKSpecResolveDecisionContext, error) {
+	if !resolveCtx.decisionCtx.orderMatch {
+		return resolveCtx, nil
+	}
+	decisionCtx, err := stage2ResolveFastTargetSharedPeerTopKPaginationDecision(resolveCtx.decisionCtx)
+	if err != nil {
+		return resolveCtx, err
+	}
+	resolveCtx.decisionCtx = decisionCtx
+	return resolveCtx, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKSpecFinalizeDecision(resolveCtx stage2FastTargetSharedPeerTopKSpecResolveDecisionContext) stage2FastTargetSharedPeerTopKSpecResolveDecisionContext {
+	if !resolveCtx.decisionCtx.orderMatch || !resolveCtx.decisionCtx.paginationOK {
+		return resolveCtx
+	}
+	resolveCtx.spec = stage2ResolveFastTargetSharedPeerTopKSpecDecision(resolveCtx.decisionCtx)
+	resolveCtx.hasSpec = true
+	return resolveCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKSpecResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKSpecResolveDecisionContext) (fastTargetSharedPeerTopKSpec, bool, error) {
+	resolveCtx = stage2ResolveFastTargetSharedPeerTopKSpecOrderDecision(resolveCtx)
+	resolveCtx, err := stage2ResolveFastTargetSharedPeerTopKSpecPaginationDecision(resolveCtx)
+	if err != nil {
+		return fastTargetSharedPeerTopKSpec{}, false, err
+	}
+	resolveCtx = stage2ResolveFastTargetSharedPeerTopKSpecFinalizeDecision(resolveCtx)
+	if !resolveCtx.hasSpec {
+		return fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+	return resolveCtx.spec, true, nil
+}
+
+func stage2BuildFastTargetSharedPeerTopKSpecDecisionContext(withSpec projectionClauseSpec, projection fastTargetSharedPeerTopKProjection, params Params) stage2FastTargetSharedPeerTopKSpecDecisionContext {
+	return stage2FastTargetSharedPeerTopKSpecDecisionContext{withSpec: withSpec, projection: projection, params: params}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKOrderMatchDecision(decisionCtx stage2FastTargetSharedPeerTopKSpecDecisionContext) stage2FastTargetSharedPeerTopKSpecDecisionContext {
+	decisionCtx.orderExpr = stage2ResolveFastTargetSharedPeerTopKOrderExpression(decisionCtx.withSpec)
+	decisionCtx.orderMatch = stage2MatchesFastTargetSharedPeerTopKOrderExpression(decisionCtx.orderExpr, decisionCtx.projection)
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKPaginationDecision(decisionCtx stage2FastTargetSharedPeerTopKSpecDecisionContext) (stage2FastTargetSharedPeerTopKSpecDecisionContext, error) {
+	skip, limit, err := stage2ResolveFastTargetSharedPeerTopKPagination(decisionCtx.withSpec, decisionCtx.params)
+	if err != nil {
+		return decisionCtx, err
+	}
+	decisionCtx.skip = skip
+	decisionCtx.limit = limit
+	decisionCtx.paginationOK = true
+	return decisionCtx, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKSpecDecision(decisionCtx stage2FastTargetSharedPeerTopKSpecDecisionContext) fastTargetSharedPeerTopKSpec {
+	return stage2BuildFastTargetSharedPeerTopKSpec(decisionCtx.withSpec, decisionCtx.skip, decisionCtx.limit)
+}
+
+func parseFastTargetSharedPeerTopKWithClause(clause ast.Clause, prior fastTargetSharedPeerProjection, params Params) (fastTargetSharedPeerTopKProjection, fastTargetSharedPeerTopKSpec, bool, error) {
+	parseDecisionCtx := stage2BuildFastTargetSharedPeerTopKWithClauseParseDecisionContext(clause, prior, params)
+	return stage2ResolveFastTargetSharedPeerTopKWithClauseParseDecision(parseDecisionCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKWithClauseParseDecisionContext(clause ast.Clause, prior fastTargetSharedPeerProjection, params Params) stage2FastTargetSharedPeerTopKWithClauseParseDecisionContext {
+	return stage2FastTargetSharedPeerTopKWithClauseParseDecisionContext{clause: clause, prior: prior, params: params}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseSpecParseDecision(decisionCtx stage2FastTargetSharedPeerTopKWithClauseParseDecisionContext) stage2FastTargetSharedPeerTopKWithClauseParseDecisionContext {
+	withSpec, err := projectionClauseSpecFromClause(decisionCtx.clause)
+	if err != nil {
+		return decisionCtx
+	}
+	decisionCtx.withSpec = withSpec
+	decisionCtx.hasWithSpec = true
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseEligibilityDecision(decisionCtx stage2FastTargetSharedPeerTopKWithClauseParseDecisionContext) stage2FastTargetSharedPeerTopKWithClauseParseDecisionContext {
+	decisionCtx.eligible = decisionCtx.hasWithSpec && stage2IsFastTargetSharedPeerTopKWithSpecEligible(decisionCtx.withSpec)
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseParseDecision(decisionCtx stage2FastTargetSharedPeerTopKWithClauseParseDecisionContext) (fastTargetSharedPeerTopKProjection, fastTargetSharedPeerTopKSpec, bool, error) {
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKWithClauseSpecParseDecision(decisionCtx)
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKWithClauseEligibilityDecision(decisionCtx)
+	if !decisionCtx.eligible {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+	withClauseDecisionCtx := stage2BuildFastTargetSharedPeerTopKWithClauseDecisionContext(decisionCtx.withSpec, decisionCtx.prior, decisionCtx.params)
+	return stage2ResolveFastTargetSharedPeerTopKWithClauseDecision(withClauseDecisionCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKWithClauseDecisionContext(withSpec projectionClauseSpec, prior fastTargetSharedPeerProjection, params Params) stage2FastTargetSharedPeerTopKWithClauseDecisionContext {
+	return stage2FastTargetSharedPeerTopKWithClauseDecisionContext{withSpec: withSpec, prior: prior, params: params}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseItemsDecision(decisionCtx stage2FastTargetSharedPeerTopKWithClauseDecisionContext) (stage2FastTargetSharedPeerTopKWithClauseDecisionContext, bool) {
+	items, err := parseProjectionItems(decisionCtx.withSpec.ProjectionRaw)
+	if err != nil {
+		return decisionCtx, false
+	}
+	if !stage2HasFastTargetSharedPeerTopKProjectionItems(items) {
+		return decisionCtx, false
+	}
+	decisionCtx.items = items
+	decisionCtx.hasItems = true
+	return decisionCtx, true
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseProjectionDecision(decisionCtx stage2FastTargetSharedPeerTopKWithClauseDecisionContext) (stage2FastTargetSharedPeerTopKWithClauseDecisionContext, bool) {
+	projection, ok := stage2ResolveFastTargetSharedPeerTopKProjection(decisionCtx.items, decisionCtx.prior)
+	if !ok {
+		return decisionCtx, false
+	}
+	decisionCtx.projection = projection
+	decisionCtx.hasProjection = true
+	return decisionCtx, true
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseSpecDecision(decisionCtx stage2FastTargetSharedPeerTopKWithClauseDecisionContext) (stage2FastTargetSharedPeerTopKWithClauseDecisionContext, bool, error) {
+	spec, ok, err := stage2ResolveFastTargetSharedPeerTopKSpecFromWith(decisionCtx.withSpec, decisionCtx.projection, decisionCtx.params)
+	if err != nil {
+		return decisionCtx, false, err
+	}
+	if !ok {
+		return decisionCtx, false, nil
+	}
+	decisionCtx.spec = spec
+	decisionCtx.hasSpec = true
+	return decisionCtx, true, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseDecision(decisionCtx stage2FastTargetSharedPeerTopKWithClauseDecisionContext) (fastTargetSharedPeerTopKProjection, fastTargetSharedPeerTopKSpec, bool, error) {
+	resolveCtx := stage2BuildFastTargetSharedPeerTopKWithClauseResolveDecisionContext(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKWithClauseResolveDecision(resolveCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKWithClauseResolveDecisionContext(decisionCtx stage2FastTargetSharedPeerTopKWithClauseDecisionContext) stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext {
+	return stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext{decisionCtx: decisionCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseItemsResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext) stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext {
+	decisionCtx, ok := stage2ResolveFastTargetSharedPeerTopKWithClauseItemsDecision(resolveCtx.decisionCtx)
+	resolveCtx.decisionCtx = decisionCtx
+	resolveCtx.ok = ok
+	return resolveCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseProjectionResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext) stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext {
+	if !resolveCtx.ok {
+		return resolveCtx
+	}
+	decisionCtx, ok := stage2ResolveFastTargetSharedPeerTopKWithClauseProjectionDecision(resolveCtx.decisionCtx)
+	resolveCtx.decisionCtx = decisionCtx
+	resolveCtx.ok = ok
+	return resolveCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseSpecResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext) (stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext, error) {
+	if !resolveCtx.ok {
+		return resolveCtx, nil
+	}
+	decisionCtx, ok, err := stage2ResolveFastTargetSharedPeerTopKWithClauseSpecDecision(resolveCtx.decisionCtx)
+	if err != nil {
+		return resolveCtx, err
+	}
+	resolveCtx.decisionCtx = decisionCtx
+	resolveCtx.ok = ok
+	return resolveCtx, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseFinalizeResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext) stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext {
+	if !resolveCtx.ok {
+		return resolveCtx
+	}
+	resolveCtx.projection = resolveCtx.decisionCtx.projection
+	resolveCtx.spec = resolveCtx.decisionCtx.spec
+	return resolveCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWithClauseResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKWithClauseResolveDecisionContext) (fastTargetSharedPeerTopKProjection, fastTargetSharedPeerTopKSpec, bool, error) {
+	resolveCtx = stage2ResolveFastTargetSharedPeerTopKWithClauseItemsResolveDecision(resolveCtx)
+	resolveCtx = stage2ResolveFastTargetSharedPeerTopKWithClauseProjectionResolveDecision(resolveCtx)
+	resolvedCtx, err := stage2ResolveFastTargetSharedPeerTopKWithClauseSpecResolveDecision(resolveCtx)
+	if err != nil {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, err
+	}
+	resolvedCtx = stage2ResolveFastTargetSharedPeerTopKWithClauseFinalizeResolveDecision(resolvedCtx)
+	if !resolvedCtx.ok {
+		return fastTargetSharedPeerTopKProjection{}, fastTargetSharedPeerTopKSpec{}, false, nil
+	}
+	return resolvedCtx.projection, resolvedCtx.spec, true, nil
+}
+
+func stage2ShouldReturnEmptyFastTargetSharedPeerTopKRows(limit int) bool {
+	return limit <= 0
+}
+
+func stage2ResolveFastTargetSharedPeerTopKKeepSize(skip int, limit int) int {
+	keep := skip + limit
 	if keep <= 0 {
-		keep = spec.limit
+		keep = limit
 	}
-	top := &fastTargetSharedPeerTopKHeap{descending: spec.descending, rows: make([]fastTargetSharedPeerRankedRow, 0, keep)}
-	inputIndex := 0
-	for _, agg := range sortedFastTargetSharedPeerAggregates(aggs) {
-		if agg == nil || agg.shared <= 0 {
-			continue
-		}
-		row := Row{}
-		row[projection.targetKey] = agg.target
-		row[projection.peerKey] = agg.peer
-		row[projection.sharedCountKey] = agg.shared
-		row[projection.avgDiffKey] = agg.sumAbsDiff / float64(agg.shared)
-		if withSpec.WhereRaw != "" {
-			ok, err := exec.evalWhereExpression(ctx, tx, withSpec.WhereRaw, row, params)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				continue
-			}
-		}
-		similarityValue, err := evalExpressionWithScope(topKProjection.similarityExpr, row, params)
-		if err != nil {
-			return nil, err
-		}
-		score, ok := comparableNumericValue(similarityValue)
-		if !ok {
-			continue
-		}
-		trimmed := Row{}
-		trimmed[topKProjection.targetKey] = row[projection.targetKey]
-		trimmed[topKProjection.peerKey] = row[projection.peerKey]
-		trimmed[topKProjection.similarityKey] = similarityValue
-		candidate := fastTargetSharedPeerRankedRow{row: trimmed, score: score, inputIndex: inputIndex}
-		inputIndex++
-		if top.Len() < keep {
-			heap.Push(top, candidate)
-			continue
-		}
-		if compareFastTargetSharedPeerRank(candidate, top.rows[0], spec.descending) < 0 {
-			top.rows[0] = candidate
-			heap.Fix(top, 0)
-		}
-	}
+	return keep
+}
 
-	ranked := top.rows
-	sort.Slice(ranked, func(i, j int) bool {
-		return compareFastTargetSharedPeerRank(ranked[i], ranked[j], spec.descending) < 0
-	})
-	if spec.skip >= len(ranked) {
-		return []Row{}, nil
-	}
-	end := len(ranked)
-	if max := spec.skip + spec.limit; max < end {
+func stage2ShouldIncludeFastTargetSharedPeerAggregate(agg *fastTargetSharedPeerAggregate) bool {
+	return agg != nil && agg.shared > 0
+}
+
+func stage2ShouldReturnEmptyFastTargetSharedPeerTopKRowsAfterSkip(skip int, rankedLen int) bool {
+	return skip >= rankedLen
+}
+
+func stage2ResolveFastTargetSharedPeerTopKWindowEnd(skip int, limit int, rankedLen int) int {
+	end := rankedLen
+	if max := skip + limit; max < end {
 		end = max
 	}
-	out := make([]Row, 0, end-spec.skip)
-	for _, rankedRow := range ranked[spec.skip:end] {
+	return end
+}
+
+func stage2ShouldEvaluateFastTargetSharedPeerWhere(withSpec projectionClauseSpec) bool {
+	return strings.TrimSpace(withSpec.WhereRaw) != ""
+}
+
+func stage2ResolveFastTargetSharedPeerTopKScore(similarityValue any) (float64, bool) {
+	return comparableNumericValue(similarityValue)
+}
+
+func stage2BuildFastTargetSharedPeerTopKTrimmedRow(row Row, projection fastTargetSharedPeerProjection, topKProjection fastTargetSharedPeerTopKProjection, similarityValue any) Row {
+	trimmed := Row{}
+	trimmed[topKProjection.targetKey] = row[projection.targetKey]
+	trimmed[topKProjection.peerKey] = row[projection.peerKey]
+	trimmed[topKProjection.similarityKey] = similarityValue
+	return trimmed
+}
+
+func stage2ResolveFastTargetSharedPeerAverageDiff(agg *fastTargetSharedPeerAggregate) float64 {
+	return agg.sumAbsDiff / float64(agg.shared)
+}
+
+func stage2BuildFastTargetSharedPeerTopKRowSeed(agg *fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection) Row {
+	row := Row{}
+	row[projection.targetKey] = agg.target
+	row[projection.peerKey] = agg.peer
+	row[projection.sharedCountKey] = agg.shared
+	row[projection.avgDiffKey] = stage2ResolveFastTargetSharedPeerAverageDiff(agg)
+	return row
+}
+
+func stage2BuildFastTargetSharedPeerRankedCandidate(trimmed Row, score float64, inputIndex int) fastTargetSharedPeerRankedRow {
+	return fastTargetSharedPeerRankedRow{row: trimmed, score: score, inputIndex: inputIndex}
+}
+
+func stage2ShouldPushSharedPeerTopKCandidate(currentLen int, keep int) bool {
+	return currentLen < keep
+}
+
+func stage2ShouldReplaceSharedPeerTopKRoot(candidate fastTargetSharedPeerRankedRow, root fastTargetSharedPeerRankedRow, descending bool) bool {
+	return compareFastTargetSharedPeerRank(candidate, root, descending) < 0
+}
+
+func stage2SortFastTargetSharedPeerRankedRows(ranked []fastTargetSharedPeerRankedRow, descending bool) {
+	sort.Slice(ranked, func(i, j int) bool {
+		return compareFastTargetSharedPeerRank(ranked[i], ranked[j], descending) < 0
+	})
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRankedWindow(ranked []fastTargetSharedPeerRankedRow, skip int, limit int) []fastTargetSharedPeerRankedRow {
+	if stage2ShouldReturnEmptyFastTargetSharedPeerTopKRowsAfterSkip(skip, len(ranked)) {
+		return []fastTargetSharedPeerRankedRow{}
+	}
+	end := stage2ResolveFastTargetSharedPeerTopKWindowEnd(skip, limit, len(ranked))
+	return ranked[skip:end]
+}
+
+func stage2BuildFastTargetSharedPeerTopKOutputRows(window []fastTargetSharedPeerRankedRow) []Row {
+	out := make([]Row, 0, len(window))
+	for _, rankedRow := range window {
 		out = append(out, rankedRow.row)
 	}
-	return out, nil
+	return out
+}
+
+func stage2BuildFastTargetSharedPeerTopKCandidateRowDecisionContext(agg *fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection, withSpec projectionClauseSpec, topKProjection fastTargetSharedPeerTopKProjection, ctx context.Context, tx graph.Tx, params Params, exec *Executor) stage2FastTargetSharedPeerTopKCandidateRowDecisionContext {
+	return stage2FastTargetSharedPeerTopKCandidateRowDecisionContext{
+		agg:            agg,
+		projection:     projection,
+		withSpec:       withSpec,
+		topKProjection: topKProjection,
+		ctx:            ctx,
+		tx:             tx,
+		params:         params,
+		exec:           exec,
+		row:            stage2BuildFastTargetSharedPeerTopKRowSeed(agg, projection),
+	}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateWhereDecision(decisionCtx stage2FastTargetSharedPeerTopKCandidateRowDecisionContext) (include bool, err error) {
+	if !stage2ShouldEvaluateFastTargetSharedPeerWhere(decisionCtx.withSpec) {
+		return true, nil
+	}
+	ok, err := decisionCtx.exec.evalWhereExpression(decisionCtx.ctx, decisionCtx.tx, decisionCtx.withSpec.WhereRaw, decisionCtx.row, decisionCtx.params)
+	if err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateSimilarityDecision(decisionCtx stage2FastTargetSharedPeerTopKCandidateRowDecisionContext) (stage2FastTargetSharedPeerTopKCandidateRowDecisionContext, bool, error) {
+	similarityValue, err := evalExpressionWithScope(decisionCtx.topKProjection.similarityExpr, decisionCtx.row, decisionCtx.params)
+	if err != nil {
+		return decisionCtx, false, err
+	}
+	score, ok := stage2ResolveFastTargetSharedPeerTopKScore(similarityValue)
+	if !ok {
+		return decisionCtx, false, nil
+	}
+	decisionCtx.similarityValue = similarityValue
+	decisionCtx.score = score
+	decisionCtx.trimmed = stage2BuildFastTargetSharedPeerTopKTrimmedRow(decisionCtx.row, decisionCtx.projection, decisionCtx.topKProjection, similarityValue)
+	return decisionCtx, true, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateRowDecision(decisionCtx stage2FastTargetSharedPeerTopKCandidateRowDecisionContext) (trimmed Row, score float64, include bool, err error) {
+	include, err = stage2ResolveFastTargetSharedPeerTopKCandidateWhereDecision(decisionCtx)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !include {
+		return nil, 0, false, nil
+	}
+	decisionCtx, include, err = stage2ResolveFastTargetSharedPeerTopKCandidateSimilarityDecision(decisionCtx)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !include {
+		return nil, 0, false, nil
+	}
+	return decisionCtx.trimmed, decisionCtx.score, true, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateRow(agg *fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection, withSpec projectionClauseSpec, topKProjection fastTargetSharedPeerTopKProjection, ctx context.Context, tx graph.Tx, params Params, exec *Executor) (trimmed Row, score float64, include bool, err error) {
+	decisionCtx := stage2BuildFastTargetSharedPeerTopKCandidateRowDecisionContext(agg, projection, withSpec, topKProjection, ctx, tx, params, exec)
+	return stage2ResolveFastTargetSharedPeerTopKCandidateRowDecision(decisionCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKCandidateDecisionContext(agg *fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection, withSpec projectionClauseSpec, topKProjection fastTargetSharedPeerTopKProjection, inputIndex int, ctx context.Context, tx graph.Tx, params Params, exec *Executor) stage2FastTargetSharedPeerTopKCandidateDecisionContext {
+	return stage2FastTargetSharedPeerTopKCandidateDecisionContext{
+		agg:            agg,
+		projection:     projection,
+		withSpec:       withSpec,
+		topKProjection: topKProjection,
+		inputIndex:     inputIndex,
+		ctx:            ctx,
+		tx:             tx,
+		params:         params,
+		exec:           exec,
+	}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateRowForDecision(decisionCtx stage2FastTargetSharedPeerTopKCandidateDecisionContext) (stage2FastTargetSharedPeerTopKCandidateDecisionContext, bool, error) {
+	trimmed, score, include, err := stage2ResolveFastTargetSharedPeerTopKCandidateRow(decisionCtx.agg, decisionCtx.projection, decisionCtx.withSpec, decisionCtx.topKProjection, decisionCtx.ctx, decisionCtx.tx, decisionCtx.params, decisionCtx.exec)
+	if err != nil {
+		return decisionCtx, false, err
+	}
+	if !include {
+		return decisionCtx, false, nil
+	}
+	decisionCtx.trimmed = trimmed
+	decisionCtx.score = score
+	return decisionCtx, true, nil
+}
+
+func stage2ResolveFastTargetSharedPeerRankedCandidateForDecision(decisionCtx stage2FastTargetSharedPeerTopKCandidateDecisionContext) stage2FastTargetSharedPeerTopKCandidateDecisionContext {
+	decisionCtx.candidate = stage2BuildFastTargetSharedPeerRankedCandidate(decisionCtx.trimmed, decisionCtx.score, decisionCtx.inputIndex)
+	decisionCtx.nextInputIndex = decisionCtx.inputIndex + 1
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateDecision(decisionCtx stage2FastTargetSharedPeerTopKCandidateDecisionContext) (candidate fastTargetSharedPeerRankedRow, nextInputIndex int, include bool, err error) {
+	resolveCtx := stage2BuildFastTargetSharedPeerTopKCandidateResolveDecisionContext(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKCandidateResolveDecision(resolveCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKCandidateResolveDecisionContext(decisionCtx stage2FastTargetSharedPeerTopKCandidateDecisionContext) stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext {
+	return stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext{decisionCtx: decisionCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateRowResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext) (stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext, error) {
+	decisionCtx, include, err := stage2ResolveFastTargetSharedPeerTopKCandidateRowForDecision(resolveCtx.decisionCtx)
+	if err != nil {
+		return resolveCtx, err
+	}
+	resolveCtx.decisionCtx = decisionCtx
+	resolveCtx.include = include
+	return resolveCtx, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRankedCandidateResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext) stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext {
+	if !resolveCtx.include {
+		return resolveCtx
+	}
+	resolveCtx.decisionCtx = stage2ResolveFastTargetSharedPeerRankedCandidateForDecision(resolveCtx.decisionCtx)
+	resolveCtx.candidate = resolveCtx.decisionCtx.candidate
+	resolveCtx.nextInputIndex = resolveCtx.decisionCtx.nextInputIndex
+	return resolveCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateFinalizeResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext) (candidate fastTargetSharedPeerRankedRow, nextInputIndex int, include bool) {
+	if !resolveCtx.include {
+		return fastTargetSharedPeerRankedRow{}, resolveCtx.decisionCtx.inputIndex, false
+	}
+	return resolveCtx.candidate, resolveCtx.nextInputIndex, true
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext) (candidate fastTargetSharedPeerRankedRow, nextInputIndex int, include bool, err error) {
+	flowCtx := stage2BuildFastTargetSharedPeerTopKCandidateResolveFlowDecisionContext(resolveCtx)
+	return stage2ResolveFastTargetSharedPeerTopKCandidateResolveFlowDecision(flowCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKCandidateResolveFlowDecisionContext(resolveCtx stage2FastTargetSharedPeerTopKCandidateResolveDecisionContext) stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext {
+	return stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext{resolveCtx: resolveCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateRowFlowDecision(flowCtx stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext {
+	resolveCtx, err := stage2ResolveFastTargetSharedPeerTopKCandidateRowResolveDecision(flowCtx.resolveCtx)
+	if err != nil {
+		flowCtx.err = err
+		flowCtx.hasError = true
+		return flowCtx
+	}
+	flowCtx.resolveCtx = resolveCtx
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateRankedFlowDecision(flowCtx stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext {
+	if flowCtx.hasError {
+		return flowCtx
+	}
+	flowCtx.resolveCtx = stage2ResolveFastTargetSharedPeerTopKRankedCandidateResolveDecision(flowCtx.resolveCtx)
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateResolveFlowDecision(flowCtx stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext) (candidate fastTargetSharedPeerRankedRow, nextInputIndex int, include bool, err error) {
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKCandidateRowFlowDecision(flowCtx)
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKCandidateRankedFlowDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKCandidateResolveFlowResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidateResolveFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKCandidateResolveFlowDecisionContext) (candidate fastTargetSharedPeerRankedRow, nextInputIndex int, include bool, err error) {
+	if flowCtx.hasError {
+		return fastTargetSharedPeerRankedRow{}, flowCtx.resolveCtx.decisionCtx.inputIndex, false, flowCtx.err
+	}
+	candidate, nextInputIndex, include = stage2ResolveFastTargetSharedPeerTopKCandidateFinalizeResolveDecision(flowCtx.resolveCtx)
+	return candidate, nextInputIndex, include, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKCandidate(agg *fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection, withSpec projectionClauseSpec, topKProjection fastTargetSharedPeerTopKProjection, inputIndex int, ctx context.Context, tx graph.Tx, params Params, exec *Executor) (candidate fastTargetSharedPeerRankedRow, nextInputIndex int, include bool, err error) {
+	decisionCtx := stage2BuildFastTargetSharedPeerTopKCandidateDecisionContext(agg, projection, withSpec, topKProjection, inputIndex, ctx, tx, params, exec)
+	return stage2ResolveFastTargetSharedPeerTopKCandidateDecision(decisionCtx)
+}
+
+func stage2ApplySharedPeerTopKCandidate(top *fastTargetSharedPeerTopKHeap, candidate fastTargetSharedPeerRankedRow, keep int) {
+	decisionCtx := stage2BuildSharedPeerTopKCandidateApplyDecisionContext(top, candidate, keep)
+	stage2ResolveSharedPeerTopKCandidateApplyDecision(decisionCtx)
+}
+
+func stage2BuildSharedPeerTopKCandidateApplyDecisionContext(top *fastTargetSharedPeerTopKHeap, candidate fastTargetSharedPeerRankedRow, keep int) stage2SharedPeerTopKCandidateApplyDecisionContext {
+	return stage2SharedPeerTopKCandidateApplyDecisionContext{top: top, candidate: candidate, keep: keep}
+}
+
+func stage2ResolveSharedPeerTopKCandidatePushDecision(decisionCtx stage2SharedPeerTopKCandidateApplyDecisionContext) stage2SharedPeerTopKCandidateApplyDecisionContext {
+	decisionCtx.shouldPush = stage2ShouldPushSharedPeerTopKCandidate(decisionCtx.top.Len(), decisionCtx.keep)
+	return decisionCtx
+}
+
+func stage2ResolveSharedPeerTopKCandidateReplaceDecision(decisionCtx stage2SharedPeerTopKCandidateApplyDecisionContext) stage2SharedPeerTopKCandidateApplyDecisionContext {
+	if decisionCtx.shouldPush || decisionCtx.top.Len() == 0 {
+		return decisionCtx
+	}
+	decisionCtx.shouldReplace = stage2ShouldReplaceSharedPeerTopKRoot(decisionCtx.candidate, decisionCtx.top.rows[0], decisionCtx.top.descending)
+	return decisionCtx
+}
+
+func stage2ApplySharedPeerTopKCandidatePushDecision(decisionCtx stage2SharedPeerTopKCandidateApplyDecisionContext) bool {
+	if !decisionCtx.shouldPush {
+		return false
+	}
+	heap.Push(decisionCtx.top, decisionCtx.candidate)
+	return true
+}
+
+func stage2ApplySharedPeerTopKCandidateReplaceDecision(decisionCtx stage2SharedPeerTopKCandidateApplyDecisionContext) {
+	if !decisionCtx.shouldReplace {
+		return
+	}
+	decisionCtx.top.rows[0] = decisionCtx.candidate
+	heap.Fix(decisionCtx.top, 0)
+}
+
+func stage2ResolveSharedPeerTopKCandidateApplyDecision(decisionCtx stage2SharedPeerTopKCandidateApplyDecisionContext) {
+	decisionCtx = stage2ResolveSharedPeerTopKCandidatePushDecision(decisionCtx)
+	decisionCtx = stage2ResolveSharedPeerTopKCandidateReplaceDecision(decisionCtx)
+	decisionCtx = stage2ResolveSharedPeerTopKCandidateApplyExecutionDecision(decisionCtx)
+	stage2ResolveSharedPeerTopKCandidateApplyFinalizeDecision(decisionCtx)
+}
+
+func stage2ResolveSharedPeerTopKCandidateApplyExecutionDecision(decisionCtx stage2SharedPeerTopKCandidateApplyDecisionContext) stage2SharedPeerTopKCandidateApplyDecisionContext {
+	decisionCtx.pushApplied = stage2ApplySharedPeerTopKCandidatePushDecision(decisionCtx)
+	return decisionCtx
+}
+
+func stage2ResolveSharedPeerTopKCandidateApplyFinalizeDecision(decisionCtx stage2SharedPeerTopKCandidateApplyDecisionContext) {
+	if decisionCtx.pushApplied {
+		return
+	}
+	stage2ApplySharedPeerTopKCandidateReplaceDecision(decisionCtx)
+}
+
+func stage2FinalizeFastTargetSharedPeerTopKRows(top *fastTargetSharedPeerTopKHeap, spec fastTargetSharedPeerTopKSpec) []Row {
+	decisionCtx := stage2BuildFastTargetSharedPeerTopKFinalizeDecisionContext(top, spec)
+	return stage2ResolveFastTargetSharedPeerTopKFinalizeDecision(decisionCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKFinalizeDecisionContext(top *fastTargetSharedPeerTopKHeap, spec fastTargetSharedPeerTopKSpec) stage2FastTargetSharedPeerTopKFinalizeDecisionContext {
+	return stage2FastTargetSharedPeerTopKFinalizeDecisionContext{top: top, spec: spec}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKFinalizeRankedDecision(decisionCtx stage2FastTargetSharedPeerTopKFinalizeDecisionContext) stage2FastTargetSharedPeerTopKFinalizeDecisionContext {
+	decisionCtx.ranked = decisionCtx.top.rows
+	stage2SortFastTargetSharedPeerRankedRows(decisionCtx.ranked, decisionCtx.spec.descending)
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKFinalizeWindowDecision(decisionCtx stage2FastTargetSharedPeerTopKFinalizeDecisionContext) stage2FastTargetSharedPeerTopKFinalizeDecisionContext {
+	decisionCtx.window = stage2ResolveFastTargetSharedPeerTopKRankedWindow(decisionCtx.ranked, decisionCtx.spec.skip, decisionCtx.spec.limit)
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKFinalizeRowsDecision(decisionCtx stage2FastTargetSharedPeerTopKFinalizeDecisionContext) stage2FastTargetSharedPeerTopKFinalizeDecisionContext {
+	decisionCtx.rows = stage2BuildFastTargetSharedPeerTopKOutputRows(decisionCtx.window)
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKFinalizeDecision(decisionCtx stage2FastTargetSharedPeerTopKFinalizeDecisionContext) []Row {
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKFinalizeRankedDecision(decisionCtx)
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKFinalizeWindowDecision(decisionCtx)
+	decisionCtx = stage2ResolveFastTargetSharedPeerTopKFinalizeRowsDecision(decisionCtx)
+	return decisionCtx.rows
+}
+
+func stage2BuildFastTargetSharedPeerTopKRowsDecisionContext(aggs map[string]*fastTargetSharedPeerAggregate, projection fastTargetSharedPeerProjection, withSpec projectionClauseSpec, topKProjection fastTargetSharedPeerTopKProjection, spec fastTargetSharedPeerTopKSpec, ctx context.Context, tx graph.Tx, params Params, exec *Executor) stage2FastTargetSharedPeerTopKRowsDecisionContext {
+	runtimeParams := withProjectionEvalRuntime(ctx, tx, params, exec)
+	keep := stage2ResolveFastTargetSharedPeerTopKKeepSize(spec.skip, spec.limit)
+	return stage2FastTargetSharedPeerTopKRowsDecisionContext{
+		aggs:           aggs,
+		projection:     projection,
+		withSpec:       withSpec,
+		topKProjection: topKProjection,
+		spec:           spec,
+		ctx:            ctx,
+		tx:             tx,
+		params:         runtimeParams,
+		exec:           exec,
+		keep:           keep,
+		top:            &fastTargetSharedPeerTopKHeap{descending: spec.descending, rows: make([]fastTargetSharedPeerRankedRow, 0, keep)},
+		inputIndex:     0,
+	}
+}
+
+func stage2BuildFastTargetSharedPeerTopKAggregateDecisionContext(rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext, agg *fastTargetSharedPeerAggregate) stage2FastTargetSharedPeerTopKAggregateDecisionContext {
+	return stage2FastTargetSharedPeerTopKAggregateDecisionContext{
+		rowsDecisionCtx: rowsDecisionCtx,
+		agg:             agg,
+	}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateDecision(decisionCtx stage2FastTargetSharedPeerTopKAggregateDecisionContext) (stage2FastTargetSharedPeerTopKAggregateDecisionContext, error) {
+	resolveCtx := stage2BuildFastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateCandidateResolveDecision(resolveCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext(decisionCtx stage2FastTargetSharedPeerTopKAggregateDecisionContext) stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext {
+	return stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext{decisionCtx: decisionCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateEligibilityDecision(resolveCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext) stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext {
+	resolveCtx.eligible = stage2ShouldIncludeFastTargetSharedPeerAggregate(resolveCtx.decisionCtx.agg)
+	return resolveCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateValuesDecision(resolveCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext) (stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext, error) {
+	if !resolveCtx.eligible {
+		return resolveCtx, nil
+	}
+	candidate, nextInputIndex, include, err := stage2ResolveFastTargetSharedPeerTopKCandidate(resolveCtx.decisionCtx.agg, resolveCtx.decisionCtx.rowsDecisionCtx.projection, resolveCtx.decisionCtx.rowsDecisionCtx.withSpec, resolveCtx.decisionCtx.rowsDecisionCtx.topKProjection, resolveCtx.decisionCtx.rowsDecisionCtx.inputIndex, resolveCtx.decisionCtx.rowsDecisionCtx.ctx, resolveCtx.decisionCtx.rowsDecisionCtx.tx, resolveCtx.decisionCtx.rowsDecisionCtx.params, resolveCtx.decisionCtx.rowsDecisionCtx.exec)
+	if err != nil {
+		return resolveCtx, err
+	}
+	resolveCtx.include = include
+	resolveCtx.candidate = candidate
+	resolveCtx.nextInputIndex = nextInputIndex
+	return resolveCtx, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateFinalizeDecision(resolveCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext) stage2FastTargetSharedPeerTopKAggregateDecisionContext {
+	decisionCtx := resolveCtx.decisionCtx
+	if !resolveCtx.include {
+		return decisionCtx
+	}
+	decisionCtx.candidate = resolveCtx.candidate
+	decisionCtx.nextInputIndex = resolveCtx.nextInputIndex
+	decisionCtx.include = true
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext) (stage2FastTargetSharedPeerTopKAggregateDecisionContext, error) {
+	flowCtx := stage2BuildFastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext(resolveCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateCandidateResolveFlowDecision(flowCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext(resolveCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveDecisionContext) stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext {
+	return stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext{resolveCtx: resolveCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateEligibilityFlowDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext {
+	flowCtx.resolveCtx = stage2ResolveFastTargetSharedPeerTopKAggregateEligibilityDecision(flowCtx.resolveCtx)
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateValuesFlowDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext {
+	if flowCtx.hasError {
+		return flowCtx
+	}
+	resolveCtx, err := stage2ResolveFastTargetSharedPeerTopKAggregateCandidateValuesDecision(flowCtx.resolveCtx)
+	if err != nil {
+		flowCtx.err = err
+		flowCtx.hasError = true
+		return flowCtx
+	}
+	flowCtx.resolveCtx = resolveCtx
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateFinalizeFlowDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext {
+	if flowCtx.hasError {
+		return flowCtx
+	}
+	flowCtx.resolvedDecisionCtx = stage2ResolveFastTargetSharedPeerTopKAggregateCandidateFinalizeDecision(flowCtx.resolveCtx)
+	flowCtx.hasResolvedDecision = true
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateResolveFlowDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKAggregateDecisionContext, error) {
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKAggregateCandidateEligibilityFlowDecision(flowCtx)
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKAggregateCandidateValuesFlowDecision(flowCtx)
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKAggregateCandidateFinalizeFlowDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateCandidateResolveFlowResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateResolveFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateCandidateResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKAggregateDecisionContext, error) {
+	if flowCtx.hasError {
+		return flowCtx.resolveCtx.decisionCtx, flowCtx.err
+	}
+	if !flowCtx.hasResolvedDecision {
+		return flowCtx.resolveCtx.decisionCtx, nil
+	}
+	return flowCtx.resolvedDecisionCtx, nil
+}
+
+func stage2ApplyFastTargetSharedPeerTopKAggregateCandidateDecision(decisionCtx stage2FastTargetSharedPeerTopKAggregateDecisionContext) stage2FastTargetSharedPeerTopKRowsDecisionContext {
+	applyCtx := stage2BuildFastTargetSharedPeerTopKAggregateApplyDecisionContext(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateApplyDecision(applyCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKAggregateApplyDecisionContext(decisionCtx stage2FastTargetSharedPeerTopKAggregateDecisionContext) stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext {
+	return stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext{decisionCtx: decisionCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyGateDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext) stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext {
+	applyCtx.shouldApply = applyCtx.decisionCtx.include
+	return applyCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyRowsContextDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext) stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext {
+	shouldPrepareRowsCtx := stage2ResolveFastTargetSharedPeerTopKAggregateApplyRowsContextGateDecision(applyCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateApplyRowsContextResultDecision(applyCtx, shouldPrepareRowsCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyRowsContextGateDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext) bool {
+	return applyCtx.shouldApply
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyRowsContextResultDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext, shouldPrepareRowsCtx bool) stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext {
+	if !shouldPrepareRowsCtx {
+		return applyCtx
+	}
+	applyCtx.updatedRowsCtx = applyCtx.decisionCtx.rowsDecisionCtx
+	applyCtx.updatedRowsCtx.inputIndex = applyCtx.decisionCtx.nextInputIndex
+	applyCtx.rowsCtxPrepared = true
+	return applyCtx
+}
+
+func stage2ApplyFastTargetSharedPeerTopKAggregateApplyCandidateDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext) stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext {
+	shouldApplyCandidate := stage2ResolveFastTargetSharedPeerTopKAggregateApplyCandidateGateDecision(applyCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateApplyCandidateResultDecision(applyCtx, shouldApplyCandidate)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyCandidateGateDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext) bool {
+	return applyCtx.rowsCtxPrepared
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyCandidateResultDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext, shouldApplyCandidate bool) stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext {
+	if !shouldApplyCandidate {
+		return applyCtx
+	}
+	stage2ApplySharedPeerTopKCandidate(applyCtx.updatedRowsCtx.top, applyCtx.decisionCtx.candidate, applyCtx.updatedRowsCtx.keep)
+	applyCtx.candidateApplied = true
+	return applyCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyFinalizeDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext) stage2FastTargetSharedPeerTopKRowsDecisionContext {
+	shouldReturnUpdatedRowsCtx := stage2ResolveFastTargetSharedPeerTopKAggregateApplyFinalizeGateDecision(applyCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateApplyFinalizeResultDecision(applyCtx, shouldReturnUpdatedRowsCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyFinalizeGateDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext) bool {
+	return applyCtx.shouldApply
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyFinalizeResultDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext, shouldReturnUpdatedRowsCtx bool) stage2FastTargetSharedPeerTopKRowsDecisionContext {
+	if !shouldReturnUpdatedRowsCtx {
+		return applyCtx.decisionCtx.rowsDecisionCtx
+	}
+	return applyCtx.updatedRowsCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyDecision(applyCtx stage2FastTargetSharedPeerTopKAggregateApplyDecisionContext) stage2FastTargetSharedPeerTopKRowsDecisionContext {
+	applyCtx = stage2ResolveFastTargetSharedPeerTopKAggregateApplyGateDecision(applyCtx)
+	applyCtx = stage2ResolveFastTargetSharedPeerTopKAggregateApplyRowsContextDecision(applyCtx)
+	applyCtx = stage2ApplyFastTargetSharedPeerTopKAggregateApplyCandidateDecision(applyCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateApplyFinalizeDecision(applyCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateDecision(rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext, agg *fastTargetSharedPeerAggregate) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	flowCtx := stage2BuildFastTargetSharedPeerTopKAggregateResolveFlowDecisionContext(rowsDecisionCtx, agg)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateResolveFlowDecision(flowCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKAggregateResolveFlowDecisionContext(rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext, agg *fastTargetSharedPeerAggregate) stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext {
+	return stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext{rowsDecisionCtx: rowsDecisionCtx, agg: agg}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateCandidateFlowDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext {
+	flowCtx.decisionCtx = stage2BuildFastTargetSharedPeerTopKAggregateDecisionContext(flowCtx.rowsDecisionCtx, flowCtx.agg)
+	decisionCtx, err := stage2ResolveFastTargetSharedPeerTopKAggregateCandidateDecision(flowCtx.decisionCtx)
+	if err != nil {
+		flowCtx.err = err
+		flowCtx.hasError = true
+		return flowCtx
+	}
+	flowCtx.decisionCtx = decisionCtx
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateApplyFlowDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext {
+	if flowCtx.hasError {
+		return flowCtx
+	}
+	flowCtx.resolvedRowsCtx = stage2ApplyFastTargetSharedPeerTopKAggregateCandidateDecision(flowCtx.decisionCtx)
+	flowCtx.hasResolvedRowsCtx = true
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateResolveFlowDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKAggregateCandidateFlowDecision(flowCtx)
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKAggregateApplyFlowDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKAggregateResolveFlowResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKAggregateResolveFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKAggregateResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	if flowCtx.hasError {
+		return flowCtx.rowsDecisionCtx, flowCtx.err
+	}
+	if !flowCtx.hasResolvedRowsCtx {
+		return flowCtx.rowsDecisionCtx, nil
+	}
+	return flowCtx.resolvedRowsCtx, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidates(decisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	resolveCtx := stage2BuildFastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveDecision(resolveCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext(rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext {
+	return stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext{
+		rowsDecisionCtx: rowsDecisionCtx,
+		sortedAggs:      sortedFastTargetSharedPeerAggregates(rowsDecisionCtx.aggs),
+	}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationDecision(resolveCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, agg *fastTargetSharedPeerAggregate) (stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, error) {
+	flowCtx := stage2BuildFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext(resolveCtx, agg)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecision(flowCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext(resolveCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, agg *fastTargetSharedPeerAggregate) stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext {
+	return stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext{resolveCtx: resolveCtx, agg: agg}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationAggregateFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext {
+	rowsDecisionCtx, err := stage2ResolveFastTargetSharedPeerTopKAggregateDecision(flowCtx.resolveCtx.rowsDecisionCtx, flowCtx.agg)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationAggregateFlowResultDecision(flowCtx, rowsDecisionCtx, err)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationAggregateFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext, rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext, resolveErr error) stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext {
+	if resolveErr != nil {
+		return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationAggregateFlowErrorResultDecision(flowCtx, resolveErr)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationAggregateFlowSuccessResultDecision(flowCtx, rowsDecisionCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationAggregateFlowErrorResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext, resolveErr error) stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext {
+	flowCtx.err = resolveErr
+	flowCtx.hasError = true
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationAggregateFlowSuccessResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext, rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext {
+	flowCtx.resolvedRowsDecisionCtx = rowsDecisionCtx
+	flowCtx.hasResolvedRowsDecisionCtx = true
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationApplyFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext {
+	shouldApplyRowsDecisionCtx := stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationApplyGateDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationApplyResultDecision(flowCtx, shouldApplyRowsDecisionCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationApplyGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext) bool {
+	return !flowCtx.hasError && flowCtx.hasResolvedRowsDecisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationApplyResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext, shouldApplyRowsDecisionCtx bool) stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext {
+	if !shouldApplyRowsDecisionCtx {
+		return flowCtx
+	}
+	flowCtx.resolveCtx.rowsDecisionCtx = flowCtx.resolvedRowsDecisionCtx
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, error) {
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationAggregateFlowDecision(flowCtx)
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationApplyFlowDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, error) {
+	hasResolveError := stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowResultGateDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowResultResultDecision(flowCtx, hasResolveError)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowResultGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext) bool {
+	return flowCtx.hasError
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowResultResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext, hasResolveError bool) (stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, error) {
+	if hasResolveError {
+		return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowErrorResultDecision(flowCtx)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowSuccessResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowErrorResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, error) {
+	return flowCtx.resolveCtx, flowCtx.err
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationResolveFlowSuccessResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateIterationResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, error) {
+	return flowCtx.resolveCtx, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveDecision(resolveCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	flowCtx := stage2BuildFastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext(resolveCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowDecision(flowCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext(resolveCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext {
+	return stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext{resolveCtx: resolveCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext, agg *fastTargetSharedPeerAggregate) stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext {
+	shouldResolveIteration := stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationGateDecision(flowCtx)
+	if !shouldResolveIteration {
+		return flowCtx
+	}
+	updatedCtx, err := stage2ResolveFastTargetSharedPeerTopKRowsCandidateIterationDecision(flowCtx.resolveCtx, agg)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationResultDecision(flowCtx, updatedCtx, err)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext) bool {
+	return !flowCtx.hasError
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext, updatedCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext, iterationErr error) stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext {
+	if iterationErr != nil {
+		return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationErrorResultDecision(flowCtx, iterationErr)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationSuccessResultDecision(flowCtx, updatedCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationErrorResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext, iterationErr error) stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext {
+	flowCtx.err = iterationErr
+	flowCtx.hasError = true
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationSuccessResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext, updatedCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext {
+	flowCtx.resolveCtx = updatedCtx
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	for _, agg := range flowCtx.resolveCtx.sortedAggs {
+		flowCtx = stage2ResolveFastTargetSharedPeerTopKRowsCandidatesIterationFlowDecision(flowCtx, agg)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	hasResolveError := stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowResultGateDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowResultResultDecision(flowCtx, hasResolveError)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowResultGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext) bool {
+	return flowCtx.hasError
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowResultResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext, hasResolveError bool) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	if hasResolveError {
+		return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowErrorResultDecision(flowCtx)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowSuccessResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowErrorResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	return flowCtx.resolveCtx.rowsDecisionCtx, flowCtx.err
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidatesResolveFlowSuccessResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidatesResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsDecisionContext, error) {
+	return flowCtx.resolveCtx.rowsDecisionCtx, nil
+}
+
+func stage2BuildFastTargetSharedPeerTopKRowsResolveDecisionContext(rowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	return stage2FastTargetSharedPeerTopKRowsResolveDecisionContext{rowsDecisionCtx: rowsDecisionCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	shouldReturnEmpty := stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitGateDecision(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitResultDecision(decisionCtx, shouldReturnEmpty)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitGateDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) bool {
+	return stage2ShouldReturnEmptyFastTargetSharedPeerTopKRows(decisionCtx.rowsDecisionCtx.spec.limit)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitResultDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, shouldReturnEmpty bool) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	if shouldReturnEmpty {
+		return stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitApplyResultDecision(decisionCtx)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitPreserveResultDecision(decisionCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitApplyResultDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	decisionCtx.returnEmpty = true
+	decisionCtx.rows = []Row{}
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitPreserveResultDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) (stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, error) {
+	flowCtx := stage2BuildFastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowDecision(flowCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext(resolveCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext {
+	return stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext{resolveCtx: resolveCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext {
+	shouldResolveRows := stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowGateDecision(flowCtx)
+	if !shouldResolveRows {
+		return flowCtx
+	}
+	resolvedRowsDecisionCtx, err := stage2ResolveFastTargetSharedPeerTopKRowsCandidates(flowCtx.resolveCtx.rowsDecisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowResultDecision(flowCtx, resolvedRowsDecisionCtx, err)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) bool {
+	return !flowCtx.resolveCtx.returnEmpty
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext, resolvedRowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext, resolveErr error) stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext {
+	if resolveErr != nil {
+		return stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowErrorResultDecision(flowCtx, resolveErr)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowSuccessResultDecision(flowCtx, resolvedRowsDecisionCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowErrorResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext, resolveErr error) stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext {
+	flowCtx.err = resolveErr
+	flowCtx.hasError = true
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowSuccessResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext, resolvedRowsDecisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext {
+	flowCtx.resolvedRowsDecisionCtx = resolvedRowsDecisionCtx
+	flowCtx.hasResolvedRowsDecisionCtx = true
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateApplyFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext {
+	shouldApplyRowsCtx := stage2ResolveFastTargetSharedPeerTopKRowsCandidateApplyFlowGateDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateApplyFlowResultDecision(flowCtx, shouldApplyRowsCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateApplyFlowGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) bool {
+	return !flowCtx.hasError && flowCtx.hasResolvedRowsDecisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateApplyFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext, shouldApplyRowsCtx bool) stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext {
+	if !shouldApplyRowsCtx {
+		return flowCtx
+	}
+	flowCtx.resolveCtx.rowsDecisionCtx = flowCtx.resolvedRowsDecisionCtx
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, error) {
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKRowsCandidateRowsFlowDecision(flowCtx)
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKRowsCandidateApplyFlowDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, error) {
+	hasResolveError := stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowResultGateDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowResultResultDecision(flowCtx, hasResolveError)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowResultGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) bool {
+	return flowCtx.hasError
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowResultResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext, hasResolveError bool) (stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, error) {
+	if hasResolveError {
+		return stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowErrorResultDecision(flowCtx)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowSuccessResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowErrorResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, error) {
+	return flowCtx.resolveCtx, flowCtx.err
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateResolveFlowSuccessResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsCandidateResolveFlowDecisionContext) (stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, error) {
+	return flowCtx.resolveCtx, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	shouldFinalize := stage2ResolveFastTargetSharedPeerTopKRowsFinalizeGateDecision(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsFinalizeResultDecision(decisionCtx, shouldFinalize)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeGateDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) bool {
+	return !decisionCtx.returnEmpty
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeResultDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, shouldFinalize bool) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	if !shouldFinalize {
+		return stage2ResolveFastTargetSharedPeerTopKRowsFinalizePreserveResultDecision(decisionCtx)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsFinalizeApplyResultDecision(decisionCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizePreserveResultDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeApplyResultDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveDecisionContext {
+	decisionCtx.rows = stage2FinalizeFastTargetSharedPeerTopKRows(decisionCtx.rowsDecisionCtx.top, decisionCtx.rowsDecisionCtx.spec)
+	return decisionCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsResolveDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) ([]Row, error) {
+	flowCtx := stage2BuildFastTargetSharedPeerTopKRowsResolveFlowDecisionContext(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowDecision(flowCtx)
+}
+
+func stage2BuildFastTargetSharedPeerTopKRowsResolveFlowDecisionContext(decisionCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	return stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext{resolveCtx: decisionCtx}
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	flowCtx.resolveCtx = stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitDecision(flowCtx.resolveCtx)
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	shouldResolveCandidateFlow := stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowGateDecision(flowCtx)
+	if !shouldResolveCandidateFlow {
+		return flowCtx
+	}
+	resolvedCtx, err := stage2ResolveFastTargetSharedPeerTopKRowsCandidateDecision(flowCtx.resolveCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowResultDecision(flowCtx, resolvedCtx, err)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) bool {
+	return !flowCtx.hasError
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext, resolvedCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext, resolveErr error) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	if resolveErr != nil {
+		return stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowErrorResultDecision(flowCtx, resolveErr)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowSuccessResultDecision(flowCtx, resolvedCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowErrorResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext, resolveErr error) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	flowCtx.err = resolveErr
+	flowCtx.hasError = true
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowSuccessResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext, resolvedCtx stage2FastTargetSharedPeerTopKRowsResolveDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	flowCtx.resolveCtx = resolvedCtx
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	shouldFinalizeFlow := stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowGateDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowResultDecision(flowCtx, shouldFinalizeFlow)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) bool {
+	return !flowCtx.hasError
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext, shouldFinalizeFlow bool) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	if !shouldFinalizeFlow {
+		return stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowPreserveResultDecision(flowCtx)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowApplyResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowPreserveResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowApplyResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext {
+	flowCtx.resolveCtx = stage2ResolveFastTargetSharedPeerTopKRowsFinalizeDecision(flowCtx.resolveCtx)
+	return flowCtx
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) ([]Row, error) {
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKRowsEmptyLimitFlowDecision(flowCtx)
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKRowsCandidateFlowDecision(flowCtx)
+	flowCtx = stage2ResolveFastTargetSharedPeerTopKRowsFinalizeFlowDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) ([]Row, error) {
+	hasResolveError := stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowResultGateDecision(flowCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowResultResultDecision(flowCtx, hasResolveError)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowResultGateDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) bool {
+	return flowCtx.hasError
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowResultResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext, hasResolveError bool) ([]Row, error) {
+	if hasResolveError {
+		return stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowErrorResultDecision(flowCtx)
+	}
+	return stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowSuccessResultDecision(flowCtx)
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowErrorResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) ([]Row, error) {
+	return nil, flowCtx.err
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsResolveFlowSuccessResultDecision(flowCtx stage2FastTargetSharedPeerTopKRowsResolveFlowDecisionContext) ([]Row, error) {
+	return flowCtx.resolveCtx.rows, nil
+}
+
+func stage2ResolveFastTargetSharedPeerTopKRowsDecision(decisionCtx stage2FastTargetSharedPeerTopKRowsDecisionContext) ([]Row, error) {
+	resolveCtx := stage2BuildFastTargetSharedPeerTopKRowsResolveDecisionContext(decisionCtx)
+	return stage2ResolveFastTargetSharedPeerTopKRowsResolveDecision(resolveCtx)
 }
 
 type fastTargetSharedPeerTopKHeap struct {
@@ -3289,84 +5405,82 @@ func (h *fastTargetSharedPeerTopKHeap) Pop() any {
 	return item
 }
 
-func compareFastTargetSharedPeerRank(left, right fastTargetSharedPeerRankedRow, descending bool) int {
-	if left.score != right.score {
-		if descending {
-			if left.score > right.score {
-				return -1
-			}
-			return 1
-		}
-		if left.score < right.score {
+func stage2CompareSharedPeerTopKScore(leftScore float64, rightScore float64, descending bool) int {
+	if leftScore == rightScore {
+		return 0
+	}
+	if descending {
+		if leftScore > rightScore {
 			return -1
 		}
 		return 1
 	}
-	if left.inputIndex < right.inputIndex {
+	if leftScore < rightScore {
 		return -1
 	}
-	if left.inputIndex > right.inputIndex {
+	return 1
+}
+
+func stage2CompareSharedPeerTopKInputIndex(leftInputIndex int, rightInputIndex int) int {
+	if leftInputIndex < rightInputIndex {
+		return -1
+	}
+	if leftInputIndex > rightInputIndex {
 		return 1
 	}
 	return 0
 }
 
-func sortedFastTargetSharedPeerAggregates(aggs map[string]*fastTargetSharedPeerAggregate) []*fastTargetSharedPeerAggregate {
+func compareFastTargetSharedPeerRank(left, right fastTargetSharedPeerRankedRow, descending bool) int {
+	if scoreCmp := stage2CompareSharedPeerTopKScore(left.score, right.score, descending); scoreCmp != 0 {
+		return scoreCmp
+	}
+	return stage2CompareSharedPeerTopKInputIndex(left.inputIndex, right.inputIndex)
+}
+
+func stage2FastTargetSharedPeerVertexID(v *graph.Vertex) string {
+	if v == nil {
+		return ""
+	}
+	return strings.TrimSpace(v.ID)
+}
+
+func stage2FastTargetSharedPeerAggregateLess(left, right *fastTargetSharedPeerAggregate) bool {
+	leftTarget := stage2FastTargetSharedPeerVertexID(left.target)
+	rightTarget := stage2FastTargetSharedPeerVertexID(right.target)
+	if leftTarget != rightTarget {
+		return leftTarget < rightTarget
+	}
+	leftPeer := stage2FastTargetSharedPeerVertexID(left.peer)
+	rightPeer := stage2FastTargetSharedPeerVertexID(right.peer)
+	return leftPeer < rightPeer
+}
+
+func stage2ShouldIncludeFastTargetSharedPeerAggregateForOrdering(agg *fastTargetSharedPeerAggregate) bool {
+	return agg != nil
+}
+
+func stage2CollectFastTargetSharedPeerAggregates(aggs map[string]*fastTargetSharedPeerAggregate) []*fastTargetSharedPeerAggregate {
 	out := make([]*fastTargetSharedPeerAggregate, 0, len(aggs))
 	for _, agg := range aggs {
-		if agg == nil {
+		if !stage2ShouldIncludeFastTargetSharedPeerAggregateForOrdering(agg) {
 			continue
 		}
 		out = append(out, agg)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		leftTarget := ""
-		if out[i].target != nil {
-			leftTarget = strings.TrimSpace(out[i].target.ID)
-		}
-		rightTarget := ""
-		if out[j].target != nil {
-			rightTarget = strings.TrimSpace(out[j].target.ID)
-		}
-		if leftTarget != rightTarget {
-			return leftTarget < rightTarget
-		}
-		leftPeer := ""
-		if out[i].peer != nil {
-			leftPeer = strings.TrimSpace(out[i].peer.ID)
-		}
-		rightPeer := ""
-		if out[j].peer != nil {
-			rightPeer = strings.TrimSpace(out[j].peer.ID)
-		}
-		return leftPeer < rightPeer
-	})
 	return out
 }
 
-func validateUnionKinds(kinds []ast.UnionKind) error {
-	if len(kinds) <= 1 {
-		return nil
-	}
-	first := kinds[0]
-	for _, kind := range kinds[1:] {
-		if kind != first {
-			return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "InvalidClauseComposition", Statement: 1}
-		}
-	}
-	return nil
+func stage2SortFastTargetSharedPeerAggregates(aggs []*fastTargetSharedPeerAggregate) {
+	sort.Slice(aggs, func(i, j int) bool {
+		return stage2FastTargetSharedPeerAggregateLess(aggs[i], aggs[j])
+	})
 }
 
-func equalStringSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+func sortedFastTargetSharedPeerAggregates(aggs map[string]*fastTargetSharedPeerAggregate) []*fastTargetSharedPeerAggregate {
+	out := stage2CollectFastTargetSharedPeerAggregates(aggs)
+	stage2SortFastTargetSharedPeerAggregates(out)
+	return out
 }
 
 func hasWriteClause(part ast.QueryPart) bool {
@@ -3387,431 +5501,6 @@ func isWriteClauseKind(kind ast.ClauseKind) bool {
 	}
 }
 
-type fastTypedCollectDistinctEndpointExpr struct {
-	Var      string
-	Property string
-}
-
-type fastTypedCollectDistinctReturnSpec struct {
-	groupExpr             fastTypedCollectDistinctEndpointExpr
-	groupKey              string
-	collectExpr           fastTypedCollectDistinctEndpointExpr
-	collectKey            string
-	orderedOutputKeys     []string
-	groupOrderByDirection *projectionOrderBySpec
-}
-
-func (e *Executor) tryFastTypedCollectDistinctReturnQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
-	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
-		return nil, false, nil
-	}
-	part := stmt.Parts[0]
-	if len(part.Clauses) != 2 {
-		return nil, false, nil
-	}
-	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindReturn {
-		return nil, false, nil
-	}
-
-	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
-	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
-		return nil, false, nil
-	}
-	pattern, err := parseDirectedRelationshipPattern(matchSpec.Pattern)
-	if err != nil {
-		return nil, false, nil
-	}
-	if strings.TrimSpace(pattern.EdgeType) == "" || len(pattern.EdgeAnyOf) != 0 || strings.TrimSpace(pattern.EdgeProps) != "" {
-		return nil, false, nil
-	}
-	leftVar := strings.TrimSpace(pattern.Left.Var)
-	rightVar := strings.TrimSpace(pattern.Right.Var)
-	if leftVar == "" || rightVar == "" {
-		return nil, false, nil
-	}
-
-	leftLabel, leftAny, ok := fastEdgeCountVertexLabelFilter(pattern.Left)
-	if !ok {
-		return nil, false, nil
-	}
-	rightLabel, rightAny, ok := fastEdgeCountVertexLabelFilter(pattern.Right)
-	if !ok {
-		return nil, false, nil
-	}
-
-	retSpec, err := projectionClauseSpecFromClause(part.Clauses[1])
-	if err != nil {
-		return nil, false, nil
-	}
-	if retSpec.Distinct || strings.TrimSpace(retSpec.WhereRaw) != "" || strings.TrimSpace(retSpec.SkipRaw) != "" || strings.TrimSpace(retSpec.LimitRaw) != "" {
-		return nil, false, nil
-	}
-	items, err := parseProjectionItems(retSpec.ProjectionRaw)
-	if err != nil || len(items) != 2 {
-		return nil, false, nil
-	}
-
-	parsed, ok := parseFastTypedCollectDistinctReturnProjection(items, retSpec.OrderBy, leftVar, rightVar)
-	if !ok {
-		return nil, false, nil
-	}
-
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, true, err
-	}
-
-	type groupState struct {
-		keyVal      any
-		collectVals []any
-		collectSeen map[string]struct{}
-	}
-
-	vertexCache := map[string]*graph.Vertex{}
-	groups := map[string]*groupState{}
-	groupOrder := make([]string, 0)
-
-	getVertex := func(tx graph.Tx, vertexID string) (*graph.Vertex, error) {
-		if cached, ok := vertexCache[vertexID]; ok {
-			return cached, nil
-		}
-		vertex, err := tx.GetVertex(ctx, tenant, vertexID)
-		if err != nil {
-			if graph.IsKind(err, graph.ErrKindNotFound) {
-				vertexCache[vertexID] = nil
-				return nil, nil
-			}
-			return nil, err
-		}
-		vertexCache[vertexID] = vertex
-		return vertex, nil
-	}
-
-	resolveExprValue := func(tx graph.Tx, expr fastTypedCollectDistinctEndpointExpr, srcID, dstID string) (any, error) {
-		vertexID := srcID
-		if expr.Var == rightVar {
-			vertexID = dstID
-		}
-		vertex, err := getVertex(tx, strings.TrimSpace(vertexID))
-		if err != nil {
-			return nil, err
-		}
-		if vertex == nil {
-			return nil, nil
-		}
-		if expr.Property == "" {
-			return vertex, nil
-		}
-		raw, ok := vertex.Properties[expr.Property]
-		if !ok {
-			return nil, nil
-		}
-		return decodeStoredPropertyValue(raw), nil
-	}
-
-	err = e.store.View(ctx, func(tx graph.Tx) error {
-		return tx.ScanOutEdgeLinksByType(ctx, tenant, pattern.EdgeType, 0, func(srcID, _ string, dstID string) error {
-			srcID = strings.TrimSpace(srcID)
-			dstID = strings.TrimSpace(dstID)
-			if srcID == "" || dstID == "" {
-				return nil
-			}
-
-			srcVertex, err := getVertex(tx, srcID)
-			if err != nil {
-				return err
-			}
-			if srcVertex == nil {
-				return nil
-			}
-			dstVertex, err := getVertex(tx, dstID)
-			if err != nil {
-				return err
-			}
-			if dstVertex == nil {
-				return nil
-			}
-
-			if !leftAny && !vertexHasLabel(srcVertex, leftLabel) {
-				return nil
-			}
-			if !rightAny && !vertexHasLabel(dstVertex, rightLabel) {
-				return nil
-			}
-
-			groupVal, err := resolveExprValue(tx, parsed.groupExpr, srcID, dstID)
-			if err != nil {
-				return err
-			}
-			collectVal, err := resolveExprValue(tx, parsed.collectExpr, srcID, dstID)
-			if err != nil {
-				return err
-			}
-
-			groupKeyRaw, err := json.Marshal(normalizeResultValue(groupVal))
-			if err != nil {
-				return graph.NewError(graph.ErrKindUnsupported, "fast collect group key is not serializable", err)
-			}
-			groupKey := string(groupKeyRaw)
-			group, exists := groups[groupKey]
-			if !exists {
-				group = &groupState{keyVal: groupVal, collectSeen: map[string]struct{}{}}
-				groups[groupKey] = group
-				groupOrder = append(groupOrder, groupKey)
-			}
-
-			collectKeyRaw, err := json.Marshal(normalizeResultValue(collectVal))
-			if err != nil {
-				return graph.NewError(graph.ErrKindUnsupported, "fast collect value is not serializable", err)
-			}
-			collectKey := string(collectKeyRaw)
-			if _, seen := group.collectSeen[collectKey]; seen {
-				return nil
-			}
-			group.collectSeen[collectKey] = struct{}{}
-			group.collectVals = append(group.collectVals, collectVal)
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, true, err
-	}
-
-	outRows := make([]Row, 0, len(groups))
-	for _, groupKey := range groupOrder {
-		group := groups[groupKey]
-		if group == nil {
-			continue
-		}
-		row := Row{
-			parsed.groupKey:   group.keyVal,
-			parsed.collectKey: group.collectVals,
-		}
-		outRows = append(outRows, row)
-	}
-
-	if parsed.groupOrderByDirection != nil {
-		sorted, err := sortProjectedRows(outRows, []projectionOrderBySpec{*parsed.groupOrderByDirection}, params, 0)
-		if err != nil {
-			return nil, true, err
-		}
-		outRows = sorted
-	}
-
-	return &Result{
-		Columns: append([]string(nil), parsed.orderedOutputKeys...),
-		Rows:    outRows,
-		Stats:   Stats{RowsReturned: len(outRows)},
-	}, true, nil
-}
-
-func parseFastTypedCollectDistinctReturnProjection(items []projectionSpec, orderBy []projectionOrderBySpec, leftVar, rightVar string) (fastTypedCollectDistinctReturnSpec, bool) {
-	if len(items) != 2 {
-		return fastTypedCollectDistinctReturnSpec{}, false
-	}
-	out := fastTypedCollectDistinctReturnSpec{}
-	groupSeen := false
-	collectSeen := false
-	groupExprRaw := ""
-	collectExprRaw := ""
-
-	for _, item := range items {
-		key := item.Expression
-		if item.Alias != "" {
-			key = item.Alias
-		}
-		out.orderedOutputKeys = append(out.orderedOutputKeys, key)
-
-		if item.CountArg != "" || item.AggFunc != "" {
-			return fastTypedCollectDistinctReturnSpec{}, false
-		}
-
-		if item.CollectArg != "" {
-			collectExpr, distinct := parseCollectDistinctArg(item.CollectArg)
-			if !distinct {
-				return fastTypedCollectDistinctReturnSpec{}, false
-			}
-			parsedExpr, ok := parseFastTypedCollectDistinctEndpointExpr(collectExpr, leftVar, rightVar)
-			if !ok {
-				return fastTypedCollectDistinctReturnSpec{}, false
-			}
-			out.collectExpr = parsedExpr
-			out.collectKey = key
-			collectExprRaw = strings.TrimSpace(collectExpr)
-			collectSeen = true
-			continue
-		}
-
-		parsedExpr, ok := parseFastTypedCollectDistinctEndpointExpr(item.Expression, leftVar, rightVar)
-		if !ok {
-			return fastTypedCollectDistinctReturnSpec{}, false
-		}
-		out.groupExpr = parsedExpr
-		out.groupKey = key
-		groupExprRaw = strings.TrimSpace(item.Expression)
-		groupSeen = true
-	}
-
-	if !groupSeen || !collectSeen || out.groupKey == "" || out.collectKey == "" {
-		return fastTypedCollectDistinctReturnSpec{}, false
-	}
-	if out.groupExpr.Var == out.collectExpr.Var {
-		return fastTypedCollectDistinctReturnSpec{}, false
-	}
-
-	if len(orderBy) > 1 {
-		return fastTypedCollectDistinctReturnSpec{}, false
-	}
-	if len(orderBy) == 1 {
-		orderExpr := strings.TrimSpace(orderBy[0].Expression)
-		if orderExpr != strings.TrimSpace(out.groupKey) && orderExpr != groupExprRaw {
-			return fastTypedCollectDistinctReturnSpec{}, false
-		}
-		if orderExpr == strings.TrimSpace(out.collectKey) || orderExpr == collectExprRaw {
-			return fastTypedCollectDistinctReturnSpec{}, false
-		}
-		spec := orderBy[0]
-		spec.Expression = out.groupKey
-		out.groupOrderByDirection = &spec
-	}
-
-	return out, true
-}
-
-func parseFastTypedCollectDistinctEndpointExpr(rawExpr, leftVar, rightVar string) (fastTypedCollectDistinctEndpointExpr, bool) {
-	rawExpr = strings.TrimSpace(rawExpr)
-	if rawExpr == "" {
-		return fastTypedCollectDistinctEndpointExpr{}, false
-	}
-	if identifierRE.MatchString(rawExpr) {
-		if rawExpr == leftVar || rawExpr == rightVar {
-			return fastTypedCollectDistinctEndpointExpr{Var: rawExpr}, true
-		}
-		return fastTypedCollectDistinctEndpointExpr{}, false
-	}
-	parts := strings.Split(rawExpr, ".")
-	if len(parts) != 2 {
-		return fastTypedCollectDistinctEndpointExpr{}, false
-	}
-	base := strings.TrimSpace(parts[0])
-	prop := strings.TrimSpace(parts[1])
-	if !identifierRE.MatchString(base) || !identifierRE.MatchString(prop) {
-		return fastTypedCollectDistinctEndpointExpr{}, false
-	}
-	if base != leftVar && base != rightVar {
-		return fastTypedCollectDistinctEndpointExpr{}, false
-	}
-	return fastTypedCollectDistinctEndpointExpr{Var: base, Property: prop}, true
-}
-
-func (e *Executor) tryFastEdgeCountQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
-	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
-		return nil, false, nil
-	}
-	part := stmt.Parts[0]
-	if len(part.Clauses) != 2 {
-		return nil, false, nil
-	}
-	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindReturn {
-		return nil, false, nil
-	}
-
-	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
-	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
-		return nil, false, nil
-	}
-
-	relPattern, err := parseUndirectedRelationshipPattern(matchSpec.Pattern)
-	if err != nil {
-		return nil, false, nil
-	}
-	if strings.TrimSpace(relPattern.EdgeVar) == "" || len(relPattern.EdgeAnyOf) != 0 || strings.TrimSpace(relPattern.EdgeProps) != "" {
-		return nil, false, nil
-	}
-	if strings.TrimSpace(relPattern.Left.Var) != "" || strings.TrimSpace(relPattern.Right.Var) != "" {
-		return nil, false, nil
-	}
-
-	leftLabel, leftAny, ok := fastEdgeCountVertexLabelFilter(relPattern.Left)
-	if !ok {
-		return nil, false, nil
-	}
-	rightLabel, rightAny, ok := fastEdgeCountVertexLabelFilter(relPattern.Right)
-	if !ok {
-		return nil, false, nil
-	}
-
-	projection, err := projectionClauseSpecFromClause(part.Clauses[1])
-	if err != nil {
-		return nil, false, nil
-	}
-	if projection.Distinct || strings.TrimSpace(projection.WhereRaw) != "" || len(projection.OrderBy) != 0 || strings.TrimSpace(projection.SkipRaw) != "" || strings.TrimSpace(projection.LimitRaw) != "" {
-		return nil, false, nil
-	}
-	items, err := parseProjectionItems(projection.ProjectionRaw)
-	if err != nil || len(items) != 1 {
-		return nil, false, nil
-	}
-	item := items[0]
-	if item.CollectArg != "" || item.AggFunc != "" {
-		return nil, false, nil
-	}
-	countExpr, countDistinct := parseCountDistinctArg(item.CountArg)
-	if countDistinct || strings.TrimSpace(countExpr) != relPattern.EdgeVar {
-		return nil, false, nil
-	}
-
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, true, err
-	}
-
-	total := 0
-	err = e.store.View(ctx, func(tx graph.Tx) error {
-		switch {
-		case leftAny && rightAny:
-			count, err := countUndirectedEdgeMatchesFast(ctx, tx, tenant, "")
-			if err != nil {
-				return err
-			}
-			total = count
-			return nil
-		case !leftAny && rightAny:
-			count, err := countUndirectedEdgeMatchesFast(ctx, tx, tenant, leftLabel)
-			if err != nil {
-				return err
-			}
-			total = count
-			return nil
-		case leftAny && !rightAny:
-			count, err := countUndirectedEdgeMatchesFast(ctx, tx, tenant, rightLabel)
-			if err != nil {
-				return err
-			}
-			total = count
-			return nil
-		default:
-			return graph.NewError(graph.ErrKindUnsupported, "fast edge count unavailable for this label combination", nil)
-		}
-	})
-	if err != nil {
-		if graph.IsKind(err, graph.ErrKindUnsupported) {
-			return nil, false, nil
-		}
-		return nil, true, err
-	}
-
-	column := item.Expression
-	if item.Alias != "" {
-		column = item.Alias
-	}
-	return &Result{
-		Columns: []string{column},
-		Rows:    []Row{{column: total}},
-		Stats:   Stats{RowsReturned: 1},
-	}, true, nil
-}
-
 func fastEdgeCountVertexLabelFilter(pattern vertexPattern) (label string, any bool, ok bool) {
 	if strings.TrimSpace(pattern.PropertiesRaw) != "" {
 		return "", false, false
@@ -3827,541 +5516,6 @@ func fastEdgeCountVertexLabelFilter(pattern vertexPattern) (label string, any bo
 	default:
 		return "", false, false
 	}
-}
-
-func countUndirectedEdgeMatchesFast(ctx context.Context, tx graph.Tx, tenant, leftLabel string) (int, error) {
-	total := 0
-	err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
-		if vertex == nil {
-			return nil
-		}
-		if strings.TrimSpace(leftLabel) != "" && !vertexHasLabel(vertex, leftLabel) {
-			return nil
-		}
-
-		emitted := map[string]struct{}{}
-		if err := tx.ScanOutEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
-			if edge == nil {
-				return nil
-			}
-			key := edge.ID + "|" + edge.DstID
-			if _, seen := emitted[key]; seen {
-				return nil
-			}
-			emitted[key] = struct{}{}
-			total++
-			return nil
-		}); err != nil {
-			return err
-		}
-		return tx.ScanInEdges(ctx, tenant, vertex.ID, "", 0, func(edge *graph.Edge) error {
-			if edge == nil {
-				return nil
-			}
-			key := edge.ID + "|" + edge.SrcID
-			if _, seen := emitted[key]; seen {
-				return nil
-			}
-			emitted[key] = struct{}{}
-			total++
-			return nil
-		})
-	})
-	return total, err
-}
-
-func (e *Executor) tryFastVertexCountQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
-	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
-		return nil, false, nil
-	}
-	part := stmt.Parts[0]
-	if len(part.Clauses) != 2 {
-		return nil, false, nil
-	}
-	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindReturn {
-		return nil, false, nil
-	}
-
-	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
-	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
-		return nil, false, nil
-	}
-	vertexPattern, err := parseVertexPattern(matchSpec.Pattern)
-	if err != nil {
-		return nil, false, nil
-	}
-	vertexVar := strings.TrimSpace(vertexPattern.Var)
-	if vertexVar == "" || strings.TrimSpace(vertexPattern.PropertiesRaw) != "" || len(vertexPattern.AllOfLabels) != 0 || len(vertexPattern.AnyOfLabels) != 0 || len(vertexPattern.ExcludedLabels) != 0 {
-		return nil, false, nil
-	}
-
-	projection, err := projectionClauseSpecFromClause(part.Clauses[1])
-	if err != nil {
-		return nil, false, nil
-	}
-	if projection.Distinct || strings.TrimSpace(projection.WhereRaw) != "" || len(projection.OrderBy) != 0 || strings.TrimSpace(projection.SkipRaw) != "" || strings.TrimSpace(projection.LimitRaw) != "" {
-		return nil, false, nil
-	}
-	items, err := parseProjectionItems(projection.ProjectionRaw)
-	if err != nil || len(items) != 1 {
-		return nil, false, nil
-	}
-	item := items[0]
-	if item.CountArg == "" || item.CollectArg != "" || item.AggFunc != "" {
-		return nil, false, nil
-	}
-	countExpr, countDistinct := parseCountDistinctArg(item.CountArg)
-	if countDistinct || strings.TrimSpace(countExpr) != vertexVar {
-		return nil, false, nil
-	}
-
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, true, err
-	}
-
-	total := 0
-	err = e.store.View(ctx, func(tx graph.Tx) error {
-		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
-			if vertex != nil {
-				total++
-			}
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, true, err
-	}
-
-	column := item.Expression
-	if item.Alias != "" {
-		column = item.Alias
-	}
-	return &Result{Columns: []string{column}, Rows: []Row{{column: total}}, Stats: Stats{RowsReturned: 1}}, true, nil
-}
-
-func (e *Executor) tryFastLabelHistogramQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
-	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
-		return nil, false, nil
-	}
-	part := stmt.Parts[0]
-	if len(part.Clauses) != 2 {
-		return nil, false, nil
-	}
-	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindReturn {
-		return nil, false, nil
-	}
-
-	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
-	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
-		return nil, false, nil
-	}
-	vertexPattern, err := parseVertexPattern(matchSpec.Pattern)
-	if err != nil {
-		return nil, false, nil
-	}
-	vertexVar := strings.TrimSpace(vertexPattern.Var)
-	if vertexVar == "" || strings.TrimSpace(vertexPattern.PropertiesRaw) != "" || len(vertexPattern.AnyOfLabels) != 0 || len(vertexPattern.ExcludedLabels) != 0 || len(vertexPattern.AllOfLabels) != 0 {
-		return nil, false, nil
-	}
-
-	projection, err := projectionClauseSpecFromClause(part.Clauses[1])
-	if err != nil {
-		return nil, false, nil
-	}
-	if projection.Distinct || strings.TrimSpace(projection.WhereRaw) != "" || len(projection.OrderBy) != 0 || strings.TrimSpace(projection.SkipRaw) != "" || strings.TrimSpace(projection.LimitRaw) != "" {
-		return nil, false, nil
-	}
-	items, err := parseProjectionItems(projection.ProjectionRaw)
-	if err != nil || len(items) != 2 {
-		return nil, false, nil
-	}
-
-	labelsIdx := -1
-	countIdx := -1
-	for idx, item := range items {
-		if arg, ok := parseFunctionCall(item.Expression, "labels"); ok {
-			if strings.TrimSpace(arg) == vertexVar && item.CountArg == "" && item.CollectArg == "" && item.AggFunc == "" {
-				labelsIdx = idx
-				continue
-			}
-		}
-		if item.CountArg == "" || item.CollectArg != "" || item.AggFunc != "" {
-			continue
-		}
-		countExpr, countDistinct := parseCountDistinctArg(item.CountArg)
-		if countDistinct {
-			continue
-		}
-		if arg, ok := parseFunctionCall(countExpr, "labels"); ok && strings.TrimSpace(arg) == vertexVar {
-			countIdx = idx
-		}
-	}
-	if labelsIdx < 0 || countIdx < 0 || labelsIdx == countIdx {
-		return nil, false, nil
-	}
-
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, true, err
-	}
-
-	type labelGroup struct {
-		labels []string
-		count  int
-	}
-	groups := map[string]*labelGroup{}
-	groupOrder := make([]string, 0)
-	err = e.store.View(ctx, func(tx graph.Tx) error {
-		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
-			if vertex == nil {
-				return nil
-			}
-			labels := append([]string(nil), vertex.Labels...)
-			keyBytes, marshalErr := json.Marshal(normalizeResultValue(labels))
-			if marshalErr != nil {
-				return graph.NewError(graph.ErrKindUnsupported, "labels histogram key is not serializable", marshalErr)
-			}
-			key := string(keyBytes)
-			group, ok := groups[key]
-			if !ok {
-				group = &labelGroup{labels: labels}
-				groups[key] = group
-				groupOrder = append(groupOrder, key)
-			}
-			group.count++
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, true, err
-	}
-
-	columns := make([]string, len(items))
-	for idx, item := range items {
-		if item.Alias != "" {
-			columns[idx] = item.Alias
-		} else {
-			columns[idx] = item.Expression
-		}
-	}
-
-	rows := make([]Row, 0, len(groupOrder))
-	for _, key := range groupOrder {
-		group := groups[key]
-		if group == nil {
-			continue
-		}
-		row := Row{}
-		row[columns[labelsIdx]] = append([]string(nil), group.labels...)
-		row[columns[countIdx]] = group.count
-		rows = append(rows, row)
-	}
-
-	return &Result{Columns: columns, Rows: rows, Stats: Stats{RowsReturned: len(rows)}}, true, nil
-}
-
-func (e *Executor) tryFastEdgeDeleteQuery(ctx context.Context, stmt *ast.QueryStatement, params Params) (*Result, bool, error) {
-	if stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
-		return nil, false, nil
-	}
-	part := stmt.Parts[0]
-	if len(part.Clauses) != 2 {
-		return nil, false, nil
-	}
-	if part.Clauses[0].Kind != ast.ClauseKindMatch || part.Clauses[1].Kind != ast.ClauseKindDelete {
-		return nil, false, nil
-	}
-
-	matchSpec, err := anchoredMatchSpecFromClause(part.Clauses[0])
-	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
-		return nil, false, nil
-	}
-
-	relPattern, err := parseFastDeleteRelationshipPattern(matchSpec.Pattern)
-	if err != nil {
-		return nil, false, nil
-	}
-	if strings.TrimSpace(relPattern.EdgeVar) == "" || len(relPattern.EdgeAnyOf) != 0 || strings.TrimSpace(relPattern.EdgeProps) != "" {
-		return nil, false, nil
-	}
-	if strings.TrimSpace(relPattern.Left.Var) != "" || strings.TrimSpace(relPattern.Right.Var) != "" {
-		return nil, false, nil
-	}
-
-	leftLabel, leftAny, ok := fastEdgeCountVertexLabelFilter(relPattern.Left)
-	if !ok {
-		return nil, false, nil
-	}
-	rightLabel, rightAny, ok := fastEdgeCountVertexLabelFilter(relPattern.Right)
-	if !ok {
-		return nil, false, nil
-	}
-	deleteTarget, ok := fastDeleteEdgeTarget(part.Clauses[1].Raw)
-	if !ok || deleteTarget != relPattern.EdgeVar {
-		return nil, false, nil
-	}
-
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, true, err
-	}
-
-	err = e.store.Update(ctx, func(tx graph.Tx) error {
-		edgeIDs, err := collectFastEdgeIDsForLabels(ctx, tx, tenant, relPattern.EdgeType, leftLabel, rightLabel, leftAny, rightAny, relPattern.Undirected)
-		if err != nil {
-			return err
-		}
-		const deleteChunkSize = 2048
-		for start := 0; start < len(edgeIDs); start += deleteChunkSize {
-			end := start + deleteChunkSize
-			if end > len(edgeIDs) {
-				end = len(edgeIDs)
-			}
-			for _, edgeID := range edgeIDs[start:end] {
-				if err := e.deleteEdgeWithIndexes(ctx, tx, tenant, edgeID); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, true, err
-	}
-
-	return &Result{Columns: nil, Rows: nil, Stats: Stats{RowsReturned: 0}}, true, nil
-}
-
-type fastDeleteRelationshipPattern struct {
-	Left       vertexPattern
-	Right      vertexPattern
-	EdgeVar    string
-	EdgeType   string
-	EdgeAnyOf  []string
-	EdgeProps  string
-	Undirected bool
-}
-
-func parseFastDeleteRelationshipPattern(raw string) (fastDeleteRelationshipPattern, error) {
-	if directed, err := parseDirectedRelationshipPattern(raw); err == nil {
-		return fastDeleteRelationshipPattern{
-			Left:       directed.Left,
-			Right:      directed.Right,
-			EdgeVar:    directed.EdgeVar,
-			EdgeType:   directed.EdgeType,
-			EdgeAnyOf:  directed.EdgeAnyOf,
-			EdgeProps:  directed.EdgeProps,
-			Undirected: false,
-		}, nil
-	}
-	if reverse, err := parseReverseDirectedRelationshipPattern(raw); err == nil {
-		// Canonicalize to stored edge direction (source->destination).
-		return fastDeleteRelationshipPattern{
-			Left:       reverse.Right,
-			Right:      reverse.Left,
-			EdgeVar:    reverse.EdgeVar,
-			EdgeType:   reverse.EdgeType,
-			EdgeAnyOf:  reverse.EdgeAnyOf,
-			EdgeProps:  reverse.EdgeProps,
-			Undirected: false,
-		}, nil
-	}
-	undirected, err := parseUndirectedRelationshipPattern(raw)
-	if err != nil {
-		return fastDeleteRelationshipPattern{}, err
-	}
-	return fastDeleteRelationshipPattern{
-		Left:       undirected.Left,
-		Right:      undirected.Right,
-		EdgeVar:    undirected.EdgeVar,
-		EdgeType:   undirected.EdgeType,
-		EdgeAnyOf:  undirected.EdgeAnyOf,
-		EdgeProps:  undirected.EdgeProps,
-		Undirected: true,
-	}, nil
-}
-
-func fastDeleteEdgeTarget(raw string) (string, bool) {
-	normalized := normalizeClauseBody(raw)
-	upper := strings.ToUpper(normalized)
-	if strings.HasPrefix(upper, "DETACHDELETE") {
-		return "", false
-	}
-	if !strings.HasPrefix(upper, "DELETE") {
-		return "", false
-	}
-	body := strings.TrimSpace(normalized[len("DELETE"):])
-	if body == "" || strings.Contains(body, ",") || !isIdentifierLike(body) {
-		return "", false
-	}
-	return body, true
-}
-
-func collectFastEdgeIDsForLabels(ctx context.Context, tx graph.Tx, tenant, edgeType, leftLabel, rightLabel string, leftAny, rightAny, undirected bool) ([]string, error) {
-	edgeIDs := make([]string, 0)
-	edgeType = strings.TrimSpace(edgeType)
-	if edgeType != "" {
-		labelMatchCache := map[string]bool{}
-		vertexMatchesLabel := func(vertexID, label string, any bool) (bool, error) {
-			if any || strings.TrimSpace(label) == "" {
-				return true, nil
-			}
-			cacheKey := label + "\x00" + vertexID
-			if cached, ok := labelMatchCache[cacheKey]; ok {
-				return cached, nil
-			}
-			hasLabel, err := tx.HasVertexLabel(ctx, tenant, vertexID, label)
-			if err != nil {
-				return false, err
-			}
-			labelMatchCache[cacheKey] = hasLabel
-			return hasLabel, nil
-		}
-
-		err := tx.ScanOutEdgeLinksByType(ctx, tenant, edgeType, 0, func(srcID, edgeID, dstID string) error {
-			leftMatch, err := vertexMatchesLabel(srcID, leftLabel, leftAny)
-			if err != nil {
-				return err
-			}
-			rightMatch, err := vertexMatchesLabel(dstID, rightLabel, rightAny)
-			if err != nil {
-				return err
-			}
-			matched := leftMatch && rightMatch
-			if !matched && undirected {
-				revLeftMatch, err := vertexMatchesLabel(srcID, rightLabel, rightAny)
-				if err != nil {
-					return err
-				}
-				revRightMatch, err := vertexMatchesLabel(dstID, leftLabel, leftAny)
-				if err != nil {
-					return err
-				}
-				matched = revLeftMatch && revRightMatch
-			}
-			if !matched {
-				return nil
-			}
-			edgeIDs = append(edgeIDs, edgeID)
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		return edgeIDs, nil
-	}
-
-	type edgeIDScannerTx interface {
-		ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
-		ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
-	}
-	seen := map[string]struct{}{}
-
-	collectAllOut := func(scanOut func(vertexID string, fn func(string) error) error) error {
-		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
-			if vertex == nil {
-				return nil
-			}
-			return scanOut(vertex.ID, func(edgeID string) error {
-				if _, ok := seen[edgeID]; ok {
-					return nil
-				}
-				seen[edgeID] = struct{}{}
-				edgeIDs = append(edgeIDs, edgeID)
-				return nil
-			})
-		})
-	}
-
-	collectIncidentForLabel := func(label string, scanOutIn func(vertexID string, fn func(string) error) error) error {
-		return tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
-			if !vertexHasLabel(vertex, label) {
-				return nil
-			}
-			return scanOutIn(vertex.ID, func(edgeID string) error {
-				if _, ok := seen[edgeID]; ok {
-					return nil
-				}
-				seen[edgeID] = struct{}{}
-				edgeIDs = append(edgeIDs, edgeID)
-				return nil
-			})
-		})
-	}
-
-	if scanner, ok := tx.(edgeIDScannerTx); ok {
-		scanOut := func(vertexID string, fn func(string) error) error {
-			return scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, edgeType, 0, fn)
-		}
-		scanOutIn := func(vertexID string, fn func(string) error) error {
-			if err := scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, edgeType, 0, fn); err != nil {
-				return err
-			}
-			return scanner.ScanInEdgeIDs(ctx, tenant, vertexID, edgeType, 0, fn)
-		}
-		switch {
-		case leftAny && rightAny:
-			if err := collectAllOut(scanOut); err != nil {
-				return nil, err
-			}
-		case !leftAny && rightAny:
-			if err := collectIncidentForLabel(leftLabel, scanOutIn); err != nil {
-				return nil, err
-			}
-		case leftAny && !rightAny:
-			if err := collectIncidentForLabel(rightLabel, scanOutIn); err != nil {
-				return nil, err
-			}
-		default:
-			return nil, graph.NewError(graph.ErrKindUnsupported, "fast edge id collection unavailable for this label combination", nil)
-		}
-		return edgeIDs, nil
-	}
-
-	scanOut := func(vertexID string, fn func(string) error) error {
-		return tx.ScanOutEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
-			if edge == nil {
-				return nil
-			}
-			return fn(edge.ID)
-		})
-	}
-	scanOutIn := func(vertexID string, fn func(string) error) error {
-		if err := tx.ScanOutEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
-			if edge == nil {
-				return nil
-			}
-			return fn(edge.ID)
-		}); err != nil {
-			return err
-		}
-		return tx.ScanInEdges(ctx, tenant, vertexID, edgeType, 0, func(edge *graph.Edge) error {
-			if edge == nil {
-				return nil
-			}
-			return fn(edge.ID)
-		})
-	}
-
-	switch {
-	case leftAny && rightAny:
-		if err := collectAllOut(scanOut); err != nil {
-			return nil, err
-		}
-	case !leftAny && rightAny:
-		if err := collectIncidentForLabel(leftLabel, scanOutIn); err != nil {
-			return nil, err
-		}
-	case leftAny && !rightAny:
-		if err := collectIncidentForLabel(rightLabel, scanOutIn); err != nil {
-			return nil, err
-		}
-	default:
-		return nil, graph.NewError(graph.ErrKindUnsupported, "fast edge id collection unavailable for this label combination", nil)
-	}
-
-	return edgeIDs, nil
 }
 
 func (e *Executor) applyMatchClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
@@ -7017,7 +8171,6 @@ func (e *Executor) expandTwoHopDirectedChainMatch(ctx context.Context, tx graph.
 			setOptionalNoMatchBinding(merged, row, pattern.Mid.Var)
 			setOptionalNoMatchBinding(merged, row, pattern.Right.Var)
 			setOptionalNoMatchBinding(merged, row, pattern.FirstEdgeVar)
-			setOptionalNoMatchBinding(merged, row, pattern.SecondEdgeVar)
 			out = append(out, merged)
 		}
 	}
@@ -8190,6 +9343,47 @@ func vertexBindingMatches(row Row, varName string, candidate *graph.Vertex) bool
 		return candidate != nil && typed.ID == candidate.ID
 	case string:
 		return candidate != nil && typed == candidate.ID
+	case map[string]any:
+		if candidate == nil {
+			return false
+		}
+		id := ""
+		if rawID, ok := typed["id"]; ok {
+			id = strings.TrimSpace(fmt.Sprint(rawID))
+		}
+		if id == "" {
+			if rawID, ok := typed["ID"]; ok {
+				id = strings.TrimSpace(fmt.Sprint(rawID))
+			}
+		}
+		if id == "" {
+			return false
+		}
+		if id == candidate.ID {
+			return true
+		}
+		if raw, ok := candidate.Properties["id"]; ok {
+			return strings.TrimSpace(string(raw)) == id
+		}
+		return false
+	case map[string]string:
+		if candidate == nil {
+			return false
+		}
+		id := strings.TrimSpace(typed["id"])
+		if id == "" {
+			id = strings.TrimSpace(typed["ID"])
+		}
+		if id == "" {
+			return false
+		}
+		if id == candidate.ID {
+			return true
+		}
+		if raw, ok := candidate.Properties["id"]; ok {
+			return strings.TrimSpace(string(raw)) == id
+		}
+		return false
 	default:
 		return false
 	}
@@ -8299,6 +9493,8 @@ func edgeTypeMatches(edge *graph.Edge, edgeType string, edgeAnyOf []string) bool
 func (e *Executor) resolveVertexPatternCandidates(ctx context.Context, tx graph.Tx, tenant string, row Row, pattern vertexPattern, params Params) ([]*graph.Vertex, error) {
 	if binding, ok := row[pattern.Var]; ok {
 		switch typed := binding.(type) {
+		case nil:
+			return nil, nil
 		case *graph.Vertex:
 			if vertexPatternMatches(typed, pattern, params, row) {
 				return []*graph.Vertex{typed}, nil
@@ -8316,6 +9512,53 @@ func (e *Executor) resolveVertexPatternCandidates(ctx context.Context, tx graph.
 				return []*graph.Vertex{vertex}, nil
 			}
 			return nil, nil
+		case map[string]any:
+			id := ""
+			if rawID, hasID := typed["id"]; hasID {
+				id = strings.TrimSpace(fmt.Sprint(rawID))
+			}
+			if id == "" {
+				if rawID, hasID := typed["ID"]; hasID {
+					id = strings.TrimSpace(fmt.Sprint(rawID))
+				}
+			}
+			if id != "" {
+				vertex, err := tx.GetVertex(ctx, tenant, id)
+				if err == nil && vertexPatternMatches(vertex, pattern, params, row) {
+					return []*graph.Vertex{vertex}, nil
+				}
+				if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+					return nil, err
+				}
+				vertex, err = resolveBoundPredicateVertexBySemanticID(ctx, tx, tenant, id, pattern, params, row)
+				if err != nil {
+					return nil, err
+				}
+				if vertex != nil {
+					return []*graph.Vertex{vertex}, nil
+				}
+			}
+		case map[string]string:
+			id := strings.TrimSpace(typed["id"])
+			if id == "" {
+				id = strings.TrimSpace(typed["ID"])
+			}
+			if id != "" {
+				vertex, err := tx.GetVertex(ctx, tenant, id)
+				if err == nil && vertexPatternMatches(vertex, pattern, params, row) {
+					return []*graph.Vertex{vertex}, nil
+				}
+				if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
+					return nil, err
+				}
+				vertex, err = resolveBoundPredicateVertexBySemanticID(ctx, tx, tenant, id, pattern, params, row)
+				if err != nil {
+					return nil, err
+				}
+				if vertex != nil {
+					return []*graph.Vertex{vertex}, nil
+				}
+			}
 		}
 	}
 
@@ -8586,14 +9829,6 @@ func vertexPatternMatches(vertex *graph.Vertex, pattern vertexPattern, params Pa
 			}
 		}
 	}
-	if len(pattern.AllOfLabels) > 0 && len(pattern.AnyOfLabels) == 0 && len(pattern.ExcludedLabels) == 0 {
-		if pattern.Var == "" {
-			vertex.Labels = reorderLabelsByPattern(vertex.Labels, pattern.AllOfLabels)
-		} else if _, alreadyBound := row[pattern.Var]; !alreadyBound {
-			vertex.Labels = reorderLabelsByPattern(vertex.Labels, pattern.AllOfLabels)
-		}
-	}
-
 	props := strings.TrimSpace(pattern.PropertiesRaw)
 	if props == "" {
 		return true
@@ -8604,6 +9839,12 @@ func vertexPatternMatches(vertex *graph.Vertex, pattern vertexPattern, params Pa
 		return false
 	}
 	for key, value := range parsed {
+		if strings.EqualFold(strings.TrimSpace(key), "id") {
+			if strings.TrimSpace(vertex.ID) != strings.TrimSpace(fmt.Sprint(value)) {
+				return false
+			}
+			continue
+		}
 		if vertex.Properties == nil {
 			return false
 		}
@@ -8629,34 +9870,6 @@ func vertexHasLabel(vertex *graph.Vertex, label string) bool {
 		}
 	}
 	return false
-}
-
-func reorderLabelsByPattern(labels []string, ordered []string) []string {
-	if len(labels) == 0 || len(ordered) == 0 {
-		return labels
-	}
-	seen := make(map[string]struct{}, len(labels))
-	out := make([]string, 0, len(labels))
-	for _, want := range ordered {
-		for _, label := range labels {
-			if label != want {
-				continue
-			}
-			if _, ok := seen[label]; ok {
-				break
-			}
-			seen[label] = struct{}{}
-			out = append(out, label)
-			break
-		}
-	}
-	for _, label := range labels {
-		if _, ok := seen[label]; ok {
-			continue
-		}
-		out = append(out, label)
-	}
-	return out
 }
 
 func anchoredSourcePropertyEquality(pattern anchoredOutPattern, params Params, row Row) (string, any, bool) {
@@ -9528,1107 +10741,6 @@ func vertexMatchesProperty(vertex *graph.Vertex, prop string, encoded []byte, la
 	return bytes.Equal(value, encoded)
 }
 
-func (e *Executor) applyCreateClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, merge bool) ([]Row, error) {
-	rawClause := stripLeadingClauseKeyword(clause.Raw, string(clause.Kind))
-	raw := normalizeClauseBody(stripCypherLineComments(rawClause))
-	tenant, err := requireStringParam(params, "tenant")
-	if err != nil {
-		return nil, err
-	}
-	if rows == nil {
-		rows = []Row{{}}
-	}
-	parts := splitTopLevelCommaSeparated(raw)
-	if merge {
-		parts = []string{raw}
-	}
-	out := rows
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		patternRaw := part
-		onCreateSet := ""
-		onMatchSet := ""
-		if merge {
-			patternRaw = normalizeClauseBody(stripCypherLineComments(clause.MergePattern))
-			onCreateSet = normalizeClauseBody(stripCypherLineComments(clause.MergeOnCreate))
-			onMatchSet = normalizeClauseBody(stripCypherLineComments(clause.MergeOnMatch))
-			if patternRaw == "" {
-				return nil, graph.NewError(graph.ErrKindUnsupported, "MERGE clause requires structured pattern metadata", nil)
-			}
-		}
-
-		out, err = e.applyCreatePattern(ctx, tx, out, patternRaw, params, tenant, merge)
-		if err != nil {
-			return nil, err
-		}
-		if merge {
-			out, err = e.applyMergeActions(ctx, tx, out, onCreateSet, onMatchSet, params)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	if len(out) == 0 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("CREATE/MERGE pattern %q is not yet supported", raw), nil)
-	}
-	out = clearMergeCreatedMarker(out)
-	return out, nil
-}
-
-func (e *Executor) applyMergeActions(ctx context.Context, tx graph.Tx, rows []Row, onCreateSet string, onMatchSet string, params Params) ([]Row, error) {
-	onCreateSet = strings.TrimSpace(onCreateSet)
-	onMatchSet = strings.TrimSpace(onMatchSet)
-	if onCreateSet == "" && onMatchSet == "" {
-		return rows, nil
-	}
-	if err := validateMergeActionAssignmentTargets(rows, onCreateSet, onMatchSet); err != nil {
-		return nil, err
-	}
-
-	updated := make([]Row, 0, len(rows))
-	for _, row := range rows {
-		created := false
-		if marker, ok := row[mergeCreatedMarkerKey]; ok {
-			if flagged, ok := marker.(bool); ok {
-				created = flagged
-			}
-		}
-
-		current := cloneRow(row)
-		if created && onCreateSet != "" {
-			setClause := ast.Clause{Kind: ast.ClauseKindSet, Raw: "SET" + onCreateSet}
-			nextRows, err := e.applySetClause(ctx, tx, []Row{current}, setClause, params)
-			if err != nil {
-				return nil, err
-			}
-			if len(nextRows) > 0 {
-				current = nextRows[0]
-			}
-		}
-		if !created && onMatchSet != "" {
-			setClause := ast.Clause{Kind: ast.ClauseKindSet, Raw: "SET" + onMatchSet}
-			nextRows, err := e.applySetClause(ctx, tx, []Row{current}, setClause, params)
-			if err != nil {
-				return nil, err
-			}
-			if len(nextRows) > 0 {
-				current = nextRows[0]
-			}
-		}
-		updated = append(updated, current)
-	}
-	return updated, nil
-}
-
-func validateMergeActionAssignmentTargets(rows []Row, onCreateSet string, onMatchSet string) error {
-	if len(rows) == 0 {
-		return nil
-	}
-
-	bound := map[string]struct{}{}
-	for _, row := range rows {
-		for key := range row {
-			bound[key] = struct{}{}
-		}
-	}
-
-	validateOne := func(raw string) error {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			return nil
-		}
-		for _, item := range splitTopLevelCommaSeparated(raw) {
-			item = strings.TrimSpace(item)
-			if item == "" {
-				continue
-			}
-			varName := ""
-			if m := setClauseRE.FindStringSubmatch(item); len(m) == 4 {
-				varName = m[1]
-			} else if m := setMapAppendClauseRE.FindStringSubmatch(item); len(m) == 3 {
-				varName = m[1]
-			} else if m := setMapReplaceClauseRE.FindStringSubmatch(item); len(m) == 3 {
-				varName = m[1]
-			} else if m := setLabelClauseRE.FindStringSubmatch(item); len(m) == 3 {
-				varName = m[1]
-			}
-			if varName == "" {
-				continue
-			}
-			if _, ok := bound[varName]; !ok {
-				return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "UndefinedVariable"}
-			}
-		}
-		return nil
-	}
-
-	if err := validateOne(onCreateSet); err != nil {
-		return err
-	}
-	if err := validateOne(onMatchSet); err != nil {
-		return err
-	}
-	return nil
-}
-
-func clearMergeCreatedMarker(rows []Row) []Row {
-	clean := make([]Row, 0, len(rows))
-	for _, row := range rows {
-		next := cloneRow(row)
-		delete(next, mergeCreatedMarkerKey)
-		clean = append(clean, next)
-	}
-	return clean
-}
-
-func (e *Executor) applyCreatePattern(ctx context.Context, tx graph.Tx, rows []Row, raw string, params Params, tenant string, merge bool) ([]Row, error) {
-	if pathVar, innerPattern, ok := parseBoundPathPattern(raw); ok {
-		createdRows, err := e.applyCreatePattern(ctx, tx, rows, innerPattern, params, tenant, merge)
-		if err != nil {
-			return nil, err
-		}
-		if err := bindCreatePatternPathValues(ctx, tx, createdRows, pathVar, innerPattern); err != nil {
-			return nil, err
-		}
-		return createdRows, nil
-	}
-
-	if isMissingRelationshipTypePattern(raw) {
-		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
-	}
-	if createVariableLengthRelRE.MatchString(raw) {
-		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "CreatingVarLength"}
-	}
-	if createEdgePatternTwoDirectionsRE.MatchString(raw) {
-		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "RequiresDirectedRelationship"}
-	}
-	if m := createEdgePatternRE.FindStringSubmatch(raw); len(m) == 10 {
-		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge, createEdgeDirectionForward)
-	}
-	if m := createEdgePatternReverseRE.FindStringSubmatch(raw); len(m) == 10 {
-		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge, createEdgeDirectionReverse)
-	}
-	if m := createEdgePatternUndirectedRE.FindStringSubmatch(raw); len(m) == 10 {
-		if !merge {
-			return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "RequiresDirectedRelationship"}
-		}
-		return e.applyCreateEdge(ctx, tx, rows, m, params, tenant, merge, createEdgeDirectionUndirected)
-	}
-	if chain, ok := parseCreateChainPattern(raw); ok {
-		return e.applyCreateChainPattern(ctx, tx, rows, chain, params, tenant, merge)
-	}
-	if m := createVertexPatternRE.FindStringSubmatch(raw); len(m) == 4 {
-		return e.applyCreateVertex(ctx, tx, rows, m, params, tenant, merge)
-	}
-	if spec, ok := parseCreateVertexPatternSpec(raw); ok {
-		return e.applyCreateVertexSpec(ctx, tx, rows, spec, params, tenant, merge)
-	}
-	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("CREATE/MERGE pattern %q is not yet supported", raw), nil)
-}
-
-func bindCreatePatternPathValues(ctx context.Context, tx graph.Tx, rows []Row, pathVar, patternRaw string) error {
-	if pathVar == "" {
-		return nil
-	}
-
-	if spec, ok := parseCreateVertexPatternSpec(patternRaw); ok {
-		if spec.Var == "" {
-			for _, row := range rows {
-				row[pathVar] = nil
-			}
-			return nil
-		}
-		for _, row := range rows {
-			row[pathVar] = cypherPathValue{Left: vertexFromRowBinding(row, spec.Var)}
-		}
-		return nil
-	}
-
-	if m := createEdgePatternRE.FindStringSubmatch(patternRaw); len(m) == 10 {
-		return bindCreateSingleEdgePathValues(ctx, tx, rows, pathVar, m, createEdgeDirectionForward)
-	}
-	if m := createEdgePatternReverseRE.FindStringSubmatch(patternRaw); len(m) == 10 {
-		return bindCreateSingleEdgePathValues(ctx, tx, rows, pathVar, m, createEdgeDirectionReverse)
-	}
-	if m := createEdgePatternUndirectedRE.FindStringSubmatch(patternRaw); len(m) == 10 {
-		return bindCreateSingleEdgePathValues(ctx, tx, rows, pathVar, m, createEdgeDirectionUndirected)
-	}
-
-	if chain, ok := parseCreateChainPattern(patternRaw); ok {
-		return bindCreateChainPathValues(ctx, tx, rows, pathVar, chain)
-	}
-
-	for _, row := range rows {
-		row[pathVar] = nil
-	}
-	return nil
-}
-
-func bindCreateSingleEdgePathValues(ctx context.Context, tx graph.Tx, rows []Row, pathVar string, m []string, direction createEdgeDirection) error {
-	leftVar := strings.TrimSpace(m[1])
-	edgeVar := strings.TrimSpace(m[4])
-	rightVar := strings.TrimSpace(m[7])
-	edgeType, err := normalizeCreateRelationshipType(m[5])
-	if err != nil {
-		return err
-	}
-
-	for _, row := range rows {
-		left := vertexFromRowBinding(row, leftVar)
-		right := vertexFromRowBinding(row, rightVar)
-		edge := edgeFromRowBinding(row, edgeVar)
-		if edge == nil {
-			edge, err = lookupBoundPathEdge(ctx, tx, left, right, edgeType, direction)
-			if err != nil {
-				return err
-			}
-		}
-		row[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: right, Direction: createEdgeDirectionName(direction)}
-	}
-	return nil
-}
-
-func bindCreateChainPathValues(ctx context.Context, tx graph.Tx, rows []Row, pathVar string, pattern createChainPattern) error {
-	for _, row := range rows {
-		vertexes := make([]*graph.Vertex, 0, len(pattern.Vertexes))
-		edges := make([]*graph.Edge, 0, len(pattern.Rels))
-		dirs := make([]string, 0, len(pattern.Rels))
-		for _, vertex := range pattern.Vertexes {
-			vertexes = append(vertexes, vertexFromRowBinding(row, vertex.Var))
-		}
-		for i, rel := range pattern.Rels {
-			edge := edgeFromRowBinding(row, rel.Var)
-			if edge == nil && i+1 < len(vertexes) {
-				edgeType, err := normalizeCreateRelationshipType(rel.Type)
-				if err != nil {
-					return err
-				}
-				edge, err = lookupBoundPathEdge(ctx, tx, vertexes[i], vertexes[i+1], edgeType, rel.Direction)
-				if err != nil {
-					return err
-				}
-			}
-			edges = append(edges, edge)
-			dirs = append(dirs, createEdgeDirectionName(rel.Direction))
-		}
-		if len(edges) <= 1 {
-			var edge *graph.Edge
-			if len(edges) == 1 {
-				edge = edges[0]
-			}
-			left := (*graph.Vertex)(nil)
-			right := (*graph.Vertex)(nil)
-			if len(vertexes) > 0 {
-				left = vertexes[0]
-			}
-			if len(vertexes) > 1 {
-				right = vertexes[1]
-			}
-			row[pathVar] = cypherPathValue{Left: left, Edge: edge, Right: right, Direction: firstOrDefault(dirs, "forward")}
-			continue
-		}
-		row[pathVar] = multiHopPathValue(vertexes, edges, dirs)
-	}
-	return nil
-}
-
-func lookupBoundPathEdge(ctx context.Context, tx graph.Tx, left, right *graph.Vertex, edgeType string, direction createEdgeDirection) (*graph.Edge, error) {
-	if left == nil || right == nil || strings.TrimSpace(edgeType) == "" {
-		return nil, nil
-	}
-
-	matches, err := findMergeEdges(ctx, tx, left, right, edgeType, map[string]any{}, direction)
-	if err != nil {
-		return nil, err
-	}
-	if len(matches) == 0 {
-		return nil, nil
-	}
-	return matches[0], nil
-}
-
-func createEdgeDirectionName(direction createEdgeDirection) string {
-	switch direction {
-	case createEdgeDirectionReverse:
-		return "reverse"
-	case createEdgeDirectionUndirected:
-		return "undirected"
-	default:
-		return "forward"
-	}
-}
-
-func firstOrDefault(values []string, fallback string) string {
-	if len(values) == 0 || strings.TrimSpace(values[0]) == "" {
-		return fallback
-	}
-	return values[0]
-}
-
-func parseCreateChainPattern(raw string) (createChainPattern, bool) {
-	remaining := strings.TrimSpace(raw)
-	if remaining == "" {
-		return createChainPattern{}, false
-	}
-
-	vertexMatch := createChainVertexTokenRE.FindStringSubmatch(remaining)
-	if len(vertexMatch) != 4 {
-		return createChainPattern{}, false
-	}
-	pattern := createChainPattern{
-		Vertexes: []createChainVertexPattern{{Var: vertexMatch[1], Labels: splitLabels(vertexMatch[2]), PropsRaw: vertexMatch[3]}},
-		Rels:     make([]createChainRelPattern, 0),
-	}
-	remaining = strings.TrimSpace(remaining[len(vertexMatch[0]):])
-
-	for remaining != "" {
-		rel, consumed, ok := parseCreateChainRelToken(remaining)
-		if !ok {
-			return createChainPattern{}, false
-		}
-		pattern.Rels = append(pattern.Rels, rel)
-		remaining = strings.TrimSpace(remaining[consumed:])
-
-		nextVertex := createChainVertexTokenRE.FindStringSubmatch(remaining)
-		if len(nextVertex) != 4 {
-			return createChainPattern{}, false
-		}
-		pattern.Vertexes = append(pattern.Vertexes, createChainVertexPattern{Var: nextVertex[1], Labels: splitLabels(nextVertex[2]), PropsRaw: nextVertex[3]})
-		remaining = strings.TrimSpace(remaining[len(nextVertex[0]):])
-	}
-
-	if len(pattern.Rels) == 0 || len(pattern.Vertexes) != len(pattern.Rels)+1 {
-		return createChainPattern{}, false
-	}
-	return pattern, true
-}
-
-func parseCreateChainRelToken(raw string) (createChainRelPattern, int, bool) {
-	if m := createChainRelForwardTokenRE.FindStringSubmatch(raw); len(m) == 4 {
-		return createChainRelPattern{Var: m[1], Type: m[2], PropsRaw: m[3], Direction: createEdgeDirectionForward}, len(m[0]), true
-	}
-	if m := createChainRelReverseTokenRE.FindStringSubmatch(raw); len(m) == 4 {
-		return createChainRelPattern{Var: m[1], Type: m[2], PropsRaw: m[3], Direction: createEdgeDirectionReverse}, len(m[0]), true
-	}
-	if m := createChainRelUndirTokenRE.FindStringSubmatch(raw); len(m) == 4 {
-		return createChainRelPattern{Var: m[1], Type: m[2], PropsRaw: m[3], Direction: createEdgeDirectionUndirected}, len(m[0]), true
-	}
-	return createChainRelPattern{}, 0, false
-}
-
-func (e *Executor) applyCreateVertex(ctx context.Context, tx graph.Tx, rows []Row, m []string, params Params, tenant string, merge bool) ([]Row, error) {
-	return e.applyCreateVertexSpec(ctx, tx, rows, createVertexPatternSpec{Var: m[1], Labels: splitLabels(m[2]), PropsRaw: m[3]}, params, tenant, merge)
-}
-
-func (e *Executor) applyCreateVertexSpec(ctx context.Context, tx graph.Tx, rows []Row, spec createVertexPatternSpec, params Params, tenant string, merge bool) ([]Row, error) {
-	varName := spec.Var
-	labels := spec.Labels
-
-	out := make([]Row, 0, len(rows))
-	for _, row := range rows {
-		props, err := parsePropertyMap(spec.PropsRaw, params, row)
-		if err != nil {
-			return nil, err
-		}
-		if merge && hasNilPropertyValue(props) {
-			return nil, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
-		}
-		normalizedProps := normalizeVertexProperties(props)
-		vertexID := ""
-		if strings.TrimSpace(varName) != "" {
-			if derivedID, ok := vertexIDFromPatternProperties(props); ok {
-				vertexID = derivedID
-			}
-		}
-		if vertexID == "" {
-			if varName != "" {
-				if existing, ok := row[varName].(*graph.Vertex); ok {
-					vertexID = existing.ID
-				}
-			}
-		}
-
-		if merge && vertexID == "" {
-			matches, err := e.findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
-			if err != nil {
-				return nil, err
-			}
-			if len(matches) == 0 {
-				vertex := &graph.Vertex{Tenant: tenant, ID: nextAutoVertexID(varName), Labels: labels, Properties: normalizedProps}
-				if err := e.putVertexWithIndexes(ctx, tx, vertex); err != nil {
-					return nil, err
-				}
-				merged := cloneRow(row)
-				merged[mergeCreatedMarkerKey] = true
-				if varName != "" {
-					merged[varName] = vertex
-				}
-				out = append(out, merged)
-				continue
-			}
-			for _, match := range matches {
-				merged := cloneRow(row)
-				merged[mergeCreatedMarkerKey] = false
-				if varName != "" {
-					merged[varName] = match
-				}
-				out = append(out, merged)
-			}
-			continue
-		}
-
-		if vertexID == "" {
-			vertexID = nextAutoVertexID(varName)
-		}
-
-		vertex := &graph.Vertex{Tenant: tenant, ID: vertexID, Labels: labels, Properties: normalizedProps}
-		created := true
-		if merge {
-			if existing, err := tx.GetVertex(ctx, vertex.Tenant, vertex.ID); err == nil {
-				vertex = existing
-				created = false
-			}
-		}
-		if err := e.putVertexWithIndexes(ctx, tx, vertex); err != nil {
-			return nil, err
-		}
-		merged := cloneRow(row)
-		if merge {
-			merged[mergeCreatedMarkerKey] = created
-		}
-		if varName != "" {
-			merged[varName] = vertex
-		}
-		out = append(out, merged)
-	}
-	return out, nil
-}
-
-func hasNilPropertyValue(props map[string]any) bool {
-	for _, value := range props {
-		if value == nil {
-			return true
-		}
-	}
-	return false
-}
-
-func (e *Executor) findMergeVerticesByPattern(ctx context.Context, tx graph.Tx, tenant string, labels []string, props map[string]any) ([]*graph.Vertex, error) {
-	if idValue, ok := vertexIDFromPatternProperties(props); ok {
-		vertex, err := tx.GetVertex(ctx, tenant, idValue)
-		if err != nil {
-			if !graph.IsKind(err, graph.ErrKindNotFound) {
-				return nil, err
-			}
-		} else if vertexMatchesMergePattern(vertex, labels, props) {
-			return []*graph.Vertex{vertex}, nil
-		}
-	}
-
-	type lookupPlan struct {
-		schema   string
-		property string
-		value    any
-	}
-
-	plan := lookupPlan{}
-	hasPlan := false
-	if len(labels) > 0 && len(props) > 0 {
-		propKeys := make([]string, 0, len(props))
-		for prop := range props {
-			propKeys = append(propKeys, prop)
-		}
-		sort.Strings(propKeys)
-
-		for _, label := range labels {
-			for _, prop := range propKeys {
-				indexed := e.indexCatalog != nil && e.indexCatalog.HasPropertyIndex(tenant, label, prop)
-				e.metrics.ObserveIndexCandidate(tenant, label, prop, indexed)
-				if hasPlan || !indexed {
-					continue
-				}
-				plan = lookupPlan{schema: label, property: prop, value: props[prop]}
-				hasPlan = true
-			}
-		}
-	}
-
-	if hasPlan {
-		encoded := valueToBytes(plan.value)
-		ids := map[string]struct{}{}
-		err := tx.ScanPropertyIndex(ctx, tenant, plan.schema, plan.property, encoded, 0, func(entry *graph.PropertyIndexEntry) error {
-			ids[entry.EntityID] = struct{}{}
-			return nil
-		})
-		if err != nil {
-			e.metrics.ObserveIndexLookup("property_index", "error", 0)
-			return nil, err
-		}
-
-		matches := make([]*graph.Vertex, 0, len(ids))
-		for id := range ids {
-			vertex, err := tx.GetVertex(ctx, tenant, id)
-			if err != nil {
-				if graph.IsKind(err, graph.ErrKindNotFound) {
-					continue
-				}
-				e.metrics.ObserveIndexLookup("property_index", "error", 0)
-				return nil, err
-			}
-			if !vertexMatchesMergePattern(vertex, labels, props) {
-				continue
-			}
-			matches = append(matches, vertex)
-		}
-		if len(matches) == 0 {
-			e.metrics.ObserveIndexLookup("property_index", "miss", 0)
-			return nil, nil
-		}
-		e.metrics.ObserveIndexLookup("property_index", "hit", len(matches))
-		return matches, nil
-	}
-
-	matches := make([]*graph.Vertex, 0)
-	err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
-		if !vertexMatchesMergePattern(vertex, labels, props) {
-			return nil
-		}
-		matches = append(matches, vertex)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return matches, nil
-}
-
-func vertexMatchesMergePattern(vertex *graph.Vertex, labels []string, props map[string]any) bool {
-	if vertex == nil {
-		return false
-	}
-	if len(labels) > 0 {
-		for _, want := range labels {
-			found := false
-			for _, current := range vertex.Labels {
-				if current == want {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-	}
-	for key, expected := range props {
-		stored, ok := vertex.Properties[key]
-		if !ok {
-			return false
-		}
-		actual := decodeStoredPropertyValue(stored)
-		if !mergePropertyValueEqual(expected, actual) {
-			return false
-		}
-	}
-	return true
-}
-
-func (e *Executor) putVertexWithIndexes(ctx context.Context, tx graph.Tx, vertex *graph.Vertex) error {
-	if err := tx.PutVertex(ctx, vertex); err != nil {
-		return err
-	}
-	if e.indexCatalog == nil || vertex == nil {
-		return nil
-	}
-	for _, label := range vertex.Labels {
-		for property, encoded := range vertex.Properties {
-			if !e.indexCatalog.HasPropertyIndex(vertex.Tenant, label, property) {
-				continue
-			}
-			valueCopy := append([]byte(nil), encoded...)
-			if err := tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
-				Tenant:      vertex.Tenant,
-				Schema:      label,
-				Property:    property,
-				Value:       valueCopy,
-				EntityID:    vertex.ID,
-				EntityClass: "vertex",
-			}); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (e *Executor) putEdgeWithIndexes(ctx context.Context, tx graph.Tx, edge *graph.Edge) error {
-	if err := tx.PutEdge(ctx, edge); err != nil {
-		return err
-	}
-	if e.indexCatalog == nil || edge == nil || strings.TrimSpace(edge.Type) == "" {
-		return nil
-	}
-	for property, encoded := range edge.Properties {
-		if !e.indexCatalog.HasEdgePropertyIndex(edge.Tenant, edge.Type, property) {
-			continue
-		}
-		valueCopy := append([]byte(nil), encoded...)
-		if err := tx.PutPropertyIndex(ctx, &graph.PropertyIndexEntry{
-			Tenant:      edge.Tenant,
-			Schema:      edge.Type,
-			Property:    property,
-			Value:       valueCopy,
-			EntityID:    edge.ID,
-			EntityClass: "edge",
-			EdgeSrcID:   edge.SrcID,
-			EdgeDstID:   edge.DstID,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func mergePropertyValueEqual(expected, actual any) bool {
-	if reflect.DeepEqual(expected, actual) {
-		return true
-	}
-
-	switch exp := expected.(type) {
-	case int:
-		switch typed := actual.(type) {
-		case int64:
-			return int64(exp) == typed
-		case json.Number:
-			if i, err := typed.Int64(); err == nil {
-				return int64(exp) == i
-			}
-		}
-	case int64:
-		switch typed := actual.(type) {
-		case int:
-			return exp == int64(typed)
-		case json.Number:
-			if i, err := typed.Int64(); err == nil {
-				return exp == i
-			}
-		}
-	case float64:
-		if num, ok := actual.(json.Number); ok {
-			if f, err := num.Float64(); err == nil {
-				return exp == f
-			}
-		}
-	case json.Number:
-		switch typed := actual.(type) {
-		case int:
-			if i, err := exp.Int64(); err == nil {
-				return i == int64(typed)
-			}
-		case int64:
-			if i, err := exp.Int64(); err == nil {
-				return i == typed
-			}
-		case float64:
-			if f, err := exp.Float64(); err == nil {
-				return f == typed
-			}
-		}
-	}
-
-	return fmt.Sprint(expected) == fmt.Sprint(actual)
-}
-
-func parseCreateVertexPatternSpec(raw string) (createVertexPatternSpec, bool) {
-	raw = strings.TrimSpace(raw)
-	if !strings.HasPrefix(raw, "(") || !strings.HasSuffix(raw, ")") {
-		return createVertexPatternSpec{}, false
-	}
-	body := strings.TrimSpace(raw[1 : len(raw)-1])
-	if body == "" {
-		return createVertexPatternSpec{}, true
-	}
-
-	head := body
-	propsRaw := ""
-	if idx := strings.Index(body, "{"); idx >= 0 {
-		end, ok := findMatchingDelimiter(body, idx, '{', '}')
-		if !ok {
-			return createVertexPatternSpec{}, false
-		}
-		if strings.TrimSpace(body[end+1:]) != "" {
-			return createVertexPatternSpec{}, false
-		}
-		head = strings.TrimSpace(body[:idx])
-		propsRaw = strings.TrimSpace(body[idx+1 : end])
-	}
-
-	varName := ""
-	labelsRaw := ""
-	if strings.HasPrefix(head, ":") {
-		labelsRaw = strings.TrimPrefix(head, ":")
-	} else if strings.Contains(head, ":") {
-		parts := strings.SplitN(head, ":", 2)
-		varName = strings.TrimSpace(parts[0])
-		labelsRaw = strings.TrimSpace(parts[1])
-	} else {
-		varName = strings.TrimSpace(head)
-	}
-
-	if varName != "" && !identifierRE.MatchString(varName) {
-		return createVertexPatternSpec{}, false
-	}
-	return createVertexPatternSpec{Var: varName, Labels: splitLabels(labelsRaw), PropsRaw: propsRaw}, true
-}
-
-func findMatchingDelimiter(raw string, start int, open byte, close byte) (int, bool) {
-	if start < 0 || start >= len(raw) || raw[start] != open {
-		return -1, false
-	}
-	depth := 0
-	inSingle := false
-	inDouble := false
-	for i := start; i < len(raw); i++ {
-		ch := raw[i]
-		switch ch {
-		case '\'':
-			if !inDouble {
-				inSingle = !inSingle
-			}
-		case '"':
-			if !inSingle {
-				inDouble = !inDouble
-			}
-		}
-		if inSingle || inDouble {
-			continue
-		}
-		if ch == open {
-			depth++
-			continue
-		}
-		if ch == close {
-			depth--
-			if depth == 0 {
-				return i, true
-			}
-		}
-	}
-	return -1, false
-}
-
-func (e *Executor) applyCreateEdge(ctx context.Context, tx graph.Tx, rows []Row, m []string, params Params, tenant string, merge bool, direction createEdgeDirection) ([]Row, error) {
-	leftVar := m[1]
-	leftLabels := splitLabels(m[2])
-	edgeVar := m[4]
-	edgeType, err := normalizeCreateRelationshipType(m[5])
-	if err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(edgeType) == "" {
-		return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
-	}
-	rightVar := m[7]
-	rightLabels := splitLabels(m[8])
-	undirectedSeenEdges := map[string]struct{}{}
-
-	out := make([]Row, 0, len(rows))
-	for _, row := range rows {
-		workRow := cloneRow(row)
-
-		leftProps, err := parsePropertyMap(m[3], params, workRow)
-		if err != nil {
-			return nil, err
-		}
-		leftVertex, leftCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, workRow, leftVar, leftLabels, leftProps, merge, true)
-		if err != nil {
-			return nil, err
-		}
-		if leftVar != "" {
-			workRow[leftVar] = leftVertex
-		}
-
-		edgeProps, err := parsePropertyMap(m[6], params, workRow)
-		if err != nil {
-			return nil, err
-		}
-		rightProps, err := parsePropertyMap(m[9], params, workRow)
-		if err != nil {
-			return nil, err
-		}
-		rightVertex, rightCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, workRow, rightVar, rightLabels, rightProps, merge, true)
-		if err != nil {
-			return nil, err
-		}
-		if rightVar != "" {
-			workRow[rightVar] = rightVertex
-		}
-
-		if merge {
-			matchedEdges, err := findMergeEdges(ctx, tx, leftVertex, rightVertex, edgeType, edgeProps, direction)
-			if err != nil {
-				return nil, err
-			}
-			if len(matchedEdges) > 0 {
-				seenEdges := map[string]struct{}{}
-				for _, edge := range matchedEdges {
-					if edge == nil {
-						continue
-					}
-					if _, seen := seenEdges[edge.ID]; seen {
-						continue
-					}
-					if direction == createEdgeDirectionUndirected {
-						if _, seen := undirectedSeenEdges[edge.ID]; seen {
-							continue
-						}
-						undirectedSeenEdges[edge.ID] = struct{}{}
-					}
-					seenEdges[edge.ID] = struct{}{}
-					merged := cloneRow(workRow)
-					merged[mergeCreatedMarkerKey] = leftCreated || rightCreated
-					if leftVar != "" {
-						merged[leftVar] = leftVertex
-					}
-					if rightVar != "" {
-						merged[rightVar] = rightVertex
-					}
-					if edgeVar != "" {
-						merged[edgeVar] = edge
-					}
-					out = append(out, merged)
-				}
-				continue
-			}
-		}
-
-		edge, edgeCreated, err := e.createOrMergeEdge(ctx, tx, leftVertex, rightVertex, edgeType, edgeProps, merge, direction)
-		if err != nil {
-			return nil, err
-		}
-
-		merged := cloneRow(workRow)
-		if merge {
-			merged[mergeCreatedMarkerKey] = leftCreated || rightCreated || edgeCreated
-		}
-		if leftVar != "" {
-			merged[leftVar] = leftVertex
-		}
-		if rightVar != "" {
-			merged[rightVar] = rightVertex
-		}
-		if edgeVar != "" {
-			merged[edgeVar] = edge
-		}
-		out = append(out, merged)
-	}
-	return out, nil
-}
-
-func (e *Executor) applyCreateChainPattern(ctx context.Context, tx graph.Tx, rows []Row, pattern createChainPattern, params Params, tenant string, merge bool) ([]Row, error) {
-	out := make([]Row, 0, len(rows))
-	for _, row := range rows {
-		merged := cloneRow(row)
-		vertices := make([]*graph.Vertex, len(pattern.Vertexes))
-		createdAny := false
-
-		for i, vertexPattern := range pattern.Vertexes {
-			props, err := parsePropertyMap(vertexPattern.PropsRaw, params, merged)
-			if err != nil {
-				return nil, err
-			}
-			vertex, vertexCreated, err := e.resolveOrCreateVertex(ctx, tx, tenant, merged, vertexPattern.Var, vertexPattern.Labels, props, merge, true)
-			if err != nil {
-				return nil, err
-			}
-			if merge && vertexCreated {
-				createdAny = true
-			}
-			vertices[i] = vertex
-			if vertexPattern.Var != "" {
-				merged[vertexPattern.Var] = vertex
-			}
-		}
-
-		for i, rel := range pattern.Rels {
-			relType, err := normalizeCreateRelationshipType(rel.Type)
-			if err != nil {
-				return nil, err
-			}
-			if strings.TrimSpace(relType) == "" {
-				return nil, &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
-			}
-			relProps, err := parsePropertyMap(rel.PropsRaw, params, merged)
-			if err != nil {
-				return nil, err
-			}
-			edge, edgeCreated, err := e.createOrMergeEdge(ctx, tx, vertices[i], vertices[i+1], relType, relProps, merge, rel.Direction)
-			if err != nil {
-				return nil, err
-			}
-			if merge && edgeCreated {
-				createdAny = true
-			}
-			if rel.Var != "" {
-				merged[rel.Var] = edge
-			}
-		}
-		if merge {
-			merged[mergeCreatedMarkerKey] = createdAny
-		}
-
-		out = append(out, merged)
-	}
-	return out, nil
-}
-
-func (e *Executor) createOrMergeEdge(ctx context.Context, tx graph.Tx, leftVertex, rightVertex *graph.Vertex, edgeType string, edgeProps map[string]any, merge bool, direction createEdgeDirection) (*graph.Edge, bool, error) {
-	if merge && hasNilPropertyValue(edgeProps) {
-		return nil, false, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
-	}
-
-	srcVertex := leftVertex
-	dstVertex := rightVertex
-	switch direction {
-	case createEdgeDirectionReverse:
-		srcVertex = rightVertex
-		dstVertex = leftVertex
-	case createEdgeDirectionForward, createEdgeDirectionUndirected:
-		// Keep CREATE default direction left-to-right.
-	default:
-		return nil, false, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown edge direction %q", direction), nil)
-	}
-
-	if merge {
-		matches, err := findMergeEdges(ctx, tx, leftVertex, rightVertex, edgeType, edgeProps, direction)
-		if err != nil {
-			return nil, false, err
-		}
-		if len(matches) > 0 {
-			return matches[0], false, nil
-		}
-	}
-
-	edgeID := ""
-	if merge {
-		edgeID = nextAutoEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
-	} else {
-		edgeID = syntheticEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
-		if _, err := tx.GetEdge(ctx, srcVertex.Tenant, edgeID); err == nil {
-			edgeID = nextAutoEdgeID(srcVertex.Tenant, srcVertex.ID, edgeType, dstVertex.ID)
-		} else if !graph.IsKind(err, graph.ErrKindNotFound) {
-			return nil, false, err
-		}
-	}
-
-	edge := &graph.Edge{
-		Tenant:     srcVertex.Tenant,
-		ID:         edgeID,
-		Type:       edgeType,
-		SrcID:      srcVertex.ID,
-		DstID:      dstVertex.ID,
-		Properties: normalizeEdgeProperties(edgeProps),
-	}
-	if err := e.putEdgeWithIndexes(ctx, tx, edge); err != nil {
-		return nil, false, err
-	}
-	return edge, true, nil
-}
-
-func findMergeEdges(ctx context.Context, tx graph.Tx, leftVertex, rightVertex *graph.Vertex, edgeType string, edgeProps map[string]any, direction createEdgeDirection) ([]*graph.Edge, error) {
-	if leftVertex == nil || rightVertex == nil {
-		return nil, nil
-	}
-
-	appendMatches := func(out []*graph.Edge, seen map[string]struct{}, srcID, dstID string) ([]*graph.Edge, error) {
-		err := tx.ScanOutEdges(ctx, leftVertex.Tenant, srcID, edgeType, 0, func(edge *graph.Edge) error {
-			if edge.DstID != dstID {
-				return nil
-			}
-			if !edgeMatchesMergePattern(edge, edgeProps) {
-				return nil
-			}
-			if _, ok := seen[edge.ID]; ok {
-				return nil
-			}
-			seen[edge.ID] = struct{}{}
-			out = append(out, edge)
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		return out, nil
-	}
-
-	matches := make([]*graph.Edge, 0)
-	seen := map[string]struct{}{}
-	switch direction {
-	case createEdgeDirectionForward:
-		return appendMatches(matches, seen, leftVertex.ID, rightVertex.ID)
-	case createEdgeDirectionReverse:
-		return appendMatches(matches, seen, rightVertex.ID, leftVertex.ID)
-	case createEdgeDirectionUndirected:
-		out, err := appendMatches(matches, seen, leftVertex.ID, rightVertex.ID)
-		if err != nil {
-			return nil, err
-		}
-		return appendMatches(out, seen, rightVertex.ID, leftVertex.ID)
-	default:
-		return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown edge direction %q", direction), nil)
-	}
-}
-
-func edgeMatchesMergePattern(edge *graph.Edge, props map[string]any) bool {
-	if edge == nil {
-		return false
-	}
-	for key, expected := range props {
-		if strings.EqualFold(key, "id") {
-			if edge.ID != stringFromProperty(map[string]any{"id": expected}, "id") {
-				return false
-			}
-			continue
-		}
-		if strings.EqualFold(key, "type") {
-			if edge.Type != stringFromProperty(map[string]any{"type": expected}, "type") {
-				return false
-			}
-			continue
-		}
-		if edge.Properties == nil {
-			return false
-		}
-		stored, ok := edge.Properties[key]
-		if !ok {
-			return false
-		}
-		actual := decodeStoredPropertyValue(stored)
-		if !mergePropertyValueEqual(expected, actual) {
-			return false
-		}
-	}
-	return true
-}
-
-func normalizeCreateRelationshipType(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", nil
-	}
-	edgeType, edgeAnyOf, err := parseEdgeTypeFilter(strings.ReplaceAll(raw, ":", ""))
-	if err != nil {
-		return "", err
-	}
-	if len(edgeAnyOf) > 0 {
-		return "", &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "NoSingleRelationshipType"}
-	}
-	return edgeType, nil
-}
-
 func isMissingRelationshipTypePattern(raw string) bool {
 	raw = strings.TrimSpace(raw)
 	if strings.Contains(raw, "[") || strings.Contains(raw, "]") {
@@ -10644,259 +10756,6 @@ func isMissingRelationshipTypePattern(raw string) bool {
 		return true
 	}
 	return false
-}
-
-func (e *Executor) applySetClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
-	raw := normalizeClauseBody(clause.Raw)
-	raw = stripNormalizedPrefix(raw, "SET")
-	items := splitTopLevelCommaSeparated(raw)
-	if len(items) == 0 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET clause %q is not yet supported", raw), nil)
-	}
-
-	out := make([]Row, 0, len(rows))
-	for _, row := range rows {
-		working := row
-		for _, item := range items {
-			item = strings.TrimSpace(item)
-			if item == "" {
-				continue
-			}
-
-			if varName, field, exprRaw, ok := parseSetPropertyAssignment(item); ok {
-				binding, ok := working[varName]
-				if !ok {
-					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
-				}
-				value, err := evalExpressionWithScope(exprRaw, working, params)
-				if err != nil {
-					value, err = evalWriteValue(exprRaw, params, working)
-				}
-				if err != nil {
-					return nil, err
-				}
-				switch typed := binding.(type) {
-				case *graph.Vertex:
-					if field == "id" {
-						return nil, graph.NewError(graph.ErrKindUnsupported, "setting vertex id is not supported", nil)
-					}
-					current, err := loadCurrentVertexForWrite(ctx, tx, typed)
-					if err != nil {
-						return nil, err
-					}
-					mutated := cloneVertex(current)
-					ensureProperties(mutated)
-					if value == nil {
-						delete(mutated.Properties, field)
-					} else {
-						encoded, err := valueToPropertyBytes(value)
-						if err != nil {
-							return nil, err
-						}
-						mutated.Properties[field] = encoded
-					}
-					if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
-						return nil, err
-					}
-					working = cloneRow(working)
-					working[varName] = mutated
-				case *graph.Edge:
-					if field == "id" {
-						return nil, graph.NewError(graph.ErrKindUnsupported, "setting edge id is not supported", nil)
-					}
-					current, err := loadCurrentEdgeForWrite(ctx, tx, typed)
-					if err != nil {
-						return nil, err
-					}
-					mutated := cloneEdge(current)
-					ensurePropertiesEdge(mutated)
-					if value == nil {
-						delete(mutated.Properties, field)
-					} else {
-						encoded, err := valueToPropertyBytes(value)
-						if err != nil {
-							return nil, err
-						}
-						mutated.Properties[field] = encoded
-					}
-					if err := e.putEdgeWithIndexes(ctx, tx, mutated); err != nil {
-						return nil, err
-					}
-					working = cloneRow(working)
-					working[varName] = mutated
-				case nil:
-					continue
-				default:
-					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET on %T is not supported", binding), nil)
-				}
-				continue
-			}
-
-			if match := setMapAppendClauseRE.FindStringSubmatch(item); len(match) == 3 {
-				varName, exprRaw := match[1], match[2]
-				binding, ok := working[varName]
-				if !ok {
-					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
-				}
-				mapValue, err := evalSetMapValue(exprRaw, working, params)
-				if err != nil {
-					return nil, err
-				}
-				switch typed := binding.(type) {
-				case *graph.Vertex:
-					current, err := loadCurrentVertexForWrite(ctx, tx, typed)
-					if err != nil {
-						return nil, err
-					}
-					mutated := cloneVertex(current)
-					ensureProperties(mutated)
-					for key, value := range mapValue {
-						if value == nil {
-							delete(mutated.Properties, key)
-							continue
-						}
-						encoded, err := valueToPropertyBytes(value)
-						if err != nil {
-							return nil, err
-						}
-						mutated.Properties[key] = encoded
-					}
-					if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
-						return nil, err
-					}
-					working = cloneRow(working)
-					working[varName] = mutated
-				case *graph.Edge:
-					current, err := loadCurrentEdgeForWrite(ctx, tx, typed)
-					if err != nil {
-						return nil, err
-					}
-					mutated := cloneEdge(current)
-					ensurePropertiesEdge(mutated)
-					for key, value := range mapValue {
-						if value == nil {
-							delete(mutated.Properties, key)
-							continue
-						}
-						encoded, err := valueToPropertyBytes(value)
-						if err != nil {
-							return nil, err
-						}
-						mutated.Properties[key] = encoded
-					}
-					if err := e.putEdgeWithIndexes(ctx, tx, mutated); err != nil {
-						return nil, err
-					}
-					working = cloneRow(working)
-					working[varName] = mutated
-				case nil:
-					continue
-				default:
-					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET on %T is not supported", binding), nil)
-				}
-				continue
-			}
-
-			if match := setMapReplaceClauseRE.FindStringSubmatch(item); len(match) == 3 {
-				varName, exprRaw := match[1], match[2]
-				binding, ok := working[varName]
-				if !ok {
-					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
-				}
-				mapValue, err := evalSetMapValue(exprRaw, working, params)
-				if err != nil {
-					return nil, err
-				}
-				switch typed := binding.(type) {
-				case *graph.Vertex:
-					current, err := loadCurrentVertexForWrite(ctx, tx, typed)
-					if err != nil {
-						return nil, err
-					}
-					mutated := cloneVertex(current)
-					mutated.Properties = map[string][]byte{}
-					for key, value := range mapValue {
-						if value == nil {
-							continue
-						}
-						encoded, err := valueToPropertyBytes(value)
-						if err != nil {
-							return nil, err
-						}
-						mutated.Properties[key] = encoded
-					}
-					if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
-						return nil, err
-					}
-					working = cloneRow(working)
-					working[varName] = mutated
-				case *graph.Edge:
-					current, err := loadCurrentEdgeForWrite(ctx, tx, typed)
-					if err != nil {
-						return nil, err
-					}
-					mutated := cloneEdge(current)
-					mutated.Properties = map[string][]byte{}
-					for key, value := range mapValue {
-						if value == nil {
-							continue
-						}
-						encoded, err := valueToPropertyBytes(value)
-						if err != nil {
-							return nil, err
-						}
-						mutated.Properties[key] = encoded
-					}
-					if err := e.putEdgeWithIndexes(ctx, tx, mutated); err != nil {
-						return nil, err
-					}
-					working = cloneRow(working)
-					working[varName] = mutated
-				case nil:
-					continue
-				default:
-					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET on %T is not supported", binding), nil)
-				}
-				continue
-			}
-
-			if match := setLabelClauseRE.FindStringSubmatch(item); len(match) == 3 {
-				varName := match[1]
-				labels := splitLabels(match[2])
-				binding, ok := working[varName]
-				if !ok {
-					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
-				}
-				vertex, ok := binding.(*graph.Vertex)
-				if !ok {
-					if binding == nil {
-						continue
-					}
-					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET on %T is not supported", binding), nil)
-				}
-				current, err := loadCurrentVertexForWrite(ctx, tx, vertex)
-				if err != nil {
-					return nil, err
-				}
-				mutated := cloneVertex(current)
-				for _, label := range labels {
-					if !vertexHasLabel(mutated, label) {
-						mutated.Labels = append(mutated.Labels, label)
-					}
-				}
-				if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
-					return nil, err
-				}
-				working = cloneRow(working)
-				working[varName] = mutated
-				continue
-			}
-
-			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("SET clause %q is not yet supported", raw), nil)
-		}
-		out = append(out, working)
-	}
-	return out, nil
 }
 
 func parseSetPropertyAssignment(item string) (string, string, string, bool) {
@@ -10973,353 +10832,12 @@ func indexTopLevelEqualsInSetItem(raw string) int {
 	return -1
 }
 
-func loadCurrentVertexForWrite(ctx context.Context, tx graph.Tx, vertex *graph.Vertex) (*graph.Vertex, error) {
-	if vertex == nil {
-		return nil, nil
-	}
-	current, err := tx.GetVertex(ctx, vertex.Tenant, vertex.ID)
-	if err == nil {
-		return current, nil
-	}
-	if graph.IsKind(err, graph.ErrKindNotFound) {
-		return vertex, nil
-	}
-	return nil, err
-}
-
-func loadCurrentEdgeForWrite(ctx context.Context, tx graph.Tx, edge *graph.Edge) (*graph.Edge, error) {
-	if edge == nil {
-		return nil, nil
-	}
-	current, err := tx.GetEdge(ctx, edge.Tenant, edge.ID)
-	if err == nil {
-		return current, nil
-	}
-	if graph.IsKind(err, graph.ErrKindNotFound) {
-		return edge, nil
-	}
-	return nil, err
-}
-
-func evalSetMapValue(exprRaw string, row Row, params Params) (map[string]any, error) {
-	value, err := evalExpressionWithScope(exprRaw, row, params)
-	if err != nil {
-		value, err = evalWriteValue(exprRaw, params, row)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	switch typed := value.(type) {
-	case nil:
-		return map[string]any{}, nil
-	case map[string]any:
-		return typed, nil
-	case *graph.Vertex:
-		return decodePropertyMap(typed.Properties), nil
-	case *graph.Edge:
-		return decodePropertyMap(typed.Properties), nil
-	default:
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
-	}
-}
-
-func decodePropertyMap(raw map[string][]byte) map[string]any {
-	decoded := make(map[string]any, len(raw))
-	for key, value := range raw {
-		decoded[key] = decodeStoredPropertyValue(value)
-	}
-	return decoded
-}
-
-func (e *Executor) applyRemoveClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause) ([]Row, error) {
-	raw := normalizeClauseBody(clause.Raw)
-	raw = stripNormalizedPrefix(raw, "REMOVE")
-	items := splitTopLevelCommaSeparated(raw)
-	if len(items) == 0 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE clause %q is not yet supported", raw), nil)
-	}
-
-	out := make([]Row, 0, len(rows))
-	for _, row := range rows {
-		working := row
-		for _, item := range items {
-			item = strings.TrimSpace(item)
-			if item == "" {
-				continue
-			}
-
-			if match := removeClauseRE.FindStringSubmatch(item); len(match) == 3 {
-				varName, field := match[1], match[2]
-				binding, ok := working[varName]
-				if !ok {
-					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
-				}
-				switch typed := binding.(type) {
-				case *graph.Vertex:
-					mutated := cloneVertex(typed)
-					ensureProperties(mutated)
-					delete(mutated.Properties, field)
-					if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
-						return nil, err
-					}
-					working = cloneRow(working)
-					working[varName] = mutated
-				case *graph.Edge:
-					mutated := cloneEdge(typed)
-					ensurePropertiesEdge(mutated)
-					delete(mutated.Properties, field)
-					if err := e.putEdgeWithIndexes(ctx, tx, mutated); err != nil {
-						return nil, err
-					}
-					working = cloneRow(working)
-					working[varName] = mutated
-				case nil:
-					continue
-				default:
-					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE on %T is not supported", binding), nil)
-				}
-				continue
-			}
-
-			if match := removeLabelClauseRE.FindStringSubmatch(item); len(match) == 3 {
-				varName := match[1]
-				labelsToRemove := splitLabels(match[2])
-				binding, ok := working[varName]
-				if !ok {
-					return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("unknown binding %q", varName), nil)
-				}
-				vertex, ok := binding.(*graph.Vertex)
-				if !ok {
-					if binding == nil {
-						continue
-					}
-					return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE on %T is not supported", binding), nil)
-				}
-				removeSet := map[string]struct{}{}
-				for _, label := range labelsToRemove {
-					removeSet[label] = struct{}{}
-				}
-				mutated := cloneVertex(vertex)
-				kept := make([]string, 0, len(mutated.Labels))
-				for _, label := range mutated.Labels {
-					if _, remove := removeSet[label]; remove {
-						continue
-					}
-					kept = append(kept, label)
-				}
-				mutated.Labels = kept
-				if err := e.putVertexWithIndexes(ctx, tx, mutated); err != nil {
-					return nil, err
-				}
-				working = cloneRow(working)
-				working[varName] = mutated
-				continue
-			}
-
-			return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("REMOVE clause %q is not yet supported", raw), nil)
-		}
-		out = append(out, working)
-	}
-	return out, nil
-}
-
-func (e *Executor) applyDeleteClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params) ([]Row, error) {
-	raw := normalizeClauseBody(clause.Raw)
-	detach := false
-	switch {
-	case strings.HasPrefix(strings.ToUpper(raw), "DETACHDELETE"):
-		detach = true
-		raw = strings.TrimSpace(raw[len("DETACHDELETE"):])
-	case strings.HasPrefix(strings.ToUpper(raw), "DELETE"):
-		raw = strings.TrimSpace(raw[len("DELETE"):])
-	default:
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("DELETE clause %q is not yet supported", raw), nil)
-	}
-	targets := splitTopLevelCommaSeparated(raw)
-	if len(targets) == 0 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("DELETE clause %q is not yet supported", raw), nil)
-	}
-
-	out := make([]Row, 0, len(rows))
-	e.metrics.ObserveDeleteCounter("rows_seen", int64(len(rows)))
-	for _, row := range rows {
-		working := row
-		for _, target := range targets {
-			target = strings.TrimSpace(target)
-			if target == "" {
-				continue
-			}
-
-			value, err := evalExpressionWithScope(target, working, params)
-			if err != nil {
-				value, err = evalWriteValue(target, params, working)
-			}
-			if err != nil {
-				return nil, err
-			}
-
-			replacement, err := e.deleteValue(ctx, tx, value, detach)
-			if err != nil {
-				return nil, err
-			}
-
-			if isIdentifierLike(target) {
-				if _, bound := working[target]; bound {
-					working = cloneRow(working)
-					working[target] = replacement
-				}
-			}
-		}
-		out = append(out, working)
-	}
-	return out, nil
-}
-
 func stripNormalizedPrefix(raw, prefix string) string {
 	raw = strings.TrimSpace(raw)
 	if strings.HasPrefix(strings.ToUpper(raw), prefix) {
 		return strings.TrimSpace(raw[len(prefix):])
 	}
 	return raw
-}
-
-func (e *Executor) deleteValue(ctx context.Context, tx graph.Tx, value any, detach bool) (any, error) {
-	switch typed := value.(type) {
-	case nil:
-		return nil, nil
-	case *graph.Vertex:
-		e.metrics.ObserveDeleteCounter("vertex_targets", 1)
-		if detach {
-			if err := e.deleteVertexWithEdges(ctx, tx, typed.Tenant, typed.ID, e.metrics); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
-				return nil, err
-			}
-		} else {
-			hasEdges, err := vertexHasAnyEdges(ctx, tx, typed.Tenant, typed.ID)
-			if err != nil {
-				return nil, err
-			}
-			if hasEdges {
-				return nil, graph.NewError(graph.ErrKindConflict, "DeleteConnectedVertex", nil)
-			}
-			if err := e.deleteVertexWithIndexes(ctx, tx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
-				return nil, err
-			}
-			e.metrics.ObserveDeleteCounter("vertices_deleted", 1)
-		}
-		return deletedVertexBinding{Tenant: typed.Tenant, ID: typed.ID, Labels: append([]string(nil), typed.Labels...)}, nil
-	case *graph.Edge:
-		e.metrics.ObserveDeleteCounter("edge_targets", 1)
-		if err := e.deleteEdgeWithIndexes(ctx, tx, typed.Tenant, typed.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
-			return nil, err
-		}
-		e.metrics.ObserveDeleteCounter("edges_deleted", 1)
-		return deletedEdgeBinding{Tenant: typed.Tenant, ID: typed.ID, Type: typed.Type}, nil
-	case deletedVertexBinding, deletedEdgeBinding:
-		return typed, nil
-	case cypherPathValue:
-		return e.deletePathValue(ctx, tx, typed)
-	case multiHopCypherPath:
-		return e.deletePathValue(ctx, tx, typed)
-	case []any:
-		for _, item := range typed {
-			if _, err := e.deleteValue(ctx, tx, item, detach); err != nil {
-				return nil, err
-			}
-		}
-		return nil, nil
-	default:
-		rv := reflect.ValueOf(value)
-		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
-			for i := 0; i < rv.Len(); i++ {
-				if _, err := e.deleteValue(ctx, tx, rv.Index(i).Interface(), detach); err != nil {
-					return nil, err
-				}
-			}
-			return nil, nil
-		}
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("DELETE on %T is not supported", value), nil)
-	}
-}
-
-func (e *Executor) deletePathValue(ctx context.Context, tx graph.Tx, value any) (any, error) {
-	deleteEdge := func(edge *graph.Edge) error {
-		if edge == nil {
-			return nil
-		}
-		if err := e.deleteEdgeWithIndexes(ctx, tx, edge.Tenant, edge.ID); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
-			return err
-		}
-		return nil
-	}
-
-	deleteVertex := func(vertex *graph.Vertex) error {
-		if vertex == nil {
-			return nil
-		}
-		// Deleting a path should remove entities reachable by that path.
-		if err := e.deleteVertexWithEdges(ctx, tx, vertex.Tenant, vertex.ID, e.metrics); err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
-			return err
-		}
-		return nil
-	}
-
-	switch typed := value.(type) {
-	case cypherPathValue:
-		if err := deleteEdge(typed.Edge); err != nil {
-			return nil, err
-		}
-		if err := deleteVertex(typed.Left); err != nil {
-			return nil, err
-		}
-		if err := deleteVertex(typed.Right); err != nil {
-			return nil, err
-		}
-	case multiHopCypherPath:
-		for _, edge := range typed.Edges {
-			if err := deleteEdge(edge); err != nil {
-				return nil, err
-			}
-		}
-		for _, vertex := range typed.Vertexes {
-			if err := deleteVertex(vertex); err != nil {
-				return nil, err
-			}
-		}
-	}
-	return nil, nil
-}
-
-func (e *Executor) applyUnwindClause(rows []Row, clause ast.Clause, params Params) ([]Row, error) {
-	raw := normalizeClauseBody(stripLeadingClauseKeyword(clause.Raw, "UNWIND"))
-	parts := strings.SplitN(raw, "AS", 2)
-	if len(parts) != 2 {
-		return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("UNWIND clause %q is not yet supported", raw), nil)
-	}
-
-	exprRaw := strings.TrimSpace(parts[0])
-	varName := strings.TrimSpace(parts[1])
-	if varName == "" {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "UNWIND target variable is required", nil)
-	}
-
-	if len(rows) == 0 {
-		rows = []Row{{}}
-	}
-
-	out := make([]Row, 0)
-	for _, row := range rows {
-		values, err := evalUnwindValues(exprRaw, params, row)
-		if err != nil {
-			return nil, err
-		}
-		for _, value := range values {
-			merged := cloneRow(row)
-			merged[varName] = value
-			out = append(out, merged)
-		}
-	}
-	return out, nil
 }
 
 func (e *Executor) applyProjectionClause(ctx context.Context, tx graph.Tx, rows []Row, clause ast.Clause, params Params, priorColumns []string) ([]Row, []string, error) {
@@ -12430,11 +11948,8 @@ func validateProjectionOrderBy(items []projectionSpec, orderBy []projectionOrder
 			}
 			return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "undefined variable"}
 		}
-		if ident, ok := parseSimpleIdentifierRoot(expr); ok {
-			if _, ok := inScope[ident]; !ok {
-				return &parser.ParseError{Kind: parser.ParseErrorUnsupported, Message: "undefined variable"}
-			}
-		}
+		// Non-DISTINCT ORDER BY may reference in-scope variables beyond the projection list.
+		// Semantic analysis owns undefined-variable validation for this shape.
 	}
 
 	return nil
@@ -15144,17 +14659,7 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
 		}
 	}
-	if value, err := evalWriteValue(raw, params, row); err == nil {
-		return value, nil
-	}
-	if value, handled, err := evalPatternComprehensionFromRuntime(raw, row, params); handled {
-		if err != nil {
-			return nil, err
-		}
-		return value, nil
-	}
-	baseExpr, fields, ok := splitTopLevelFieldAccess(raw)
-	if ok && len(fields) >= 1 {
+	if baseExpr, fields, ok := splitTopLevelFieldAccess(raw); ok && len(fields) >= 1 {
 		var base any
 		if isIdentifierLike(baseExpr) {
 			if value, exists := row[baseExpr]; exists {
@@ -15184,6 +14689,15 @@ func evalExpressionWithScope(raw string, row Row, params Params) (any, error) {
 			base = next
 		}
 		return base, nil
+	}
+	if value, err := evalWriteValue(raw, params, row); err == nil {
+		return value, nil
+	}
+	if value, handled, err := evalPatternComprehensionFromRuntime(raw, row, params); handled {
+		if err != nil {
+			return nil, err
+		}
+		return value, nil
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", raw), nil)
 }
@@ -15270,6 +14784,12 @@ func evalFieldAccessValue(base any, field string) (any, error) {
 				return value, nil
 			}
 			if value, ok := mapped[field]; ok {
+				return value, nil
+			}
+			return nil, nil
+		}
+		if temporal, ok := parseTemporalStringValue(typed); ok {
+			if value, ok := evalTemporalAccessor(temporal, field); ok {
 				return value, nil
 			}
 			return nil, nil
@@ -15442,6 +14962,23 @@ func normalizeFieldAccessPart(part string) string {
 func resolveBareIdentifier(raw string, row Row, params Params) (any, bool) {
 	if !isIdentifierLike(raw) {
 		return nil, false
+	}
+	if strings.Contains(raw, ".") {
+		if baseExpr, _, ok := splitTopLevelFieldAccess(raw); ok {
+			baseExpr = strings.TrimSpace(baseExpr)
+			if baseExpr != "" {
+				if row != nil {
+					if _, exists := row[baseExpr]; exists {
+						return nil, false
+					}
+				}
+				if params != nil {
+					if _, exists := params[baseExpr]; exists {
+						return nil, false
+					}
+				}
+			}
+		}
 	}
 	if row != nil {
 		if value, ok := row[raw]; ok {
@@ -19154,6 +18691,76 @@ func resolveBoundPredicateVertex(ctx context.Context, tx graph.Tx, tenant string
 			return nil, true, nil
 		}
 		vertex = resolved
+	case map[string]any:
+		id := ""
+		if rawID, ok := typed["id"]; ok {
+			id = strings.TrimSpace(fmt.Sprint(rawID))
+		}
+		if id == "" {
+			if rawID, ok := typed["ID"]; ok {
+				id = strings.TrimSpace(fmt.Sprint(rawID))
+			}
+		}
+		if id != "" {
+			resolved, err := getVertexQueryCached(ctx, tx, tenant, id, params)
+			if err != nil {
+				return nil, true, err
+			}
+			if resolved != nil {
+				vertex = resolved
+				break
+			}
+			resolved, err = resolveBoundPredicateVertexBySemanticID(ctx, tx, tenant, id, pattern, params, row)
+			if err != nil {
+				return nil, true, err
+			}
+			if resolved != nil {
+				vertex = resolved
+				break
+			}
+		}
+		labelsOut := []string{}
+		if labelsRaw, ok := typed["labels"]; ok {
+			switch labels := labelsRaw.(type) {
+			case []string:
+				labelsOut = append(labelsOut, labels...)
+			case []any:
+				for _, item := range labels {
+					label := strings.TrimSpace(fmt.Sprint(item))
+					if label != "" {
+						labelsOut = append(labelsOut, label)
+					}
+				}
+			}
+		}
+		if len(labelsOut) == 0 {
+			return nil, false, nil
+		}
+		vertex = &graph.Vertex{Tenant: tenant, ID: id, Labels: labelsOut}
+	case map[string]string:
+		id := strings.TrimSpace(typed["id"])
+		if id == "" {
+			id = strings.TrimSpace(typed["ID"])
+		}
+		if id != "" {
+			resolved, err := getVertexQueryCached(ctx, tx, tenant, id, params)
+			if err != nil {
+				return nil, true, err
+			}
+			if resolved != nil {
+				vertex = resolved
+				break
+			}
+			resolved, err = resolveBoundPredicateVertexBySemanticID(ctx, tx, tenant, id, pattern, params, row)
+			if err != nil {
+				return nil, true, err
+			}
+			if resolved != nil {
+				vertex = resolved
+				break
+			}
+		}
+		return nil, false, nil
 	default:
 		return nil, false, nil
 	}
@@ -19163,6 +18770,33 @@ func resolveBoundPredicateVertex(ctx context.Context, tx graph.Tx, tenant string
 	}
 
 	return vertex, true, nil
+}
+
+func resolveBoundPredicateVertexBySemanticID(ctx context.Context, tx graph.Tx, tenant, semanticID string, pattern vertexPattern, params Params, row Row) (*graph.Vertex, error) {
+	semanticID = strings.TrimSpace(semanticID)
+	if semanticID == "" {
+		return nil, nil
+	}
+	stopScan := errors.New("resolveBoundPredicateVertexBySemanticID stop")
+	var matched *graph.Vertex
+	if err := tx.ScanVertices(ctx, tenant, 0, func(vertex *graph.Vertex) error {
+		if vertex == nil {
+			return nil
+		}
+		if currentID, ok := vertex.Properties["id"]; !ok || string(currentID) != semanticID {
+			return nil
+		}
+		if !vertexPatternMatches(vertex, pattern, params, row) {
+			return nil
+		}
+		matched = vertex
+		return stopScan
+	}); err != nil {
+		if err != stopScan {
+			return nil, err
+		}
+	}
+	return matched, nil
 }
 
 func relationshipExistsByDirection(ctx context.Context, tx graph.Tx, params Params, tenant, srcID, dstID, edgeType string, forward bool) (bool, error) {
@@ -19214,13 +18848,6 @@ func ensureWherePatternPredicateCache(params Params) *wherePatternPredicateCache
 	return cache
 }
 
-func resetWherePatternPredicateCache(params Params) {
-	if params == nil {
-		return
-	}
-	delete(params, wherePatternPredicateCacheParam)
-}
-
 func ensureQueryEntityCache(params Params) *queryEntityCache {
 	if params == nil {
 		return &queryEntityCache{vertexes: map[string]*graph.Vertex{}, missing: map[string]struct{}{}}
@@ -19237,13 +18864,6 @@ func ensureQueryEntityCache(params Params) *queryEntityCache {
 	cache := &queryEntityCache{vertexes: map[string]*graph.Vertex{}, missing: map[string]struct{}{}}
 	params[queryEntityCacheParam] = cache
 	return cache
-}
-
-func resetQueryEntityCache(params Params) {
-	if params == nil {
-		return
-	}
-	delete(params, queryEntityCacheParam)
 }
 
 func ensureQueryAdjacencyCache(params Params) *queryAdjacencyCache {
@@ -19268,13 +18888,6 @@ func ensureQueryAdjacencyCache(params Params) *queryAdjacencyCache {
 	cache := &queryAdjacencyCache{outEdges: map[string][]*graph.Edge{}, inEdges: map[string][]*graph.Edge{}, outEdgeLinks: map[string][]queryOutEdgeLink{}, outSourceIDs: map[string][]string{}}
 	params[queryAdjacencyCacheParam] = cache
 	return cache
-}
-
-func resetQueryAdjacencyCache(params Params) {
-	if params == nil {
-		return
-	}
-	delete(params, queryAdjacencyCacheParam)
 }
 
 func queryAdjacencyCacheKey(tenant, vertexID, edgeType string) string {
@@ -20465,66 +20078,6 @@ func parensAreBalanced(raw string) bool {
 	return depth == 0
 }
 
-func evalUnwindValues(raw string, params Params, row Row) ([]any, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil, graph.NewError(graph.ErrKindSemantic, "empty UNWIND expression", nil)
-	}
-	if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
-		inner := strings.TrimSpace(raw[1 : len(raw)-1])
-		if inner == "" {
-			return []any{}, nil
-		}
-		parts := splitTopLevelCommaSeparated(inner)
-		values := make([]any, 0, len(parts))
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			value, err := evalExpressionWithScope(part, row, params)
-			if err != nil {
-				value, err = evalWriteValue(part, params, row)
-			}
-			if err != nil {
-				return nil, err
-			}
-			values = append(values, value)
-		}
-		return values, nil
-	}
-	if strings.HasPrefix(raw, "$") {
-		name := strings.TrimPrefix(raw, "$")
-		value, ok := params[name]
-		if !ok {
-			return nil, graph.NewError(graph.ErrKindInvalidInput, fmt.Sprintf("missing parameter %q", name), nil)
-		}
-		if value == nil {
-			return []any{}, nil
-		}
-		return flattenListValue(value)
-	}
-	if row != nil {
-		if value, ok := row[raw]; ok {
-			if value == nil {
-				return []any{}, nil
-			}
-			return flattenListValue(value)
-		}
-	}
-	if value, err := evalExpressionWithScope(raw, row, params); err == nil {
-		if value == nil {
-			return []any{}, nil
-		}
-		return flattenListValue(value)
-	}
-	value, err := evalWriteValue(raw, params, row)
-	if err == nil {
-		if value == nil {
-			return []any{}, nil
-		}
-		return []any{value}, nil
-	}
-	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("UNWIND expression %q is not yet supported", raw), nil)
-}
-
 func (e *Executor) evalProjectionPatternComprehension(ctx context.Context, tx graph.Tx, raw string, row Row, params Params) (any, bool, error) {
 	if tx == nil {
 		return nil, false, nil
@@ -20701,153 +20254,6 @@ func findTopLevelPipeIndex(raw string) int {
 	return -1
 }
 
-func flattenListValue(value any) ([]any, error) {
-	if value == nil {
-		return []any{nil}, nil
-	}
-	rv := reflect.ValueOf(value)
-	if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
-		out := make([]any, 0, rv.Len())
-		for i := 0; i < rv.Len(); i++ {
-			out = append(out, rv.Index(i).Interface())
-		}
-		return out, nil
-	}
-	return []any{value}, nil
-}
-
-func (e *Executor) deleteVertexWithEdges(ctx context.Context, tx graph.Tx, tenant, vertexID string, metrics Metrics) error {
-	if metrics != nil {
-		metrics.ObserveDeleteCounter("vertex_detach_targets", 1)
-	}
-	type edgeIDScannerTx interface {
-		ScanOutEdgeIDs(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(string) error) error
-		ScanInEdgeIDs(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(string) error) error
-	}
-	edgeIDs := map[string]struct{}{}
-	if scanner, ok := tx.(edgeIDScannerTx); ok {
-		if err := scanner.ScanOutEdgeIDs(ctx, tenant, vertexID, "", 0, func(edgeID string) error {
-			edgeIDs[edgeID] = struct{}{}
-			if metrics != nil {
-				metrics.ObserveDeleteCounter("out_edges_scanned", 1)
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		if err := scanner.ScanInEdgeIDs(ctx, tenant, vertexID, "", 0, func(edgeID string) error {
-			edgeIDs[edgeID] = struct{}{}
-			if metrics != nil {
-				metrics.ObserveDeleteCounter("in_edges_scanned", 1)
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-	} else {
-		if err := tx.ScanOutEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
-			edgeIDs[edge.ID] = struct{}{}
-			if metrics != nil {
-				metrics.ObserveDeleteCounter("out_edges_scanned", 1)
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		if err := tx.ScanInEdges(ctx, tenant, vertexID, "", 0, func(edge *graph.Edge) error {
-			edgeIDs[edge.ID] = struct{}{}
-			if metrics != nil {
-				metrics.ObserveDeleteCounter("in_edges_scanned", 1)
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	for edgeID := range edgeIDs {
-		if err := e.deleteEdgeWithIndexes(ctx, tx, tenant, edgeID); err != nil {
-			return err
-		}
-		if metrics != nil {
-			metrics.ObserveDeleteCounter("edges_deleted", 1)
-		}
-	}
-	if err := e.deleteVertexWithIndexes(ctx, tx, tenant, vertexID); err != nil {
-		return err
-	}
-	if metrics != nil {
-		metrics.ObserveDeleteCounter("vertices_deleted", 1)
-	}
-	return nil
-}
-
-func (e *Executor) deleteVertexWithIndexes(ctx context.Context, tx graph.Tx, tenant, vertexID string) error {
-	vertex, err := tx.GetVertex(ctx, tenant, vertexID)
-	if err != nil {
-		if graph.IsKind(err, graph.ErrKindNotFound) {
-			return nil
-		}
-		return err
-	}
-
-	if e != nil && e.indexCatalog != nil && vertex != nil {
-		for _, label := range vertex.Labels {
-			for property, encoded := range vertex.Properties {
-				if !e.indexCatalog.HasPropertyIndex(tenant, label, property) {
-					continue
-				}
-				if err := tx.DeletePropertyIndex(ctx, &graph.PropertyIndexEntry{
-					Tenant:      tenant,
-					Schema:      label,
-					Property:    property,
-					Value:       append([]byte(nil), encoded...),
-					EntityID:    vertex.ID,
-					EntityClass: "vertex",
-				}); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	return tx.DeleteVertex(ctx, tenant, vertexID)
-}
-
-func (e *Executor) deleteEdgeWithIndexes(ctx context.Context, tx graph.Tx, tenant, edgeID string) error {
-	edge, err := tx.GetEdge(ctx, tenant, edgeID)
-	if err != nil {
-		if graph.IsKind(err, graph.ErrKindNotFound) {
-			return nil
-		}
-		return err
-	}
-
-	if e != nil && e.indexCatalog != nil && edge != nil {
-		edgeType := strings.TrimSpace(edge.Type)
-		if edgeType != "" {
-			for property, encoded := range edge.Properties {
-				if !e.indexCatalog.HasEdgePropertyIndex(tenant, edgeType, property) {
-					continue
-				}
-				if err := tx.DeletePropertyIndex(ctx, &graph.PropertyIndexEntry{
-					Tenant:      tenant,
-					Schema:      edgeType,
-					Property:    property,
-					Value:       append([]byte(nil), encoded...),
-					EntityID:    edge.ID,
-					EntityClass: "edge",
-					EdgeSrcID:   edge.SrcID,
-					EdgeDstID:   edge.DstID,
-				}); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	return tx.DeleteEdge(ctx, tenant, edgeID)
-}
-
 func resolvePatternSourceID(row Row, params Params, varName, paramName string) (string, error) {
 	if binding, ok := row[varName]; ok {
 		switch typed := binding.(type) {
@@ -20858,56 +20264,6 @@ func resolvePatternSourceID(row Row, params Params, varName, paramName string) (
 		}
 	}
 	return requireStringParam(params, paramName)
-}
-
-func (e *Executor) resolveOrCreateVertex(ctx context.Context, tx graph.Tx, tenant string, row Row, varName string, labels []string, props map[string]any, merge bool, allowAnonymousIDFromProps bool) (*graph.Vertex, bool, error) {
-	if binding, ok := row[varName]; ok {
-		if v, ok := binding.(*graph.Vertex); ok {
-			return v, false, nil
-		}
-		if s, ok := binding.(string); ok && s != "" {
-			v, err := tx.GetVertex(ctx, tenant, s)
-			if err == nil {
-				return v, false, nil
-			}
-		}
-	}
-	if merge && hasNilPropertyValue(props) {
-		return nil, false, graph.NewError(graph.ErrKindSemantic, "MergeReadOwnWrites", nil)
-	}
-
-	vertexID := ""
-	if strings.TrimSpace(varName) != "" || allowAnonymousIDFromProps {
-		if derivedID, ok := vertexIDFromPatternProperties(props); ok {
-			vertexID = derivedID
-		}
-	}
-	if vertexID == "" {
-		if merge {
-			matches, err := e.findMergeVerticesByPattern(ctx, tx, tenant, labels, props)
-			if err != nil {
-				return nil, false, err
-			}
-			if len(matches) > 0 {
-				return matches[0], false, nil
-			}
-		}
-		vertexID = nextAutoVertexID(varName)
-	}
-
-	vertex, err := tx.GetVertex(ctx, tenant, vertexID)
-	if err == nil {
-		return vertex, false, nil
-	}
-	if !graph.IsKind(err, graph.ErrKindNotFound) {
-		return nil, false, err
-	}
-
-	vertex = &graph.Vertex{Tenant: tenant, ID: vertexID, Labels: labels, Properties: normalizeVertexProperties(props)}
-	if err := e.putVertexWithIndexes(ctx, tx, vertex); err != nil {
-		return nil, false, err
-	}
-	return vertex, true, nil
 }
 
 func vertexIDFromPatternProperties(props map[string]any) (string, bool) {
@@ -20933,19 +20289,6 @@ func propertyIDString(rawProps string, params Params, row Row) (string, bool) {
 		return "", false
 	}
 	return vertexIDFromPatternProperties(props)
-}
-
-func nextAutoVertexID(varName string) string {
-	n := atomic.AddUint64(&autoVertexIDSeq, 1)
-	if strings.TrimSpace(varName) == "" {
-		return fmt.Sprintf("auto-v-%d", n)
-	}
-	return fmt.Sprintf("auto-%s-%d", varName, n)
-}
-
-func nextAutoEdgeID(tenant, srcID, edgeType, dstID string) string {
-	n := atomic.AddUint64(&autoEdgeIDSeq, 1)
-	return fmt.Sprintf("%s|%s|%s|%s|%d", tenant, srcID, edgeType, dstID, n)
 }
 
 func parsePropertyMap(raw string, params Params, row Row) (map[string]any, error) {
@@ -20978,26 +20321,6 @@ func parsePropertyMap(raw string, params Params, row Row) (map[string]any, error
 		out[key] = value
 	}
 	return out, nil
-}
-
-func vertexHasAnyEdges(ctx context.Context, tx graph.Tx, tenant, vertexID string) (bool, error) {
-	hasEdges := false
-	if err := tx.ScanOutEdges(ctx, tenant, vertexID, "", 1, func(edge *graph.Edge) error {
-		hasEdges = true
-		return nil
-	}); err != nil {
-		return false, err
-	}
-	if hasEdges {
-		return true, nil
-	}
-	if err := tx.ScanInEdges(ctx, tenant, vertexID, "", 1, func(edge *graph.Edge) error {
-		hasEdges = true
-		return nil
-	}); err != nil {
-		return false, err
-	}
-	return hasEdges, nil
 }
 
 func evalWriteValue(raw string, params Params, row Row) (any, error) {
@@ -21348,7 +20671,7 @@ func normalizeTemporalConstructorMap(name string, in map[string]any) (map[string
 		}
 
 		if typeName == "time" || typeName == "datetime" {
-			targetTZ := strings.TrimSpace(fmt.Sprint(out["timezone"]))
+			targetTZ := temporalTimezoneString(out)
 			if sourceTZ != "" && targetTZ != "" && sourceTZ != targetTZ {
 				year, month, day := 1970, 1, 1
 				if typeName == "datetime" {
@@ -21398,7 +20721,7 @@ func normalizeTemporalConstructorMap(name string, in map[string]any) (map[string
 	}
 
 	if typeName == "time" || typeName == "datetime" {
-		tz := strings.TrimSpace(fmt.Sprint(out["timezone"]))
+		tz := temporalTimezoneString(out)
 		if tz == "" {
 			out["timezone"] = "Z"
 		}
@@ -23159,6 +22482,12 @@ func evalAdditiveExpression(op, left, right, raw string, row Row, params Params)
 	if value, ok := evalTemporalArithmetic(lhs, rhs, op); ok {
 		return value, nil
 	}
+	if _, ok := temporalMapValue(lhs); ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	if _, ok := temporalMapValue(rhs); ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
 	if op == "+" {
 		return fmt.Sprint(lhs) + fmt.Sprint(rhs), nil
 	}
@@ -23231,6 +22560,12 @@ func evalMultiplicativeExpression(op, left, right, raw string, row Row, params P
 	}
 	if value, ok := evalTemporalArithmetic(lhs, rhs, op); ok {
 		return value, nil
+	}
+	if _, ok := temporalMapValue(lhs); ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
+	}
+	if _, ok := temporalMapValue(rhs); ok {
+		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidArgumentType", nil)
 	}
 	return nil, graph.NewError(graph.ErrKindUnsupported, fmt.Sprintf("expression %q is not yet supported", compactExpression(raw)), nil)
 }
@@ -23402,8 +22737,84 @@ func temporalMapValue(v any) (map[string]any, bool) {
 				return mapped, true
 			}
 		}
+		if parsed, ok := parseTemporalStringValue(typed); ok {
+			return parsed, true
+		}
 	}
 	return nil, false
+}
+
+func parseTemporalStringValue(raw string) (map[string]any, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+
+	constructorNames := []struct {
+		name  string
+		alias string
+	}{
+		{name: "date", alias: "date"},
+		{name: "localtime", alias: "localtime"},
+		{name: "localtime", alias: "local_time"},
+		{name: "time", alias: "time"},
+		{name: "time", alias: "zoned_time"},
+		{name: "localdatetime", alias: "localdatetime"},
+		{name: "localdatetime", alias: "local_datetime"},
+		{name: "datetime", alias: "datetime"},
+		{name: "datetime", alias: "zoned_datetime"},
+		{name: "duration", alias: "duration"},
+	}
+
+	for _, constructor := range constructorNames {
+		arg, ok := parseFunctionCall(raw, constructor.alias)
+		if !ok {
+			continue
+		}
+		arg = strings.TrimSpace(arg)
+		if arg == "" {
+			return map[string]any{"__temporal_type": constructor.name}, true
+		}
+		value, err := evalWriteValue(arg, nil, nil)
+		if err != nil {
+			return nil, false
+		}
+		constructed, err := temporalFromConstructedValue(constructor.name, value)
+		if err != nil {
+			return nil, false
+		}
+		mapped, ok := constructed.(map[string]any)
+		if ok {
+			return mapped, true
+		}
+		return nil, false
+	}
+
+	literalTypes := []string{"date", "localtime", "time", "localdatetime", "datetime", "duration"}
+	if temporalLiteralHasTimezone(raw) {
+		literalTypes = []string{"date", "time", "datetime", "localtime", "localdatetime", "duration"}
+	}
+	for _, typeName := range literalTypes {
+		if parsed, ok := parseTemporalLiteralToMap(typeName, raw); ok {
+			parsed["__temporal_type"] = typeName
+			return parsed, true
+		}
+	}
+
+	return nil, false
+}
+
+func temporalLiteralHasTimezone(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if _, clockPart, ok := strings.Cut(raw, "T"); ok {
+		_, _, _, _, tz, parsed := parseClockAndZone(clockPart)
+		return parsed && tz != ""
+	}
+	_, _, _, _, tz, parsed := parseClockAndZone(raw)
+	return parsed && tz != ""
 }
 
 func durationComponentsFromMap(value map[string]any) durationComponents {
@@ -23803,7 +23214,7 @@ func formatTemporalToString(temporal map[string]any) (string, bool) {
 		minute, _ := mapInt(temporal, "minute")
 		second, _ := mapInt(temporal, "second")
 		nano := combineNanoseconds(temporal)
-		tzName := strings.TrimSpace(fmt.Sprint(temporal["timezone"]))
+		tzName := temporalTimezoneString(temporal)
 		if tzName == "" {
 			tzName = "Z"
 		}
@@ -23831,7 +23242,7 @@ func formatTemporalToString(temporal map[string]any) (string, bool) {
 		minute, _ := mapInt(temporal, "minute")
 		second, _ := mapInt(temporal, "second")
 		nano := combineNanoseconds(temporal)
-		tzName := strings.TrimSpace(fmt.Sprint(temporal["timezone"]))
+		tzName := temporalTimezoneString(temporal)
 		if tzName == "" {
 			tzName = "Z"
 		}
@@ -23857,6 +23268,18 @@ func formatTemporalToString(temporal map[string]any) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func temporalTimezoneString(temporal map[string]any) string {
+	raw, ok := temporal["timezone"]
+	if !ok || raw == nil {
+		return ""
+	}
+	tz := strings.TrimSpace(fmt.Sprint(raw))
+	if strings.EqualFold(tz, "<nil>") {
+		return ""
+	}
+	return tz
 }
 
 func formatDurationFromExactSecondNanos(seconds int64, nanos int) string {
@@ -24067,28 +23490,6 @@ func unquoteCypherString(raw string) (string, error) {
 	}
 }
 
-func normalizeVertexProperties(props map[string]any) graph.PropertyMap {
-	out := graph.PropertyMap{}
-	for k, v := range props {
-		if v == nil {
-			continue
-		}
-		out[k] = valueToBytes(v)
-	}
-	return out
-}
-
-func normalizeEdgeProperties(props map[string]any) graph.PropertyMap {
-	out := graph.PropertyMap{}
-	for k, v := range props {
-		if v == nil {
-			continue
-		}
-		out[k] = valueToBytes(v)
-	}
-	return out
-}
-
 func stringFromProperty(props map[string]any, key string) string {
 	v, ok := props[key]
 	if !ok {
@@ -24134,48 +23535,6 @@ func valueToBytes(v any) []byte {
 		return []byte("false")
 	default:
 		return []byte(fmt.Sprint(v))
-	}
-}
-
-func valueToPropertyBytes(v any) ([]byte, error) {
-	if !isSupportedPropertyValue(v) {
-		return nil, graph.NewError(graph.ErrKindInvalidInput, "InvalidPropertyType", nil)
-	}
-	return valueToBytes(v), nil
-}
-
-func isSupportedPropertyValue(v any) bool {
-	switch typed := v.(type) {
-	case nil, string, bool,
-		int, int8, int16, int32, int64,
-		uint, uint8, uint16, uint32, uint64,
-		float32, float64,
-		json.Number:
-		return true
-	case map[string]any:
-		_, temporal := typed["__temporal_type"]
-		_, spatial := typed["__spatial_type"]
-		return temporal || spatial
-	case *graph.Vertex, *graph.Edge, cypherPathValue, multiHopCypherPath:
-		return false
-	case []any:
-		for _, item := range typed {
-			if !isSupportedPropertyValue(item) {
-				return false
-			}
-		}
-		return true
-	default:
-		rv := reflect.ValueOf(v)
-		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
-			for i := 0; i < rv.Len(); i++ {
-				if !isSupportedPropertyValue(rv.Index(i).Interface()) {
-					return false
-				}
-			}
-			return true
-		}
-		return false
 	}
 }
 
@@ -24327,56 +23686,6 @@ func cloneRow(in Row) Row {
 		out[k] = v
 	}
 	return out
-}
-
-func cloneVertex(v *graph.Vertex) *graph.Vertex {
-	if v == nil {
-		return nil
-	}
-	out := &graph.Vertex{
-		Tenant: v.Tenant,
-		ID:     v.ID,
-		Labels: append([]string(nil), v.Labels...),
-	}
-	if v.Properties != nil {
-		out.Properties = make(graph.PropertyMap, len(v.Properties))
-		for k, val := range v.Properties {
-			out.Properties[k] = append([]byte(nil), val...)
-		}
-	}
-	return out
-}
-
-func cloneEdge(e *graph.Edge) *graph.Edge {
-	if e == nil {
-		return nil
-	}
-	out := &graph.Edge{
-		Tenant: e.Tenant,
-		ID:     e.ID,
-		Type:   e.Type,
-		SrcID:  e.SrcID,
-		DstID:  e.DstID,
-	}
-	if e.Properties != nil {
-		out.Properties = make(graph.PropertyMap, len(e.Properties))
-		for k, val := range e.Properties {
-			out.Properties[k] = append([]byte(nil), val...)
-		}
-	}
-	return out
-}
-
-func ensureProperties(v *graph.Vertex) {
-	if v.Properties == nil {
-		v.Properties = graph.PropertyMap{}
-	}
-}
-
-func ensurePropertiesEdge(e *graph.Edge) {
-	if e.Properties == nil {
-		e.Properties = graph.PropertyMap{}
-	}
 }
 
 func syntheticEdgeID(tenant, srcID, edgeType, dstID string) string {

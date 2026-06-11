@@ -261,6 +261,7 @@ type RequestOptions struct {
 	IncludeStats          bool                   `protobuf:"varint,2,opt,name=include_stats,json=includeStats,proto3" json:"include_stats,omitempty"`
 	IncludeWarnings       bool                   `protobuf:"varint,3,opt,name=include_warnings,json=includeWarnings,proto3" json:"include_warnings,omitempty"`
 	AllowFallbackToCypher bool                   `protobuf:"varint,4,opt,name=allow_fallback_to_cypher,json=allowFallbackToCypher,proto3" json:"allow_fallback_to_cypher,omitempty"`
+	StrictVariantDispatch bool                   `protobuf:"varint,5,opt,name=strict_variant_dispatch,json=strictVariantDispatch,proto3" json:"strict_variant_dispatch,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -319,6 +320,13 @@ func (x *RequestOptions) GetIncludeWarnings() bool {
 func (x *RequestOptions) GetAllowFallbackToCypher() bool {
 	if x != nil {
 		return x.AllowFallbackToCypher
+	}
+	return false
+}
+
+func (x *RequestOptions) GetStrictVariantDispatch() bool {
+	if x != nil {
+		return x.StrictVariantDispatch
 	}
 	return false
 }
@@ -676,19 +684,20 @@ func (*CapabilitiesRequest) Descriptor() ([]byte, []int) {
 }
 
 type CapabilitiesResponse struct {
-	state                        protoimpl.MessageState `protogen:"open.v1"`
-	ProtocolVersion              string                 `protobuf:"bytes,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
-	ParserVersions               []string               `protobuf:"bytes,2,rep,name=parser_versions,json=parserVersions,proto3" json:"parser_versions,omitempty"`
-	IrVersions                   []string               `protobuf:"bytes,3,rep,name=ir_versions,json=irVersions,proto3" json:"ir_versions,omitempty"`
-	PreparedQuerySupported       bool                   `protobuf:"varint,4,opt,name=prepared_query_supported,json=preparedQuerySupported,proto3" json:"prepared_query_supported,omitempty"`
-	ParameterBinding             string                 `protobuf:"bytes,5,opt,name=parameter_binding,json=parameterBinding,proto3" json:"parameter_binding,omitempty"`
-	IndexDdlSupported            bool                   `protobuf:"varint,6,opt,name=index_ddl_supported,json=indexDdlSupported,proto3" json:"index_ddl_supported,omitempty"`
-	MaxWriteBatchBytes           int64                  `protobuf:"varint,7,opt,name=max_write_batch_bytes,json=maxWriteBatchBytes,proto3" json:"max_write_batch_bytes,omitempty"`
-	ConfiguredMaxWriteBatchBytes int64                  `protobuf:"varint,8,opt,name=configured_max_write_batch_bytes,json=configuredMaxWriteBatchBytes,proto3" json:"configured_max_write_batch_bytes,omitempty"`
-	EffectiveMaxWriteBatchBytes  int64                  `protobuf:"varint,9,opt,name=effective_max_write_batch_bytes,json=effectiveMaxWriteBatchBytes,proto3" json:"effective_max_write_batch_bytes,omitempty"`
-	MaxWriteBatchBytesTuned      bool                   `protobuf:"varint,10,opt,name=max_write_batch_bytes_tuned,json=maxWriteBatchBytesTuned,proto3" json:"max_write_batch_bytes_tuned,omitempty"`
-	unknownFields                protoimpl.UnknownFields
-	sizeCache                    protoimpl.SizeCache
+	state                          protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolVersion                string                 `protobuf:"bytes,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	ParserVersions                 []string               `protobuf:"bytes,2,rep,name=parser_versions,json=parserVersions,proto3" json:"parser_versions,omitempty"`
+	IrVersions                     []string               `protobuf:"bytes,3,rep,name=ir_versions,json=irVersions,proto3" json:"ir_versions,omitempty"`
+	PreparedQuerySupported         bool                   `protobuf:"varint,4,opt,name=prepared_query_supported,json=preparedQuerySupported,proto3" json:"prepared_query_supported,omitempty"`
+	ParameterBinding               string                 `protobuf:"bytes,5,opt,name=parameter_binding,json=parameterBinding,proto3" json:"parameter_binding,omitempty"`
+	IndexDdlSupported              bool                   `protobuf:"varint,6,opt,name=index_ddl_supported,json=indexDdlSupported,proto3" json:"index_ddl_supported,omitempty"`
+	MaxWriteBatchBytes             int64                  `protobuf:"varint,7,opt,name=max_write_batch_bytes,json=maxWriteBatchBytes,proto3" json:"max_write_batch_bytes,omitempty"`
+	ConfiguredMaxWriteBatchBytes   int64                  `protobuf:"varint,8,opt,name=configured_max_write_batch_bytes,json=configuredMaxWriteBatchBytes,proto3" json:"configured_max_write_batch_bytes,omitempty"`
+	EffectiveMaxWriteBatchBytes    int64                  `protobuf:"varint,9,opt,name=effective_max_write_batch_bytes,json=effectiveMaxWriteBatchBytes,proto3" json:"effective_max_write_batch_bytes,omitempty"`
+	MaxWriteBatchBytesTuned        bool                   `protobuf:"varint,10,opt,name=max_write_batch_bytes_tuned,json=maxWriteBatchBytesTuned,proto3" json:"max_write_batch_bytes_tuned,omitempty"`
+	StrictVariantDispatchSupported bool                   `protobuf:"varint,11,opt,name=strict_variant_dispatch_supported,json=strictVariantDispatchSupported,proto3" json:"strict_variant_dispatch_supported,omitempty"`
+	unknownFields                  protoimpl.UnknownFields
+	sizeCache                      protoimpl.SizeCache
 }
 
 func (x *CapabilitiesResponse) Reset() {
@@ -787,6 +796,13 @@ func (x *CapabilitiesResponse) GetEffectiveMaxWriteBatchBytes() int64 {
 func (x *CapabilitiesResponse) GetMaxWriteBatchBytesTuned() bool {
 	if x != nil {
 		return x.MaxWriteBatchBytesTuned
+	}
+	return false
+}
+
+func (x *CapabilitiesResponse) GetStrictVariantDispatchSupported() bool {
+	if x != nil {
+		return x.StrictVariantDispatchSupported
 	}
 	return false
 }
@@ -1284,12 +1300,13 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"ir_version\x18\x02 \x01(\tR\tirVersion\x12 \n" +
 	"\vfingerprint\x18\x03 \x01(\tR\vfingerprint\x12\x18\n" +
 	"\apayload\x18\x04 \x01(\fR\apayload\x12'\n" +
-	"\x0ffallback_cypher\x18\x05 \x01(\tR\x0efallbackCypher\"\xb6\x01\n" +
+	"\x0ffallback_cypher\x18\x05 \x01(\tR\x0efallbackCypher\"\xee\x01\n" +
 	"\x0eRequestOptions\x12\x1b\n" +
 	"\tread_only\x18\x01 \x01(\bR\breadOnly\x12#\n" +
 	"\rinclude_stats\x18\x02 \x01(\bR\fincludeStats\x12)\n" +
 	"\x10include_warnings\x18\x03 \x01(\bR\x0fincludeWarnings\x127\n" +
-	"\x18allow_fallback_to_cypher\x18\x04 \x01(\bR\x15allowFallbackToCypher\"~\n" +
+	"\x18allow_fallback_to_cypher\x18\x04 \x01(\bR\x15allowFallbackToCypher\x126\n" +
+	"\x17strict_variant_dispatch\x18\x05 \x01(\bR\x15strictVariantDispatch\"~\n" +
 	"\rClientContext\x12!\n" +
 	"\fsdk_language\x18\x01 \x01(\tR\vsdkLanguage\x12\x1f\n" +
 	"\vsdk_version\x18\x02 \x01(\tR\n" +
@@ -1316,7 +1333,7 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"Diagnostic\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"\x15\n" +
-	"\x13CapabilitiesRequest\"\xa1\x04\n" +
+	"\x13CapabilitiesRequest\"\xec\x04\n" +
 	"\x14CapabilitiesResponse\x12)\n" +
 	"\x10protocol_version\x18\x01 \x01(\tR\x0fprotocolVersion\x12'\n" +
 	"\x0fparser_versions\x18\x02 \x03(\tR\x0eparserVersions\x12\x1f\n" +
@@ -1329,7 +1346,8 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	" configured_max_write_batch_bytes\x18\b \x01(\x03R\x1cconfiguredMaxWriteBatchBytes\x12D\n" +
 	"\x1feffective_max_write_batch_bytes\x18\t \x01(\x03R\x1beffectiveMaxWriteBatchBytes\x12<\n" +
 	"\x1bmax_write_batch_bytes_tuned\x18\n" +
-	" \x01(\bR\x17maxWriteBatchBytesTuned\"\x8c\x01\n" +
+	" \x01(\bR\x17maxWriteBatchBytesTuned\x12I\n" +
+	"!strict_variant_dispatch_supported\x18\v \x01(\bR\x1estrictVariantDispatchSupported\"\x8c\x01\n" +
 	"\x1aCreatePropertyIndexRequest\x12\x16\n" +
 	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x12\x16\n" +
 	"\x06schema\x18\x02 \x01(\tR\x06schema\x12\x1a\n" +

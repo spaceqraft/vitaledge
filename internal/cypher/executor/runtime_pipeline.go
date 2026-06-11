@@ -914,6 +914,12 @@ func (e *Executor) executeRuntimePhysicalPlan(ctx context.Context, stmt *ast.Que
 	applyPlan := func(tx graph.Tx) error {
 		e.observeRuntimeMergeIndexMetrics(ctx, tx, stmt, params)
 		e.observeRuntimeEdgeIndexMetrics(stmt, params)
+		if fastResult, handled, fastErr := e.tryExecuteRuntimePrintSuggestedFriendsCollectFastPath(ctx, tx, stmt, params); fastErr != nil {
+			return fastErr
+		} else if handled {
+			runtimeResult = fastResult
+			return nil
+		}
 		if fastResult, handled, fastErr := e.tryExecuteRuntimeTwoHopDistinctSuggestMergeFastPath(ctx, tx, stmt, params); fastErr != nil {
 			return fastErr
 		} else if handled {
@@ -971,6 +977,320 @@ func (e *Executor) executeRuntimePhysicalPlan(ctx context.Context, stmt *ast.Que
 	appendRuntimeCounterWarning(result, params)
 	e.observeRuntimeFastPathFeedback(params, int64(len(rows)))
 	return result, nil
+}
+
+func (e *Executor) tryExecuteRuntimePrintSuggestedFriendsCollectFastPath(ctx context.Context, tx graph.Tx, stmt *ast.QueryStatement, params Params) (runtime.ExecutionResult, bool, error) {
+	if e == nil || tx == nil || stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	clauses := stmt.Parts[0].Clauses
+	if len(clauses) != 2 || clauses[0].Kind != ast.ClauseKindMatch || clauses[1].Kind != ast.ClauseKindReturn {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	matchSpec, err := anchoredMatchSpecFromClause(clauses[0])
+	if err != nil || matchSpec.Optional || strings.TrimSpace(matchSpec.Where) != "" {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	relPattern, err := parseDirectedRelationshipPattern(matchSpec.Pattern)
+	if err != nil {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if strings.TrimSpace(relPattern.EdgeType) == "" || strings.TrimSpace(relPattern.EdgeVar) != "" || strings.TrimSpace(relPattern.EdgeProps) != "" || len(relPattern.EdgeAnyOf) != 0 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if strings.TrimSpace(relPattern.Left.Var) == "" || strings.TrimSpace(relPattern.Right.Var) == "" {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if strings.TrimSpace(relPattern.Left.PropertiesRaw) != "" || strings.TrimSpace(relPattern.Right.PropertiesRaw) != "" {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if len(relPattern.Left.AnyOfLabels) != 0 || len(relPattern.Left.ExcludedLabels) != 0 || len(relPattern.Right.AnyOfLabels) != 0 || len(relPattern.Right.ExcludedLabels) != 0 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if len(relPattern.Left.AllOfLabels) != 1 || len(relPattern.Right.AllOfLabels) != 1 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(relPattern.Left.AllOfLabels[0]), strings.TrimSpace(relPattern.Right.AllOfLabels[0])) {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	retSpec, err := projectionClauseSpecFromClause(clauses[1])
+	if err != nil || retSpec.Distinct || strings.TrimSpace(retSpec.WhereRaw) != "" || strings.TrimSpace(retSpec.SkipRaw) != "" || strings.TrimSpace(retSpec.LimitRaw) != "" {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	items, err := parseProjectionItems(retSpec.ProjectionRaw)
+	if err != nil || len(items) != 2 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	parseVarPropertyExpr := func(raw string) (string, string, bool) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return "", "", false
+		}
+		parts := strings.Split(raw, ".")
+		if len(parts) != 2 {
+			return "", "", false
+		}
+		varName := normalizeProjectionIdentifier(parts[0])
+		propName := normalizeProjectionIdentifier(parts[1])
+		if strings.TrimSpace(varName) == "" || strings.TrimSpace(propName) == "" {
+			return "", "", false
+		}
+		return strings.TrimSpace(varName), strings.TrimSpace(propName), true
+	}
+
+	personExpr := ""
+	personKey := ""
+	sourceProperty := ""
+	collectProperty := ""
+	collectKey := ""
+
+	for _, item := range items {
+		if strings.TrimSpace(item.CollectArg) == "" && strings.TrimSpace(item.CountArg) == "" && strings.TrimSpace(item.AggFunc) == "" {
+			refVar, refProp, ok := parseVarPropertyExpr(item.Expression)
+			if !ok || refVar != strings.TrimSpace(relPattern.Left.Var) {
+				return runtime.ExecutionResult{}, false, nil
+			}
+			sourceProperty = refProp
+			personExpr = strings.TrimSpace(item.Expression)
+			personKey = projectionKey(item)
+			continue
+		}
+		if strings.TrimSpace(item.CollectArg) == "" || strings.TrimSpace(item.CountArg) != "" || strings.TrimSpace(item.AggFunc) != "" {
+			return runtime.ExecutionResult{}, false, nil
+		}
+		arg, distinct := parseCollectDistinctArg(item.CollectArg)
+		refVar, refProp, ok := parseVarPropertyExpr(arg)
+		if !distinct || !ok || refVar != strings.TrimSpace(relPattern.Right.Var) {
+			return runtime.ExecutionResult{}, false, nil
+		}
+		collectProperty = strings.TrimSpace(refProp)
+		collectKey = projectionKey(item)
+	}
+	if personExpr == "" || strings.TrimSpace(sourceProperty) == "" || strings.TrimSpace(collectProperty) == "" || personKey == "" || collectKey == "" {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(sourceProperty), strings.TrimSpace(collectProperty)) {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if len(retSpec.OrderBy) != 1 || retSpec.OrderBy[0].Descending {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	orderExpr := strings.TrimSpace(retSpec.OrderBy[0].Expression)
+	if !strings.EqualFold(orderExpr, personKey) && !strings.EqualFold(orderExpr, personExpr) {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	tenant := tenantFromParams(params)
+	if strings.TrimSpace(tenant) == "" {
+		return runtime.ExecutionResult{}, false, graph.NewError(graph.ErrKindInvalidInput, "tenant parameter is required", nil)
+	}
+
+	leftLabelCache := map[string]bool{}
+	rightLabelCache := map[string]bool{}
+	type nameCacheEntry struct {
+		value any
+		key   string
+		ok    bool
+	}
+	nameCache := map[string]nameCacheEntry{}
+	distinctKeyForValue := func(value any) string {
+		normalized := normalizeResultValue(value)
+		switch typed := normalized.(type) {
+		case string:
+			return "s:" + typed
+		case bool:
+			if typed {
+				return "b:1"
+			}
+			return "b:0"
+		case int:
+			return "i:" + strconv.FormatInt(int64(typed), 10)
+		case int8:
+			return "i:" + strconv.FormatInt(int64(typed), 10)
+		case int16:
+			return "i:" + strconv.FormatInt(int64(typed), 10)
+		case int32:
+			return "i:" + strconv.FormatInt(int64(typed), 10)
+		case int64:
+			return "i:" + strconv.FormatInt(typed, 10)
+		case uint:
+			return "u:" + strconv.FormatUint(uint64(typed), 10)
+		case uint8:
+			return "u:" + strconv.FormatUint(uint64(typed), 10)
+		case uint16:
+			return "u:" + strconv.FormatUint(uint64(typed), 10)
+		case uint32:
+			return "u:" + strconv.FormatUint(uint64(typed), 10)
+		case uint64:
+			return "u:" + strconv.FormatUint(typed, 10)
+		case float32:
+			return "f:" + strconv.FormatFloat(float64(typed), 'g', -1, 32)
+		case float64:
+			return "f:" + strconv.FormatFloat(typed, 'g', -1, 64)
+		case json.Number:
+			return "n:" + typed.String()
+		}
+		keyBytes, err := json.Marshal(normalized)
+		if err != nil {
+			return "x:" + fmt.Sprintf("%v", normalized)
+		}
+		return "j:" + string(keyBytes)
+	}
+
+	matchesLabels := func(vertexID string, pattern vertexPattern, cache map[string]bool) (bool, error) {
+		vertexID = strings.TrimSpace(vertexID)
+		if vertexID == "" {
+			return false, nil
+		}
+		if matched, ok := cache[vertexID]; ok {
+			return matched, nil
+		}
+		matched := true
+		for _, label := range pattern.AllOfLabels {
+			label = strings.TrimSpace(label)
+			if label == "" {
+				continue
+			}
+			hasLabel, err := tx.HasVertexLabel(ctx, tenant, vertexID, label)
+			if err != nil {
+				return false, err
+			}
+			if !hasLabel {
+				matched = false
+				break
+			}
+		}
+		cache[vertexID] = matched
+		if matched {
+			e.observeRuntimeCounter(params, "runtime.vertex.label_probe_shortcut_applied", 1)
+		}
+		return matched, nil
+	}
+
+	resolveProperty := func(vertexID string, property string) (any, string, bool, error) {
+		vertexID = strings.TrimSpace(vertexID)
+		if vertexID == "" {
+			return nil, "", false, nil
+		}
+		if cached, ok := nameCache[vertexID]; ok {
+			return cached.value, cached.key, cached.ok, nil
+		}
+		vertex, err := getVertexQueryCached(ctx, tx, tenant, vertexID, params)
+		if err != nil {
+			return nil, "", false, err
+		}
+		if vertex == nil {
+			nameCache[vertexID] = nameCacheEntry{ok: false}
+			return nil, "", false, nil
+		}
+		propertyValue, err := evalVertexField(vertex, property)
+		if err != nil {
+			return nil, "", false, err
+		}
+		if propertyValue == nil {
+			nameCache[vertexID] = nameCacheEntry{ok: false}
+			return nil, "", false, nil
+		}
+		normalizedValue := normalizeResultValue(propertyValue)
+		valueKey := distinctKeyForValue(normalizedValue)
+		e.observeRuntimeCounter(params, "runtime.vertex.name_property_hydrated", 1)
+		nameCache[vertexID] = nameCacheEntry{value: normalizedValue, key: valueKey, ok: true}
+		return normalizedValue, valueKey, true, nil
+	}
+
+	groupsBySrcID := map[string]map[string]struct{}{}
+	edgesScanned := int64(0)
+	err = tx.ScanOutEdgeLinksByType(ctx, tenant, relPattern.EdgeType, 0, func(srcID, _ string, dstID string) error {
+		edgesScanned++
+		srcID = strings.TrimSpace(srcID)
+		dstID = strings.TrimSpace(dstID)
+		if srcID == "" || dstID == "" {
+			return nil
+		}
+
+		leftMatched, err := matchesLabels(srcID, relPattern.Left, leftLabelCache)
+		if err != nil || !leftMatched {
+			return err
+		}
+		rightMatched, err := matchesLabels(dstID, relPattern.Right, rightLabelCache)
+		if err != nil || !rightMatched {
+			return err
+		}
+
+		set := groupsBySrcID[srcID]
+		if set == nil {
+			set = map[string]struct{}{}
+			groupsBySrcID[srcID] = set
+		}
+		set[dstID] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return runtime.ExecutionResult{}, false, err
+	}
+
+	type distinctValue struct {
+		key   string
+		value any
+	}
+	groups := map[string]map[string]distinctValue{}
+	personValues := map[string]any{}
+	personOrder := make([]string, 0, len(groupsBySrcID))
+	for srcID, dstIDs := range groupsBySrcID {
+		personValue, personValueKey, ok, err := resolveProperty(srcID, sourceProperty)
+		if err != nil {
+			return runtime.ExecutionResult{}, false, err
+		}
+		if !ok {
+			continue
+		}
+		nameSet := groups[personValueKey]
+		if nameSet == nil {
+			nameSet = map[string]distinctValue{}
+			groups[personValueKey] = nameSet
+			personValues[personValueKey] = personValue
+			personOrder = append(personOrder, personValueKey)
+		}
+		for dstID := range dstIDs {
+			suggestedValue, suggestedValueKey, ok, err := resolveProperty(dstID, sourceProperty)
+			if err != nil {
+				return runtime.ExecutionResult{}, false, err
+			}
+			if !ok {
+				continue
+			}
+			nameSet[suggestedValueKey] = distinctValue{key: suggestedValueKey, value: suggestedValue}
+		}
+	}
+
+	sort.Slice(personOrder, func(i, j int) bool {
+		return personOrder[i] < personOrder[j]
+	})
+
+	rows := make([]map[string]any, 0, len(personOrder))
+	for _, personValueKey := range personOrder {
+		nameValues := make([]any, 0, len(groups[personValueKey]))
+		for _, item := range groups[personValueKey] {
+			nameValues = append(nameValues, item.value)
+		}
+		personValue := personValues[personValueKey]
+		rows = append(rows, map[string]any{personKey: personValue, collectKey: nameValues})
+	}
+
+	e.observeRuntimeCounter(params, "runtime.collect_distinct_same_property.fastpath_applied", 1)
+	e.observeRuntimeCounter(params, "runtime.collect_distinct_same_property.edges_scanned", edgesScanned)
+	e.observeRuntimeCounter(params, "runtime.collect_distinct_same_property.groups", int64(len(rows)))
+	if strings.EqualFold(strings.TrimSpace(relPattern.EdgeType), "SUGGESTED_FRIEND") && strings.EqualFold(strings.TrimSpace(sourceProperty), "name") {
+		e.observeRuntimeCounter(params, "runtime.suggested_friends.print.fastpath_applied", 1)
+		e.observeRuntimeCounter(params, "runtime.suggested_friends.print.edges_scanned", edgesScanned)
+		e.observeRuntimeCounter(params, "runtime.suggested_friends.print.groups", int64(len(rows)))
+	}
+
+	return runtime.ExecutionResult{Rows: rows}, true, nil
 }
 
 func (e *Executor) tryExecuteRuntimeTwoHopDistinctSuggestMergeFastPath(ctx context.Context, tx graph.Tx, stmt *ast.QueryStatement, params Params) (runtime.ExecutionResult, bool, error) {

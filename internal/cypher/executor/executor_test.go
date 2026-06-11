@@ -4943,6 +4943,228 @@ func TestExecuteTypedCollectDistinctReturnRecommendations(t *testing.T) {
 	}
 }
 
+func TestExecutePrintSuggestedFriendsCollectDistinctFastPath(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "p1", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Alice")}},
+			{Tenant: "acme", ID: "p2", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Bob")}},
+			{Tenant: "acme", ID: "p3", Labels: []string{"Person"}, Properties: map[string][]byte{"name": []byte("Cora")}},
+			{Tenant: "acme", ID: "p4", Labels: []string{"Movie"}, Properties: map[string][]byte{"name": []byte("NotAPerson")}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "s1", Type: "SUGGESTED_FRIEND", SrcID: "p1", DstID: "p2"},
+			{Tenant: "acme", ID: "s2", Type: "SUGGESTED_FRIEND", SrcID: "p1", DstID: "p3"},
+			{Tenant: "acme", ID: "s3", Type: "SUGGESTED_FRIEND", SrcID: "p1", DstID: "p3"},
+			{Tenant: "acme", ID: "s4", Type: "SUGGESTED_FRIEND", SrcID: "p2", DstID: "p3"},
+			{Tenant: "acme", ID: "s5", Type: "SUGGESTED_FRIEND", SrcID: "p2", DstID: "p4"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:Person)-[:SUGGESTED_FRIEND]->(suggested:Person) RETURN a.name AS person, collect(DISTINCT suggested.name) AS suggested_friends ORDER BY person")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "emit_runtime_counters": true})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+
+	toStringSet := func(raw any) map[string]struct{} {
+		out := map[string]struct{}{}
+		switch typed := raw.(type) {
+		case []any:
+			for _, item := range typed {
+				text, ok := item.(string)
+				if !ok {
+					t.Fatalf("expected collected value to be string, got %#v", item)
+				}
+				out[text] = struct{}{}
+			}
+		case []string:
+			for _, item := range typed {
+				out[item] = struct{}{}
+			}
+		default:
+			t.Fatalf("expected collected list, got %#v", raw)
+		}
+		return out
+	}
+
+	people := make([]string, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		person, _ := row["person"].(string)
+		people = append(people, person)
+		suggested := toStringSet(row["suggested_friends"])
+		switch person {
+		case "Alice":
+			if len(suggested) != 2 {
+				t.Fatalf("expected two distinct suggestions for Alice, got %#v", row["suggested_friends"])
+			}
+			if _, ok := suggested["Bob"]; !ok {
+				t.Fatalf("missing Bob suggestion for Alice: %#v", row["suggested_friends"])
+			}
+			if _, ok := suggested["Cora"]; !ok {
+				t.Fatalf("missing Cora suggestion for Alice: %#v", row["suggested_friends"])
+			}
+		case "Bob":
+			if len(suggested) != 1 {
+				t.Fatalf("expected one distinct suggestion for Bob, got %#v", row["suggested_friends"])
+			}
+			if _, ok := suggested["Cora"]; !ok {
+				t.Fatalf("missing Cora suggestion for Bob: %#v", row["suggested_friends"])
+			}
+		default:
+			t.Fatalf("unexpected person row: %#v", row)
+		}
+	}
+	if !reflect.DeepEqual(people, []string{"Alice", "Bob"}) {
+		t.Fatalf("unexpected ordering: %#v", people)
+	}
+
+	counters, err := runtimeCountersFromWarnings(res.Warnings)
+	if err != nil {
+		t.Fatalf("decode runtime counters failed: %v", err)
+	}
+	if counters["runtime.suggested_friends.print.fastpath_applied"] <= 0 {
+		t.Fatalf("expected print fast path counter > 0, counters=%v", counters)
+	}
+}
+
+func TestExecuteCollectDistinctSamePropertyFastPathGeneralShape(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: map[string][]byte{"handle": []byte("amy")}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"handle": []byte("ben")}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"User"}, Properties: map[string][]byte{"handle": []byte("cai")}},
+			{Tenant: "acme", ID: "u4", Labels: []string{"Team"}, Properties: map[string][]byte{"handle": []byte("team-only")}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "k1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "k2", Type: "KNOWS", SrcID: "u1", DstID: "u3"},
+			{Tenant: "acme", ID: "k3", Type: "KNOWS", SrcID: "u1", DstID: "u3"},
+			{Tenant: "acme", ID: "k4", Type: "KNOWS", SrcID: "u2", DstID: "u3"},
+			{Tenant: "acme", ID: "k5", Type: "KNOWS", SrcID: "u2", DstID: "u4"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (src:User)-[:KNOWS]->(dst:User) RETURN src.handle AS person, collect(DISTINCT dst.handle) AS suggested ORDER BY person")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "emit_runtime_counters": true})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(res.Rows))
+	}
+
+	toStringSet := func(raw any) map[string]struct{} {
+		out := map[string]struct{}{}
+		switch typed := raw.(type) {
+		case []any:
+			for _, item := range typed {
+				text, ok := item.(string)
+				if !ok {
+					t.Fatalf("expected collected value to be string, got %#v", item)
+				}
+				out[text] = struct{}{}
+			}
+		case []string:
+			for _, item := range typed {
+				out[item] = struct{}{}
+			}
+		default:
+			t.Fatalf("expected collected list, got %#v", raw)
+		}
+		return out
+	}
+
+	people := make([]string, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		person, _ := row["person"].(string)
+		people = append(people, person)
+		suggested := toStringSet(row["suggested"])
+		switch person {
+		case "amy":
+			if len(suggested) != 2 {
+				t.Fatalf("expected two distinct suggestions for amy, got %#v", row["suggested"])
+			}
+			if _, ok := suggested["ben"]; !ok {
+				t.Fatalf("missing ben suggestion for amy: %#v", row["suggested"])
+			}
+			if _, ok := suggested["cai"]; !ok {
+				t.Fatalf("missing cai suggestion for amy: %#v", row["suggested"])
+			}
+		case "ben":
+			if len(suggested) != 1 {
+				t.Fatalf("expected one distinct suggestion for ben, got %#v", row["suggested"])
+			}
+			if _, ok := suggested["cai"]; !ok {
+				t.Fatalf("missing cai suggestion for ben: %#v", row["suggested"])
+			}
+		default:
+			t.Fatalf("unexpected person row: %#v", row)
+		}
+	}
+	if !reflect.DeepEqual(people, []string{"amy", "ben"}) {
+		t.Fatalf("unexpected ordering: %#v", people)
+	}
+
+	counters, err := runtimeCountersFromWarnings(res.Warnings)
+	if err != nil {
+		t.Fatalf("decode runtime counters failed: %v", err)
+	}
+	if counters["runtime.collect_distinct_same_property.fastpath_applied"] <= 0 {
+		t.Fatalf("expected generalized fast path counter > 0, counters=%v", counters)
+	}
+}
+
 func TestExecuteCollectReturnPreservesDuplicatesWithoutDistinct(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

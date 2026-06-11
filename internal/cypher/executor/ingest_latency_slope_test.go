@@ -183,6 +183,7 @@ func medianInt64(values []int64) int64 {
 type scanCountingStore struct {
 	inner           graph.GraphStore
 	scannedVertexes atomic.Int64
+	scannedAdj      atomic.Int64
 }
 
 func newScanCountingStore(inner graph.GraphStore) *scanCountingStore {
@@ -217,6 +218,10 @@ func (s *scanCountingStore) scannedVertices() int64 {
 	return s.scannedVertexes.Load()
 }
 
+func (s *scanCountingStore) scannedAdjacencyItems() int64 {
+	return s.scannedAdj.Load()
+}
+
 type scanCountingTx struct {
 	graph.Tx
 	store *scanCountingStore
@@ -239,5 +244,45 @@ func (t *scanCountingTx) ScanVerticesFrom(ctx context.Context, tenant, startAfte
 			return nil
 		}
 		return fn(vertex)
+	})
+}
+
+func (t *scanCountingTx) ScanOutEdges(ctx context.Context, tenant, srcID, edgeType string, limit int, fn func(*graph.Edge) error) error {
+	return t.Tx.ScanOutEdges(ctx, tenant, srcID, edgeType, limit, func(edge *graph.Edge) error {
+		t.store.scannedAdj.Add(1)
+		if fn == nil {
+			return nil
+		}
+		return fn(edge)
+	})
+}
+
+func (t *scanCountingTx) ScanInEdges(ctx context.Context, tenant, dstID, edgeType string, limit int, fn func(*graph.Edge) error) error {
+	return t.Tx.ScanInEdges(ctx, tenant, dstID, edgeType, limit, func(edge *graph.Edge) error {
+		t.store.scannedAdj.Add(1)
+		if fn == nil {
+			return nil
+		}
+		return fn(edge)
+	})
+}
+
+func (t *scanCountingTx) ScanOutEdgeSourceIDs(ctx context.Context, tenant, edgeType string, limit int, fn func(string) error) error {
+	return t.Tx.ScanOutEdgeSourceIDs(ctx, tenant, edgeType, limit, func(sourceID string) error {
+		t.store.scannedAdj.Add(1)
+		if fn == nil {
+			return nil
+		}
+		return fn(sourceID)
+	})
+}
+
+func (t *scanCountingTx) ScanOutEdgeLinksByType(ctx context.Context, tenant, edgeType string, limit int, fn func(srcID, edgeID, dstID string) error) error {
+	return t.Tx.ScanOutEdgeLinksByType(ctx, tenant, edgeType, limit, func(srcID, edgeID, dstID string) error {
+		t.store.scannedAdj.Add(1)
+		if fn == nil {
+			return nil
+		}
+		return fn(srcID, edgeID, dstID)
 	})
 }

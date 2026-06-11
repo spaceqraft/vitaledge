@@ -2622,7 +2622,7 @@ func TestRecommendationStage2TopKEarlyStopActivatesPipelinePayload(t *testing.T)
 	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "executionStrategies", "runtimeStats", "warnings")
 }
 
-func TestTwoHopAntiJoinShortcutAppliesAndPreservesResults(t *testing.T) {
+func TestTwoHopAntiJoinShortcutAndRuntimeFastPathApplyAndPreserveResults(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
 
@@ -2668,10 +2668,21 @@ func TestTwoHopAntiJoinShortcutAppliesAndPreservesResults(t *testing.T) {
 		t.Fatalf("execute recommend query failed: %v", err)
 	}
 
-	if counters, err := runtimeCountersFromWarnings(res.Warnings); err == nil {
-		if counters["runtime.antijoin.shortcut_applied"] <= 0 {
-			t.Fatalf("expected anti-join shortcut to apply when runtime counters are present, got counters %#v", counters)
-		}
+	counters, err := runtimeCountersFromWarnings(res.Warnings)
+	if err != nil {
+		t.Fatalf("runtime counters parse failed: %v", err)
+	}
+	if counters["runtime.id_first.fastpath_applied"] <= 0 {
+		t.Fatalf("expected id-first fast path to apply, got counters %#v", counters)
+	}
+	if counters["runtime.antijoin.shortcut_applied"] <= 0 {
+		t.Fatalf("expected anti-join shortcut to apply, got counters %#v", counters)
+	}
+	if counters["runtime.antijoin.endpoint_probe_applied"] <= 0 && counters["runtime.antijoin.prefetch_applied"] <= 0 {
+		t.Fatalf("expected anti-join endpoint probes or prefetch path to apply, got counters %#v", counters)
+	}
+	if counters["runtime.merge.batch_probe_applied"] <= 0 {
+		t.Fatalf("expected merge batch probe to apply, got counters %#v", counters)
 	}
 
 	verifyStmt, err := parser.ParseStatement("MATCH (a:Person)-[:SUGGESTED_FRIEND]->(s:Person) RETURN a.name AS source, s.name AS suggested ORDER BY suggested")

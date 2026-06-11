@@ -914,6 +914,12 @@ func (e *Executor) executeRuntimePhysicalPlan(ctx context.Context, stmt *ast.Que
 	applyPlan := func(tx graph.Tx) error {
 		e.observeRuntimeMergeIndexMetrics(ctx, tx, stmt, params)
 		e.observeRuntimeEdgeIndexMetrics(stmt, params)
+		if fastResult, handled, fastErr := e.tryExecuteRuntimeTwoHopDistinctSuggestMergeFastPath(ctx, tx, stmt, params); fastErr != nil {
+			return fastErr
+		} else if handled {
+			runtimeResult = fastResult
+			return nil
+		}
 		result, err := engine.ExecuteWithTx(ctx, input, tx)
 		if err != nil {
 			return err
@@ -965,6 +971,288 @@ func (e *Executor) executeRuntimePhysicalPlan(ctx context.Context, stmt *ast.Que
 	appendRuntimeCounterWarning(result, params)
 	e.observeRuntimeFastPathFeedback(params, int64(len(rows)))
 	return result, nil
+}
+
+func (e *Executor) tryExecuteRuntimeTwoHopDistinctSuggestMergeFastPath(ctx context.Context, tx graph.Tx, stmt *ast.QueryStatement, params Params) (runtime.ExecutionResult, bool, error) {
+	if e == nil || tx == nil || stmt == nil || len(stmt.Parts) != 1 || len(stmt.Unions) != 0 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	clauses := stmt.Parts[0].Clauses
+	if len(clauses) != 3 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if clauses[0].Kind != ast.ClauseKindMatch || clauses[1].Kind != ast.ClauseKindWith || clauses[2].Kind != ast.ClauseKindMerge {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	if !stage1CanTryFastTwoHopDistinctWrite([]Row{{}}, tx) {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	matchSpec, chain, ok := stage1ResolveFastTwoHopDistinctWriteMatchAndChain(clauses[0])
+	if !ok || matchSpec.Optional {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if strings.TrimSpace(chain.FirstEdgeType) == "" || strings.TrimSpace(chain.SecondEdgeType) == "" || !chain.SecondForward {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if len(chain.Left.AnyOfLabels) != 0 || len(chain.Left.ExcludedLabels) != 0 || len(chain.Mid.AnyOfLabels) != 0 || len(chain.Mid.ExcludedLabels) != 0 || len(chain.Right.AnyOfLabels) != 0 || len(chain.Right.ExcludedLabels) != 0 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	_, withItems, ok := stage1ResolveFastTwoHopDistinctWriteWithItems(clauses[1])
+	if !ok {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	mergeRaw := stage1ResolveFastTwoHopDistinctWritePatternRaw(clauses[2])
+	mergePattern, err := parseDirectedRelationshipPattern(mergeRaw)
+	if err != nil {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if !stage1CanUseFastTwoHopDistinctMergeSemantics(clauses[2], true) {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if strings.TrimSpace(mergePattern.EdgeVar) != "" || strings.TrimSpace(mergePattern.EdgeProps) != "" || len(mergePattern.EdgeAnyOf) != 0 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	mergeLeftVar := strings.TrimSpace(mergePattern.Left.Var)
+	mergeRightVar := strings.TrimSpace(mergePattern.Right.Var)
+	if mergeLeftVar == "" || mergeRightVar == "" || strings.TrimSpace(mergePattern.EdgeType) == "" {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if !stage1HasFastTwoHopDistinctWriteProjectionBindings(withItems, chain, mergeLeftVar, mergeRightVar) {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	antijoin := buildTwoHopDirectedAntiJoinShortcutPlan(matchSpec.Where, chain)
+	if !antijoin.enabled || !antijoin.requireRightNotLeft || !antijoin.requireNoDirectEdge {
+		return runtime.ExecutionResult{}, false, nil
+	}
+	if strings.TrimSpace(antijoin.directEdgeType) == "" || len(antijoin.directEdgeAnyOf) != 0 {
+		return runtime.ExecutionResult{}, false, nil
+	}
+
+	tenant := tenantFromParams(params)
+	if strings.TrimSpace(tenant) == "" {
+		return runtime.ExecutionResult{}, false, graph.NewError(graph.ErrKindInvalidInput, "tenant parameter is required", nil)
+	}
+
+	buildOutAdjacency := func(edgeType string) (map[string]map[string]struct{}, error) {
+		adj := map[string]map[string]struct{}{}
+		err := tx.ScanOutEdgeLinksByType(ctx, tenant, edgeType, 0, func(srcID, _ string, dstID string) error {
+			srcID = strings.TrimSpace(srcID)
+			dstID = strings.TrimSpace(dstID)
+			if srcID == "" || dstID == "" {
+				return nil
+			}
+			neighbors := adj[srcID]
+			if neighbors == nil {
+				neighbors = map[string]struct{}{}
+				adj[srcID] = neighbors
+			}
+			neighbors[dstID] = struct{}{}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return adj, nil
+	}
+
+	buildUndirectedAdjacency := func(edgeType string) (map[string]map[string]struct{}, error) {
+		adj := map[string]map[string]struct{}{}
+		err := tx.ScanOutEdgeLinksByType(ctx, tenant, edgeType, 0, func(srcID, _ string, dstID string) error {
+			srcID = strings.TrimSpace(srcID)
+			dstID = strings.TrimSpace(dstID)
+			if srcID == "" || dstID == "" {
+				return nil
+			}
+			left := adj[srcID]
+			if left == nil {
+				left = map[string]struct{}{}
+				adj[srcID] = left
+			}
+			left[dstID] = struct{}{}
+
+			right := adj[dstID]
+			if right == nil {
+				right = map[string]struct{}{}
+				adj[dstID] = right
+			}
+			right[srcID] = struct{}{}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return adj, nil
+	}
+
+	firstOutAdj, err := buildOutAdjacency(chain.FirstEdgeType)
+	if err != nil {
+		return runtime.ExecutionResult{}, false, err
+	}
+	secondOutAdj, err := buildOutAdjacency(chain.SecondEdgeType)
+	if err != nil {
+		return runtime.ExecutionResult{}, false, err
+	}
+	directUndirectedAdj, err := buildUndirectedAdjacency(antijoin.directEdgeType)
+	if err != nil {
+		return runtime.ExecutionResult{}, false, err
+	}
+
+	e.observeRuntimeCounter(params, "runtime.id_first.fastpath_applied", 1)
+	e.observeRuntimeCounter(params, "runtime.adjacency.out_sources.prefilter_applied", 1)
+	e.observeRuntimeCounter(params, "runtime.adjacency.out_sources.prefilter_candidates", int64(len(firstOutAdj)))
+
+	pairs := make(map[string]graph.DirectedEdgeProbe, len(firstOutAdj))
+	seenPairKeys := make(map[string]struct{}, len(firstOutAdj)*4)
+	leftLabelMatchCache := map[string]bool{}
+	midLabelMatchCache := map[string]bool{}
+	rightLabelMatchCache := map[string]bool{}
+
+	matchesLabels := func(vertexID string, pattern vertexPattern, cache map[string]bool) (bool, error) {
+		vertexID = strings.TrimSpace(vertexID)
+		if vertexID == "" {
+			return false, nil
+		}
+		if matched, ok := cache[vertexID]; ok {
+			return matched, nil
+		}
+		matched := true
+		for _, label := range pattern.AllOfLabels {
+			label = strings.TrimSpace(label)
+			if label == "" {
+				continue
+			}
+			hasLabel, err := tx.HasVertexLabel(ctx, tenant, vertexID, label)
+			if err != nil {
+				return false, err
+			}
+			if !hasLabel {
+				matched = false
+				break
+			}
+		}
+		cache[vertexID] = matched
+		if matched {
+			e.observeRuntimeCounter(params, "runtime.vertex.label_probe_shortcut_applied", 1)
+		}
+		return matched, nil
+	}
+
+	for leftID, midNeighbors := range firstOutAdj {
+		leftID = strings.TrimSpace(leftID)
+		if leftID == "" {
+			continue
+		}
+		leftMatched, err := matchesLabels(leftID, chain.Left, leftLabelMatchCache)
+		if err != nil {
+			return runtime.ExecutionResult{}, false, err
+		}
+		if !leftMatched {
+			continue
+		}
+
+		leftAntiJoinNeighbors := directUndirectedAdj[leftID]
+		if leftAntiJoinNeighbors == nil {
+			leftAntiJoinNeighbors = map[string]struct{}{}
+		}
+		e.observeRuntimeCounter(params, "runtime.antijoin.prefetch_applied", 1)
+		e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_sets_built", 1)
+		e.observeRuntimeCounter(params, "runtime.antijoin.neighbor_set_size_total", int64(len(leftAntiJoinNeighbors)))
+
+		for midID := range midNeighbors {
+			midID = strings.TrimSpace(midID)
+			if midID == "" {
+				continue
+			}
+			midMatched, err := matchesLabels(midID, chain.Mid, midLabelMatchCache)
+			if err != nil {
+				return runtime.ExecutionResult{}, false, err
+			}
+			if !midMatched {
+				continue
+			}
+
+			secondNeighbors := secondOutAdj[midID]
+			for rightID := range secondNeighbors {
+				rightID = strings.TrimSpace(rightID)
+				if rightID == "" || rightID == leftID {
+					e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+					continue
+				}
+
+				pairKey := leftID + "|" + rightID
+				if _, seen := seenPairKeys[pairKey]; seen {
+					continue
+				}
+				seenPairKeys[pairKey] = struct{}{}
+
+				if _, connected := leftAntiJoinNeighbors[rightID]; connected {
+					e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_drops", 1)
+					continue
+				}
+
+				rightMatched, err := matchesLabels(rightID, chain.Right, rightLabelMatchCache)
+				if err != nil {
+					return runtime.ExecutionResult{}, false, err
+				}
+				if !rightMatched {
+					continue
+				}
+
+				e.observeRuntimeCounter(params, "runtime.antijoin.shortcut_applied", 1)
+				pairs[pairKey] = graph.DirectedEdgeProbe{SrcID: leftID, DstID: rightID, EdgeType: mergePattern.EdgeType}
+			}
+		}
+	}
+
+	if len(pairs) == 0 {
+		return runtime.ExecutionResult{Rows: []map[string]any{}}, true, nil
+	}
+
+	probes := make([]graph.DirectedEdgeProbe, 0, len(pairs))
+	for _, probe := range pairs {
+		probes = append(probes, probe)
+	}
+
+	existing, err := tx.BatchHasDirectedEdgeBetween(ctx, tenant, probes)
+	if err != nil || len(existing) != len(probes) {
+		existing = make([]bool, len(probes))
+		for i, probe := range probes {
+			present, presentErr := tx.HasDirectedEdgeBetween(ctx, tenant, probe.SrcID, probe.DstID, probe.EdgeType)
+			if presentErr != nil {
+				return runtime.ExecutionResult{}, false, presentErr
+			}
+			existing[i] = present
+		}
+	} else {
+		e.observeRuntimeCounter(params, "runtime.merge.batch_probe_applied", 1)
+	}
+
+	edgesToCreate := make([]*graph.Edge, 0, len(probes))
+	for i, probe := range probes {
+		if existing[i] {
+			continue
+		}
+		edgesToCreate = append(edgesToCreate, &graph.Edge{
+			Tenant: tenant,
+			ID:     syntheticEdgeID(tenant, probe.SrcID, probe.EdgeType, probe.DstID),
+			Type:   probe.EdgeType,
+			SrcID:  probe.SrcID,
+			DstID:  probe.DstID,
+		})
+	}
+	if len(edgesToCreate) > 0 {
+		if err := tx.PutEdgeBatch(ctx, edgesToCreate); err != nil {
+			return runtime.ExecutionResult{}, false, err
+		}
+	}
+
+	return runtime.ExecutionResult{Rows: []map[string]any{}}, true, nil
 }
 
 func (e *Executor) ensureRuntimeObservabilityCounters(ctx context.Context, stmt *ast.QueryStatement, params Params, rowCount int) {

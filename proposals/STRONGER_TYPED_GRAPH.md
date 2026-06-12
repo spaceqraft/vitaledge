@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft proposal.
+Completed core proposal. Track 6 optional type constraints are deferred to a separate proposal.
 
 ### Track Completion Snapshot (2026-06-11)
 
@@ -82,12 +82,7 @@ Draft proposal.
   - [x] Runtime counters exposing typed-vs-fallback usage
   - [x] Measurable allocation reduction and performance gains vs generic paths
 
-- [ ] **Track 6: Optional Type Constraints**
-  - [ ] DDL for property type constraints (label/property and edgeType/property)
-  - [ ] Write-time enforcement of constraints
-  - [ ] Error messaging and EXPLAIN diagnostics for constraint violations
-  - [ ] Constraint lifecycle tests
-  - [ ] Coercion and audit tooling where useful
+- [ ] **Track 6: Optional Type Constraints** is deferred to a separate proposal.
 
 ### Completion Gate Status
 

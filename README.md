@@ -19,6 +19,7 @@ Quick link: [Cypher Coverage and Compliance](CYPHER.md)
 - [Property Graph Design](DESIGN.md)
 - [Property Graph Implementation Plan](IMPLEMENTATION_PLAN.md)
 - [Graph Keyspace Specification](GRAPH_KEYSPACE.md)
+- [Stronger Typed Graph Proposal](proposals/STRONGER_TYPED_GRAPH.md): core typed-storage/runtime work is complete; optional type constraints are deferred to a separate proposal.
 
 ## Repository Layout
 

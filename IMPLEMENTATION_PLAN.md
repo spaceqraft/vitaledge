@@ -2,7 +2,7 @@
 
 ## Status
 
-Active plan with ongoing status refreshes, derived from [DESIGN.md](DESIGN.md).
+Active plan with ongoing status refreshes, derived from [DESIGN.md](DESIGN.md). Core stronger typed-graph work is complete; optional type constraints are deferred to a separate proposal.
 
 ## Planning Goals
 
@@ -116,7 +116,7 @@ Remaining Phase 1 gaps before close:
 - Phase 1 performance evidence has now been captured in this document (see Phase 1 closure evidence below).
 - Operability baseline for Phase 1 is satisfied via in-process metrics collectors and periodic metrics/recommendation reporting; production sink/export wiring remains a Phase 2+ hardening task.
 - Runtime optimization transparency baseline completed: query-level runtime counters are emitted as warnings for immediate developer reflection, and aggregated counters are exported through Prometheus for operational trending.
-- Planner/explainability backlog (Phase 2): explain-plan output coverage is still listed as a Phase 2 deliverable and is not yet evidenced for all supported query forms.
+- Core stronger typed-graph closeout is complete; optional type constraints are intentionally deferred to a separate proposal and are not part of this plan's active scope.
 
 MVP-critical items not yet complete:
 

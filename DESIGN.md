@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (decision-driving document for initial implementation)
+Implemented for the current single-node engine. Core stronger typed-graph work is complete; optional type constraints are deferred to a separate proposal.
 
 ## Context
 

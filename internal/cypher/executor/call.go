@@ -207,6 +207,46 @@ func (e *Executor) resolveBuiltinProcedure(name string) (resolvedProcedure, bool
 			},
 			handler: e.builtinCreatePropertyIndexProcedure,
 		}, true
+	case "db.index.propertybuildjobs":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.propertyBuildJobs",
+				Outputs: []ProcedureArg{
+					{Name: "tenant", Type: "STRING", Nullable: false},
+					{Name: "schema", Type: "STRING", Nullable: false},
+					{Name: "property", Type: "STRING", Nullable: false},
+					{Name: "pending", Type: "BOOLEAN", Nullable: false},
+					{Name: "checkpointVertexID", Type: "STRING", Nullable: false},
+					{Name: "indexedEntities", Type: "INTEGER", Nullable: false},
+				},
+			},
+			handler: e.builtinPropertyBuildJobsProcedure,
+		}, true
+	case "db.index.processpropertybuildjobs":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.processPropertyBuildJobs",
+				Outputs: []ProcedureArg{
+					{Name: "processed", Type: "INTEGER", Nullable: false},
+					{Name: "pending", Type: "INTEGER", Nullable: false},
+				},
+			},
+			handler: e.builtinProcessPropertyBuildJobsProcedure,
+		}, true
+	case "db.index.restartpropertybuild":
+		return resolvedProcedure{
+			decl: ProcedureDecl{
+				Name: "db.index.restartPropertyBuild",
+				Inputs: []ProcedureArg{
+					{Name: "schema", Type: "STRING", Nullable: false},
+					{Name: "property", Type: "STRING", Nullable: false},
+				},
+				Outputs: []ProcedureArg{
+					{Name: "enqueued", Type: "BOOLEAN", Nullable: false},
+				},
+			},
+			handler: e.builtinRestartPropertyBuildProcedure,
+		}, true
 	case "db.index.dropproperty":
 		return resolvedProcedure{
 			decl: ProcedureDecl{
@@ -325,11 +365,60 @@ func (e *Executor) builtinCreatePropertyIndexProcedure(ctx context.Context, args
 	if err != nil {
 		return nil, err
 	}
-	created, indexedEntities, err := e.CreatePropertyIndex(ctx, tenant, schema, property, ifNotExists)
+	created, indexedEntities, err := e.CreatePropertyIndexAsync(ctx, tenant, schema, property, ifNotExists)
 	if err != nil {
 		return nil, err
 	}
 	return []Row{{"created": created, "indexedEntities": indexedEntities}}, nil
+}
+
+func (e *Executor) builtinPropertyBuildJobsProcedure(ctx context.Context, _ []any, _ Params) ([]Row, error) {
+	progress, err := e.listPendingPropertyIndexBuildProgress(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]Row, 0, len(progress))
+	for _, item := range progress {
+		rows = append(rows, Row{
+			"tenant":             item.Tenant,
+			"schema":             item.Schema,
+			"property":           item.Property,
+			"pending":            item.Pending,
+			"checkpointVertexID": item.CheckpointVertexID,
+			"indexedEntities":    item.IndexedEntities,
+		})
+	}
+	return rows, nil
+}
+
+func (e *Executor) builtinProcessPropertyBuildJobsProcedure(ctx context.Context, _ []any, _ Params) ([]Row, error) {
+	processed, err := e.processPendingPropertyIndexBuildJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pendingJobs, err := e.listPropertyIndexBuildJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return []Row{{"processed": processed, "pending": len(pendingJobs)}}, nil
+}
+
+func (e *Executor) builtinRestartPropertyBuildProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
+	tenant, err := requireStringParam(params, "tenant")
+	if err != nil {
+		return nil, err
+	}
+	schema, property, err := parseRestartPropertyBuildArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	if e.indexCatalog != nil {
+		e.indexCatalog.AddPropertyIndex(tenant, schema, property)
+	}
+	if err := e.enqueuePropertyIndexBuildJob(ctx, tenant, schema, property); err != nil {
+		return nil, err
+	}
+	return []Row{{"enqueued": true}}, nil
 }
 
 func (e *Executor) builtinDropPropertyIndexProcedure(ctx context.Context, args []any, params Params) ([]Row, error) {
@@ -789,6 +878,21 @@ func parseRestartEdgePropertyBuildArgs(args []any) (edgeType, property string, e
 		return "", "", graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"property\"", nil)
 	}
 	return strings.TrimSpace(edgeTypeValue), strings.TrimSpace(propertyValue), nil
+}
+
+func parseRestartPropertyBuildArgs(args []any) (schema, property string, err error) {
+	if len(args) != 2 {
+		return "", "", graph.NewError(graph.ErrKindSemantic, "invalid number of arguments", nil)
+	}
+	schemaValue, ok := args[0].(string)
+	if !ok {
+		return "", "", graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"schema\"", nil)
+	}
+	propertyValue, ok := args[1].(string)
+	if !ok {
+		return "", "", graph.NewError(graph.ErrKindSemantic, "invalid argument type for \"property\"", nil)
+	}
+	return strings.TrimSpace(schemaValue), strings.TrimSpace(propertyValue), nil
 }
 
 func parseCallClauseRaw(raw string) (callSpec, error) {

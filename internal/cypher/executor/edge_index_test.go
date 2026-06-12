@@ -102,7 +102,7 @@ func TestCreateEdgePropertyIndexBackfillsExistingEdges(t *testing.T) {
 	}
 }
 
-func TestCallCreatePropertyIndexBackfillsExistingVertexes(t *testing.T) {
+func TestCallCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
 
@@ -137,11 +137,26 @@ func TestCallCreatePropertyIndexBackfillsExistingVertexes(t *testing.T) {
 	if res.Rows[0]["created"] != true {
 		t.Fatalf("expected created=true, got %#v", res.Rows[0]["created"])
 	}
-	if res.Rows[0]["indexedEntities"] != 1 {
-		t.Fatalf("expected indexedEntities=1, got %#v", res.Rows[0]["indexedEntities"])
+	if res.Rows[0]["indexedEntities"] != 0 {
+		t.Fatalf("expected indexedEntities=0 for async enqueue, got %#v", res.Rows[0]["indexedEntities"])
 	}
 	if !catalog.HasPropertyIndex("acme", "User", "email") {
 		t.Fatalf("expected vertex property index in catalog")
+	}
+	jobs, err := exec.listPropertyIndexBuildJobs(ctx)
+	if err != nil {
+		t.Fatalf("list jobs failed: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected one pending property index job, got %#v", jobs)
+	}
+
+	processed, err := exec.processPendingPropertyIndexBuildJobs(ctx)
+	if err != nil {
+		t.Fatalf("process jobs failed: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("expected one processed job, got %d", processed)
 	}
 
 	found := false
@@ -268,6 +283,9 @@ func TestCallDropPropertyIndexRemovesEntriesAndCatalog(t *testing.T) {
 	}
 	if _, err := exec.ExecuteStatement(ctx, createStmt, Params{"tenant": "acme"}); err != nil {
 		t.Fatalf("execute create failed: %v", err)
+	}
+	if _, err := exec.processPendingPropertyIndexBuildJobs(ctx); err != nil {
+		t.Fatalf("process property jobs failed: %v", err)
 	}
 
 	dropStmt, err := parser.ParseStatement("CALL db.index.dropProperty('User', 'email') YIELD dropped, deletedEntities")
@@ -464,6 +482,9 @@ func TestDeleteVertexRemovesPropertyIndexEntries(t *testing.T) {
 	}
 	if _, err := exec.ExecuteStatement(ctx, createStmt, Params{"tenant": tenant}); err != nil {
 		t.Fatalf("execute create failed: %v", err)
+	}
+	if _, err := exec.processPendingPropertyIndexBuildJobs(ctx); err != nil {
+		t.Fatalf("process property jobs failed: %v", err)
 	}
 
 	deleteStmt, err := parser.ParseStatement("MATCH (u:User {email: 'alice@example.com'}) DELETE u")
@@ -3665,6 +3686,84 @@ func runtimeCountersFromWarnings(warnings []Diagnostic) (map[string]int64, error
 		return payload, nil
 	}
 	return nil, fmt.Errorf("RUNTIME_COUNTERS warning not found")
+}
+
+func TestPropertyBuildJobProceduresExposeProgressAndManualControls(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: map[string][]byte{"email": valueToBytes("alice@example.com")}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"email": valueToBytes("bob@example.com")}}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+	if _, _, err := exec.CreatePropertyIndexAsync(ctx, "acme", "User", "email", false); err != nil {
+		t.Fatalf("create async property index failed: %v", err)
+	}
+
+	statusStmt, err := parser.ParseStatement("CALL db.index.propertyBuildJobs() YIELD tenant, schema, property, pending, indexedEntities RETURN tenant, schema, property, pending, indexedEntities")
+	if err != nil {
+		t.Fatalf("parse status call failed: %v", err)
+	}
+	statusRes, err := exec.ExecuteStatement(ctx, statusStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute status call failed: %v", err)
+	}
+	if len(statusRes.Rows) != 1 {
+		t.Fatalf("expected one pending job row, got %d (%#v)", len(statusRes.Rows), statusRes.Rows)
+	}
+	row := statusRes.Rows[0]
+	if row["tenant"] != "acme" || row["schema"] != "User" || row["property"] != "email" {
+		t.Fatalf("unexpected status row identity: %#v", row)
+	}
+	if row["pending"] != true {
+		t.Fatalf("expected pending=true, got %#v", row["pending"])
+	}
+
+	processStmt, err := parser.ParseStatement("CALL db.index.processPropertyBuildJobs() YIELD processed, pending RETURN processed, pending")
+	if err != nil {
+		t.Fatalf("parse process call failed: %v", err)
+	}
+	processRes, err := exec.ExecuteStatement(ctx, processStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute process call failed: %v", err)
+	}
+	if len(processRes.Rows) != 1 {
+		t.Fatalf("expected one process row, got %d (%#v)", len(processRes.Rows), processRes.Rows)
+	}
+	if processRes.Rows[0]["processed"] != 1 || processRes.Rows[0]["pending"] != 0 {
+		t.Fatalf("unexpected process result: %#v", processRes.Rows[0])
+	}
+
+	restartStmt, err := parser.ParseStatement("CALL db.index.restartPropertyBuild('User', 'email') YIELD enqueued RETURN enqueued")
+	if err != nil {
+		t.Fatalf("parse restart call failed: %v", err)
+	}
+	restartRes, err := exec.ExecuteStatement(ctx, restartStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute restart call failed: %v", err)
+	}
+	if len(restartRes.Rows) != 1 || restartRes.Rows[0]["enqueued"] != true {
+		t.Fatalf("unexpected restart result: %#v", restartRes.Rows)
+	}
+
+	statusRes, err = exec.ExecuteStatement(ctx, statusStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute status call after restart failed: %v", err)
+	}
+	if len(statusRes.Rows) != 1 {
+		t.Fatalf("expected one pending job row after restart enqueue, got %d (%#v)", len(statusRes.Rows), statusRes.Rows)
+	}
 }
 
 func sortRowsByMovieID(rows []Row) {

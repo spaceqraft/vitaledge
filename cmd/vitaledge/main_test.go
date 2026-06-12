@@ -667,7 +667,7 @@ func withHostMemoryTotalBytes(t *testing.T, totalBytes uint64, fn func()) {
 	fn()
 }
 
-func TestGRPCQueryServiceCreatePropertyIndex(t *testing.T) {
+func TestGRPCQueryServiceCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T) {
 	store := openTestStore(t)
 	defer func() { _ = store.Close() }()
 
@@ -717,8 +717,19 @@ func TestGRPCQueryServiceCreatePropertyIndex(t *testing.T) {
 	if !createResp.GetCreated() {
 		t.Fatalf("expected created=true")
 	}
-	if createResp.GetIndexedEntities() != 2 {
-		t.Fatalf("expected indexed_entities=2, got %d", createResp.GetIndexedEntities())
+	if createResp.GetIndexedEntities() != 0 {
+		t.Fatalf("expected indexed_entities=0 for async enqueue, got %d", createResp.GetIndexedEntities())
+	}
+
+	processResp, err := client.Execute(ctx, &v1.QueryRequest{
+		Tenant: "acme",
+		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "CALL db.index.processPropertyBuildJobs() YIELD processed, pending RETURN processed, pending"}},
+	})
+	if err != nil {
+		t.Fatalf("process property build jobs failed: %v", err)
+	}
+	if len(processResp.GetRows()) != 1 {
+		t.Fatalf("expected one process row, got %d", len(processResp.GetRows()))
 	}
 
 	if err := store.View(context.Background(), func(tx graph.Tx) error {

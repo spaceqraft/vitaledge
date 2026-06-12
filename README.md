@@ -1,539 +1,208 @@
 # VitalEdge
 
-VitalEdge is a Go project that is building Cypher parsing support with a strict parser-first architecture.
+VitalEdge is a property graph database focused on three primary use cases:
 
-## Cypher Status
+1. Research and dataset loading.
+2. Threat and anomaly detection over structured logs.
+3. ReBAC at the edge.
 
-Cypher support is documented in [CYPHER.md](CYPHER.md), including:
+## Why VitalEdge
 
-- compliance and coverage statement
-- high-level feature table
-- current guarantees and limitations
+- Local-first runtime with low operational overhead (single binary + embedded storage).
+- Cypher-oriented query workflow with explicit compliance tracking.
+- Focus on practical graph workloads: research datasets, threat/anomaly analysis, and ReBAC-style relationship queries.
+- Performance and explainability emphasis through benchmarks, EXPLAIN output, and metrics.
 
-That status document also summarizes the implemented built-in function surface, including string, math, list, predicate/scalar, temporal, spatial, and vector families.
+## Current Status
 
-Quick link: [Cypher Coverage and Compliance](CYPHER.md)
+- Engine shape: single-node production profile with distributed-ready architecture direction.
+- Query language: implemented Cypher surface documented in [docs/architecture/CYPHER.md](docs/architecture/CYPHER.md).
+- Compliance: openCypher TCK-driven testing is part of normal development.
+- Runtime interfaces: gRPC server and CLI are both available today.
 
-## Architecture Decisions
+## Quick Start
 
-- [Property Graph Design](DESIGN.md)
-- [Property Graph Implementation Plan](IMPLEMENTATION_PLAN.md)
-- [Graph Keyspace Specification](GRAPH_KEYSPACE.md)
-- [Stronger Typed Graph Proposal](proposals/STRONGER_TYPED_GRAPH.md): core typed-storage/runtime work is complete; optional type constraints are deferred to a separate proposal.
+### Prerequisites
 
-## Repository Layout
+- Go 1.22+
+- POSIX-compatible shell
 
-- [cmd/vitaledge/main.go](cmd/vitaledge/main.go): gRPC server entrypoint
-- [cmd/vitaledge-cli/main.go](cmd/vitaledge-cli/main.go): gRPC interactive CLI/client entrypoint
-- [cmd/vitaledge/grpc_server.go](cmd/vitaledge/grpc_server.go): QueryService gRPC handler and transport wiring
-- [internal/cypher/grammar/Cypher.g4](internal/cypher/grammar/Cypher.g4): pinned openCypher grammar source
-- [internal/cypher/parser/parser.go](internal/cypher/parser/parser.go): parse entrypoints
-- [internal/cypher/ast/ast.go](internal/cypher/ast/ast.go): typed AST models
-
-## Development Notes
-
-- Grammar is pinned to openCypher M23 in source control.
-- Parser generation target: `make generate-cypher-parser`
-- Test command: `go test ./...`
-- Compliance suite (official openCypher TCK via godog): `make cypher-compliance`
-- Compliance run + summarized gap report: `make cypher-compliance-report`
-- Summarize last compliance run log: `make cypher-compliance-summary`
-- Smoke benchmark: `make bench-smoke`
-- Graph store benchmark baseline: `make bench-graph-store`
-- Cypher ingest benchmark (indexed vs non-indexed UNWIND..MERGE): `make bench-merge-index`
-- Recommendation query optimization benchmark hooks: `go test ./internal/cypher/executor -run '^$' -bench 'BenchmarkRecommendationQueryStep1TopKPushdown|BenchmarkRecommendationQueryStep2LateMaterialization' -benchtime=1x`
-- Recommendation stage2 adaptive pushdown A/B hooks (broad + selective): `go test ./internal/cypher/executor -run '^$' -bench 'BenchmarkRecommendationQueryStep2IndexPushdown(Baseline|Enabled)|BenchmarkRecommendationQuerySelectiveStep2IndexPushdown(Baseline|Enabled)$' -benchtime=1x`
-- Milestone benchmark baseline (local JSONL snapshot): `make bench-milestone`
-- Mixed CLI soak profile (concurrent write/noop-write/read): `make soak-mixed`
-
-`vitaledge-bench` supports repeatability-oriented flags:
-
-- `-iterations N`: operation count for the scenario loop.
-- `-seed-size N`: explicit seed graph size override for seeded scenarios (`research`, `rebac`).
-- `-json`: machine-readable output for baseline capture.
-
-### Adaptive Pushdown Tuning Workflow
-
-VitalEdge uses adaptive pushdown for stage2 recommendation expansion to avoid index paths that are not selective enough.
-
-Current defaults are intentionally conservative and may evolve:
-
-- `stage2IndexPushdownProbeCandidateLimit = 1536`
-- `stage2IndexPushdownMaxIndexedCandidates = 512`
-- `stage2IndexPushdownMaxAverageEdgesPerSource = 16`
-
-When tuning these values, use the broad and selective A/B benchmarks above and compare:
-
-1. Broad predicate shape: should stay at or near baseline when adaptive pushdown is enabled.
-2. Selective predicate shape: should not regress materially, and may improve when pushdown is applied.
-3. Runtime counters: inspect `fast_path.stage2.index_pushdown_applied`, `fast_path.stage2.index_pushdown_rows`, `fast_path.stage2.index_pushdown_skipped_predicate_shape`, `fast_path.stage2.index_pushdown_skipped_unselective`, and `fast_path.stage2.index_candidates_total`.
-
-Technique guideline:
-
-1. Prefer bounded probe + fallback over unconditional global index scans.
-2. Keep correctness invariant: adaptive decisions only change access path, never result semantics.
-3. Tune by benchmark evidence across at least one broad and one selective workload shape before changing defaults.
-
-## Startup Index Schema Config
-
-The server can load configuration-based index DDL at startup:
-
-- flag: `--index-schema-config /path/to/indexes.json`
-- env: `VITALEDGE_INDEX_SCHEMA_CONFIG=/path/to/indexes.json`
-
-If both are provided, the flag value is used.
-
-Property indexes can also be created at runtime through gRPC index DDL:
-
-- RPC: `CreatePropertyIndex(CreatePropertyIndexRequest)`
-- Request fields: `tenant`, `schema`, `property`, `if_not_exists`
-- Response fields: `created`, `indexed_entities`
-
-Runtime index DDL backfills existing vertices for the requested `(tenant, schema, property)` tuple so index-backed lookups become available immediately.
-
-Index DDL is also available through Cypher query execution (standalone `CALL`):
-
-```cypher
-CALL db.index.createProperty('User', 'email') YIELD created, indexedEntities
-CALL db.index.createProperty('User', 'email', true) YIELD created, indexedEntities
-CALL db.index.dropProperty('User', 'email') YIELD dropped, deletedEntities
-CALL db.index.dropProperty('User', 'email', true) YIELD dropped, deletedEntities
-
-CALL db.index.createEdgeProperty('RATED', 'rating') YIELD created, indexedEntities
-CALL db.index.createEdgeProperty('RATED', 'rating', true) YIELD created, indexedEntities
-CALL db.index.dropEdgeProperty('RATED', 'rating') YIELD dropped, deletedEntities
-CALL db.index.dropEdgeProperty('RATED', 'rating', true) YIELD dropped, deletedEntities
-```
-
-For query DDL, tenant context is read from request parameters (for example `{"tenant":"acme"}`).
-
-`db.index.createProperty` creates/backfills a vertex property index for `(tenant, schema, property)`.
-
-`db.index.dropProperty` removes a vertex property index for `(tenant, schema, property)` and deletes its persisted index entries.
-
-`db.index.createEdgeProperty` creates/backfills an edge property index for `(tenant, edgeType, property)`.
-
-`db.index.dropEdgeProperty` removes an edge property index for `(tenant, edgeType, property)`, deletes persisted index entries, and clears pending build work for that tuple.
-
-`db.index.createEdgeProperty` is fulfilled asynchronously to avoid long request timeouts on large datasets:
-
-- The call returns quickly after persisting a durable build job (`created=true`, `indexedEntities=0` when newly enqueued).
-- Background workers process the build job and backfill index entries out-of-band.
-- Pending jobs are stored durably and resumed on process restart, so fulfillment continues across restarts until completion.
-
-Operational procedures for async edge index builds:
-
-```cypher
-CALL db.index.edgeBuildJobs() YIELD tenant, edgeType, property, pending, indexedEdges
-CALL db.index.processEdgeBuildJobs() YIELD processed, pending
-CALL db.index.restartEdgePropertyBuild('RATED', 'rating') YIELD enqueued
-```
-
-- `db.index.edgeBuildJobs` lists pending durable edge-index build jobs and reports coarse progress via `indexedEdges`.
-- `db.index.edgeBuildJobs` also reports `checkpointVertexID`, which is the last committed restart checkpoint for a pending job.
-- `db.index.processEdgeBuildJobs` runs one immediate processing pass (useful for manual catch-up) and returns `processed` and remaining `pending` jobs.
-- `db.index.restartEdgePropertyBuild` re-enqueues a durable backfill job for an existing edge index tuple.
-
-Server logs now include worker progress lines on pass start and per-job completion, including indexed entry counts and duration.
-
-Edge property indexes are configured through the same startup schema file and are backfilled automatically at startup:
-
-- config field: `edge_property_indexes`
-- item fields: `tenant`, `edge_type`, `property`
-
-Example config:
-
-```json
-{
-	"property_indexes": [
-		{ "tenant": "acme", "schema": "User", "property": "email" },
-		{ "tenant": "acme", "schema": "Device", "property": "serial" }
-	],
-	"edge_property_indexes": [
-		{ "tenant": "acme", "edge_type": "RATED", "property": "rating" }
-	]
-}
-```
-
-Current edge index pushdown behavior in MATCH traversals:
-
-- Equality pushdown on relationship-pattern properties (example: `[r:RATED {rating: 5.0}]`).
-- Numeric range pushdown from WHERE conjuncts on relationship properties (examples: `r.rating >= 4.0`, `r.rating > 4.0 AND r.rating <= 5.0`).
-- Residual predicates still apply after index candidate retrieval (for example `r.note = 'top'`), so correctness is preserved when only part of WHERE is pushdown-eligible.
-- Contradictory numeric ranges short-circuit to zero candidates.
-- Very broad range scans are guarded by an internal candidate cap and safely fall back to adjacency traversal.
-
-Graph store and tenant defaults are configurable at startup:
-
-- flag: `--graph-path data/graph.db`
-- env: `VITALEDGE_GRAPH_PATH=data/graph.db`
-- flag: `--tenant default`
-- env: `VITALEDGE_DEFAULT_TENANT=default`
-
-Maximum write transaction batch size is configurable at startup:
-
-- flag: `--max-write-batch-bytes 0`
-- env: `VITALEDGE_MAX_WRITE_BATCH_BYTES=0`
-
-Set to `0` to auto-tune from host memory. When auto-tuning is active, the server logs a warning if it adjusts the batch size up or down from the default baseline.
-
-Go runtime memory ceiling is configurable at startup:
-
-- flag: `--go-memory-limit-bytes 0`
-- env: `VITALEDGE_GO_MEMORY_LIMIT_BYTES=0`
-
-Set to a positive value to apply a Go soft memory limit (in bytes). `0` disables this override.
-
-Pebble memory controls are configurable at startup:
-
-- flag: `--pebble-block-cache-bytes 0`
-- env: `VITALEDGE_PEBBLE_BLOCK_CACHE_BYTES=0`
-- flag: `--pebble-memtable-size-bytes 0`
-- env: `VITALEDGE_PEBBLE_MEMTABLE_SIZE_BYTES=0`
-- flag: `--pebble-memtable-stop-writes-threshold 0`
-- env: `VITALEDGE_PEBBLE_MEMTABLE_STOP_WRITES_THRESHOLD=0`
-
-Each value uses Pebble defaults when set to `0`.
-
-The write batch setting must resolve to a positive value before the graph store opens. Oversized write transactions are rejected with an invalid-input error instead of triggering a Pebble panic.
-
-The resolved value is exposed through gRPC capabilities as `max_write_batch_bytes`. Capabilities also include `configured_max_write_batch_bytes`, `effective_max_write_batch_bytes`, and `max_write_batch_bytes_tuned` so SDK clients can detect when the server auto-tuned the batch size and mirror that value client-side before bulk ingest.
-
-The same batch-size fields are returned in each `Execute` and `Explain` response inside `stats`, so single-threaded clients can adapt immediately without polling capabilities.
-
-Runtime counter diagnostics are emitted in `Execute` warnings for fast-path recommendation/query optimizations.
-
-- warning code: `RUNTIME_COUNTERS`
-- payload: JSON object of per-query counters (for example stage edge visits, prefilter drops, top-k application, and output rows)
-- CLI behavior: warnings are printed to stderr when `IncludeWarnings=true` (default in `vitaledge-cli` execution path)
-
-Example warning payload:
-
-```text
-warning [RUNTIME_COUNTERS]: {"fast_path.stage2.edges_visited":12345,"fast_path.stage2.antijoin_prefilter_drops":6789}
-```
-
-Prometheus metrics endpoint is optional and configurable:
-
-- flag: `--metrics-listen :9100`
-- env: `VITALEDGE_METRICS_LISTEN=:9100`
-
-gRPC query endpoint is enabled by default:
-
-- flag: `--grpc-listen :7443`
-- env: `VITALEDGE_GRPC_LISTEN=:7443`
-
-When enabled, the process serves:
-
-- `GET /metrics` (Prometheus text exposition)
-- `GET /healthz` (simple liveness check)
-
-Runtime counter metrics are exported at `/metrics` as:
-
-- `vitaledge_executor_runtime_counters_total{counter="<counter-name>"}`
-
-These counters are monotonic process-level totals and complement per-query `RUNTIME_COUNTERS` diagnostics for immediate local reflection and long-horizon operational trend analysis.
-
-## EXPLAIN For Index Tuning
-
-Use `EXPLAIN` when you want to inspect how VitalEdge would plan a query without mutating data. The output is returned as JSON in the `explain` column, and it includes the query shape, `query.options`, logical and physical plans, influencer counts, cardinality estimates, and index decisions.
-
-The EXPLAIN payload now uses a consistent shape across its list-like sections: each major entry keeps the existing flat fields for compatibility, and also exposes a nested `assessment` object with the same evidence grouped together. That applies to influencer counts, predicate signals, index decisions, cardinality, cost estimates, warnings, and execution strategies.
-
-Example:
-
-```cypher
-EXPLAIN MATCH (n:Person {name: $name}) RETURN DISTINCT n.name AS name ORDER BY name ASC SKIP 1 LIMIT $maxLimit
-```
-
-What to look at:
-
-- `query.options`: captures projection modifiers such as `distinct`, `orderBy`, `skip`, and `limit`.
-- `influencers.vertexCounts`: shows label counts observed in the current graph snapshot.
-- `influencers.edgeCounts`: shows edge-type counts that may affect traversal choices.
-- `influencers.totals`: shows tenant-level vertex and edge totals used by planner heuristics.
-- `influencers.predicateSignals`: highlights predicate clauses and the number of matching rows or vertices.
-- `indexDecisions`: reports candidate indexes, whether one was selected, chosen access path, estimated scan savings/selectivity, and recommendation (`keep-index`, `create-index`, or `consider-index`).
-- `cardinality`: shows per-plan-vertex row estimates and their quality (`exact`, `estimate`, or `sample`).
-- `warnings`: emits fallback diagnostics (for example missing index, full-scan fallback, and estimate-only tuning signals) to highlight when planning signals are partial.
-
-For each of those sections, the nested `assessment` block mirrors the same values in a more readable, grouped form for tooling and documentation consumers.
-
-Warning codes currently emitted:
-
-- `WRITE_QUERY_DRY_RUN`: write clauses were detected but EXPLAIN performed no mutations.
-- `MISSING_TENANT_CONTEXT`: tenant was not supplied, so influencer stats are from an empty snapshot.
-- `FULL_SCAN_FALLBACK`: planner selected an all-vertices scan access path.
-- `MISSING_PROPERTY_INDEX`: a property predicate has no selected property index.
-- `ESTIMATE_ONLY_INDEX_SIGNAL`: index recommendation is based on estimate-quality signals (for example unbound parameters).
-- `PLAN_ANALYSIS_PARTIAL`: catch-all fallback when no more specific diagnostics apply.
-
-Index-decision interpretation:
-
-- `recommendation=keep-index`: planner selected an existing property index.
-- `recommendation=create-index`: high-impact missing-index candidate.
-- `recommendation=consider-index`: medium-impact candidate or estimate-quality signal.
-- `recommendation=optional-index`: low-impact candidate.
-
-This is the recommended entry point when deciding whether a property should be indexed or when checking whether an existing index is actually being chosen by the planner.
-
-## Prometheus and Grafana Baseline
-
-Baseline observability assets are published under `tools/observability`:
-
-- Prometheus scrape config: `tools/observability/prometheus.yml`
-- Docker Compose stack: `tools/observability/docker-compose.yml`
-- Grafana dashboard: `tools/observability/grafana/vitaledge-overview.json`
-
-One-command local stack (Prometheus + Grafana):
-
-```bash
-make observability-up
-```
-
-Then open:
-
-- Prometheus: `http://localhost:9090`
-- Grafana: `http://localhost:3000` (default login: `admin` / `admin`)
-
-To stop the stack:
-
-```bash
-make observability-down
-```
-
-Quick start:
-
-1. Start VitalEdge with metrics endpoint enabled:
-
-```bash
-go run ./cmd/vitaledge --metrics-listen :9100
-```
-
-2. Run Prometheus with the provided config:
-
-```bash
-prometheus --config.file=tools/observability/prometheus.yml
-```
-
-3. In Grafana, add your Prometheus datasource and import `tools/observability/grafana/vitaledge-overview.json`.
-
-Dashboard coverage includes:
-
-- statement throughput and average statement duration,
-- rows-returned rate,
-- index lookup outcomes,
-- top unindexed index-candidate observations,
-- host CPU, memory, and network I/O signals,
-- Go runtime and GC behavior (goroutines, heap allocation, GC pause/cycles).
-
-### Benchmark: UNWIND..MERGE Index Tuning
-
-Use this benchmark to compare batch ingest behavior with and without property indexes on:
-
-- `Movie.movie_id`
-- `User.user_id`
-- `Genre.genre`
-
-Run:
-
-```bash
-make bench-merge-index
-```
-
-The benchmark executes a representative three-step ingest workload:
-
-1. `UNWIND $movies ... MERGE (mov:Movie {movie_id: ...})`
-2. `UNWIND $pairs ... MATCH (mov:Movie {movie_id: ...}) MERGE (g:Genre {genre: ...})`
-3. `UNWIND $ratings ... MERGE (u:User {user_id: ...}) ... MATCH (mov:Movie {movie_id: ...})`
-
-Interpretation guidance:
-
-- `with_property_indexes` should show higher `rows/s` and lower `ns/op` than `without_property_indexes` as graph size grows.
-- If the gap is small, verify index DDL and backfill for the target tenant/schema/property tuples.
-- Pair this benchmark with Prometheus/Grafana panels for `vitaledge_executor_index_lookups_total` and `vitaledge_executor_unindexed_candidate_observations` to confirm runtime index usage.
-
-### Reproducible Manual Tuning Examples
-
-Use this loop for each query family:
-
-1. Run baseline `EXPLAIN`.
-2. Capture `indexDecisions`, `costEstimate`, `runtimeStats`, and `warnings`.
-3. Apply index change (or parameter-binding change for estimate-quality signals).
-4. Re-run `EXPLAIN` and compare the same fields.
-
-Suggested comparison view:
-
-```json
-{
-	"indexDecisions": "selected/recommendation/quality/accessPath",
-	"costEstimate": "value + components",
-	"runtimeStats": "index(candidates/selected/missing), cardinality(rowsRead/rowsOutput)",
-	"warnings": "fallback and missing-index signals"
-}
-```
-
-Example 1: Point lookup on missing index -> create index
-
-Before:
-
-```cypher
-EXPLAIN MATCH (n:Person {email: $email}) RETURN n.id AS id
-```
-
-Observed baseline signals:
-
-- `indexDecisions[*].selected=false`
-- `indexDecisions[*].recommendation=create-index` or `consider-index`
-- warning includes `MISSING_PROPERTY_INDEX`
-- `runtimeStats.index.missing > 0`
-
-After adding property index (`Person.email`) and re-running EXPLAIN:
-
-- `indexDecisions[*].selected=true`
-- `indexDecisions[*].recommendation=keep-index`
-- scan vertex `accessPath=property_index`
-- `runtimeStats.index.selected` increases and `runtimeStats.index.missing` drops
-- `costEstimate.value` drops sharply on the same graph snapshot
-
-Example 2: Estimate-quality signal -> exact-quality signal via parameter binding
-
-Before (parameter omitted in EXPLAIN invocation):
-
-```cypher
-EXPLAIN MATCH (n:Device {serial: $serial}) RETURN n
-```
-
-Observed baseline signals:
-
-- index decision `quality=estimate`
-- access path can remain non-indexed (`label(Device)`) when parameter is unbound
-- selectivity and index quality are less actionable than the bound-parameter case
-
-After re-running with bound parameter values:
-
-- index decision `quality=exact`
-- access path shifts to `property_index(Device.serial)`
-- `matchedCount`, `estimatedSelectivity`, and cardinality fields become actionable for tuning
-
-Example 3: Traversal entry-point tuning
-
-Before:
-
-```cypher
-EXPLAIN MATCH (u:User {region: $region})-[:MEMBER_OF]->(g:Group) RETURN g.id AS gid
-```
-
-Observed baseline signals when `User.region` is not indexed:
-
-- scan operator uses label access (`label(User)`)
-- index decision is unselected and `runtimeStats.index.missing > 0`
-- warning includes `MISSING_PROPERTY_INDEX`
-
-After adding property index (`User.region`) and re-running EXPLAIN:
-
-- index decision becomes selected
-- `accessPath=property_index(User.region)` on index-decision entry
-- `runtimeStats.index.missing` drops to zero
-- `costEstimate.value` drops materially on the same data snapshot
-
-Local evidence snapshot (deterministic fixture run):
-
-| Example | Before (selected / access / quality / missing / cost) | After (selected / access / quality / missing / cost) |
-| --- | --- | --- |
-| 1. Person email lookup | `false / label(Person) / exact / 1 / 102` | `true / property_index(Person.email) / exact / 0 / 2` |
-| 2. Device serial parameter binding | `true / label(Device) / estimate / 0 / 2` | `true / property_index(Device.serial) / exact / 0 / 2` |
-| 3. User region traversal entry-point | `false / label(User) / exact / 1 / 22` | `true / property_index(User.region) / exact / 0 / 2` |
-
-Notes for reproducibility:
-
-- Keep the same dataset snapshot when comparing before/after plans.
-- Compare one change at a time (single index or single parameter-binding change).
-- For config-backed indexes, update the index schema config and restart the server before the after-run.
-
-## gRPC CLI
-
-Build and run the CLI against the gRPC endpoint:
+### Build
 
 ```bash
 make build
-./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme
 ```
 
-Interactive commands:
+This produces:
 
-- `SET name=<scalar>`: set or update a session variable (`null`, booleans, numbers, or quoted strings).
-- `SET` (or `LIST`/`VARS`): list all variables.
-- `UNSET name`: remove one variable.
-- `:quit` / `:exit`: leave the CLI.
+- `bin/vitaledge` (server)
+- `bin/vitaledge-cli` (interactive and one-shot CLI)
+- `bin/vitaledge-bench` (benchmark harness)
 
-Execution behavior:
-
-- Statements are sent only after local parse-completeness checks pass.
-- Variables are sent as query parameters and bound server-side from `$name` placeholders.
-- Multiline statements are buffered until complete (for example `MATCH` + `WHERE` + `RETURN`).
-- Result sets are rendered in a capped-width table:
-	- column width is computed from the column header and scanned row values,
-	- width is capped by `--max-column-width` (default `80`).
-- Returned graph values use Cypher-like rendering:
-	- vertexes: `(id:Label {"k":"v"})` (auto-generated ids suppressed, first label shown),
-	- edges: `[id:TYPE {"k":"v"}]` (internal auto-generated composite ids suppressed),
-	- paths: vertex/edge chains with directionality (`->`, `<-`).
-- Each request prints execution stats (`rows`, `durationMs`).
-
-Common CLI flags:
-
-- `--grpc-target 127.0.0.1:7443`
-- `--tenant acme`
-- `--timeout 5s`
-- `--max-column-width 80`
-- `--execute "<cypher>"` for one-shot mode.
-
-Soak/load modes (deterministic, configurable, and suitable for running multiple CLI processes):
-
-- `--load-mode write`: alternates `CREATE` and `DETACH DELETE` with locally tracked ids (equal create/delete counts).
-- `--load-mode noop-write`: repeatedly `CREATE`s the same vertex id.
-- `--load-mode read`: repeatedly runs `MATCH p=(a)-[*N]-(b) RETURN p LIMIT <k>` with deterministic hop selection.
-
-Load flags:
-
-- `--load-ops 1000`
-- `--load-seed 1`
-- `--load-prefix soak`
-- `--load-read-min-hop 1`
-- `--load-read-max-hop 3`
-- `--load-read-limit 25`
-- `--load-report-each 100`
-
-Example soak invocations:
+### Run the server
 
 ```bash
-# Balanced write churn (create/delete pairs).
-./bin/vitaledge-cli --tenant acme --load-mode write --load-ops 20000 --load-prefix writer-a --load-seed 7
-
-# No-op write pressure.
-./bin/vitaledge-cli --tenant acme --load-mode noop-write --load-ops 50000 --load-prefix noop-a --load-seed 7
-
-# Read pressure with variable path hop counts.
-./bin/vitaledge-cli --tenant acme --load-mode read --load-ops 20000 --load-read-min-hop 1 --load-read-max-hop 4 --load-read-limit 50 --load-seed 11
+./bin/vitaledge --metrics-listen :9100
 ```
 
-One-shot mode:
+Default gRPC listen address is `:7443`.
+
+### Connect with the CLI
 
 ```bash
-./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme --execute "MATCH (n:Seed) RETURN n.id AS id"
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant default
 ```
 
-Example config:
+One-shot example:
+
+```bash
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant default --execute "MATCH (v) RETURN labels(v), count(labels(v))"
+```
+
+## Common Development Commands
+
+```bash
+make run
+make test
+make cypher-compliance
+make bench-smoke
+make soak-mixed
+```
+
+## Index Configuration (Startup)
+
+VitalEdge can load property-index definitions during startup.
+
+- Flag: `--index-schema-config /path/to/indexes.json`
+- Environment variable: `VITALEDGE_INDEX_SCHEMA_CONFIG=/path/to/indexes.json`
+
+Example:
 
 ```json
 {
-	"property_indexes": [
-		{ "tenant": "acme", "schema": "User", "property": "email" },
-		{ "tenant": "acme", "schema": "Device", "property": "serial" }
-	],
-	"edge_property_indexes": [
-		{ "tenant": "acme", "edge_type": "RATED", "property": "rating" }
-	]
+  "property_indexes": [
+    { "tenant": "acme", "schema": "User", "property": "email" }
+  ],
+  "edge_property_indexes": [
+    { "tenant": "acme", "edge_type": "RATED", "property": "rating" }
+  ]
 }
 ```
+
+For operational details and index tuning guidance, see [docs/architecture/DESIGN.md](docs/architecture/DESIGN.md).
+
+## Index Configuration via vitaledge-cli DDL
+
+In addition to startup configuration, you can create and drop indexes via Cypher `CALL` statements through `vitaledge-cli`.
+
+```bash
+# Vertex property index
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme --execute "CALL db.index.createProperty('User', 'email') YIELD created, indexedEntities RETURN created, indexedEntities"
+
+# Idempotent create
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme --execute "CALL db.index.createProperty('User', 'email', true) YIELD created, indexedEntities RETURN created, indexedEntities"
+
+# Edge property index
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme --execute "CALL db.index.createEdgeProperty('RATED', 'rating') YIELD created, indexedEntities RETURN created, indexedEntities"
+
+# Drop indexes
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme --execute "CALL db.index.dropProperty('User', 'email', true) YIELD dropped, deletedEntities RETURN dropped, deletedEntities"
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme --execute "CALL db.index.dropEdgeProperty('RATED', 'rating', true) YIELD dropped, deletedEntities RETURN dropped, deletedEntities"
+```
+
+For asynchronous vertex/edge index lifecycle visibility:
+
+```bash
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme
+```
+
+```text
+vitaledge> CALL db.index.edgeBuildJobs() YIELD tenant, edgeType, property, pending, indexedEdges RETURN tenant, edgeType, property, pending, indexedEdges
+vitaledge> CALL db.index.processEdgeBuildJobs() YIELD processed, pending RETURN processed, pending
+vitaledge> CALL db.index.restartEdgePropertyBuild('RATED', 'rating') YIELD enqueued RETURN enqueued
+vitaledge> CALL db.index.propertyBuildJobs() YIELD tenant, schema, property, pending, indexedEntities RETURN tenant, schema, property, pending, indexedEntities
+vitaledge> CALL db.index.processPropertyBuildJobs() YIELD processed, pending RETURN processed, pending
+vitaledge> CALL db.index.restartPropertyBuild('User', 'email') YIELD enqueued RETURN enqueued
+```
+
+Both `db.index.createProperty` and `db.index.createEdgeProperty` enqueue durable background build jobs and return quickly. A newly enqueued job reports `created=true` and `indexedEntities=0`.
+
+## Index Configuration via gRPC
+
+The `QueryService` gRPC API currently provides a dedicated index DDL RPC for vertex property indexes:
+
+- `CreatePropertyIndex(CreatePropertyIndexRequest)`
+
+Example with `grpcurl`:
+
+```bash
+grpcurl -plaintext \
+  -import-path . \
+  -proto api/proto/vitaledge/v1/query.proto \
+  -d '{"tenant":"acme","schema":"User","property":"email","ifNotExists":true}' \
+  127.0.0.1:7443 \
+  vitaledge.v1.QueryService/CreatePropertyIndex
+```
+
+`CreatePropertyIndex` follows the same asynchronous behavior as CLI DDL and returns immediately after enqueueing a durable backfill job.
+
+You can also invoke index DDL procedures through `Execute` (Cypher over gRPC):
+
+```bash
+grpcurl -plaintext \
+  -import-path . \
+  -proto api/proto/vitaledge/v1/query.proto \
+  -d '{"tenant":"acme","input":{"cypher":"CALL db.index.createProperty(\"User\", \"email\", true) YIELD created, indexedEntities RETURN created, indexedEntities"}}' \
+  127.0.0.1:7443 \
+  vitaledge.v1.QueryService/Execute
+```
+
+## Minimal End-to-End Query Example (vitaledge-cli)
+
+This flow creates a tiny graph, configures an index, runs a query, and then runs `EXPLAIN` on the same query shape.
+
+```bash
+./bin/vitaledge-cli --grpc-target 127.0.0.1:7443 --tenant acme
+```
+
+```text
+vitaledge> CALL db.index.createProperty('User', 'region', true) YIELD created, indexedEntities RETURN created, indexedEntities
+vitaledge> CREATE (u1:User {user_id:'u1', name:'Alice', region:'west'}), (u2:User {user_id:'u2', name:'Bob', region:'east'}), (g:Group {group_id:'g1', name:'Blue'}), (u1)-[:MEMBER_OF]->(g), (u2)-[:MEMBER_OF]->(g)
+vitaledge> MATCH (u:User {region:'west'})-[:MEMBER_OF]->(g:Group) RETURN u.name AS user, g.name AS grp ORDER BY user
+vitaledge> EXPLAIN MATCH (u:User {region:'west'})-[:MEMBER_OF]->(g:Group) RETURN u.name AS user, g.name AS grp ORDER BY user
+```
+
+`EXPLAIN` returns a JSON payload in the `explain` column; this is the fastest way to inspect access paths and index recommendations before and after index changes.
+
+## Observability
+
+VitalEdge exposes Prometheus metrics and ships a baseline Grafana/Prometheus setup.
+
+- Stack files: [tools/observability](tools/observability)
+- Bring up stack: `make observability-up`
+- Tear down stack: `make observability-down`
+
+## Documentation Map
+
+- Graph design and architecture decisions: [docs/architecture/DESIGN.md](docs/architecture/DESIGN.md)
+- Graph keyspace proposal: [proposals/GRAPH_KEYSPACE.md](proposals/GRAPH_KEYSPACE.md)
+- Cypher support and guarantees: [docs/architecture/CYPHER.md](docs/architecture/CYPHER.md)
+- Cypher ID semantics: [docs/architecture/CYPHER_ID_SEMANTICS.md](docs/architecture/CYPHER_ID_SEMANTICS.md)
+- Implementation planning context: [docs/architecture/IMPLEMENTATION_PLAN.md](docs/architecture/IMPLEMENTATION_PLAN.md)
+
+## Repository Layout
+
+- `cmd/vitaledge`: gRPC server entrypoint
+- `cmd/vitaledge-cli`: CLI entrypoint
+- `cmd/vitaledge-bench`: benchmark binary
+- `internal/cypher`: parser, planner, and execution pipeline
+- `internal/graph`: storage abstractions and graph store implementations
+- `api/proto`: protobuf API definitions
+
+## Contributing
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) and sign the CLA before your first merged contribution.
+
+## License
+
+See [LICENSE](LICENSE).

@@ -210,7 +210,7 @@ func (h *grpcQueryHandler) CreatePropertyIndex(ctx context.Context, req *v1.Crea
 		return nil, status.Error(codes.InvalidArgument, "tenant is required")
 	}
 
-	created, indexedEntities, err := h.executor.CreatePropertyIndex(
+	created, indexedEntities, err := h.executor.CreatePropertyIndexAsync(
 		ctx,
 		tenant,
 		strings.TrimSpace(req.GetSchema()),

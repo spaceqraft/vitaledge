@@ -88,8 +88,51 @@ func (e *Executor) DropPropertyIndex(ctx context.Context, tenant, schema, proper
 		return false, deleted, deleteErr
 	}
 
+	if finalizeErr := e.completePropertyIndexBuildJobs(ctx, tenant, schema, property); finalizeErr != nil {
+		return false, deleted, finalizeErr
+	}
+
 	e.indexCatalog.RemovePropertyIndex(tenant, schema, property)
 	return true, deleted, nil
+}
+
+// CreatePropertyIndexAsync registers a property index and enqueues a durable
+// background backfill job so callers can return quickly on large datasets.
+// Pending jobs are resumed across restarts by StartIndexBuildWorker.
+func (e *Executor) CreatePropertyIndexAsync(ctx context.Context, tenant, schema, property string, ifNotExists bool) (created bool, indexedEntities int, err error) {
+	if e == nil || e.store == nil {
+		return false, 0, graph.NewError(graph.ErrKindInvalidInput, "executor requires a graph store", nil)
+	}
+	if e.indexCatalog == nil {
+		return false, 0, graph.NewError(graph.ErrKindInvalidInput, "index catalog is not configured", nil)
+	}
+
+	tenant = strings.TrimSpace(tenant)
+	schema = strings.TrimSpace(schema)
+	property = strings.TrimSpace(property)
+	if tenant == "" || schema == "" || property == "" {
+		return false, 0, graph.NewError(graph.ErrKindInvalidInput, "tenant, schema, and property are required", nil)
+	}
+
+	if e.indexCatalog.HasPropertyIndex(tenant, schema, property) {
+		if ifNotExists {
+			return false, 0, nil
+		}
+		return false, 0, graph.NewError(graph.ErrKindConflict, "property index already exists", nil)
+	}
+	if !e.indexCatalog.AddPropertyIndex(tenant, schema, property) {
+		if ifNotExists {
+			return false, 0, nil
+		}
+		return false, 0, graph.NewError(graph.ErrKindConflict, "property index already exists", nil)
+	}
+
+	if enqueueErr := e.enqueuePropertyIndexBuildJob(ctx, tenant, schema, property); enqueueErr != nil {
+		e.indexCatalog.RemovePropertyIndex(tenant, schema, property)
+		return false, 0, enqueueErr
+	}
+
+	return true, 0, nil
 }
 
 // CreateEdgePropertyIndex registers an edge-property index in the runtime catalog and
@@ -514,6 +557,31 @@ func (e *Executor) completeEdgeIndexBuildJobs(ctx context.Context, tenant, edgeT
 			continue
 		}
 		if err := e.dequeueEdgeIndexBuildJob(ctx, record.Job, record.State); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Executor) completePropertyIndexBuildJobs(ctx context.Context, tenant, schema, property string) error {
+	records, err := e.listAllPropertyIndexBuildJobRecords(ctx)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if !strings.EqualFold(strings.TrimSpace(record.Job.Tenant), tenant) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(record.Job.Schema), schema) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(record.Job.Property), property) {
+			continue
+		}
+		if record.State.Completed {
+			continue
+		}
+		if err := e.dequeuePropertyIndexBuildJob(ctx, record.Job, record.State); err != nil {
 			return err
 		}
 	}

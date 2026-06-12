@@ -98,8 +98,8 @@ update-comprehension:
 	python3 scripts/update_comprehension_docs_llm.py
 
 verify-comprehension:
-	@q_count=$$(grep -c '^### Q-[0-9]\{3\}:' COMPREHENSION-Q.md); \
-	a_count=$$(grep -c '^### A-[0-9]\{3\}$$' COMPREHENSION-A.md); \
+	@q_count=$$(grep -c '^### Q-[0-9]\{3\}:' docs/architecture/COMPREHENSION-Q.md); \
+	a_count=$$(grep -c '^### A-[0-9]\{3\}$$' docs/architecture/COMPREHENSION-A.md); \
 	if [ "$$q_count" -ne "$$a_count" ]; then \
 		echo "ERROR: Q/A count mismatch (Q=$$q_count, A=$$a_count)"; \
 		exit 1; \

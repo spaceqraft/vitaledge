@@ -149,12 +149,12 @@ Current COMPREHENSION-A.md (style and baseline):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="LLM-driven COMPREHENSION doc refresh")
-    parser.add_argument("--design", default="DESIGN.md", help="Path to DESIGN markdown")
+    parser.add_argument("--design", default="docs/architecture/DESIGN.md", help="Path to DESIGN markdown")
     parser.add_argument(
-        "--plan", default="IMPLEMENTATION_PLAN.md", help="Path to implementation plan markdown"
+        "--plan", default="docs/architecture/IMPLEMENTATION_PLAN.md", help="Path to implementation plan markdown"
     )
-    parser.add_argument("--out-q", default="COMPREHENSION-Q.md", help="Output Q markdown path")
-    parser.add_argument("--out-a", default="COMPREHENSION-A.md", help="Output A markdown path")
+    parser.add_argument("--out-q", default="docs/architecture/COMPREHENSION-Q.md", help="Output Q markdown path")
+    parser.add_argument("--out-a", default="docs/architecture/COMPREHENSION-A.md", help="Output A markdown path")
     parser.add_argument(
         "--api-url",
         default=os.getenv("OPENAI_API_URL", "https://api.openai.com/v1/responses"),

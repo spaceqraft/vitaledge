@@ -880,3 +880,94 @@ func TestBuildWithStatsPlannerVariantsAreRuntimeSupported(t *testing.T) {
 		assertPlannerVariantsRuntimeSupported(t, physicalPlan)
 	})
 }
+
+func TestBuildWithStatsAnnotatesTypedDomainGuardrailEqualityBoundary(t *testing.T) {
+	stmt, err := parser.ParseStatement("MATCH (u:User {age: 30}) RETURN u.id AS uid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	model, err := semantic.Build(stmt)
+	if err != nil {
+		t.Fatalf("semantic build failed: %v", err)
+	}
+	physicalPlan := BuildWithStats(logical.Build(model), StatsHints{
+		PropertyDomainHints: map[string]PropertyDomainHint{
+			"vertex|USER|age": {
+				EntityClass:    "vertex",
+				Schema:         "User",
+				Property:       "age",
+				TypeDomain:     "numeric",
+				Strategy:       "typed_property_index_seek",
+				GuardrailState: "typed_seek_preferred",
+				GuardrailRule:  "typed_seek_if_single_known_domain",
+				Reason:         "single known property type domain supports typed seek",
+				DominantKind:   "numeric",
+				DominantShare:  1.0,
+				SampleSize:     40,
+				EqualitySel:    0.02,
+				RangeSel:       0.08,
+			},
+		},
+	})
+	if len(physicalPlan.Nodes) == 0 {
+		t.Fatalf("expected physical plan nodes")
+	}
+	guardrail, ok := physicalPlan.Nodes[0].Attrs["typedDomainGuardrail"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected typedDomainGuardrail attr, got %#v", physicalPlan.Nodes[0].Attrs)
+	}
+	if got, _ := guardrail["predicateClass"].(string); got != "equality" {
+		t.Fatalf("expected equality predicateClass, got %#v", guardrail)
+	}
+	if got, _ := guardrail["planBoundary"].(string); got != "equality_predicate" {
+		t.Fatalf("expected equality_predicate boundary, got %#v", guardrail)
+	}
+}
+
+func TestBuildWithStatsAnnotatesTypedDomainGuardrailRangeBoundary(t *testing.T) {
+	stmt, err := parser.ParseStatement("MATCH (u:User {age: 30}) WHERE u.age > 18 RETURN u.id AS uid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	model, err := semantic.Build(stmt)
+	if err != nil {
+		t.Fatalf("semantic build failed: %v", err)
+	}
+	physicalPlan := BuildWithStats(logical.Build(model), StatsHints{
+		PropertyDomainHints: map[string]PropertyDomainHint{
+			"vertex|USER|age": {
+				EntityClass:    "vertex",
+				Schema:         "User",
+				Property:       "age",
+				TypeDomain:     "numeric",
+				Strategy:       "typed_property_index_seek",
+				GuardrailState: "typed_seek_guarded",
+				GuardrailRule:  "guardrail_if_null_or_absent_rate_high",
+				Reason:         "null/absent rates are high; prefer guarded typed seek with conservative selectivity",
+				DominantKind:   "numeric",
+				DominantShare:  1.0,
+				SampleSize:     40,
+				NullRate:       0.35,
+				AbsentRate:     0.65,
+				EqualitySel:    0.01,
+				RangeSel:       0.04,
+			},
+		},
+	})
+	if len(physicalPlan.Nodes) == 0 {
+		t.Fatalf("expected physical plan nodes")
+	}
+	guardrail, ok := physicalPlan.Nodes[0].Attrs["typedDomainGuardrail"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected typedDomainGuardrail attr, got %#v", physicalPlan.Nodes[0].Attrs)
+	}
+	if got, _ := guardrail["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected range predicateClass, got %#v", guardrail)
+	}
+	if got, _ := guardrail["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected range_predicate boundary, got %#v", guardrail)
+	}
+	if got, _ := guardrail["rule"].(string); got != "guardrail_if_null_or_absent_rate_high" {
+		t.Fatalf("expected null/absent guardrail rule, got %#v", guardrail)
+	}
+}

@@ -18,6 +18,7 @@ import (
 	"github.com/paegun/vitaledge/internal/cypher/parser"
 	"github.com/paegun/vitaledge/internal/graph"
 	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
+	"github.com/paegun/vitaledge/internal/graph/store/typedvalue"
 )
 
 func TestExecuteMatchReturnIDs(t *testing.T) {
@@ -335,8 +336,8 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if selected, _ := indexDecisions[0]["selected"].(bool); !selected {
 		t.Fatalf("expected indexed decision to be selected")
 	}
-	if recommendation, _ := indexDecisions[0]["recommendation"].(string); recommendation != "keep-index" {
-		t.Fatalf("expected recommendation keep-index for selected index, got %#v", indexDecisions[0]["recommendation"])
+	if recommendation, _ := indexDecisions[0]["recommendation"].(string); recommendation != "keep-typed-index" {
+		t.Fatalf("expected recommendation keep-typed-index for selected typed index, got %#v", indexDecisions[0]["recommendation"])
 	}
 	if tuningImpact, _ := indexDecisions[0]["tuningImpact"].(string); tuningImpact != "none" {
 		t.Fatalf("expected tuningImpact none for selected index, got %#v", indexDecisions[0]["tuningImpact"])
@@ -357,8 +358,8 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	if selected, _ := assessment["selected"].(bool); !selected {
 		t.Fatalf("expected assessment.selected=true, got %#v", assessment["selected"])
 	}
-	if recommendation, _ := assessment["recommendation"].(string); recommendation != "keep-index" {
-		t.Fatalf("expected assessment recommendation keep-index, got %#v", assessment["recommendation"])
+	if recommendation, _ := assessment["recommendation"].(string); recommendation != "keep-typed-index" {
+		t.Fatalf("expected assessment recommendation keep-typed-index, got %#v", assessment["recommendation"])
 	}
 	if quality, _ := assessment["quality"].(string); quality != "exact" {
 		t.Fatalf("expected assessment quality exact, got %#v", assessment["quality"])
@@ -467,6 +468,871 @@ func TestExecuteExplainOutputContainsPlanAndParams(t *testing.T) {
 	}
 	if quality, _ := cardinalityStats["quality"].(string); quality != "estimate" {
 		t.Fatalf("expected runtimeStats.cardinality quality estimate, got %#v", cardinalityStats["quality"])
+	}
+	warningSummary, ok := runtimeStats["warningSummary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.warningSummary map, got %T", runtimeStats["warningSummary"])
+	}
+	if totalWarnings, _ := warningSummary["totalWarnings"].(int); totalWarnings != 0 {
+		t.Fatalf("expected warningSummary totalWarnings=0, got %#v", warningSummary)
+	}
+	byCategory, ok := warningSummary["byCategory"].(map[string]int)
+	if !ok {
+		t.Fatalf("expected warningSummary byCategory map[string]int, got %T", warningSummary["byCategory"])
+	}
+	if len(byCategory) != 0 {
+		t.Fatalf("expected empty byCategory for no-warning query, got %#v", warningSummary)
+	}
+	if highestPriorityCode, _ := warningSummary["highestPriorityCode"].(string); highestPriorityCode != "" {
+		t.Fatalf("expected empty highestPriorityCode for no-warning query, got %#v", warningSummary)
+	}
+	diagnosticPosture, ok := runtimeStats["diagnosticPosture"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.diagnosticPosture map, got %T", runtimeStats["diagnosticPosture"])
+	}
+	if primary, _ := diagnosticPosture["primary"].(string); primary != "healthy" {
+		t.Fatalf("expected diagnostic posture primary healthy, got %#v", diagnosticPosture)
+	}
+	if recommendation, _ := diagnosticPosture["recommendation"].(string); recommendation != "maintain_typed_paths" {
+		t.Fatalf("expected diagnostic posture recommendation maintain_typed_paths, got %#v", diagnosticPosture)
+	}
+	if confidence, _ := diagnosticPosture["confidence"].(string); confidence != "high" {
+		t.Fatalf("expected diagnostic posture confidence high, got %#v", diagnosticPosture)
+	}
+	if score, _ := diagnosticPosture["score"].(int); score != 95 {
+		t.Fatalf("expected diagnostic posture score 95, got %#v", diagnosticPosture)
+	}
+	if scoreBand, _ := diagnosticPosture["scoreBand"].(string); scoreBand != "excellent" {
+		t.Fatalf("expected diagnostic posture scoreBand excellent, got %#v", diagnosticPosture)
+	}
+	if trendHint, _ := diagnosticPosture["trendHint"].(string); trendHint != "stable" {
+		t.Fatalf("expected diagnostic posture trendHint stable, got %#v", diagnosticPosture)
+	}
+	if trendScore, _ := diagnosticPosture["trendScore"].(int); trendScore != 1 {
+		t.Fatalf("expected diagnostic posture trendScore 1, got %#v", diagnosticPosture)
+	}
+	if trendEvidence, _ := diagnosticPosture["trendEvidence"].(map[string]any); !reflect.DeepEqual(trendEvidence, map[string]any{
+		"drivers":             []string{"typed_friendly"},
+		"totalWarnings":       0,
+		"highestPriorityCode": "",
+		"highestCategory":     "",
+	}) {
+		t.Fatalf("expected diagnostic posture trendEvidence for healthy posture, got %#v", diagnosticPosture)
+	}
+	if trendDriverWeights, _ := diagnosticPosture["trendDriverWeights"].(map[string]int); !reflect.DeepEqual(trendDriverWeights, map[string]int{}) {
+		t.Fatalf("expected diagnostic posture trendDriverWeights for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationVersion, _ := diagnosticPosture["scoreComputationVersion"].(string); scoreComputationVersion != "v1" {
+		t.Fatalf("expected diagnostic posture scoreComputationVersion v1, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig, explainDiagnosticPostureScoreComputationConfig()) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["categoryWeights"], explainDiagnosticScoreCategoryWeights()) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig categoryWeights for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["trendRules"], map[string]any{
+		"stableMinScore":      80,
+		"degradingMaxScore":   30,
+		"degradingCategories": []string{"planner", "index"},
+		"ruleEvaluationOrder": []string{"stable_min_score", "degrading_categories", "degrading_max_score", "default_trend"},
+		"reasonByRule": map[string]string{
+			"stable_min_score":     "score >= stableMinScore",
+			"degrading_categories": "planner/index category warnings present",
+			"degrading_max_score":  "score <= degradingMaxScore",
+			"default_trend":        "fallback trend when no prior trend rule matched",
+		},
+		"trendScoreByHint": map[string]int{
+			"stable":    1,
+			"watch":     0,
+			"degrading": -1,
+		},
+		"trendScoreRules": map[string]string{
+			"stable":    "trend_score_stable",
+			"watch":     "trend_score_watch",
+			"degrading": "trend_score_degrading",
+		},
+		"defaultTrend": "watch",
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig trendRules for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["primarySelectionRules"], map[string]any{
+		"categoryPriority":       []string{"planner", "index"},
+		"primaryEvaluationOrder": []string{"category_priority_planner", "category_priority_index", "operator_fallback_status", "typed_friendly_reset", "default"},
+		"categoryToPrimary": map[string]string{
+			"planner": "planner_limited",
+			"index":   "index_limited",
+		},
+		"operatorFallbackStatuses": []string{"mixed_domain_risk", "fallback_likely"},
+		"typedFriendlyReset": map[string]any{
+			"requiresTotalWarnings": 0,
+			"requiresOverallStatus": "typed_friendly",
+			"primary":               "healthy",
+			"signal":                "typed_friendly",
+			"recommendation":        "maintain_typed_paths",
+		},
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig primarySelectionRules for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["confidenceRules"], map[string]any{
+		"evaluationOrder": []string{"high_healthy_typed_friendly", "low_warning_or_multisignal", "default_medium"},
+		"high": map[string]any{
+			"requiresPrimary":       "healthy",
+			"requiresTotalWarnings": 0,
+			"requiresOverallStatus": "typed_friendly",
+		},
+		"low": map[string]int{
+			"minTotalWarnings": 3,
+			"orMinSignalCount": 2,
+		},
+		"default": "medium",
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig confidenceRules for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["recommendationRules"], map[string]string{
+		"healthy":                   "maintain_typed_paths",
+		"index_limited":             "improve_index_coverage",
+		"planner_limited":           "optimize_scan_and_plan_shapes",
+		"operator_fallback_limited": "reduce_operator_fallback_shapes",
+		"default":                   "maintain_typed_paths",
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig recommendationRules for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["recommendationEvaluationOrder"], []string{"primary_planner", "primary_index", "operator_status_fallback", "typed_friendly_reset", "default"}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig recommendationEvaluationOrder for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["rationaleTemplates"], map[string]string{
+		"healthy":                   "No explain warnings and typed-friendly operator assessment",
+		"index_limited":             "Index warnings dominate diagnostics; highestPriorityCode=%s",
+		"planner_limited":           "Planner warnings dominate diagnostics; highestPriorityCode=%s",
+		"operator_fallback_limited": "Operator assessment indicates %s with fallback-oriented signals",
+		"default":                   "Diagnostic posture derived from signals=%s and highestPriorityCode=%s",
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig rationaleTemplates for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["rationaleRules"], map[string]string{
+		"healthy":                   "primary_healthy",
+		"index_limited":             "primary_index_limited",
+		"planner_limited":           "primary_planner_limited",
+		"operator_fallback_limited": "primary_operator_fallback_limited",
+		"default":                   "default",
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig rationaleRules for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["rationaleTemplateInputs"], map[string][]string{
+		"healthy":                   {},
+		"index_limited":             {"highestPriorityCode"},
+		"planner_limited":           {"highestPriorityCode"},
+		"operator_fallback_limited": {"overallStatus"},
+		"default":                   {"signals", "highestPriorityCode"},
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig rationaleTemplateInputs for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["scoreRules"], map[string]any{
+		"baseRuleByPrimary": map[string]string{
+			"healthy":                   "base_primary_healthy",
+			"operator_fallback_limited": "base_primary_operator_fallback_limited",
+			"index_limited":             "base_primary_index_limited",
+			"planner_limited":           "base_primary_planner_limited",
+			"default":                   "base_primary_default",
+		},
+		"confidenceAdjustmentRuleByClass": map[string]string{
+			"high":    "confidence_adjustment_high",
+			"medium":  "confidence_adjustment_default",
+			"low":     "confidence_adjustment_low",
+			"default": "confidence_adjustment_default",
+		},
+		"warningVolumePenaltyRule": "warning_penalty_per_warning_linear",
+		"categoryPenaltyRule":      "repeated_category_weighted_penalty",
+		"clampRules": map[string]string{
+			"withinBounds": "within_bounds",
+			"min":          "clamped_min",
+			"max":          "clamped_max",
+		},
+		"scoreBandRules": map[string]string{
+			"excellent": "score_band_excellent",
+			"good":      "score_band_good",
+			"fair":      "score_band_fair",
+			"poor":      "score_band_poor",
+		},
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig scoreRules for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["decisionTraceSchema"], map[string]any{
+		"version":    "v1",
+		"stageOrder": []string{"primary", "confidence", "recommendation", "rationale", "score", "trend"},
+		"stageFields": map[string][]string{
+			"primary":        {"stage", "rule", "result", "reason", "inputs"},
+			"confidence":     {"stage", "rule", "result", "reason", "inputs"},
+			"recommendation": {"stage", "rule", "result", "reason", "inputs"},
+			"rationale":      {"stage", "rule", "result", "reason", "inputs"},
+			"score":          {"stage", "rule", "result", "reason", "inputs"},
+			"trend":          {"stage", "rule", "result", "reason", "inputs"},
+		},
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig decisionTraceSchema for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["ruleReasonCatalog"], map[string]map[string]string{
+		"primary": {
+			"category_priority_planner": "planner category warning took primary precedence",
+			"category_priority_index":   "index category warning set primary posture",
+			"operator_fallback_status":  "operator assessment indicates fallback risk",
+			"typed_friendly_reset":      "typed-friendly assessment with zero warnings reset posture",
+			"default":                   "default primary posture applied",
+		},
+		"confidence": {
+			"high_healthy_typed_friendly": "healthy posture with zero warnings and typed-friendly assessment",
+			"low_warning_or_multisignal":  "warning volume or multi-signal posture lowered confidence",
+			"default_medium":              "default medium confidence classification",
+		},
+		"recommendation": {
+			"primary_planner":          "planner-limited posture selected planner optimization recommendation",
+			"primary_index":            "index-limited posture selected index coverage recommendation",
+			"operator_status_fallback": "operator fallback status selected fallback-reduction recommendation",
+			"typed_friendly_reset":     "typed-friendly reset selected maintenance recommendation",
+			"default":                  "default recommendation applied",
+		},
+		"rationale": {
+			"primary_healthy":                   "healthy posture uses fixed healthy rationale",
+			"primary_index_limited":             "index-limited posture uses highest-priority-code rationale",
+			"primary_planner_limited":           "planner-limited posture uses highest-priority-code rationale",
+			"primary_operator_fallback_limited": "operator-fallback posture uses operator-status rationale",
+			"default":                           "default rationale template selected",
+		},
+		"score": {
+			"score_band_excellent": "final score mapped to excellent band",
+			"score_band_good":      "final score mapped to good band",
+			"score_band_fair":      "final score mapped to fair band",
+			"score_band_poor":      "final score mapped to poor band",
+		},
+		"trend": {
+			"stable_min_score":     "score met stable threshold",
+			"degrading_categories": "planner or index warning categories triggered degrading trend",
+			"degrading_max_score":  "score met degrading threshold",
+			"default_trend":        "default watch trend applied",
+		},
+	}) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig ruleReasonCatalog for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); scoreComputationConfig["ruleReasonCatalogVersion"] != "v1" {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig ruleReasonCatalogVersion v1 for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreClampRange, _ := diagnosticPosture["scoreClampRange"].(map[string]int); !reflect.DeepEqual(scoreClampRange, map[string]int{"min": 0, "max": 100}) {
+		t.Fatalf("expected diagnostic posture scoreClampRange for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreInputs, _ := diagnosticPosture["scoreInputs"].(map[string]any); !reflect.DeepEqual(scoreInputs, map[string]any{
+		"totalWarnings":          0,
+		"confidenceClass":        "high",
+		"repeatedCategoryCounts": map[string]int{},
+	}) {
+		t.Fatalf("expected diagnostic posture scoreInputs for healthy posture, got %#v", diagnosticPosture)
+	}
+	if evaluatedPolicy, _ := diagnosticPosture["evaluatedPolicy"].(map[string]any); !reflect.DeepEqual(evaluatedPolicy, map[string]any{
+		"decisionTraceVersion": "v1",
+		"validationMode":       "strict",
+		"contractHash":         explainDiagnosticPostureContractHash(explainDiagnosticPostureScoreComputationConfig()),
+		"contractComponents":   explainDiagnosticPostureContractComponents(explainDiagnosticPostureScoreComputationConfig()),
+		"compatibility": map[string]any{
+			"compatibilityVersion":       "v1",
+			"contractEpoch":              "contract.v1",
+			"baselineContractEpoch":      "contract.v1",
+			"contractEpochTransition":    "unchanged",
+			"remediationEpoch":           "remediation.v1",
+			"baselineRemediationEpoch":   "remediation.v1",
+			"remediationEpochTransition": "unchanged",
+			"epochTransitionRule":        "epoch_transition_none",
+			"epochTransitionReason":      "contract and remediation epochs match baseline",
+			"epochEvaluationOrder":       []string{"contract_epoch", "remediation_epoch"},
+			"epochReasonCodes": map[string]string{
+				"contract_epoch":    "contract_epoch_advanced_from_baseline",
+				"remediation_epoch": "remediation_epoch_advanced_from_baseline",
+			},
+			"epochCompatibility": map[string]bool{
+				"contract_epoch":    true,
+				"remediation_epoch": true,
+			},
+			"epochFailedTransitions":       []string{},
+			"epochFailedTransitionReasons": map[string]string{},
+			"epochTransitionSummary":       "baseline_aligned",
+			"epochImpactEvaluationOrder":   []string{"epoch_compatible_if_no_failed_transitions", "epoch_breaking_on_contract_transition", "epoch_breaking_on_remediation_transition", "epoch_unknown_default"},
+			"epochImpactByCheck": map[string]string{
+				"contract_epoch":    "breaking",
+				"remediation_epoch": "breaking",
+			},
+			"epochImpactClassification": "compatible",
+			"epochImpactRule":           "epoch_compatible_if_no_failed_transitions",
+			"epochImpactReason":         "no epoch transition drift detected",
+			"epochRemediationByCheck": map[string]string{
+				"contract_epoch":    "upgrade parser/runtime consumers to a contract.v1-compatible epoch before parsing evaluatedPolicy compatibility metadata",
+				"remediation_epoch": "refresh remediation consumers to the remediation.v1 schema before applying compatibility remediation guidance",
+			},
+			"epochRemediationPriorityOrder":   []string{"contract_epoch", "remediation_epoch"},
+			"epochRemediationSummary":         "none_required",
+			"epochRemediationActions":         []string{},
+			"epochRemediationActionPlan":      []map[string]any{},
+			"epochRemediationPlanHash":        explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochStateID":                    explainDiagnosticPostureHashString("contractEpoch=contract.v1;remediationEpoch=remediation.v1;"),
+			"baselineEpochStateID":            explainDiagnosticPostureHashString("contractEpoch=contract.v1;remediationEpoch=remediation.v1;"),
+			"epochDriftStatus":                "unchanged",
+			"epochDriftFields":                []string{},
+			"epochCompatibilityFingerprint":   explainDiagnosticPostureHashString("epochStateID=" + explainDiagnosticPostureHashString("contractEpoch=contract.v1;remediationEpoch=remediation.v1;") + ";" + "baselineEpochStateID=" + explainDiagnosticPostureHashString("contractEpoch=contract.v1;remediationEpoch=remediation.v1;") + ";" + "driftStatus=unchanged;" + "driftFields=;" + "impact=compatible;" + "remediationPlanHash=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";"),
+			"epochConsistencyEvaluationOrder": []string{"transition_summary_matches_failed_transitions", "drift_status_matches_state_ids", "impact_matches_failed_transitions", "remediation_summary_matches_actions"},
+			"epochConsistencyReasonCodes": map[string]string{
+				"transition_summary_matches_failed_transitions": "epoch_transition_summary_mismatch",
+				"drift_status_matches_state_ids":                "epoch_drift_status_mismatch",
+				"impact_matches_failed_transitions":             "epoch_impact_mismatch",
+				"remediation_summary_matches_actions":           "epoch_remediation_summary_mismatch",
+			},
+			"epochConsistencyChecks": map[string]bool{
+				"transition_summary_matches_failed_transitions": true,
+				"drift_status_matches_state_ids":                true,
+				"impact_matches_failed_transitions":             true,
+				"remediation_summary_matches_actions":           true,
+			},
+			"epochConsistencyFailedChecks":  []string{},
+			"epochConsistencyFailedReasons": map[string]string{},
+			"epochConsistencySummary":       "consistent",
+			"epochConsistencyFingerprint":   explainDiagnosticPostureHashString("summary=consistent;failedChecks=;driftStatus=unchanged;impact=compatible;remediationSummary=none_required;"),
+			"epochRuleCatalogVersion":       "v1",
+			"epochRuleCatalog": map[string]map[string]string{
+				"transition": {
+					"epoch_transition_none":     "contract and remediation epochs match baseline",
+					"epoch_transition_detected": "contract or remediation epoch advanced from baseline",
+				},
+				"impact": {
+					"epoch_compatible_if_no_failed_transitions": "no epoch transition drift detected",
+					"epoch_breaking_on_contract_transition":     "contract epoch advanced relative to baseline",
+					"epoch_breaking_on_remediation_transition":  "remediation epoch advanced relative to baseline",
+				},
+				"consistency": {
+					"consistent":   "epoch consistency checks passed",
+					"inconsistent": "epoch consistency checks failed",
+				},
+			},
+			"epochMatchedRuleLookup": map[string]map[string]any{
+				"transition": {
+					"rule":           "epoch_transition_none",
+					"expectedReason": "contract and remediation epochs match baseline",
+					"actualReason":   "contract and remediation epochs match baseline",
+					"matchesCatalog": true,
+				},
+				"impact": {
+					"rule":           "epoch_compatible_if_no_failed_transitions",
+					"expectedReason": "no epoch transition drift detected",
+					"actualReason":   "no epoch transition drift detected",
+					"matchesCatalog": true,
+				},
+				"consistency": {
+					"rule":           "consistent",
+					"expectedReason": "epoch consistency checks passed",
+					"actualReason":   "epoch consistency checks passed",
+					"matchesCatalog": true,
+				},
+			},
+			"epochRuleCatalogConsistent": true,
+			"epochRuleCatalogMismatches": []string{},
+			"epochContractVersion":       "v1",
+			"epochContractHash": explainDiagnosticPostureHashString(
+				"version=v1;" +
+					"ruleCatalogHash=" + explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;") + ";" +
+					"evaluationOrderHash=" + explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;") + ";" +
+					"consistencyCheckSchemaHash=" + explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;") + ";",
+			),
+			"epochContractComponents": map[string]any{
+				"version":                    "v1",
+				"ruleCatalogHash":            explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;"),
+				"evaluationOrderHash":        explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;"),
+				"consistencyCheckSchemaHash": explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;"),
+				"overallHash": explainDiagnosticPostureHashString(
+					"version=v1;" +
+						"ruleCatalogHash=" + explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;") + ";" +
+						"evaluationOrderHash=" + explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;") + ";" +
+						"consistencyCheckSchemaHash=" + explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;") + ";",
+				),
+			},
+			"epochContractCompatibility": map[string]bool{
+				"ruleCatalogPresent":       true,
+				"evaluationOrderPresent":   true,
+				"consistencySchemaPresent": true,
+				"overallHashPresent":       true,
+			},
+			"epochContractCheckEvaluationOrder": []string{"rule_catalog_present", "evaluation_order_present", "consistency_schema_present", "overall_hash_present"},
+			"epochContractCheckReasonCodes": map[string]string{
+				"rule_catalog_present":       "missing_epoch_rule_catalog_hash",
+				"evaluation_order_present":   "missing_epoch_evaluation_order_hash",
+				"consistency_schema_present": "missing_epoch_consistency_schema_hash",
+				"overall_hash_present":       "missing_epoch_contract_overall_hash",
+			},
+			"epochContractCheckStatus": map[string]bool{
+				"rule_catalog_present":       true,
+				"evaluation_order_present":   true,
+				"consistency_schema_present": true,
+				"overall_hash_present":       true,
+			},
+			"epochContractFailedChecks":       []string{},
+			"epochContractFailedCheckReasons": map[string]string{},
+			"epochContractCheckSummary":       "all_checks_passed",
+			"epochContractCheckFingerprint": explainDiagnosticPostureHashString(
+				"summary=all_checks_passed;" +
+					"failedChecks=;" +
+					"overallHash=" + explainDiagnosticPostureHashString(
+					"version=v1;"+
+						"ruleCatalogHash="+explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;")+";"+
+						"evaluationOrderHash="+explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;")+";"+
+						"consistencyCheckSchemaHash="+explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;")+";",
+				) + ";",
+			),
+			"epochContractFullyCompatible":               true,
+			"epochContractImpactEvaluationOrder":         []string{"compatible_if_all_contract_checks_pass", "breaking_if_contract_components_missing", "unknown_default"},
+			"epochContractImpactByCheck":                 map[string]string{"rule_catalog_present": "breaking", "evaluation_order_present": "breaking", "consistency_schema_present": "breaking", "overall_hash_present": "breaking"},
+			"epochContractImpactClassification":          "compatible",
+			"epochContractImpactRule":                    "compatible_if_all_contract_checks_pass",
+			"epochContractImpactReason":                  "all epoch-contract checks passed",
+			"epochContractRemediationByCheck":            map[string]string{"rule_catalog_present": "regenerate epoch rule catalog metadata and persist a non-empty epoch rule catalog hash", "evaluation_order_present": "restore epoch evaluation-order metadata and persist a non-empty evaluation-order hash", "consistency_schema_present": "regenerate epoch consistency-check schema metadata and persist a non-empty schema hash", "overall_hash_present": "recompute epoch contract overall hash after restoring contract component hashes"},
+			"epochContractRemediationSeverityByCheck":    map[string]string{"rule_catalog_present": "high", "evaluation_order_present": "high", "consistency_schema_present": "high", "overall_hash_present": "high"},
+			"epochContractRemediationRequirementByCheck": map[string]string{"rule_catalog_present": "required", "evaluation_order_present": "required", "consistency_schema_present": "required", "overall_hash_present": "required"},
+			"epochContractRemediationPriorityOrder":      []string{"rule_catalog_present", "evaluation_order_present", "consistency_schema_present", "overall_hash_present"},
+			"epochContractRemediationSummary":            "none_required",
+			"epochContractRemediationUrgency":            "none",
+			"epochContractRemediationBundleID":           explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none"),
+			"epochContractRemediationActions":            []string{},
+			"epochContractRemediationPlanHash":           explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochContractRemediationFingerprint":        explainDiagnosticPostureHashString("impact=compatible;summary=none_required;planHash=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";"),
+			"baselineEpochContractCheckSummary":          "all_checks_passed",
+			"baselineEpochContractImpactClassification":  "compatible",
+			"baselineEpochContractRemediationSummary":    "none_required",
+			"baselineEpochContractRemediationUrgency":    "none",
+			"baselineEpochContractRemediationBundleID":   explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none"),
+			"baselineEpochContractRemediationPlanHash":   explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochContractRemediationBundleDriftStatus":  "unchanged",
+			"epochContractRemediationPlanDriftStatus":    "unchanged",
+			"epochContractRemediationDriftSummary":       "baseline_aligned",
+			"epochContractRemediationDriftRule":          "baseline_epoch_contract_bundle_and_plan_match",
+			"epochContractRemediationDriftReason":        "current epoch-contract remediation bundle and plan hash match baseline compatible state",
+			"epochContractRemediationDriftFields":        []string{},
+			"epochContractRemediationDriftFingerprint": explainDiagnosticPostureHashString(
+				"baselineBundle=" + explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none") + ";" +
+					"currentBundle=" + explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none") + ";" +
+					"baselinePlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";" +
+					"currentPlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";" +
+					"bundleDrift=unchanged;" +
+					"planDrift=unchanged;",
+			),
+			"epochContractCheckDriftStatus": "unchanged",
+			"epochContractCheckDriftRule":   "baseline_epoch_contract_check_state_matches",
+			"epochContractCheckDriftReason": "epoch-contract check, impact, and remediation summaries match baseline",
+			"epochContractCheckDriftFields": []string{},
+			"epochContractCheckDriftFingerprint": explainDiagnosticPostureHashString(
+				"baselineCheckSummary=all_checks_passed;" +
+					"currentCheckSummary=all_checks_passed;" +
+					"baselineImpact=compatible;" +
+					"currentImpact=compatible;" +
+					"baselineRemediationSummary=none_required;" +
+					"currentRemediationSummary=none_required;" +
+					"driftStatus=unchanged;" +
+					"driftFields=;",
+			),
+			"epochContractGovernanceEvaluationOrder": []string{"stable_if_compatible_and_baseline_aligned", "degraded_if_incompatible", "degraded_if_check_or_remediation_drift", "unknown_default"},
+			"epochContractGovernanceChecks": map[string]bool{
+				"contract_fully_compatible":    true,
+				"check_state_baseline_aligned": true,
+				"remediation_baseline_aligned": true,
+			},
+			"epochContractGovernanceFailedChecks":  []string{},
+			"epochContractGovernanceFailedReasons": map[string]string{},
+			"epochContractGovernanceState":         "stable",
+			"epochContractGovernanceRule":          "stable_if_compatible_and_baseline_aligned",
+			"epochContractGovernanceReason":        "epoch-contract checks are compatible and both check/remediation baselines are aligned",
+			"epochContractGovernanceFingerprint": explainDiagnosticPostureHashString(
+				"state=stable;" +
+					"rule=stable_if_compatible_and_baseline_aligned;" +
+					"failedChecks=;" +
+					"checkDrift=unchanged;" +
+					"remediationDrift=baseline_aligned;",
+			),
+			"epochContractGovernanceRemediationByCheck": map[string]string{
+				"contract_fully_compatible":    "restore required epoch-contract component hashes and recompute epoch contract compatibility artifacts",
+				"check_state_baseline_aligned": "investigate epoch-contract check summary drift and realign check/impact/remediation summaries to baseline",
+				"remediation_baseline_aligned": "investigate remediation bundle/plan drift and restore baseline-compatible remediation metadata",
+			},
+			"epochContractGovernanceRemediationPriorityOrder":      []string{"contract_fully_compatible", "check_state_baseline_aligned", "remediation_baseline_aligned"},
+			"epochContractGovernanceRemediationActions":            []string{},
+			"epochContractGovernanceRemediationSummary":            "none_required",
+			"epochContractGovernanceRemediationUrgency":            "none",
+			"epochContractGovernanceRemediationPlanHash":           explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochContractGovernanceRemediationFingerprint":        explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";"),
+			"baselineEpochContractGovernanceRemediationSummary":    "none_required",
+			"baselineEpochContractGovernanceRemediationUrgency":    "none",
+			"baselineEpochContractGovernanceRemediationPlanHash":   explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochContractGovernanceRemediationSummaryDriftStatus": "unchanged",
+			"epochContractGovernanceRemediationUrgencyDriftStatus": "unchanged",
+			"epochContractGovernanceRemediationPlanDriftStatus":    "unchanged",
+			"epochContractGovernanceRemediationDriftSummary":       "baseline_aligned",
+			"epochContractGovernanceRemediationDriftRule":          "baseline_governance_remediation_matches",
+			"epochContractGovernanceRemediationDriftReason":        "epoch-contract governance remediation summary, urgency, and plan hash match baseline",
+			"epochContractGovernanceRemediationDriftFields":        []string{},
+			"epochContractGovernanceRemediationDriftFingerprint": explainDiagnosticPostureHashString(
+				"baselineSummary=none_required;" +
+					"currentSummary=none_required;" +
+					"baselineUrgency=none;" +
+					"currentUrgency=none;" +
+					"baselinePlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";" +
+					"currentPlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";" +
+					"driftFields=;",
+			),
+			"epochContractGovernanceRemediationVerdictEvaluationOrder": []string{"stable_if_governance_stable_and_remediation_baseline_aligned", "degraded_if_governance_degraded", "degraded_if_governance_remediation_drift_detected", "unknown_default"},
+			"epochContractGovernanceRemediationVerdictChecks": map[string]bool{
+				"governance_state_stable":                      true,
+				"governance_remediation_baseline_aligned":      true,
+				"governance_remediation_plan_baseline_aligned": true,
+			},
+			"epochContractGovernanceRemediationVerdictFailedChecks":  []string{},
+			"epochContractGovernanceRemediationVerdictFailedReasons": map[string]string{},
+			"epochContractGovernanceRemediationVerdictState":         "stable",
+			"epochContractGovernanceRemediationVerdictRule":          "stable_if_governance_stable_and_remediation_baseline_aligned",
+			"epochContractGovernanceRemediationVerdictReason":        "governance is stable and governance-remediation metadata is baseline aligned",
+			"epochContractGovernanceRemediationVerdictFingerprint": explainDiagnosticPostureHashString(
+				"state=stable;" +
+					"rule=stable_if_governance_stable_and_remediation_baseline_aligned;" +
+					"failedChecks=;" +
+					"driftSummary=baseline_aligned;" +
+					"planDrift=unchanged;",
+			),
+			"epochContractGovernanceRemediationVerdictSeverityByCheck": map[string]string{
+				"governance_state_stable":                      "high",
+				"governance_remediation_baseline_aligned":      "medium",
+				"governance_remediation_plan_baseline_aligned": "high",
+			},
+			"epochContractGovernanceRemediationVerdictRequirementByCheck": map[string]string{
+				"governance_state_stable":                      "required",
+				"governance_remediation_baseline_aligned":      "required",
+				"governance_remediation_plan_baseline_aligned": "required",
+			},
+			"epochContractGovernanceRemediationVerdictBundleID":          explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none"),
+			"baselineEpochContractGovernanceRemediationVerdictBundleID":  explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none"),
+			"epochContractGovernanceRemediationVerdictBundleDriftStatus": "unchanged",
+			"epochContractGovernanceLineageVersion":                      "v1",
+			"epochContractGovernanceLineageComponents": map[string]string{
+				"governanceFingerprint":                   explainDiagnosticPostureHashString("state=stable;" + "rule=stable_if_compatible_and_baseline_aligned;" + "failedChecks=;" + "checkDrift=unchanged;" + "remediationDrift=baseline_aligned;"),
+				"governanceRemediationFingerprint":        explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";"),
+				"governanceRemediationDriftFingerprint":   explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";currentPlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";driftFields=;"),
+				"governanceRemediationVerdictFingerprint": explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;"),
+			},
+			"epochContractGovernanceLineageHash": explainDiagnosticPostureHashString(
+				"version=v1;" +
+					"governanceFingerprint=" + explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;") + ";" +
+					"governanceRemediationFingerprint=" + explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";") + ";" +
+					"governanceRemediationDriftFingerprint=" + explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;") + ";" +
+					"governanceRemediationVerdictFingerprint=" + explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;") + ";",
+			),
+			"baselineEpochContractGovernanceLineageHash": explainDiagnosticPostureHashString(
+				"version=v1;" +
+					"governanceFingerprint=" + explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;") + ";" +
+					"governanceRemediationFingerprint=" + explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";") + ";" +
+					"governanceRemediationDriftFingerprint=" + explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;") + ";" +
+					"governanceRemediationVerdictFingerprint=" + explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;") + ";",
+			),
+			"epochContractGovernanceLineageDriftStatus":  "unchanged",
+			"epochContractGovernanceLineageDriftSummary": "baseline_aligned",
+			"epochContractGovernanceLineageDriftRule":    "baseline_governance_lineage_matches",
+			"epochContractGovernanceLineageDriftReason":  "governance-remediation lineage metadata matches baseline",
+			"epochContractGovernanceLineageDriftFields":  []string{},
+			"epochContractGovernanceLineageDriftFingerprint": explainDiagnosticPostureHashString(
+				"baselineLineageHash=" + explainDiagnosticPostureHashString("version=v1;governanceFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;")+";governanceRemediationFingerprint="+explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";")+";governanceRemediationDriftFingerprint="+explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;")+";governanceRemediationVerdictFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;")+";") + ";" +
+					"currentLineageHash=" + explainDiagnosticPostureHashString("version=v1;governanceFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;")+";governanceRemediationFingerprint="+explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";")+";governanceRemediationDriftFingerprint="+explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;")+";governanceRemediationVerdictFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;")+";") + ";" +
+					"baselineBundle=" + explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none") + ";" +
+					"currentBundle=" + explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none") + ";" +
+					"driftFields=;",
+			),
+			"epochContractGovernanceLineageCheckEvaluationOrder": []string{"lineage_hash_present", "lineage_component_hashes_present", "lineage_drift_status_matches_hashes"},
+			"epochContractGovernanceLineageChecks": map[string]bool{
+				"lineage_hash_present":                true,
+				"lineage_component_hashes_present":    true,
+				"lineage_drift_status_matches_hashes": true,
+			},
+			"epochContractGovernanceLineageFailedChecks":  []string{},
+			"epochContractGovernanceLineageFailedReasons": map[string]string{},
+			"epochContractGovernanceLineageSummary":       "consistent",
+			"epochContractGovernanceLineageFingerprint": explainDiagnosticPostureHashString(
+				"summary=consistent;" +
+					"lineageHash=" + explainDiagnosticPostureHashString("version=v1;governanceFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;")+";governanceRemediationFingerprint="+explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";")+";governanceRemediationDriftFingerprint="+explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;")+";governanceRemediationVerdictFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;")+";") + ";" +
+					"failedChecks=;",
+			),
+			"epochContractGovernanceLineageVerdictEvaluationOrder": []string{"stable_if_lineage_consistent_and_baseline_aligned", "degraded_if_lineage_inconsistent", "degraded_if_lineage_baseline_drifted", "unknown_default"},
+			"epochContractGovernanceLineageVerdictChecks": map[string]bool{
+				"lineage_consistent":              true,
+				"lineage_baseline_aligned":        true,
+				"lineage_drift_status_consistent": true,
+			},
+			"epochContractGovernanceLineageVerdictFailedChecks":  []string{},
+			"epochContractGovernanceLineageVerdictFailedReasons": map[string]string{},
+			"epochContractGovernanceLineageVerdictState":         "stable",
+			"epochContractGovernanceLineageVerdictRule":          "stable_if_lineage_consistent_and_baseline_aligned",
+			"epochContractGovernanceLineageVerdictReason":        "governance lineage is consistent and baseline aligned",
+			"epochContractGovernanceLineageVerdictFingerprint": explainDiagnosticPostureHashString(
+				"state=stable;" +
+					"rule=stable_if_lineage_consistent_and_baseline_aligned;" +
+					"failedChecks=;" +
+					"lineageSummary=consistent;" +
+					"lineageDrift=baseline_aligned;",
+			),
+			"epochContractGovernanceLineageVerdictSeverityByCheck": map[string]string{
+				"lineage_consistent":              "high",
+				"lineage_baseline_aligned":        "high",
+				"lineage_drift_status_consistent": "medium",
+			},
+			"epochContractGovernanceLineageVerdictRequirementByCheck": map[string]string{
+				"lineage_consistent":              "required",
+				"lineage_baseline_aligned":        "required",
+				"lineage_drift_status_consistent": "required",
+			},
+			"epochContractGovernanceLineageVerdictSummary":                "none_required",
+			"epochContractGovernanceLineageVerdictUrgency":                "none",
+			"epochContractGovernanceLineageVerdictBundleID":               explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none"),
+			"baselineEpochContractGovernanceLineageVerdictBundleID":       explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none"),
+			"epochContractGovernanceLineageVerdictBundleDriftStatus":      "unchanged",
+			"baselineEpochContractGovernanceLineageVerdictFingerprint":    explainDiagnosticPostureHashString("state=stable;rule=stable_if_lineage_consistent_and_baseline_aligned;failedChecks=;lineageSummary=consistent;lineageDrift=baseline_aligned;"),
+			"epochContractGovernanceLineageVerdictFingerprintDriftStatus": "unchanged",
+			"epochContractCompatibilitySummary":                           "epoch_contract_complete",
+			"epochContractIncompatibilityReasons":                         []string{},
+			"epochContractFingerprint": explainDiagnosticPostureHashString(
+				"summary=epoch_contract_complete;" +
+					"overallHash=" + explainDiagnosticPostureHashString(
+					"version=v1;"+
+						"ruleCatalogHash="+explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;")+";"+
+						"evaluationOrderHash="+explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;")+";"+
+						"consistencyCheckSchemaHash="+explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;")+";",
+				) + ";" +
+					"reasons=;",
+			),
+			"epochTransitionFingerprint": explainDiagnosticPostureHashString(
+				"contractEpoch=contract.v1;" +
+					"baselineContractEpoch=contract.v1;" +
+					"contractTransition=unchanged;" +
+					"remediationEpoch=remediation.v1;" +
+					"baselineRemediationEpoch=remediation.v1;" +
+					"remediationTransition=unchanged;" +
+					"summary=baseline_aligned;" +
+					"failed=;",
+			),
+			"checkEvaluationOrder": []string{"version", "schema", "rule_reason_catalog", "stage_order", "stage_fragments", "overall_hash"},
+			"checkReasonCodes": map[string]string{
+				"version":             "version_mismatch",
+				"schema":              "missing_decision_trace_schema_hash",
+				"rule_reason_catalog": "missing_rule_reason_catalog_hash",
+				"stage_order":         "missing_stage_order_hash",
+				"stage_fragments":     "missing_stage_fragment",
+				"overall_hash":        "missing_overall_hash",
+			},
+			"impactEvaluationOrder": []string{"compatible_if_no_failed_checks", "breaking_on_core_contract_checks", "breaking_on_stage_fragment_gap", "unknown_default"},
+			"impactByCheck": map[string]string{
+				"version":             "breaking",
+				"schema":              "breaking",
+				"rule_reason_catalog": "breaking",
+				"stage_order":         "breaking",
+				"stage_fragments":     "breaking",
+				"overall_hash":        "breaking",
+			},
+			"checkFingerprints":           explainDiagnosticPostureContractCheckFingerprints(explainDiagnosticPostureContractComponents(explainDiagnosticPostureScoreComputationConfig())),
+			"compatibilityFingerprint":    explainDiagnosticPostureContractCompatibilityFingerprint(explainDiagnosticPostureContractCheckFingerprints(explainDiagnosticPostureContractComponents(explainDiagnosticPostureScoreComputationConfig())), []string{"version", "schema", "rule_reason_catalog", "stage_order", "stage_fragments", "overall_hash"}),
+			"versionCompatible":           true,
+			"schemaCompatible":            true,
+			"ruleReasonCatalogCompatible": true,
+			"stageOrderCompatible":        true,
+			"stageCompatibility": map[string]bool{
+				"primary":        true,
+				"confidence":     true,
+				"recommendation": true,
+				"rationale":      true,
+				"score":          true,
+				"trend":          true,
+			},
+			"stageReasonCodes": map[string]string{
+				"primary":        "missing_stage_fragment:primary",
+				"confidence":     "missing_stage_fragment:confidence",
+				"recommendation": "missing_stage_fragment:recommendation",
+				"rationale":      "missing_stage_fragment:rationale",
+				"score":          "missing_stage_fragment:score",
+				"trend":          "missing_stage_fragment:trend",
+			},
+			"overallHashPresent":   true,
+			"fullyCompatible":      true,
+			"compatibilitySummary": "contract_components_complete",
+			"impactClassification": "compatible",
+			"impactRule":           "compatible_if_no_failed_checks",
+			"impactReason":         "all compatibility checks passed",
+			"remediationVersion":   "v1",
+			"remediationByCheck": map[string]string{
+				"version":             "align compatibilityVersion and contractComponents.version with the expected parser/runtime contract version",
+				"schema":              "regenerate decisionTraceSchema metadata and ensure decisionTraceSchemaHash is present",
+				"rule_reason_catalog": "regenerate ruleReasonCatalog metadata and ensure ruleReasonCatalogHash is present",
+				"stage_order":         "restore decision-trace stageOrder metadata and ensure stageOrderHash is present",
+				"stage_fragments":     "recompute stageContractFragments for all required stages and verify fragment hashes are non-empty",
+				"overall_hash":        "rebuild contractComponents overallHash after schema/catalog/stage fragment metadata is refreshed",
+			},
+			"remediationSeverityByCheck": map[string]string{
+				"version":             "high",
+				"schema":              "high",
+				"rule_reason_catalog": "high",
+				"stage_order":         "high",
+				"stage_fragments":     "medium",
+				"overall_hash":        "high",
+			},
+			"remediationRequirementByCheck": map[string]string{
+				"version":             "required",
+				"schema":              "required",
+				"rule_reason_catalog": "required",
+				"stage_order":         "required",
+				"stage_fragments":     "required",
+				"overall_hash":        "required",
+			},
+			"remediationPriorityOrder":     []string{"version", "schema", "rule_reason_catalog", "stage_order", "stage_fragments", "overall_hash"},
+			"remediationSummary":           "none_required",
+			"remediationUrgency":           "none",
+			"remediationBundleID":          explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none"),
+			"remediationPlanHash":          explainDiagnosticPostureRemediationPlanHash([]map[string]any{}, "none_required", "none"),
+			"baselineRemediationBundleID":  explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none"),
+			"baselineRemediationPlanHash":  explainDiagnosticPostureRemediationPlanHash([]map[string]any{}, "none_required", "none"),
+			"remediationBundleDriftStatus": "unchanged",
+			"remediationPlanDriftStatus":   "unchanged",
+			"remediationDriftSummary":      "baseline_aligned",
+			"remediationDriftRule":         "baseline_bundle_and_plan_match",
+			"remediationDriftReason":       "current remediation bundle and plan hash match baseline compatible state",
+			"remediationDriftFields":       []string{},
+			"remediationDriftFingerprint":  explainDiagnosticPostureHashString("baselineBundle=" + explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none") + ";" + "currentBundle=" + explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none") + ";" + "baselinePlan=" + explainDiagnosticPostureRemediationPlanHash([]map[string]any{}, "none_required", "none") + ";" + "currentPlan=" + explainDiagnosticPostureRemediationPlanHash([]map[string]any{}, "none_required", "none") + ";" + "bundleDrift=unchanged;" + "planDrift=unchanged;"),
+			"remediationActions":           []string{},
+			"remediationActionPlan":        []map[string]any{},
+			"failedChecks":                 []string{},
+			"failedCheckReasons":           map[string]string{},
+			"incompatibilityReasons":       []string{},
+		},
+		"reasonCatalogVersion":    "v1",
+		"reasonCatalogConsistent": true,
+		"reasonCatalogMismatches": []string{},
+		"matchedReasonLookup": map[string]map[string]any{
+			"primary":        {"rule": "typed_friendly_reset", "expectedReason": "typed-friendly assessment with zero warnings reset posture", "actualReason": "typed-friendly assessment with zero warnings reset posture", "matchesCatalog": true},
+			"confidence":     {"rule": "high_healthy_typed_friendly", "expectedReason": "healthy posture with zero warnings and typed-friendly assessment", "actualReason": "healthy posture with zero warnings and typed-friendly assessment", "matchesCatalog": true},
+			"recommendation": {"rule": "typed_friendly_reset", "expectedReason": "typed-friendly reset selected maintenance recommendation", "actualReason": "typed-friendly reset selected maintenance recommendation", "matchesCatalog": true},
+			"rationale":      {"rule": "primary_healthy", "expectedReason": "healthy posture uses fixed healthy rationale", "actualReason": "healthy posture uses fixed healthy rationale", "matchesCatalog": true},
+			"score":          {"rule": "score_band_excellent", "expectedReason": "final score mapped to excellent band", "actualReason": "final score mapped to excellent band", "matchesCatalog": true},
+			"trend":          {"rule": "stable_min_score", "expectedReason": "score met stable threshold", "actualReason": "score met stable threshold", "matchesCatalog": true},
+		},
+		"decisionTrace": []map[string]any{
+			{"stage": "primary", "rule": "typed_friendly_reset", "result": "healthy", "reason": "typed-friendly assessment with zero warnings reset posture", "inputs": map[string]any{"overallStatus": "typed_friendly", "totalWarnings": 0, "byCategory": map[string]int{}}},
+			{"stage": "confidence", "rule": "high_healthy_typed_friendly", "result": "high", "reason": "healthy posture with zero warnings and typed-friendly assessment", "inputs": map[string]any{"primary": "healthy", "overallStatus": "typed_friendly", "totalWarnings": 0, "signalCount": 1}},
+			{"stage": "recommendation", "rule": "typed_friendly_reset", "result": "maintain_typed_paths", "reason": "typed-friendly reset selected maintenance recommendation", "inputs": map[string]any{"primary": "healthy", "overallStatus": "typed_friendly", "totalWarnings": 0, "signals": []string{"typed_friendly"}}},
+			{"stage": "rationale", "rule": "primary_healthy", "result": "No explain warnings and typed-friendly operator assessment", "reason": "healthy posture uses fixed healthy rationale", "inputs": map[string]any{"primary": "healthy", "highestPriorityCode": "", "overallStatus": "typed_friendly", "signals": []string{"typed_friendly"}}},
+			{"stage": "score", "rule": "score_band_excellent", "result": "excellent", "reason": "final score mapped to excellent band", "inputs": map[string]any{"baseRule": "base_primary_healthy", "confidenceAdjustmentRule": "confidence_adjustment_high", "warningVolumePenaltyRule": "warning_penalty_skipped", "categoryPenaltyRule": "repeated_category_weighted_penalty", "rawScoreBeforeClamp": 95, "clampRule": "within_bounds"}},
+			{"stage": "trend", "rule": "stable_min_score", "result": "stable", "reason": "score met stable threshold", "inputs": map[string]any{"score": 95, "degradingCategories": []string{"planner", "index"}, "byCategory": map[string]int{}, "trendScoreRule": "trend_score_stable"}},
+		},
+		"primaryRule":                   "typed_friendly_reset",
+		"primaryEvaluationOrder":        []string{"typed_friendly_reset"},
+		"confidenceRule":                "high_healthy_typed_friendly",
+		"recommendationRule":            "typed_friendly_reset",
+		"recommendationEvaluationOrder": []string{"typed_friendly_reset"},
+		"rationaleRule":                 "primary_healthy",
+		"rationaleTemplate":             "No explain warnings and typed-friendly operator assessment",
+		"rationaleInputs": map[string]any{
+			"highestPriorityCode": "",
+			"overallStatus":       "typed_friendly",
+			"signals":             []string{"typed_friendly"},
+			"totalWarnings":       0,
+		},
+		"scoreRuleTrace": map[string]any{
+			"baseRule":                     "base_primary_healthy",
+			"confidenceAdjustmentRule":     "confidence_adjustment_high",
+			"warningVolumePenaltyRule":     "warning_penalty_skipped",
+			"categoryPenaltyContributions": map[string]int{},
+			"rawScoreBeforeClamp":          95,
+			"clampRule":                    "within_bounds",
+			"scoreBandRule":                "score_band_excellent",
+		},
+		"trendRuleTrace": map[string]any{
+			"trendRule":      "stable_min_score",
+			"trendScoreRule": "trend_score_stable",
+			"trendInputs": map[string]any{
+				"score":               95,
+				"degradingCategories": []string{"planner", "index"},
+				"byCategory":          map[string]int{},
+			},
+		},
+	}) {
+		t.Fatalf("expected diagnostic posture evaluatedPolicy for healthy posture, got %#v", diagnosticPosture)
+	}
+	if scoreBreakdown, _ := diagnosticPosture["scoreBreakdown"].(map[string]int); !reflect.DeepEqual(scoreBreakdown, map[string]int{
+		"base":                 90,
+		"confidenceAdjustment": 5,
+		"warningVolumePenalty": 0,
+		"categoryPenalty":      0,
+		"final":                95,
+	}) {
+		t.Fatalf("expected diagnostic posture scoreBreakdown for healthy posture, got %#v", diagnosticPosture)
+	}
+	if rationale, _ := diagnosticPosture["rationale"].(string); !strings.Contains(rationale, "No explain warnings") {
+		t.Fatalf("expected healthy diagnostic rationale, got %#v", diagnosticPosture)
+	}
+	operatorAssessment, ok := runtimeStats["operatorAssessment"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.operatorAssessment map, got %T", runtimeStats["operatorAssessment"])
+	}
+	if overallStatus, _ := operatorAssessment["overallStatus"].(string); overallStatus != "typed_friendly" {
+		t.Fatalf("expected operatorAssessment overallStatus typed_friendly, got %#v", operatorAssessment)
+	}
+	if recommendation, _ := operatorAssessment["recommendation"].(string); recommendation != "typed_fast_paths_likely" {
+		t.Fatalf("expected operatorAssessment recommendation typed_fast_paths_likely, got %#v", operatorAssessment)
+	}
+	typedEligibleFamilies, ok := operatorAssessment["typedEligibleFamilies"].([]string)
+	if !ok {
+		t.Fatalf("expected typedEligibleFamilies []string, got %T", operatorAssessment["typedEligibleFamilies"])
+	}
+	if !reflect.DeepEqual(typedEligibleFamilies, []string{"distinct", "sort"}) {
+		t.Fatalf("expected typedEligibleFamilies [distinct sort], got %#v", typedEligibleFamilies)
+	}
+	focusFamilies, ok := operatorAssessment["focusFamilies"].([]string)
+	if !ok {
+		t.Fatalf("expected focusFamilies []string, got %T", operatorAssessment["focusFamilies"])
+	}
+	if !reflect.DeepEqual(focusFamilies, []string{"distinct", "sort"}) {
+		t.Fatalf("expected focusFamilies [distinct sort], got %#v", focusFamilies)
+	}
+	operatorStats, ok := runtimeStats["operators"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.operators map, got %T", runtimeStats["operators"])
+	}
+	if got, _ := operatorStats["distinctOperators"].(int); got < 1 {
+		t.Fatalf("expected distinctOperators >= 1, got %#v", operatorStats["distinctOperators"])
+	}
+	if got, _ := operatorStats["sortOperators"].(int); got < 1 {
+		t.Fatalf("expected sortOperators >= 1, got %#v", operatorStats["sortOperators"])
+	}
+	if got, _ := operatorStats["typedDistinctCandidates"].(int); got < 1 {
+		t.Fatalf("expected typedDistinctCandidates >= 1, got %#v", operatorStats["typedDistinctCandidates"])
+	}
+	if got, _ := operatorStats["typedSortCandidates"].(int); got < 1 {
+		t.Fatalf("expected typedSortCandidates >= 1, got %#v", operatorStats["typedSortCandidates"])
+	}
+	distinctShapes, ok := operatorStats["distinctShapes"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected distinctShapes map, got %T", operatorStats["distinctShapes"])
+	}
+	if got, _ := distinctShapes["property"].(int); got < 1 {
+		t.Fatalf("expected distinct property-shape count >= 1, got %#v", distinctShapes)
+	}
+	sortShapes, ok := operatorStats["sortShapes"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected sortShapes map, got %T", operatorStats["sortShapes"])
+	}
+	if got, _ := sortShapes["identifier"].(int); got < 1 {
+		t.Fatalf("expected sort identifier-shape count >= 1, got %#v", sortShapes)
+	}
+	warnings, ok := explainPayload["warnings"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected warnings []map[string]any, got %T", explainPayload["warnings"])
+	}
+	for _, warning := range warnings {
+		if code, _ := warning["code"].(string); code == "OPERATOR_MIXED_DOMAIN_RISK" || code == "OPERATOR_TYPED_FALLBACK" {
+			t.Fatalf("expected typed-friendly query to avoid operator fallback warnings, got %#v", warnings)
+		}
 	}
 }
 
@@ -609,6 +1475,250 @@ func TestExecuteExplainMetadataReflectsPipelineRouteOptIn(t *testing.T) {
 	}
 	assertPipelineExplainPayloadEnvelope(t, explainPayload)
 	assertExplainPayloadOmitsKeys(t, explainPayload, "influencers", "indexDecisions", "runtimeStats", "warnings")
+}
+
+func TestBuildExplainOperatorRuntimeStatsReportsBlockedReasons(t *testing.T) {
+	stats := buildExplainOperatorRuntimeStats([]map[string]any{
+		{
+			"op":         "DISTINCT",
+			"projection": []any{"n.name AS name"},
+		},
+		{
+			"op":         "DISTINCT",
+			"projection": []any{"[n.name] AS payload"},
+		},
+		{
+			"op":       "SORT",
+			"ordering": []any{"toLower(n.name) ASC"},
+		},
+		{
+			"op":      "AGGREGATE",
+			"groupBy": []any{"toLower(n.name)"},
+		},
+		{
+			"op":      "AGGREGATE",
+			"groupBy": []any{"n.name", "toLower(n.alias)"},
+		},
+	})
+
+	if got, _ := stats["typedDistinctCandidates"].(int); got != 1 {
+		t.Fatalf("expected one typed distinct candidate, got %#v", stats["typedDistinctCandidates"])
+	}
+	if got, _ := stats["typedSortCandidates"].(int); got != 0 {
+		t.Fatalf("expected no typed sort candidates, got %#v", stats["typedSortCandidates"])
+	}
+	if got, _ := stats["typedGroupCandidates"].(int); got != 0 {
+		t.Fatalf("expected no typed group candidates, got %#v", stats["typedGroupCandidates"])
+	}
+
+	distinctBlockedReasons, ok := stats["distinctBlockedReasons"].(map[string]int)
+	if !ok {
+		t.Fatalf("expected distinctBlockedReasons map[string]int, got %T", stats["distinctBlockedReasons"])
+	}
+	if got := distinctBlockedReasons["list_expression"]; got != 1 {
+		t.Fatalf("expected list_expression distinct blocked reason count 1, got %#v", distinctBlockedReasons)
+	}
+	distinctBlockedExamples, ok := stats["distinctBlockedExamples"].(map[string][]string)
+	if !ok {
+		t.Fatalf("expected distinctBlockedExamples map[string][]string, got %T", stats["distinctBlockedExamples"])
+	}
+	if got := distinctBlockedExamples["list_expression"]; !reflect.DeepEqual(got, []string{"[n.name]"}) {
+		t.Fatalf("expected list_expression distinct blocked examples [\"[n.name]\"], got %#v", distinctBlockedExamples)
+	}
+
+	sortBlockedReasons, ok := stats["sortBlockedReasons"].(map[string]int)
+	if !ok {
+		t.Fatalf("expected sortBlockedReasons map[string]int, got %T", stats["sortBlockedReasons"])
+	}
+	if got := sortBlockedReasons["function_or_call"]; got != 1 {
+		t.Fatalf("expected function_or_call sort blocked reason count 1, got %#v", sortBlockedReasons)
+	}
+	sortBlockedExamples, ok := stats["sortBlockedExamples"].(map[string][]string)
+	if !ok {
+		t.Fatalf("expected sortBlockedExamples map[string][]string, got %T", stats["sortBlockedExamples"])
+	}
+	if got := sortBlockedExamples["function_or_call"]; !reflect.DeepEqual(got, []string{"toLower(n.name)"}) {
+		t.Fatalf("expected function_or_call sort blocked examples [\"toLower(n.name)\"], got %#v", sortBlockedExamples)
+	}
+
+	groupBlockedReasons, ok := stats["groupBlockedReasons"].(map[string]int)
+	if !ok {
+		t.Fatalf("expected groupBlockedReasons map[string]int, got %T", stats["groupBlockedReasons"])
+	}
+	if got := groupBlockedReasons["function_or_call"]; got != 1 {
+		t.Fatalf("expected function_or_call group blocked reason count 1, got %#v", groupBlockedReasons)
+	}
+	if got := groupBlockedReasons["mixed_scalar_and_non_scalar"]; got != 1 {
+		t.Fatalf("expected mixed_scalar_and_non_scalar group blocked reason count 1, got %#v", groupBlockedReasons)
+	}
+	groupBlockedExamples, ok := stats["groupBlockedExamples"].(map[string][]string)
+	if !ok {
+		t.Fatalf("expected groupBlockedExamples map[string][]string, got %T", stats["groupBlockedExamples"])
+	}
+	if got := groupBlockedExamples["function_or_call"]; !reflect.DeepEqual(got, []string{"toLower(n.name)"}) {
+		t.Fatalf("expected function_or_call group blocked examples [\"toLower(n.name)\"], got %#v", groupBlockedExamples)
+	}
+	if got := groupBlockedExamples["mixed_scalar_and_non_scalar"]; !reflect.DeepEqual(got, []string{"n.name, toLower(n.alias)"}) {
+		t.Fatalf("expected mixed_scalar_and_non_scalar group blocked examples [\"n.name, toLower(n.alias)\"], got %#v", groupBlockedExamples)
+	}
+
+	groupShapes, ok := stats["groupShapes"].(map[string]int)
+	if !ok {
+		t.Fatalf("expected groupShapes map[string]int, got %T", stats["groupShapes"])
+	}
+	if got := groupShapes["mixed_or_non_scalar"]; got != 2 {
+		t.Fatalf("expected two mixed_or_non_scalar group shapes, got %#v", groupShapes)
+	}
+
+	distinctSummary, ok := stats["distinctSummary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected distinctSummary map, got %T", stats["distinctSummary"])
+	}
+	if got, _ := distinctSummary["status"].(string); got != "mixed_domain_risk" {
+		t.Fatalf("expected distinctSummary status mixed_domain_risk, got %#v", distinctSummary)
+	}
+	if got, _ := distinctSummary["typedCandidates"].(int); got != 1 {
+		t.Fatalf("expected distinctSummary typedCandidates=1, got %#v", distinctSummary)
+	}
+	if got, _ := distinctSummary["fallbackCandidates"].(int); got != 1 {
+		t.Fatalf("expected distinctSummary fallbackCandidates=1, got %#v", distinctSummary)
+	}
+
+	sortSummary, ok := stats["sortSummary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected sortSummary map, got %T", stats["sortSummary"])
+	}
+	if got, _ := sortSummary["status"].(string); got != "fallback_likely" {
+		t.Fatalf("expected sortSummary status fallback_likely, got %#v", sortSummary)
+	}
+	if got, _ := sortSummary["blockedReasonKinds"].(int); got != 1 {
+		t.Fatalf("expected sortSummary blockedReasonKinds=1, got %#v", sortSummary)
+	}
+
+	groupSummary, ok := stats["groupSummary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected groupSummary map, got %T", stats["groupSummary"])
+	}
+	if got, _ := groupSummary["status"].(string); got != "fallback_likely" {
+		t.Fatalf("expected groupSummary status fallback_likely, got %#v", groupSummary)
+	}
+	if got, _ := groupSummary["fallbackCandidates"].(int); got != 2 {
+		t.Fatalf("expected groupSummary fallbackCandidates=2, got %#v", groupSummary)
+	}
+	if got, _ := groupSummary["blockedReasonKinds"].(int); got != 2 {
+		t.Fatalf("expected groupSummary blockedReasonKinds=2, got %#v", groupSummary)
+	}
+
+	operatorAssessment := explainBuildOperatorAssessment(stats)
+	if overallStatus, _ := operatorAssessment["overallStatus"].(string); overallStatus != "mixed_domain_risk" {
+		t.Fatalf("expected mixed_domain_risk operator assessment, got %#v", operatorAssessment)
+	}
+	if recommendation, _ := operatorAssessment["recommendation"].(string); recommendation != "investigate_mixed_operator_shapes" {
+		t.Fatalf("expected investigate_mixed_operator_shapes recommendation, got %#v", operatorAssessment)
+	}
+	mixedRiskFamilies, ok := operatorAssessment["mixedRiskFamilies"].([]string)
+	if !ok {
+		t.Fatalf("expected mixedRiskFamilies []string, got %T", operatorAssessment["mixedRiskFamilies"])
+	}
+	if !reflect.DeepEqual(mixedRiskFamilies, []string{"distinct"}) {
+		t.Fatalf("expected mixedRiskFamilies [distinct], got %#v", mixedRiskFamilies)
+	}
+	focusFamilies, ok := operatorAssessment["focusFamilies"].([]string)
+	if !ok {
+		t.Fatalf("expected focusFamilies []string, got %T", operatorAssessment["focusFamilies"])
+	}
+	if !reflect.DeepEqual(focusFamilies, []string{"distinct"}) {
+		t.Fatalf("expected focusFamilies [distinct], got %#v", focusFamilies)
+	}
+	fallbackLikelyFamilies, ok := operatorAssessment["fallbackLikelyFamilies"].([]string)
+	if !ok {
+		t.Fatalf("expected fallbackLikelyFamilies []string, got %T", operatorAssessment["fallbackLikelyFamilies"])
+	}
+	if !reflect.DeepEqual(fallbackLikelyFamilies, []string{"sort", "group"}) {
+		t.Fatalf("expected fallbackLikelyFamilies [sort group], got %#v", fallbackLikelyFamilies)
+	}
+
+	operatorWarning := explainBuildOperatorAssessmentWarning([]map[string]any{
+		{
+			"op":         "DISTINCT",
+			"projection": []any{"n.name AS name"},
+		},
+		{
+			"op":         "DISTINCT",
+			"projection": []any{"[n.name] AS payload"},
+		},
+		{
+			"op":       "SORT",
+			"ordering": []any{"toLower(n.name) ASC"},
+		},
+	})
+	if operatorWarning == nil {
+		t.Fatalf("expected mixed-risk operator warning")
+	}
+	if code, _ := operatorWarning["code"].(string); code != "OPERATOR_MIXED_DOMAIN_RISK" {
+		t.Fatalf("expected OPERATOR_MIXED_DOMAIN_RISK warning, got %#v", operatorWarning)
+	}
+	if recommendation, _ := operatorWarning["recommendation"].(string); recommendation != "investigate_mixed_operator_shapes" {
+		t.Fatalf("expected investigate_mixed_operator_shapes recommendation, got %#v", operatorWarning)
+	}
+	if severity, _ := operatorWarning["severity"].(string); severity != "medium" {
+		t.Fatalf("expected medium operator warning severity, got %#v", operatorWarning)
+	}
+	if priority, _ := operatorWarning["priority"].(int); priority != 30 {
+		t.Fatalf("expected operator warning priority 30, got %#v", operatorWarning)
+	}
+	warningFocusFamilies, ok := operatorWarning["focusFamilies"].([]string)
+	if !ok {
+		t.Fatalf("expected warning focusFamilies []string, got %T", operatorWarning["focusFamilies"])
+	}
+	if !reflect.DeepEqual(warningFocusFamilies, []string{"distinct"}) {
+		t.Fatalf("expected warning focusFamilies [distinct], got %#v", warningFocusFamilies)
+	}
+}
+
+func TestExplainSortWarningsOrdersByPriority(t *testing.T) {
+	warnings := []map[string]any{
+		{"code": "PLAN_ANALYSIS_PARTIAL", "priority": 60, "vertexId": "b"},
+		{"code": "MISSING_PROPERTY_INDEX", "priority": 20, "vertexId": "v2"},
+		{"code": "FULL_SCAN_FALLBACK", "priority": 10, "vertexId": "v1"},
+		{"code": "MISSING_PROPERTY_INDEX", "priority": 20, "vertexId": "v1"},
+	}
+
+	explainSortWarnings(warnings)
+
+	ordered := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		code, _ := warning["code"].(string)
+		vertexID, _ := warning["vertexId"].(string)
+		ordered = append(ordered, code+"@"+vertexID)
+	}
+	if !reflect.DeepEqual(ordered, []string{
+		"FULL_SCAN_FALLBACK@v1",
+		"MISSING_PROPERTY_INDEX@v1",
+		"MISSING_PROPERTY_INDEX@v2",
+		"PLAN_ANALYSIS_PARTIAL@b",
+	}) {
+		t.Fatalf("unexpected warning order: %#v", ordered)
+	}
+}
+
+func TestBuildExplainWarningSummaryRollsUpCategories(t *testing.T) {
+	summary := buildExplainWarningSummary([]map[string]any{
+		{"code": "FULL_SCAN_FALLBACK", "severity": "high", "priority": 10},
+		{"code": "MISSING_PROPERTY_INDEX", "severity": "medium", "priority": 20},
+		{"code": "OPERATOR_TYPED_FALLBACK", "severity": "low", "priority": 40},
+	})
+
+	byCategory, ok := summary["byCategory"].(map[string]int)
+	if !ok {
+		t.Fatalf("expected byCategory map[string]int, got %T", summary["byCategory"])
+	}
+	if !reflect.DeepEqual(byCategory, map[string]int{"planner": 1, "index": 1, "operator": 1}) {
+		t.Fatalf("unexpected byCategory rollup: %#v", summary)
+	}
+	if highestCategory, _ := summary["highestCategory"].(string); highestCategory != "planner" {
+		t.Fatalf("expected highestCategory planner, got %#v", summary)
+	}
 }
 
 func TestExecuteExplainMetadataReflectsPipelineRouteOptInPipelinePayload(t *testing.T) {
@@ -3120,15 +4230,993 @@ func TestExecuteExplainIndexTuningSignalsForMissingIndex(t *testing.T) {
 	if !ok || len(warnings) == 0 {
 		t.Fatalf("expected warnings to be populated for missing-index fallback, got %#v", explainPayload["warnings"])
 	}
+	if firstCode, _ := warnings[0]["code"].(string); firstCode != "MISSING_PROPERTY_INDEX" {
+		t.Fatalf("expected highest-priority warning first, got %#v", warnings)
+	}
+	runtimeStats, ok := explainPayload["runtimeStats"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats map, got %T", explainPayload["runtimeStats"])
+	}
+	warningSummary, ok := runtimeStats["warningSummary"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.warningSummary map, got %T", runtimeStats["warningSummary"])
+	}
+	if highestPriorityCode, _ := warningSummary["highestPriorityCode"].(string); highestPriorityCode != "MISSING_PROPERTY_INDEX" {
+		t.Fatalf("expected warningSummary highestPriorityCode MISSING_PROPERTY_INDEX, got %#v", warningSummary)
+	}
+	if highestPriority, _ := warningSummary["highestPriority"].(int); highestPriority != 20 {
+		t.Fatalf("expected warningSummary highestPriority 20, got %#v", warningSummary)
+	}
+	if highestSeverity, _ := warningSummary["highestSeverity"].(string); highestSeverity != "medium" {
+		t.Fatalf("expected warningSummary highestSeverity medium, got %#v", warningSummary)
+	}
+	byCategory, ok := warningSummary["byCategory"].(map[string]int)
+	if !ok {
+		t.Fatalf("expected warningSummary byCategory map[string]int, got %T", warningSummary["byCategory"])
+	}
+	if got := byCategory["index"]; got < 1 {
+		t.Fatalf("expected at least one index warning in byCategory, got %#v", warningSummary)
+	}
+	if highestCategory, _ := warningSummary["highestCategory"].(string); highestCategory != "index" {
+		t.Fatalf("expected warningSummary highestCategory index, got %#v", warningSummary)
+	}
+	diagnosticPosture, ok := runtimeStats["diagnosticPosture"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected runtimeStats.diagnosticPosture map, got %T", runtimeStats["diagnosticPosture"])
+	}
+	if primary, _ := diagnosticPosture["primary"].(string); primary != "index_limited" {
+		t.Fatalf("expected diagnostic posture primary index_limited, got %#v", diagnosticPosture)
+	}
+	if recommendation, _ := diagnosticPosture["recommendation"].(string); recommendation != "improve_index_coverage" {
+		t.Fatalf("expected diagnostic posture recommendation improve_index_coverage, got %#v", diagnosticPosture)
+	}
+	if confidence, _ := diagnosticPosture["confidence"].(string); confidence != "medium" {
+		t.Fatalf("expected diagnostic posture confidence medium, got %#v", diagnosticPosture)
+	}
+	if score, _ := diagnosticPosture["score"].(int); score != 40 {
+		t.Fatalf("expected diagnostic posture score 40, got %#v", diagnosticPosture)
+	}
+	if scoreBand, _ := diagnosticPosture["scoreBand"].(string); scoreBand != "fair" {
+		t.Fatalf("expected diagnostic posture scoreBand fair, got %#v", diagnosticPosture)
+	}
+	if trendHint, _ := diagnosticPosture["trendHint"].(string); trendHint != "degrading" {
+		t.Fatalf("expected diagnostic posture trendHint degrading, got %#v", diagnosticPosture)
+	}
+	if trendScore, _ := diagnosticPosture["trendScore"].(int); trendScore != -1 {
+		t.Fatalf("expected diagnostic posture trendScore -1, got %#v", diagnosticPosture)
+	}
+	if trendEvidence, _ := diagnosticPosture["trendEvidence"].(map[string]any); !reflect.DeepEqual(trendEvidence, map[string]any{
+		"drivers":             []string{"index"},
+		"totalWarnings":       1,
+		"highestPriorityCode": "MISSING_PROPERTY_INDEX",
+		"highestCategory":     "index",
+	}) {
+		t.Fatalf("expected diagnostic posture trendEvidence for index posture, got %#v", diagnosticPosture)
+	}
+	if trendDriverWeights, _ := diagnosticPosture["trendDriverWeights"].(map[string]int); !reflect.DeepEqual(trendDriverWeights, map[string]int{}) {
+		t.Fatalf("expected diagnostic posture trendDriverWeights for index posture, got %#v", diagnosticPosture)
+	}
+	if scoreComputationVersion, _ := diagnosticPosture["scoreComputationVersion"].(string); scoreComputationVersion != "v1" {
+		t.Fatalf("expected diagnostic posture scoreComputationVersion v1, got %#v", diagnosticPosture)
+	}
+	if scoreComputationConfig, _ := diagnosticPosture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig, explainDiagnosticPostureScoreComputationConfig()) {
+		t.Fatalf("expected diagnostic posture scoreComputationConfig for index posture, got %#v", diagnosticPosture)
+	}
+	if scoreClampRange, _ := diagnosticPosture["scoreClampRange"].(map[string]int); !reflect.DeepEqual(scoreClampRange, map[string]int{"min": 0, "max": 100}) {
+		t.Fatalf("expected diagnostic posture scoreClampRange for index posture, got %#v", diagnosticPosture)
+	}
+	if scoreInputs, _ := diagnosticPosture["scoreInputs"].(map[string]any); !reflect.DeepEqual(scoreInputs, map[string]any{
+		"totalWarnings":          1,
+		"confidenceClass":        "medium",
+		"repeatedCategoryCounts": map[string]int{},
+	}) {
+		t.Fatalf("expected diagnostic posture scoreInputs for index posture, got %#v", diagnosticPosture)
+	}
+	if scoreBreakdown, _ := diagnosticPosture["scoreBreakdown"].(map[string]int); !reflect.DeepEqual(scoreBreakdown, map[string]int{
+		"base":                 45,
+		"confidenceAdjustment": 0,
+		"warningVolumePenalty": 5,
+		"categoryPenalty":      0,
+		"final":                40,
+	}) {
+		t.Fatalf("expected diagnostic posture scoreBreakdown for index posture, got %#v", diagnosticPosture)
+	}
+	if rationale, _ := diagnosticPosture["rationale"].(string); !strings.Contains(rationale, "MISSING_PROPERTY_INDEX") {
+		t.Fatalf("expected index-limited diagnostic rationale to reference top warning code, got %#v", diagnosticPosture)
+	}
 	foundMissingIndexWarning := false
 	for _, warning := range warnings {
 		if code, _ := warning["code"].(string); code == "MISSING_PROPERTY_INDEX" {
+			if severity, _ := warning["severity"].(string); severity != "medium" {
+				t.Fatalf("expected medium missing-index warning severity, got %#v", warning)
+			}
+			if priority, _ := warning["priority"].(int); priority != 20 {
+				t.Fatalf("expected missing-index warning priority 20, got %#v", warning)
+			}
 			foundMissingIndexWarning = true
 			break
 		}
 	}
 	if !foundMissingIndexWarning {
 		t.Fatalf("expected MISSING_PROPERTY_INDEX warning, got %#v", warnings)
+	}
+}
+
+func TestBuildExplainDiagnosticPostureOperatorFallbackLimited(t *testing.T) {
+	posture := buildExplainDiagnosticPosture(
+		map[string]any{
+			"totalWarnings": 0,
+			"byCategory":    map[string]int{},
+		},
+		map[string]any{
+			"overallStatus": "mixed_domain_risk",
+		},
+	)
+
+	if primary, _ := posture["primary"].(string); primary != "operator_fallback_limited" {
+		t.Fatalf("expected operator_fallback_limited posture, got %#v", posture)
+	}
+	if recommendation, _ := posture["recommendation"].(string); recommendation != "reduce_operator_fallback_shapes" {
+		t.Fatalf("expected reduce_operator_fallback_shapes recommendation, got %#v", posture)
+	}
+	if confidence, _ := posture["confidence"].(string); confidence != "medium" {
+		t.Fatalf("expected operator posture confidence medium, got %#v", posture)
+	}
+	if score, _ := posture["score"].(int); score != 60 {
+		t.Fatalf("expected operator posture score 60, got %#v", posture)
+	}
+	if scoreBand, _ := posture["scoreBand"].(string); scoreBand != "good" {
+		t.Fatalf("expected operator posture scoreBand good, got %#v", posture)
+	}
+	if trendHint, _ := posture["trendHint"].(string); trendHint != "watch" {
+		t.Fatalf("expected operator posture trendHint watch, got %#v", posture)
+	}
+	if trendScore, _ := posture["trendScore"].(int); trendScore != 0 {
+		t.Fatalf("expected operator posture trendScore 0, got %#v", posture)
+	}
+	if trendEvidence, _ := posture["trendEvidence"].(map[string]any); !reflect.DeepEqual(trendEvidence, map[string]any{
+		"drivers":             []string{"operator"},
+		"totalWarnings":       0,
+		"highestPriorityCode": "",
+		"highestCategory":     "",
+	}) {
+		t.Fatalf("expected operator posture trendEvidence, got %#v", posture)
+	}
+	if trendDriverWeights, _ := posture["trendDriverWeights"].(map[string]int); !reflect.DeepEqual(trendDriverWeights, map[string]int{}) {
+		t.Fatalf("expected operator posture trendDriverWeights, got %#v", posture)
+	}
+	if scoreComputationVersion, _ := posture["scoreComputationVersion"].(string); scoreComputationVersion != "v1" {
+		t.Fatalf("expected operator posture scoreComputationVersion v1, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig, explainDiagnosticPostureScoreComputationConfig()) {
+		t.Fatalf("expected operator posture scoreComputationConfig, got %#v", posture)
+	}
+	if scoreClampRange, _ := posture["scoreClampRange"].(map[string]int); !reflect.DeepEqual(scoreClampRange, map[string]int{"min": 0, "max": 100}) {
+		t.Fatalf("expected operator posture scoreClampRange, got %#v", posture)
+	}
+	if scoreInputs, _ := posture["scoreInputs"].(map[string]any); !reflect.DeepEqual(scoreInputs, map[string]any{
+		"totalWarnings":          0,
+		"confidenceClass":        "medium",
+		"repeatedCategoryCounts": map[string]int{},
+	}) {
+		t.Fatalf("expected operator posture scoreInputs, got %#v", posture)
+	}
+	if scoreBreakdown, _ := posture["scoreBreakdown"].(map[string]int); !reflect.DeepEqual(scoreBreakdown, map[string]int{
+		"base":                 60,
+		"confidenceAdjustment": 0,
+		"warningVolumePenalty": 0,
+		"categoryPenalty":      0,
+		"final":                60,
+	}) {
+		t.Fatalf("expected operator posture scoreBreakdown, got %#v", posture)
+	}
+	if rationale, _ := posture["rationale"].(string); !strings.Contains(rationale, "mixed_domain_risk") {
+		t.Fatalf("expected operator posture rationale to mention overall status, got %#v", posture)
+	}
+}
+
+func TestBuildExplainDiagnosticPostureAppliesCategoryWeightedPenalty(t *testing.T) {
+	posture := buildExplainDiagnosticPosture(
+		map[string]any{
+			"totalWarnings":       4,
+			"highestPriorityCode": "MISSING_PROPERTY_INDEX",
+			"highestCategory":     "index",
+			"byCategory": map[string]int{
+				"index":    2,
+				"operator": 2,
+			},
+		},
+		map[string]any{
+			"overallStatus": "mixed_domain_risk",
+		},
+	)
+
+	if primary, _ := posture["primary"].(string); primary != "index_limited" {
+		t.Fatalf("expected index_limited posture, got %#v", posture)
+	}
+	if confidence, _ := posture["confidence"].(string); confidence != "low" {
+		t.Fatalf("expected low confidence for multi-signal/multi-warning posture, got %#v", posture)
+	}
+	if score, _ := posture["score"].(int); score != 10 {
+		t.Fatalf("expected weighted penalty score 10, got %#v", posture)
+	}
+	if scoreBand, _ := posture["scoreBand"].(string); scoreBand != "poor" {
+		t.Fatalf("expected poor scoreBand for heavily penalized posture, got %#v", posture)
+	}
+	if trendHint, _ := posture["trendHint"].(string); trendHint != "degrading" {
+		t.Fatalf("expected weighted-penalty trendHint degrading, got %#v", posture)
+	}
+	if trendScore, _ := posture["trendScore"].(int); trendScore != -1 {
+		t.Fatalf("expected weighted-penalty trendScore -1, got %#v", posture)
+	}
+	if trendEvidence, _ := posture["trendEvidence"].(map[string]any); !reflect.DeepEqual(trendEvidence, map[string]any{
+		"drivers":             []string{"index", "operator"},
+		"totalWarnings":       4,
+		"highestPriorityCode": "MISSING_PROPERTY_INDEX",
+		"highestCategory":     "index",
+	}) {
+		t.Fatalf("expected weighted-penalty trendEvidence, got %#v", posture)
+	}
+	if trendDriverWeights, _ := posture["trendDriverWeights"].(map[string]int); !reflect.DeepEqual(trendDriverWeights, map[string]int{
+		"index":    -3,
+		"operator": -2,
+	}) {
+		t.Fatalf("expected weighted-penalty trendDriverWeights, got %#v", posture)
+	}
+	if scoreComputationVersion, _ := posture["scoreComputationVersion"].(string); scoreComputationVersion != "v1" {
+		t.Fatalf("expected weighted-penalty scoreComputationVersion v1, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig, explainDiagnosticPostureScoreComputationConfig()) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["categoryWeights"], explainDiagnosticScoreCategoryWeights()) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig categoryWeights, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["trendRules"], map[string]any{
+		"stableMinScore":      80,
+		"degradingMaxScore":   30,
+		"degradingCategories": []string{"planner", "index"},
+		"ruleEvaluationOrder": []string{"stable_min_score", "degrading_categories", "degrading_max_score", "default_trend"},
+		"reasonByRule": map[string]string{
+			"stable_min_score":     "score >= stableMinScore",
+			"degrading_categories": "planner/index category warnings present",
+			"degrading_max_score":  "score <= degradingMaxScore",
+			"default_trend":        "fallback trend when no prior trend rule matched",
+		},
+		"trendScoreByHint": map[string]int{
+			"stable":    1,
+			"watch":     0,
+			"degrading": -1,
+		},
+		"trendScoreRules": map[string]string{
+			"stable":    "trend_score_stable",
+			"watch":     "trend_score_watch",
+			"degrading": "trend_score_degrading",
+		},
+		"defaultTrend": "watch",
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig trendRules, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["primarySelectionRules"], map[string]any{
+		"categoryPriority":       []string{"planner", "index"},
+		"primaryEvaluationOrder": []string{"category_priority_planner", "category_priority_index", "operator_fallback_status", "typed_friendly_reset", "default"},
+		"categoryToPrimary": map[string]string{
+			"planner": "planner_limited",
+			"index":   "index_limited",
+		},
+		"operatorFallbackStatuses": []string{"mixed_domain_risk", "fallback_likely"},
+		"typedFriendlyReset": map[string]any{
+			"requiresTotalWarnings": 0,
+			"requiresOverallStatus": "typed_friendly",
+			"primary":               "healthy",
+			"signal":                "typed_friendly",
+			"recommendation":        "maintain_typed_paths",
+		},
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig primarySelectionRules, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["confidenceRules"], map[string]any{
+		"evaluationOrder": []string{"high_healthy_typed_friendly", "low_warning_or_multisignal", "default_medium"},
+		"high": map[string]any{
+			"requiresPrimary":       "healthy",
+			"requiresTotalWarnings": 0,
+			"requiresOverallStatus": "typed_friendly",
+		},
+		"low": map[string]int{
+			"minTotalWarnings": 3,
+			"orMinSignalCount": 2,
+		},
+		"default": "medium",
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig confidenceRules, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["recommendationRules"], map[string]string{
+		"healthy":                   "maintain_typed_paths",
+		"index_limited":             "improve_index_coverage",
+		"planner_limited":           "optimize_scan_and_plan_shapes",
+		"operator_fallback_limited": "reduce_operator_fallback_shapes",
+		"default":                   "maintain_typed_paths",
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig recommendationRules, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["recommendationEvaluationOrder"], []string{"primary_planner", "primary_index", "operator_status_fallback", "typed_friendly_reset", "default"}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig recommendationEvaluationOrder, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["rationaleTemplates"], map[string]string{
+		"healthy":                   "No explain warnings and typed-friendly operator assessment",
+		"index_limited":             "Index warnings dominate diagnostics; highestPriorityCode=%s",
+		"planner_limited":           "Planner warnings dominate diagnostics; highestPriorityCode=%s",
+		"operator_fallback_limited": "Operator assessment indicates %s with fallback-oriented signals",
+		"default":                   "Diagnostic posture derived from signals=%s and highestPriorityCode=%s",
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig rationaleTemplates, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["rationaleRules"], map[string]string{
+		"healthy":                   "primary_healthy",
+		"index_limited":             "primary_index_limited",
+		"planner_limited":           "primary_planner_limited",
+		"operator_fallback_limited": "primary_operator_fallback_limited",
+		"default":                   "default",
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig rationaleRules, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["rationaleTemplateInputs"], map[string][]string{
+		"healthy":                   {},
+		"index_limited":             {"highestPriorityCode"},
+		"planner_limited":           {"highestPriorityCode"},
+		"operator_fallback_limited": {"overallStatus"},
+		"default":                   {"signals", "highestPriorityCode"},
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig rationaleTemplateInputs, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["scoreRules"], map[string]any{
+		"baseRuleByPrimary": map[string]string{
+			"healthy":                   "base_primary_healthy",
+			"operator_fallback_limited": "base_primary_operator_fallback_limited",
+			"index_limited":             "base_primary_index_limited",
+			"planner_limited":           "base_primary_planner_limited",
+			"default":                   "base_primary_default",
+		},
+		"confidenceAdjustmentRuleByClass": map[string]string{
+			"high":    "confidence_adjustment_high",
+			"medium":  "confidence_adjustment_default",
+			"low":     "confidence_adjustment_low",
+			"default": "confidence_adjustment_default",
+		},
+		"warningVolumePenaltyRule": "warning_penalty_per_warning_linear",
+		"categoryPenaltyRule":      "repeated_category_weighted_penalty",
+		"clampRules": map[string]string{
+			"withinBounds": "within_bounds",
+			"min":          "clamped_min",
+			"max":          "clamped_max",
+		},
+		"scoreBandRules": map[string]string{
+			"excellent": "score_band_excellent",
+			"good":      "score_band_good",
+			"fair":      "score_band_fair",
+			"poor":      "score_band_poor",
+		},
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig scoreRules, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["decisionTraceSchema"], map[string]any{
+		"version":    "v1",
+		"stageOrder": []string{"primary", "confidence", "recommendation", "rationale", "score", "trend"},
+		"stageFields": map[string][]string{
+			"primary":        {"stage", "rule", "result", "reason", "inputs"},
+			"confidence":     {"stage", "rule", "result", "reason", "inputs"},
+			"recommendation": {"stage", "rule", "result", "reason", "inputs"},
+			"rationale":      {"stage", "rule", "result", "reason", "inputs"},
+			"score":          {"stage", "rule", "result", "reason", "inputs"},
+			"trend":          {"stage", "rule", "result", "reason", "inputs"},
+		},
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig decisionTraceSchema, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); !reflect.DeepEqual(scoreComputationConfig["ruleReasonCatalog"], map[string]map[string]string{
+		"primary": {
+			"category_priority_planner": "planner category warning took primary precedence",
+			"category_priority_index":   "index category warning set primary posture",
+			"operator_fallback_status":  "operator assessment indicates fallback risk",
+			"typed_friendly_reset":      "typed-friendly assessment with zero warnings reset posture",
+			"default":                   "default primary posture applied",
+		},
+		"confidence": {
+			"high_healthy_typed_friendly": "healthy posture with zero warnings and typed-friendly assessment",
+			"low_warning_or_multisignal":  "warning volume or multi-signal posture lowered confidence",
+			"default_medium":              "default medium confidence classification",
+		},
+		"recommendation": {
+			"primary_planner":          "planner-limited posture selected planner optimization recommendation",
+			"primary_index":            "index-limited posture selected index coverage recommendation",
+			"operator_status_fallback": "operator fallback status selected fallback-reduction recommendation",
+			"typed_friendly_reset":     "typed-friendly reset selected maintenance recommendation",
+			"default":                  "default recommendation applied",
+		},
+		"rationale": {
+			"primary_healthy":                   "healthy posture uses fixed healthy rationale",
+			"primary_index_limited":             "index-limited posture uses highest-priority-code rationale",
+			"primary_planner_limited":           "planner-limited posture uses highest-priority-code rationale",
+			"primary_operator_fallback_limited": "operator-fallback posture uses operator-status rationale",
+			"default":                           "default rationale template selected",
+		},
+		"score": {
+			"score_band_excellent": "final score mapped to excellent band",
+			"score_band_good":      "final score mapped to good band",
+			"score_band_fair":      "final score mapped to fair band",
+			"score_band_poor":      "final score mapped to poor band",
+		},
+		"trend": {
+			"stable_min_score":     "score met stable threshold",
+			"degrading_categories": "planner or index warning categories triggered degrading trend",
+			"degrading_max_score":  "score met degrading threshold",
+			"default_trend":        "default watch trend applied",
+		},
+	}) {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig ruleReasonCatalog, got %#v", posture)
+	}
+	if scoreComputationConfig, _ := posture["scoreComputationConfig"].(map[string]any); scoreComputationConfig["ruleReasonCatalogVersion"] != "v1" {
+		t.Fatalf("expected weighted-penalty scoreComputationConfig ruleReasonCatalogVersion v1, got %#v", posture)
+	}
+	if scoreClampRange, _ := posture["scoreClampRange"].(map[string]int); !reflect.DeepEqual(scoreClampRange, map[string]int{"min": 0, "max": 100}) {
+		t.Fatalf("expected weighted-penalty scoreClampRange, got %#v", posture)
+	}
+	if scoreInputs, _ := posture["scoreInputs"].(map[string]any); !reflect.DeepEqual(scoreInputs, map[string]any{
+		"totalWarnings":   4,
+		"confidenceClass": "low",
+		"repeatedCategoryCounts": map[string]int{
+			"index":    2,
+			"operator": 2,
+		},
+	}) {
+		t.Fatalf("expected weighted-penalty scoreInputs, got %#v", posture)
+	}
+	if scoreBreakdown, _ := posture["scoreBreakdown"].(map[string]int); !reflect.DeepEqual(scoreBreakdown, map[string]int{
+		"base":                 45,
+		"confidenceAdjustment": -10,
+		"warningVolumePenalty": 20,
+		"categoryPenalty":      -5,
+		"final":                10,
+	}) {
+		t.Fatalf("expected weighted penalty scoreBreakdown, got %#v", posture)
+	}
+	if evaluatedPolicy, _ := posture["evaluatedPolicy"].(map[string]any); !reflect.DeepEqual(evaluatedPolicy, map[string]any{
+		"decisionTraceVersion": "v1",
+		"validationMode":       "strict",
+		"contractHash":         explainDiagnosticPostureContractHash(explainDiagnosticPostureScoreComputationConfig()),
+		"contractComponents":   explainDiagnosticPostureContractComponents(explainDiagnosticPostureScoreComputationConfig()),
+		"compatibility": map[string]any{
+			"compatibilityVersion":       "v1",
+			"contractEpoch":              "contract.v1",
+			"baselineContractEpoch":      "contract.v1",
+			"contractEpochTransition":    "unchanged",
+			"remediationEpoch":           "remediation.v1",
+			"baselineRemediationEpoch":   "remediation.v1",
+			"remediationEpochTransition": "unchanged",
+			"epochTransitionRule":        "epoch_transition_none",
+			"epochTransitionReason":      "contract and remediation epochs match baseline",
+			"epochEvaluationOrder":       []string{"contract_epoch", "remediation_epoch"},
+			"epochReasonCodes": map[string]string{
+				"contract_epoch":    "contract_epoch_advanced_from_baseline",
+				"remediation_epoch": "remediation_epoch_advanced_from_baseline",
+			},
+			"epochCompatibility": map[string]bool{
+				"contract_epoch":    true,
+				"remediation_epoch": true,
+			},
+			"epochFailedTransitions":       []string{},
+			"epochFailedTransitionReasons": map[string]string{},
+			"epochTransitionSummary":       "baseline_aligned",
+			"epochImpactEvaluationOrder":   []string{"epoch_compatible_if_no_failed_transitions", "epoch_breaking_on_contract_transition", "epoch_breaking_on_remediation_transition", "epoch_unknown_default"},
+			"epochImpactByCheck": map[string]string{
+				"contract_epoch":    "breaking",
+				"remediation_epoch": "breaking",
+			},
+			"epochImpactClassification": "compatible",
+			"epochImpactRule":           "epoch_compatible_if_no_failed_transitions",
+			"epochImpactReason":         "no epoch transition drift detected",
+			"epochRemediationByCheck": map[string]string{
+				"contract_epoch":    "upgrade parser/runtime consumers to a contract.v1-compatible epoch before parsing evaluatedPolicy compatibility metadata",
+				"remediation_epoch": "refresh remediation consumers to the remediation.v1 schema before applying compatibility remediation guidance",
+			},
+			"epochRemediationPriorityOrder":   []string{"contract_epoch", "remediation_epoch"},
+			"epochRemediationSummary":         "none_required",
+			"epochRemediationActions":         []string{},
+			"epochRemediationActionPlan":      []map[string]any{},
+			"epochRemediationPlanHash":        explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochStateID":                    explainDiagnosticPostureHashString("contractEpoch=contract.v1;remediationEpoch=remediation.v1;"),
+			"baselineEpochStateID":            explainDiagnosticPostureHashString("contractEpoch=contract.v1;remediationEpoch=remediation.v1;"),
+			"epochDriftStatus":                "unchanged",
+			"epochDriftFields":                []string{},
+			"epochCompatibilityFingerprint":   explainDiagnosticPostureHashString("epochStateID=" + explainDiagnosticPostureHashString("contractEpoch=contract.v1;remediationEpoch=remediation.v1;") + ";" + "baselineEpochStateID=" + explainDiagnosticPostureHashString("contractEpoch=contract.v1;remediationEpoch=remediation.v1;") + ";" + "driftStatus=unchanged;" + "driftFields=;" + "impact=compatible;" + "remediationPlanHash=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";"),
+			"epochConsistencyEvaluationOrder": []string{"transition_summary_matches_failed_transitions", "drift_status_matches_state_ids", "impact_matches_failed_transitions", "remediation_summary_matches_actions"},
+			"epochConsistencyReasonCodes": map[string]string{
+				"transition_summary_matches_failed_transitions": "epoch_transition_summary_mismatch",
+				"drift_status_matches_state_ids":                "epoch_drift_status_mismatch",
+				"impact_matches_failed_transitions":             "epoch_impact_mismatch",
+				"remediation_summary_matches_actions":           "epoch_remediation_summary_mismatch",
+			},
+			"epochConsistencyChecks": map[string]bool{
+				"transition_summary_matches_failed_transitions": true,
+				"drift_status_matches_state_ids":                true,
+				"impact_matches_failed_transitions":             true,
+				"remediation_summary_matches_actions":           true,
+			},
+			"epochConsistencyFailedChecks":  []string{},
+			"epochConsistencyFailedReasons": map[string]string{},
+			"epochConsistencySummary":       "consistent",
+			"epochConsistencyFingerprint":   explainDiagnosticPostureHashString("summary=consistent;failedChecks=;driftStatus=unchanged;impact=compatible;remediationSummary=none_required;"),
+			"epochRuleCatalogVersion":       "v1",
+			"epochRuleCatalog": map[string]map[string]string{
+				"transition": {
+					"epoch_transition_none":     "contract and remediation epochs match baseline",
+					"epoch_transition_detected": "contract or remediation epoch advanced from baseline",
+				},
+				"impact": {
+					"epoch_compatible_if_no_failed_transitions": "no epoch transition drift detected",
+					"epoch_breaking_on_contract_transition":     "contract epoch advanced relative to baseline",
+					"epoch_breaking_on_remediation_transition":  "remediation epoch advanced relative to baseline",
+				},
+				"consistency": {
+					"consistent":   "epoch consistency checks passed",
+					"inconsistent": "epoch consistency checks failed",
+				},
+			},
+			"epochMatchedRuleLookup": map[string]map[string]any{
+				"transition": {
+					"rule":           "epoch_transition_none",
+					"expectedReason": "contract and remediation epochs match baseline",
+					"actualReason":   "contract and remediation epochs match baseline",
+					"matchesCatalog": true,
+				},
+				"impact": {
+					"rule":           "epoch_compatible_if_no_failed_transitions",
+					"expectedReason": "no epoch transition drift detected",
+					"actualReason":   "no epoch transition drift detected",
+					"matchesCatalog": true,
+				},
+				"consistency": {
+					"rule":           "consistent",
+					"expectedReason": "epoch consistency checks passed",
+					"actualReason":   "epoch consistency checks passed",
+					"matchesCatalog": true,
+				},
+			},
+			"epochRuleCatalogConsistent": true,
+			"epochRuleCatalogMismatches": []string{},
+			"epochContractVersion":       "v1",
+			"epochContractHash": explainDiagnosticPostureHashString(
+				"version=v1;" +
+					"ruleCatalogHash=" + explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;") + ";" +
+					"evaluationOrderHash=" + explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;") + ";" +
+					"consistencyCheckSchemaHash=" + explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;") + ";",
+			),
+			"epochContractComponents": map[string]any{
+				"version":                    "v1",
+				"ruleCatalogHash":            explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;"),
+				"evaluationOrderHash":        explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;"),
+				"consistencyCheckSchemaHash": explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;"),
+				"overallHash": explainDiagnosticPostureHashString(
+					"version=v1;" +
+						"ruleCatalogHash=" + explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;") + ";" +
+						"evaluationOrderHash=" + explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;") + ";" +
+						"consistencyCheckSchemaHash=" + explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;") + ";",
+				),
+			},
+			"epochContractCompatibility": map[string]bool{
+				"ruleCatalogPresent":       true,
+				"evaluationOrderPresent":   true,
+				"consistencySchemaPresent": true,
+				"overallHashPresent":       true,
+			},
+			"epochContractCheckEvaluationOrder": []string{"rule_catalog_present", "evaluation_order_present", "consistency_schema_present", "overall_hash_present"},
+			"epochContractCheckReasonCodes": map[string]string{
+				"rule_catalog_present":       "missing_epoch_rule_catalog_hash",
+				"evaluation_order_present":   "missing_epoch_evaluation_order_hash",
+				"consistency_schema_present": "missing_epoch_consistency_schema_hash",
+				"overall_hash_present":       "missing_epoch_contract_overall_hash",
+			},
+			"epochContractCheckStatus": map[string]bool{
+				"rule_catalog_present":       true,
+				"evaluation_order_present":   true,
+				"consistency_schema_present": true,
+				"overall_hash_present":       true,
+			},
+			"epochContractFailedChecks":       []string{},
+			"epochContractFailedCheckReasons": map[string]string{},
+			"epochContractCheckSummary":       "all_checks_passed",
+			"epochContractCheckFingerprint": explainDiagnosticPostureHashString(
+				"summary=all_checks_passed;" +
+					"failedChecks=;" +
+					"overallHash=" + explainDiagnosticPostureHashString(
+					"version=v1;"+
+						"ruleCatalogHash="+explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;")+";"+
+						"evaluationOrderHash="+explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;")+";"+
+						"consistencyCheckSchemaHash="+explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;")+";",
+				) + ";",
+			),
+			"epochContractFullyCompatible":               true,
+			"epochContractImpactEvaluationOrder":         []string{"compatible_if_all_contract_checks_pass", "breaking_if_contract_components_missing", "unknown_default"},
+			"epochContractImpactByCheck":                 map[string]string{"rule_catalog_present": "breaking", "evaluation_order_present": "breaking", "consistency_schema_present": "breaking", "overall_hash_present": "breaking"},
+			"epochContractImpactClassification":          "compatible",
+			"epochContractImpactRule":                    "compatible_if_all_contract_checks_pass",
+			"epochContractImpactReason":                  "all epoch-contract checks passed",
+			"epochContractRemediationByCheck":            map[string]string{"rule_catalog_present": "regenerate epoch rule catalog metadata and persist a non-empty epoch rule catalog hash", "evaluation_order_present": "restore epoch evaluation-order metadata and persist a non-empty evaluation-order hash", "consistency_schema_present": "regenerate epoch consistency-check schema metadata and persist a non-empty schema hash", "overall_hash_present": "recompute epoch contract overall hash after restoring contract component hashes"},
+			"epochContractRemediationSeverityByCheck":    map[string]string{"rule_catalog_present": "high", "evaluation_order_present": "high", "consistency_schema_present": "high", "overall_hash_present": "high"},
+			"epochContractRemediationRequirementByCheck": map[string]string{"rule_catalog_present": "required", "evaluation_order_present": "required", "consistency_schema_present": "required", "overall_hash_present": "required"},
+			"epochContractRemediationPriorityOrder":      []string{"rule_catalog_present", "evaluation_order_present", "consistency_schema_present", "overall_hash_present"},
+			"epochContractRemediationSummary":            "none_required",
+			"epochContractRemediationUrgency":            "none",
+			"epochContractRemediationBundleID":           explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none"),
+			"epochContractRemediationActions":            []string{},
+			"epochContractRemediationPlanHash":           explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochContractRemediationFingerprint":        explainDiagnosticPostureHashString("impact=compatible;summary=none_required;planHash=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";"),
+			"baselineEpochContractCheckSummary":          "all_checks_passed",
+			"baselineEpochContractImpactClassification":  "compatible",
+			"baselineEpochContractRemediationSummary":    "none_required",
+			"baselineEpochContractRemediationUrgency":    "none",
+			"baselineEpochContractRemediationBundleID":   explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none"),
+			"baselineEpochContractRemediationPlanHash":   explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochContractRemediationBundleDriftStatus":  "unchanged",
+			"epochContractRemediationPlanDriftStatus":    "unchanged",
+			"epochContractRemediationDriftSummary":       "baseline_aligned",
+			"epochContractRemediationDriftRule":          "baseline_epoch_contract_bundle_and_plan_match",
+			"epochContractRemediationDriftReason":        "current epoch-contract remediation bundle and plan hash match baseline compatible state",
+			"epochContractRemediationDriftFields":        []string{},
+			"epochContractRemediationDriftFingerprint": explainDiagnosticPostureHashString(
+				"baselineBundle=" + explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none") + ";" +
+					"currentBundle=" + explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none") + ";" +
+					"baselinePlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";" +
+					"currentPlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";" +
+					"bundleDrift=unchanged;" +
+					"planDrift=unchanged;",
+			),
+			"epochContractCheckDriftStatus": "unchanged",
+			"epochContractCheckDriftRule":   "baseline_epoch_contract_check_state_matches",
+			"epochContractCheckDriftReason": "epoch-contract check, impact, and remediation summaries match baseline",
+			"epochContractCheckDriftFields": []string{},
+			"epochContractCheckDriftFingerprint": explainDiagnosticPostureHashString(
+				"baselineCheckSummary=all_checks_passed;" +
+					"currentCheckSummary=all_checks_passed;" +
+					"baselineImpact=compatible;" +
+					"currentImpact=compatible;" +
+					"baselineRemediationSummary=none_required;" +
+					"currentRemediationSummary=none_required;" +
+					"driftStatus=unchanged;" +
+					"driftFields=;",
+			),
+			"epochContractGovernanceEvaluationOrder": []string{"stable_if_compatible_and_baseline_aligned", "degraded_if_incompatible", "degraded_if_check_or_remediation_drift", "unknown_default"},
+			"epochContractGovernanceChecks": map[string]bool{
+				"contract_fully_compatible":    true,
+				"check_state_baseline_aligned": true,
+				"remediation_baseline_aligned": true,
+			},
+			"epochContractGovernanceFailedChecks":  []string{},
+			"epochContractGovernanceFailedReasons": map[string]string{},
+			"epochContractGovernanceState":         "stable",
+			"epochContractGovernanceRule":          "stable_if_compatible_and_baseline_aligned",
+			"epochContractGovernanceReason":        "epoch-contract checks are compatible and both check/remediation baselines are aligned",
+			"epochContractGovernanceFingerprint": explainDiagnosticPostureHashString(
+				"state=stable;" +
+					"rule=stable_if_compatible_and_baseline_aligned;" +
+					"failedChecks=;" +
+					"checkDrift=unchanged;" +
+					"remediationDrift=baseline_aligned;",
+			),
+			"epochContractGovernanceRemediationByCheck": map[string]string{
+				"contract_fully_compatible":    "restore required epoch-contract component hashes and recompute epoch contract compatibility artifacts",
+				"check_state_baseline_aligned": "investigate epoch-contract check summary drift and realign check/impact/remediation summaries to baseline",
+				"remediation_baseline_aligned": "investigate remediation bundle/plan drift and restore baseline-compatible remediation metadata",
+			},
+			"epochContractGovernanceRemediationPriorityOrder":      []string{"contract_fully_compatible", "check_state_baseline_aligned", "remediation_baseline_aligned"},
+			"epochContractGovernanceRemediationActions":            []string{},
+			"epochContractGovernanceRemediationSummary":            "none_required",
+			"epochContractGovernanceRemediationUrgency":            "none",
+			"epochContractGovernanceRemediationPlanHash":           explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochContractGovernanceRemediationFingerprint":        explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";"),
+			"baselineEpochContractGovernanceRemediationSummary":    "none_required",
+			"baselineEpochContractGovernanceRemediationUrgency":    "none",
+			"baselineEpochContractGovernanceRemediationPlanHash":   explainDiagnosticPostureHashString("summary=none_required;actions=;"),
+			"epochContractGovernanceRemediationSummaryDriftStatus": "unchanged",
+			"epochContractGovernanceRemediationUrgencyDriftStatus": "unchanged",
+			"epochContractGovernanceRemediationPlanDriftStatus":    "unchanged",
+			"epochContractGovernanceRemediationDriftSummary":       "baseline_aligned",
+			"epochContractGovernanceRemediationDriftRule":          "baseline_governance_remediation_matches",
+			"epochContractGovernanceRemediationDriftReason":        "epoch-contract governance remediation summary, urgency, and plan hash match baseline",
+			"epochContractGovernanceRemediationDriftFields":        []string{},
+			"epochContractGovernanceRemediationDriftFingerprint": explainDiagnosticPostureHashString(
+				"baselineSummary=none_required;" +
+					"currentSummary=none_required;" +
+					"baselineUrgency=none;" +
+					"currentUrgency=none;" +
+					"baselinePlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";" +
+					"currentPlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";" +
+					"driftFields=;",
+			),
+			"epochContractGovernanceRemediationVerdictEvaluationOrder": []string{"stable_if_governance_stable_and_remediation_baseline_aligned", "degraded_if_governance_degraded", "degraded_if_governance_remediation_drift_detected", "unknown_default"},
+			"epochContractGovernanceRemediationVerdictChecks": map[string]bool{
+				"governance_state_stable":                      true,
+				"governance_remediation_baseline_aligned":      true,
+				"governance_remediation_plan_baseline_aligned": true,
+			},
+			"epochContractGovernanceRemediationVerdictFailedChecks":  []string{},
+			"epochContractGovernanceRemediationVerdictFailedReasons": map[string]string{},
+			"epochContractGovernanceRemediationVerdictState":         "stable",
+			"epochContractGovernanceRemediationVerdictRule":          "stable_if_governance_stable_and_remediation_baseline_aligned",
+			"epochContractGovernanceRemediationVerdictReason":        "governance is stable and governance-remediation metadata is baseline aligned",
+			"epochContractGovernanceRemediationVerdictFingerprint": explainDiagnosticPostureHashString(
+				"state=stable;" +
+					"rule=stable_if_governance_stable_and_remediation_baseline_aligned;" +
+					"failedChecks=;" +
+					"driftSummary=baseline_aligned;" +
+					"planDrift=unchanged;",
+			),
+			"epochContractGovernanceRemediationVerdictSeverityByCheck": map[string]string{
+				"governance_state_stable":                      "high",
+				"governance_remediation_baseline_aligned":      "medium",
+				"governance_remediation_plan_baseline_aligned": "high",
+			},
+			"epochContractGovernanceRemediationVerdictRequirementByCheck": map[string]string{
+				"governance_state_stable":                      "required",
+				"governance_remediation_baseline_aligned":      "required",
+				"governance_remediation_plan_baseline_aligned": "required",
+			},
+			"epochContractGovernanceRemediationVerdictBundleID":          explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none"),
+			"baselineEpochContractGovernanceRemediationVerdictBundleID":  explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none"),
+			"epochContractGovernanceRemediationVerdictBundleDriftStatus": "unchanged",
+			"epochContractGovernanceLineageVersion":                      "v1",
+			"epochContractGovernanceLineageComponents": map[string]string{
+				"governanceFingerprint":                   explainDiagnosticPostureHashString("state=stable;" + "rule=stable_if_compatible_and_baseline_aligned;" + "failedChecks=;" + "checkDrift=unchanged;" + "remediationDrift=baseline_aligned;"),
+				"governanceRemediationFingerprint":        explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";"),
+				"governanceRemediationDriftFingerprint":   explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";currentPlan=" + explainDiagnosticPostureHashString("summary=none_required;actions=;") + ";driftFields=;"),
+				"governanceRemediationVerdictFingerprint": explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;"),
+			},
+			"epochContractGovernanceLineageHash": explainDiagnosticPostureHashString(
+				"version=v1;" +
+					"governanceFingerprint=" + explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;") + ";" +
+					"governanceRemediationFingerprint=" + explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";") + ";" +
+					"governanceRemediationDriftFingerprint=" + explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;") + ";" +
+					"governanceRemediationVerdictFingerprint=" + explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;") + ";",
+			),
+			"baselineEpochContractGovernanceLineageHash": explainDiagnosticPostureHashString(
+				"version=v1;" +
+					"governanceFingerprint=" + explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;") + ";" +
+					"governanceRemediationFingerprint=" + explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";") + ";" +
+					"governanceRemediationDriftFingerprint=" + explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;") + ";" +
+					"governanceRemediationVerdictFingerprint=" + explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;") + ";",
+			),
+			"epochContractGovernanceLineageDriftStatus":  "unchanged",
+			"epochContractGovernanceLineageDriftSummary": "baseline_aligned",
+			"epochContractGovernanceLineageDriftRule":    "baseline_governance_lineage_matches",
+			"epochContractGovernanceLineageDriftReason":  "governance-remediation lineage metadata matches baseline",
+			"epochContractGovernanceLineageDriftFields":  []string{},
+			"epochContractGovernanceLineageDriftFingerprint": explainDiagnosticPostureHashString(
+				"baselineLineageHash=" + explainDiagnosticPostureHashString("version=v1;governanceFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;")+";governanceRemediationFingerprint="+explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";")+";governanceRemediationDriftFingerprint="+explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;")+";governanceRemediationVerdictFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;")+";") + ";" +
+					"currentLineageHash=" + explainDiagnosticPostureHashString("version=v1;governanceFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;")+";governanceRemediationFingerprint="+explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";")+";governanceRemediationDriftFingerprint="+explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;")+";governanceRemediationVerdictFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;")+";") + ";" +
+					"baselineBundle=" + explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none") + ";" +
+					"currentBundle=" + explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none") + ";" +
+					"driftFields=;",
+			),
+			"epochContractGovernanceLineageCheckEvaluationOrder": []string{"lineage_hash_present", "lineage_component_hashes_present", "lineage_drift_status_matches_hashes"},
+			"epochContractGovernanceLineageChecks": map[string]bool{
+				"lineage_hash_present":                true,
+				"lineage_component_hashes_present":    true,
+				"lineage_drift_status_matches_hashes": true,
+			},
+			"epochContractGovernanceLineageFailedChecks":  []string{},
+			"epochContractGovernanceLineageFailedReasons": map[string]string{},
+			"epochContractGovernanceLineageSummary":       "consistent",
+			"epochContractGovernanceLineageFingerprint": explainDiagnosticPostureHashString(
+				"summary=consistent;" +
+					"lineageHash=" + explainDiagnosticPostureHashString("version=v1;governanceFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_compatible_and_baseline_aligned;failedChecks=;checkDrift=unchanged;remediationDrift=baseline_aligned;")+";governanceRemediationFingerprint="+explainDiagnosticPostureHashString("state=stable;summary=none_required;urgency=none;planHash="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";")+";governanceRemediationDriftFingerprint="+explainDiagnosticPostureHashString("baselineSummary=none_required;currentSummary=none_required;baselineUrgency=none;currentUrgency=none;baselinePlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";currentPlan="+explainDiagnosticPostureHashString("summary=none_required;actions=;")+";driftFields=;")+";governanceRemediationVerdictFingerprint="+explainDiagnosticPostureHashString("state=stable;rule=stable_if_governance_stable_and_remediation_baseline_aligned;failedChecks=;driftSummary=baseline_aligned;planDrift=unchanged;")+";") + ";" +
+					"failedChecks=;",
+			),
+			"epochContractGovernanceLineageVerdictEvaluationOrder": []string{"stable_if_lineage_consistent_and_baseline_aligned", "degraded_if_lineage_inconsistent", "degraded_if_lineage_baseline_drifted", "unknown_default"},
+			"epochContractGovernanceLineageVerdictChecks": map[string]bool{
+				"lineage_consistent":              true,
+				"lineage_baseline_aligned":        true,
+				"lineage_drift_status_consistent": true,
+			},
+			"epochContractGovernanceLineageVerdictFailedChecks":  []string{},
+			"epochContractGovernanceLineageVerdictFailedReasons": map[string]string{},
+			"epochContractGovernanceLineageVerdictState":         "stable",
+			"epochContractGovernanceLineageVerdictRule":          "stable_if_lineage_consistent_and_baseline_aligned",
+			"epochContractGovernanceLineageVerdictReason":        "governance lineage is consistent and baseline aligned",
+			"epochContractGovernanceLineageVerdictFingerprint": explainDiagnosticPostureHashString(
+				"state=stable;" +
+					"rule=stable_if_lineage_consistent_and_baseline_aligned;" +
+					"failedChecks=;" +
+					"lineageSummary=consistent;" +
+					"lineageDrift=baseline_aligned;",
+			),
+			"epochContractGovernanceLineageVerdictSeverityByCheck": map[string]string{
+				"lineage_consistent":              "high",
+				"lineage_baseline_aligned":        "high",
+				"lineage_drift_status_consistent": "medium",
+			},
+			"epochContractGovernanceLineageVerdictRequirementByCheck": map[string]string{
+				"lineage_consistent":              "required",
+				"lineage_baseline_aligned":        "required",
+				"lineage_drift_status_consistent": "required",
+			},
+			"epochContractGovernanceLineageVerdictSummary":                "none_required",
+			"epochContractGovernanceLineageVerdictUrgency":                "none",
+			"epochContractGovernanceLineageVerdictBundleID":               explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none"),
+			"baselineEpochContractGovernanceLineageVerdictBundleID":       explainDiagnosticPostureRemediationBundleID("stable", "none_required", "none"),
+			"epochContractGovernanceLineageVerdictBundleDriftStatus":      "unchanged",
+			"baselineEpochContractGovernanceLineageVerdictFingerprint":    explainDiagnosticPostureHashString("state=stable;rule=stable_if_lineage_consistent_and_baseline_aligned;failedChecks=;lineageSummary=consistent;lineageDrift=baseline_aligned;"),
+			"epochContractGovernanceLineageVerdictFingerprintDriftStatus": "unchanged",
+			"epochContractCompatibilitySummary":                           "epoch_contract_complete",
+			"epochContractIncompatibilityReasons":                         []string{},
+			"epochContractFingerprint": explainDiagnosticPostureHashString(
+				"summary=epoch_contract_complete;" +
+					"overallHash=" + explainDiagnosticPostureHashString(
+					"version=v1;"+
+						"ruleCatalogHash="+explainDiagnosticPostureHashString("transition.epoch_transition_none=contract and remediation epochs match baseline;transition.epoch_transition_detected=contract or remediation epoch advanced from baseline;impact.epoch_compatible_if_no_failed_transitions=no epoch transition drift detected;impact.epoch_breaking_on_contract_transition=contract epoch advanced relative to baseline;impact.epoch_breaking_on_remediation_transition=remediation epoch advanced relative to baseline;consistency.consistent=epoch consistency checks passed;consistency.inconsistent=epoch consistency checks failed;")+";"+
+						"evaluationOrderHash="+explainDiagnosticPostureHashString("epochEvaluationOrder=contract_epoch,remediation_epoch;epochImpactEvaluationOrder=epoch_compatible_if_no_failed_transitions,epoch_breaking_on_contract_transition,epoch_breaking_on_remediation_transition,epoch_unknown_default;epochConsistencyEvaluationOrder=transition_summary_matches_failed_transitions,drift_status_matches_state_ids,impact_matches_failed_transitions,remediation_summary_matches_actions;")+";"+
+						"consistencyCheckSchemaHash="+explainDiagnosticPostureHashString("transition_summary_matches_failed_transitions:bool;drift_status_matches_state_ids:bool;impact_matches_failed_transitions:bool;remediation_summary_matches_actions:bool;")+";",
+				) + ";" +
+					"reasons=;",
+			),
+			"epochTransitionFingerprint": explainDiagnosticPostureHashString(
+				"contractEpoch=contract.v1;" +
+					"baselineContractEpoch=contract.v1;" +
+					"contractTransition=unchanged;" +
+					"remediationEpoch=remediation.v1;" +
+					"baselineRemediationEpoch=remediation.v1;" +
+					"remediationTransition=unchanged;" +
+					"summary=baseline_aligned;" +
+					"failed=;",
+			),
+			"checkEvaluationOrder": []string{"version", "schema", "rule_reason_catalog", "stage_order", "stage_fragments", "overall_hash"},
+			"checkReasonCodes": map[string]string{
+				"version":             "version_mismatch",
+				"schema":              "missing_decision_trace_schema_hash",
+				"rule_reason_catalog": "missing_rule_reason_catalog_hash",
+				"stage_order":         "missing_stage_order_hash",
+				"stage_fragments":     "missing_stage_fragment",
+				"overall_hash":        "missing_overall_hash",
+			},
+			"impactEvaluationOrder": []string{"compatible_if_no_failed_checks", "breaking_on_core_contract_checks", "breaking_on_stage_fragment_gap", "unknown_default"},
+			"impactByCheck": map[string]string{
+				"version":             "breaking",
+				"schema":              "breaking",
+				"rule_reason_catalog": "breaking",
+				"stage_order":         "breaking",
+				"stage_fragments":     "breaking",
+				"overall_hash":        "breaking",
+			},
+			"checkFingerprints":           explainDiagnosticPostureContractCheckFingerprints(explainDiagnosticPostureContractComponents(explainDiagnosticPostureScoreComputationConfig())),
+			"compatibilityFingerprint":    explainDiagnosticPostureContractCompatibilityFingerprint(explainDiagnosticPostureContractCheckFingerprints(explainDiagnosticPostureContractComponents(explainDiagnosticPostureScoreComputationConfig())), []string{"version", "schema", "rule_reason_catalog", "stage_order", "stage_fragments", "overall_hash"}),
+			"versionCompatible":           true,
+			"schemaCompatible":            true,
+			"ruleReasonCatalogCompatible": true,
+			"stageOrderCompatible":        true,
+			"stageCompatibility": map[string]bool{
+				"primary":        true,
+				"confidence":     true,
+				"recommendation": true,
+				"rationale":      true,
+				"score":          true,
+				"trend":          true,
+			},
+			"stageReasonCodes": map[string]string{
+				"primary":        "missing_stage_fragment:primary",
+				"confidence":     "missing_stage_fragment:confidence",
+				"recommendation": "missing_stage_fragment:recommendation",
+				"rationale":      "missing_stage_fragment:rationale",
+				"score":          "missing_stage_fragment:score",
+				"trend":          "missing_stage_fragment:trend",
+			},
+			"overallHashPresent":   true,
+			"fullyCompatible":      true,
+			"compatibilitySummary": "contract_components_complete",
+			"impactClassification": "compatible",
+			"impactRule":           "compatible_if_no_failed_checks",
+			"impactReason":         "all compatibility checks passed",
+			"remediationVersion":   "v1",
+			"remediationByCheck": map[string]string{
+				"version":             "align compatibilityVersion and contractComponents.version with the expected parser/runtime contract version",
+				"schema":              "regenerate decisionTraceSchema metadata and ensure decisionTraceSchemaHash is present",
+				"rule_reason_catalog": "regenerate ruleReasonCatalog metadata and ensure ruleReasonCatalogHash is present",
+				"stage_order":         "restore decision-trace stageOrder metadata and ensure stageOrderHash is present",
+				"stage_fragments":     "recompute stageContractFragments for all required stages and verify fragment hashes are non-empty",
+				"overall_hash":        "rebuild contractComponents overallHash after schema/catalog/stage fragment metadata is refreshed",
+			},
+			"remediationSeverityByCheck": map[string]string{
+				"version":             "high",
+				"schema":              "high",
+				"rule_reason_catalog": "high",
+				"stage_order":         "high",
+				"stage_fragments":     "medium",
+				"overall_hash":        "high",
+			},
+			"remediationRequirementByCheck": map[string]string{
+				"version":             "required",
+				"schema":              "required",
+				"rule_reason_catalog": "required",
+				"stage_order":         "required",
+				"stage_fragments":     "required",
+				"overall_hash":        "required",
+			},
+			"remediationPriorityOrder":     []string{"version", "schema", "rule_reason_catalog", "stage_order", "stage_fragments", "overall_hash"},
+			"remediationSummary":           "none_required",
+			"remediationUrgency":           "none",
+			"remediationBundleID":          explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none"),
+			"remediationPlanHash":          explainDiagnosticPostureRemediationPlanHash([]map[string]any{}, "none_required", "none"),
+			"baselineRemediationBundleID":  explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none"),
+			"baselineRemediationPlanHash":  explainDiagnosticPostureRemediationPlanHash([]map[string]any{}, "none_required", "none"),
+			"remediationBundleDriftStatus": "unchanged",
+			"remediationPlanDriftStatus":   "unchanged",
+			"remediationDriftSummary":      "baseline_aligned",
+			"remediationDriftRule":         "baseline_bundle_and_plan_match",
+			"remediationDriftReason":       "current remediation bundle and plan hash match baseline compatible state",
+			"remediationDriftFields":       []string{},
+			"remediationDriftFingerprint":  explainDiagnosticPostureHashString("baselineBundle=" + explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none") + ";" + "currentBundle=" + explainDiagnosticPostureRemediationBundleID("compatible", "none_required", "none") + ";" + "baselinePlan=" + explainDiagnosticPostureRemediationPlanHash([]map[string]any{}, "none_required", "none") + ";" + "currentPlan=" + explainDiagnosticPostureRemediationPlanHash([]map[string]any{}, "none_required", "none") + ";" + "bundleDrift=unchanged;" + "planDrift=unchanged;"),
+			"remediationActions":           []string{},
+			"remediationActionPlan":        []map[string]any{},
+			"failedChecks":                 []string{},
+			"failedCheckReasons":           map[string]string{},
+			"incompatibilityReasons":       []string{},
+		},
+		"reasonCatalogVersion":    "v1",
+		"reasonCatalogConsistent": true,
+		"reasonCatalogMismatches": []string{},
+		"matchedReasonLookup": map[string]map[string]any{
+			"primary":        {"rule": "operator_fallback_status", "expectedReason": "operator assessment indicates fallback risk", "actualReason": "operator assessment indicates fallback risk", "matchesCatalog": true},
+			"confidence":     {"rule": "low_warning_or_multisignal", "expectedReason": "warning volume or multi-signal posture lowered confidence", "actualReason": "warning volume or multi-signal posture lowered confidence", "matchesCatalog": true},
+			"recommendation": {"rule": "operator_status_fallback", "expectedReason": "operator fallback status selected fallback-reduction recommendation", "actualReason": "operator fallback status selected fallback-reduction recommendation", "matchesCatalog": true},
+			"rationale":      {"rule": "primary_index_limited", "expectedReason": "index-limited posture uses highest-priority-code rationale", "actualReason": "index-limited posture uses highest-priority-code rationale", "matchesCatalog": true},
+			"score":          {"rule": "score_band_poor", "expectedReason": "final score mapped to poor band", "actualReason": "final score mapped to poor band", "matchesCatalog": true},
+			"trend":          {"rule": "degrading_categories", "expectedReason": "planner or index warning categories triggered degrading trend", "actualReason": "planner or index warning categories triggered degrading trend", "matchesCatalog": true},
+		},
+		"decisionTrace": []map[string]any{
+			{"stage": "primary", "rule": "operator_fallback_status", "result": "index_limited", "reason": "operator assessment indicates fallback risk", "inputs": map[string]any{"overallStatus": "mixed_domain_risk", "totalWarnings": 4, "byCategory": map[string]int{"index": 2, "operator": 2}}},
+			{"stage": "confidence", "rule": "low_warning_or_multisignal", "result": "low", "reason": "warning volume or multi-signal posture lowered confidence", "inputs": map[string]any{"primary": "index_limited", "overallStatus": "mixed_domain_risk", "totalWarnings": 4, "signalCount": 2}},
+			{"stage": "recommendation", "rule": "operator_status_fallback", "result": "reduce_operator_fallback_shapes", "reason": "operator fallback status selected fallback-reduction recommendation", "inputs": map[string]any{"primary": "index_limited", "overallStatus": "mixed_domain_risk", "totalWarnings": 4, "signals": []string{"index", "operator"}}},
+			{"stage": "rationale", "rule": "primary_index_limited", "result": "Index warnings dominate diagnostics; highestPriorityCode=%s", "reason": "index-limited posture uses highest-priority-code rationale", "inputs": map[string]any{"primary": "index_limited", "highestPriorityCode": "MISSING_PROPERTY_INDEX", "overallStatus": "mixed_domain_risk", "signals": []string{"index", "operator"}}},
+			{"stage": "score", "rule": "score_band_poor", "result": "poor", "reason": "final score mapped to poor band", "inputs": map[string]any{"baseRule": "base_primary_index_limited", "confidenceAdjustmentRule": "confidence_adjustment_low", "warningVolumePenaltyRule": "warning_penalty_applied", "categoryPenaltyRule": "repeated_category_weighted_penalty", "rawScoreBeforeClamp": 10, "clampRule": "within_bounds"}},
+			{"stage": "trend", "rule": "degrading_categories", "result": "degrading", "reason": "planner or index warning categories triggered degrading trend", "inputs": map[string]any{"score": 10, "degradingCategories": []string{"planner", "index"}, "byCategory": map[string]int{"index": 2, "operator": 2}, "trendScoreRule": "trend_score_degrading"}},
+		},
+		"primaryRule":                   "operator_fallback_status",
+		"primaryEvaluationOrder":        []string{"category_priority_index", "operator_fallback_status"},
+		"confidenceRule":                "low_warning_or_multisignal",
+		"recommendationRule":            "operator_status_fallback",
+		"recommendationEvaluationOrder": []string{"primary_index", "operator_status_fallback"},
+		"rationaleRule":                 "primary_index_limited",
+		"rationaleTemplate":             "Index warnings dominate diagnostics; highestPriorityCode=%s",
+		"rationaleInputs": map[string]any{
+			"highestPriorityCode": "MISSING_PROPERTY_INDEX",
+			"overallStatus":       "mixed_domain_risk",
+			"signals":             []string{"index", "operator"},
+			"totalWarnings":       4,
+		},
+		"scoreRuleTrace": map[string]any{
+			"baseRule":                 "base_primary_index_limited",
+			"confidenceAdjustmentRule": "confidence_adjustment_low",
+			"warningVolumePenaltyRule": "warning_penalty_applied",
+			"categoryPenaltyContributions": map[string]int{
+				"index":    -3,
+				"operator": -2,
+			},
+			"rawScoreBeforeClamp": 10,
+			"clampRule":           "within_bounds",
+			"scoreBandRule":       "score_band_poor",
+		},
+		"trendRuleTrace": map[string]any{
+			"trendRule":      "degrading_categories",
+			"trendScoreRule": "trend_score_degrading",
+			"trendInputs": map[string]any{
+				"score":               10,
+				"degradingCategories": []string{"planner", "index"},
+				"byCategory": map[string]int{
+					"index":    2,
+					"operator": 2,
+				},
+			},
+		},
+	}) {
+		t.Fatalf("expected weighted-penalty evaluatedPolicy, got %#v", posture)
 	}
 }
 
@@ -5052,6 +7140,12 @@ func TestExecutePrintSuggestedFriendsCollectDistinctFastPath(t *testing.T) {
 	if counters["runtime.suggested_friends.print.fastpath_applied"] <= 0 {
 		t.Fatalf("expected print fast path counter > 0, counters=%v", counters)
 	}
+	if counters["fast_path.collect_distinct.typed_scalar_key_used"] <= 0 {
+		t.Fatalf("expected typed scalar distinct key counter > 0, counters=%v", counters)
+	}
+	if counters["fast_path.collect_distinct.typed_scalar_property_extract"]+counters["fast_path.collect_distinct.typed_scalar_property_extract_fallback"] <= 0 {
+		t.Fatalf("expected typed scalar extract path accounting > 0, counters=%v", counters)
+	}
 }
 
 func TestExecuteCollectDistinctSamePropertyFastPathGeneralShape(t *testing.T) {
@@ -5162,6 +7256,70 @@ func TestExecuteCollectDistinctSamePropertyFastPathGeneralShape(t *testing.T) {
 	}
 	if counters["runtime.collect_distinct_same_property.fastpath_applied"] <= 0 {
 		t.Fatalf("expected generalized fast path counter > 0, counters=%v", counters)
+	}
+	if counters["fast_path.collect_distinct.typed_scalar_key_used"] <= 0 {
+		t.Fatalf("expected typed scalar distinct key counter > 0, counters=%v", counters)
+	}
+	if counters["fast_path.collect_distinct.typed_scalar_property_extract"]+counters["fast_path.collect_distinct.typed_scalar_property_extract_fallback"] <= 0 {
+		t.Fatalf("expected typed scalar extract path accounting > 0, counters=%v", counters)
+	}
+}
+
+func TestExecuteDistinctOrderByEmitsOperatorTypedCounters(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: map[string][]byte{"handle": []byte("amy")}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"handle": []byte("ben")}},
+			{Tenant: "acme", ID: "u3", Labels: []string{"User"}, Properties: map[string][]byte{"handle": []byte("cai")}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "k1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "k2", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "k3", Type: "KNOWS", SrcID: "u1", DstID: "u3"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdge(ctx, edge); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (src:User)-[:KNOWS]->(dst:User) RETURN DISTINCT src.handle AS person, dst.handle AS suggested ORDER BY person, suggested")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme", "emit_runtime_counters": true})
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("expected 2 rows, got %#v", res.Rows)
+	}
+	counters, err := runtimeCountersFromWarnings(res.Warnings)
+	if err != nil {
+		t.Fatalf("decode runtime counters failed: %v", err)
+	}
+	if counters["runtime.operator.project.distinct.row_key.typed"] <= 0 {
+		t.Fatalf("expected typed project distinct row key counter > 0, counters=%v", counters)
+	}
+	if counters["runtime.operator.sort.scalar_compare.typed"] <= 0 {
+		t.Fatalf("expected typed sort compare counter > 0, counters=%v", counters)
 	}
 }
 
@@ -10829,6 +12987,23 @@ func TestDecodeStoredPropertyValuePreservesWhitespace(t *testing.T) {
 	}
 	if got := decodeStoredPropertyValue([]byte("\nFoo\n")); got != "\nFoo\n" {
 		t.Fatalf("expected preserved newlines, got %#v", got)
+	}
+}
+
+func TestEvalEdgeFieldTypedScalarEnvelope(t *testing.T) {
+	tag, payload, err := typedvalue.Encode(int64(42))
+	if err != nil {
+		t.Fatalf("typedvalue encode failed: %v", err)
+	}
+	encoded := append([]byte{0xFF, 'T', 'V', 0x01, byte(tag)}, payload...)
+	edge := &graph.Edge{Properties: graph.PropertyMap{"weight": encoded}}
+
+	got, err := evalEdgeField(edge, "weight")
+	if err != nil {
+		t.Fatalf("evalEdgeField failed: %v", err)
+	}
+	if got != int64(42) {
+		t.Fatalf("expected typed int64 decode, got %#v", got)
 	}
 }
 

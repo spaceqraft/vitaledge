@@ -161,32 +161,32 @@ func PropertyEdgePrefix(tenant, schema, property string) []byte {
 	return buildPrefix(propertyEdgePrefix, tenant, schema, property)
 }
 
-func PropertyIndexKey(tenant, schema, property string, encodedValue []byte, entityID string) []byte {
-	return buildKey(indexPrefix, tenant, schema, property, hex.EncodeToString(encodedValue), entityID)
+func PropertyIndexKey(tenant, schema, property, typeSegment string, encodedValue []byte, entityID string) []byte {
+	return buildKey(indexPrefix, tenant, schema, property, typeSegment, hex.EncodeToString(encodedValue), entityID)
 }
 
 func PropertyIndexPrefix(tenant, schema, property string) []byte {
 	return buildPrefix(indexPrefix, tenant, schema, property)
 }
 
-func PropertyIndexValuePrefix(tenant, schema, property string, encodedValue []byte) []byte {
-	return buildPrefix(indexPrefix, tenant, schema, property, hex.EncodeToString(encodedValue))
+func PropertyIndexValuePrefix(tenant, schema, property, typeSegment string, encodedValue []byte) []byte {
+	return buildPrefix(indexPrefix, tenant, schema, property, typeSegment, hex.EncodeToString(encodedValue))
 }
 
 func PropertyIndexNumericPrefix(tenant, schema, property string) []byte {
-	return buildPrefix(indexNumPrefix, tenant, schema, property)
+	return buildPrefix(indexNumPrefix, tenant, schema, property, "numeric")
 }
 
 func PropertyIndexBooleanPrefix(tenant, schema, property string) []byte {
-	return buildPrefix(indexPrefix+"b", tenant, schema, property)
+	return buildPrefix(indexPrefix+"b", tenant, schema, property, "boolean")
 }
 
 func PropertyIndexBooleanKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
-	return buildKey(indexPrefix+"b", tenant, schema, property, hex.EncodeToString(orderedValue), entityID)
+	return buildKey(indexPrefix+"b", tenant, schema, property, "boolean", hex.EncodeToString(orderedValue), entityID)
 }
 
 func PropertyIndexBooleanValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
-	return buildPrefix(indexPrefix+"b", tenant, schema, property, hex.EncodeToString(orderedValue))
+	return buildPrefix(indexPrefix+"b", tenant, schema, property, "boolean", hex.EncodeToString(orderedValue))
 }
 
 func PropertyIndexBooleanValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {
@@ -194,15 +194,15 @@ func PropertyIndexBooleanValueUpperBound(tenant, schema, property string, ordere
 }
 
 func PropertyIndexDateTimePrefix(tenant, schema, property string) []byte {
-	return buildPrefix(indexPrefix+"t", tenant, schema, property)
+	return buildPrefix(indexPrefix+"t", tenant, schema, property, "datetime")
 }
 
 func PropertyIndexDateTimeKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
-	return buildKey(indexPrefix+"t", tenant, schema, property, hex.EncodeToString(orderedValue), entityID)
+	return buildKey(indexPrefix+"t", tenant, schema, property, "datetime", hex.EncodeToString(orderedValue), entityID)
 }
 
 func PropertyIndexDateTimeValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
-	return buildPrefix(indexPrefix+"t", tenant, schema, property, hex.EncodeToString(orderedValue))
+	return buildPrefix(indexPrefix+"t", tenant, schema, property, "datetime", hex.EncodeToString(orderedValue))
 }
 
 func PropertyIndexDateTimeValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {
@@ -210,11 +210,11 @@ func PropertyIndexDateTimeValueUpperBound(tenant, schema, property string, order
 }
 
 func PropertyIndexNumericKey(tenant, schema, property string, orderedValue []byte, entityID string) []byte {
-	return buildKey(indexNumPrefix, tenant, schema, property, hex.EncodeToString(orderedValue), entityID)
+	return buildKey(indexNumPrefix, tenant, schema, property, "numeric", hex.EncodeToString(orderedValue), entityID)
 }
 
 func PropertyIndexNumericValuePrefix(tenant, schema, property string, orderedValue []byte) []byte {
-	return buildPrefix(indexNumPrefix, tenant, schema, property, hex.EncodeToString(orderedValue))
+	return buildPrefix(indexNumPrefix, tenant, schema, property, "numeric", hex.EncodeToString(orderedValue))
 }
 
 func PropertyIndexNumericValueUpperBound(tenant, schema, property string, orderedValue []byte) []byte {

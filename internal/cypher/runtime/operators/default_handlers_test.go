@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"strings"
@@ -2615,6 +2616,138 @@ func TestProjectHandlerDistinct(t *testing.T) {
 	}
 }
 
+func TestProjectionDistinctRowKeyTypedScalarMultiColumnStability(t *testing.T) {
+	left := map[string]any{"a": 1, "b": "x", "c": true}
+	right := map[string]any{"c": true, "b": "x", "a": 1}
+	different := map[string]any{"a": 1, "b": "x", "c": false}
+
+	leftKey := projectionDistinctRowKey(left)
+	rightKey := projectionDistinctRowKey(right)
+	if leftKey != rightKey {
+		t.Fatalf("expected stable typed scalar row key across map order, left=%q right=%q", leftKey, rightKey)
+	}
+	if projectionDistinctRowKey(different) == leftKey {
+		t.Fatalf("expected differing scalar rows to produce different keys")
+	}
+}
+
+func TestProjectHandlerDistinctAcrossScalarColumns(t *testing.T) {
+	h := NewProjectHandler()
+	state := &State{Rows: []map[string]any{
+		{"a": 1, "b": "x", "c": true},
+		{"a": 1, "b": "x", "c": true},
+		{"a": 1, "b": "x", "c": false},
+		{"a": 2, "b": "y", "c": true},
+	}}
+
+	err := h.Execute("p7-scalar-distinct", map[string]any{
+		"items":    []string{"a", "b", "c"},
+		"distinct": true,
+	}, state)
+	if err != nil {
+		t.Fatalf("project execute failed: %v", err)
+	}
+	if len(state.Rows) != 3 {
+		t.Fatalf("expected deduplicated rows across scalar columns, got %#v", state.Rows)
+	}
+}
+
+func BenchmarkProjectionDistinctRowKeyScalarMultiColumn(b *testing.B) {
+	row := map[string]any{"a": 42, "b": "alice", "c": true, "d": int64(1001)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = projectionDistinctRowKey(row)
+	}
+}
+
+func BenchmarkStableRowKeyScalarMultiColumn(b *testing.B) {
+	row := map[string]any{"a": 42, "b": "alice", "c": true, "d": int64(1001)}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = stableRowKey(row)
+	}
+}
+
+func BenchmarkEvalProjectionAggregateExprCountDistinctStarScalarRows(b *testing.B) {
+	rows := []map[string]any{
+		{"a": 1, "b": "x", "c": true},
+		{"a": 1, "b": "x", "c": true},
+		{"a": 1, "b": "x", "c": false},
+		{"a": 2, "b": "y", "c": true},
+		{"a": 2, "b": "y", "c": true},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		value, ok := evalProjectionAggregateExpr("count(DISTINCT *)", rows, nil)
+		if !ok || value == nil {
+			b.Fatalf("expected aggregate result, got value=%#v ok=%v", value, ok)
+		}
+	}
+}
+
+func BenchmarkEvalProjectionAggregateExprCollectDistinctScalar(b *testing.B) {
+	rows := []map[string]any{
+		{"x": "a"},
+		{"x": "a"},
+		{"x": "b"},
+		{"x": "c"},
+		{"x": "c"},
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		value, ok := evalProjectionAggregateExpr("collect(DISTINCT x)", rows, nil)
+		if !ok || value == nil {
+			b.Fatalf("expected aggregate result, got value=%#v ok=%v", value, ok)
+		}
+	}
+}
+
+func BenchmarkCompareScalarValuesInt64(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if compareScalarValues(int64(41), int64(42)) >= 0 {
+			b.Fatal("expected ordered comparison")
+		}
+	}
+}
+
+func BenchmarkCompareCypherOrderValuesInt64(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if compareCypherOrderValues(int64(41), int64(42)) >= 0 {
+			b.Fatal("expected ordered comparison")
+		}
+	}
+}
+
+func BenchmarkExecuteSortScalarRows(b *testing.B) {
+	rows := make([]map[string]any, 0, 128)
+	for i := 0; i < 128; i++ {
+		rows = append(rows, map[string]any{
+			"score": 127 - i,
+			"name":  fmt.Sprintf("user-%03d", i%17),
+			"flag":  i%2 == 0,
+		})
+	}
+	h := NewSortHandler()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		state := &State{Rows: append([]map[string]any(nil), rows...)}
+		if err := h.Execute("s-bench", map[string]any{
+			"ordering": []map[string]any{{"expression": "score", "direction": "ASC"}, {"expression": "name", "direction": "ASC"}, {"expression": "flag", "direction": "DESC"}},
+		}, state); err != nil {
+			b.Fatalf("sort execute failed: %v", err)
+		}
+	}
+}
+
 func TestAntiProbeHandlerUsesRowProbeForLowVariant(t *testing.T) {
 	h := NewAntiProbeHandler()
 	tx := &antiProbeCountingTx{}
@@ -2846,6 +2979,111 @@ func TestProjectHandlerEvaluatesCountDistinctAggregateProjection(t *testing.T) {
 	ids, ok := state.Rows[0]["ids"].([]any)
 	if !ok || len(ids) != 2 {
 		t.Fatalf("expected collect(DISTINCT r) length 2, got %#v", state.Rows[0]["ids"])
+	}
+}
+
+func TestProjectHandlerEvaluatesCountDistinctStarAcrossScalarRows(t *testing.T) {
+	h := NewProjectHandler()
+	state := &State{Rows: []map[string]any{
+		{"a": 1, "b": "x", "c": true},
+		{"a": 1, "b": "x", "c": true},
+		{"a": 1, "b": "x", "c": false},
+		{"a": 2, "b": "y", "c": true},
+	}}
+
+	err := h.Execute("p10b-distinct-star", map[string]any{
+		"items": []string{"count(DISTINCT *) AS c"},
+	}, state)
+	if err != nil {
+		t.Fatalf("project execute failed: %v", err)
+	}
+	if len(state.Rows) != 1 {
+		t.Fatalf("expected one aggregate row, got %#v", state.Rows)
+	}
+	if got := state.Rows[0]["c"]; got != 3 {
+		t.Fatalf("expected count(DISTINCT *)=3, got %#v", state.Rows[0])
+	}
+}
+
+func TestProjectHandlerEvaluatesDistinctAggregatesOnEmptyInput(t *testing.T) {
+	h := NewProjectHandler()
+	state := &State{}
+
+	err := h.Execute("p10b-distinct-empty", map[string]any{
+		"items": []string{"count(DISTINCT x) AS c", "collect(DISTINCT x) AS xs", "collect_list(DISTINCT x) AS ys"},
+	}, state)
+	if err != nil {
+		t.Fatalf("project execute failed: %v", err)
+	}
+	if len(state.Rows) != 1 {
+		t.Fatalf("expected one aggregate row over empty input, got %#v", state.Rows)
+	}
+	if got := state.Rows[0]["c"]; got != 0 {
+		t.Fatalf("expected count(DISTINCT x)=0 over empty input, got %#v", state.Rows[0])
+	}
+	xs, ok := state.Rows[0]["xs"].([]any)
+	if !ok || len(xs) != 0 {
+		t.Fatalf("expected collect(DISTINCT x)=[], got %#v", state.Rows[0]["xs"])
+	}
+	ys, ok := state.Rows[0]["ys"].([]any)
+	if !ok || len(ys) != 0 {
+		t.Fatalf("expected collect_list(DISTINCT x)=[], got %#v", state.Rows[0]["ys"])
+	}
+}
+
+func TestProjectHandlerEvaluatesDistinctAggregatesWithNullAndMixedTypes(t *testing.T) {
+	h := NewProjectHandler()
+	state := &State{Rows: []map[string]any{
+		{"x": nil},
+		{"x": ""},
+		{"x": ""},
+		{"x": int64(0)},
+		{"x": float64(0)},
+		{"x": "0"},
+		{"x": false},
+		{"x": false},
+		{"x": map[string]any{"k": 1}},
+		{"x": map[string]any{"k": 1}},
+		{"x": []any{1}},
+		{"x": []any{1}},
+		{"x": []any{1, nil}},
+		{"x": []any{1, nil}},
+	}}
+
+	err := h.Execute("p10b-distinct-mixed", map[string]any{
+		"items": []string{"count(DISTINCT x) AS c", "collect(DISTINCT x) AS xs"},
+	}, state)
+	if err != nil {
+		t.Fatalf("project execute failed: %v", err)
+	}
+	if len(state.Rows) != 1 {
+		t.Fatalf("expected one aggregate row, got %#v", state.Rows)
+	}
+	if got := state.Rows[0]["c"]; got != 8 {
+		t.Fatalf("expected count(DISTINCT x)=8 for mixed typed values with null excluded, got %#v", state.Rows[0])
+	}
+
+	xs, ok := state.Rows[0]["xs"].([]any)
+	if !ok {
+		t.Fatalf("expected collect(DISTINCT x) to be []any, got %#v", state.Rows[0]["xs"])
+	}
+	if len(xs) != 8 {
+		t.Fatalf("expected collect(DISTINCT x) length 8, got %#v", xs)
+	}
+	if got, _ := xs[0].(string); got != "" {
+		t.Fatalf("expected first distinct value to preserve empty string, got %#v", xs)
+	}
+	if got, _ := xs[1].(int64); got != 0 {
+		t.Fatalf("expected second distinct value to preserve int64(0), got %#v", xs)
+	}
+	if got, _ := xs[2].(float64); got != 0 {
+		t.Fatalf("expected third distinct value to preserve float64(0), got %#v", xs)
+	}
+	if got, _ := xs[3].(string); got != "0" {
+		t.Fatalf("expected fourth distinct value to preserve string \"0\", got %#v", xs)
+	}
+	if got, _ := xs[4].(bool); got != false {
+		t.Fatalf("expected fifth distinct value to preserve false, got %#v", xs)
 	}
 }
 
@@ -3558,6 +3796,169 @@ func TestSortHandlerSortsByBoundIdentifier(t *testing.T) {
 	}
 }
 
+func TestSortHandlerSortsAcrossScalarColumns(t *testing.T) {
+	h := NewSortHandler()
+	state := &State{Rows: []map[string]any{
+		{"id": "u1", "rank": 2, "name": "bob", "flag": false},
+		{"id": "u2", "rank": 1, "name": "bob", "flag": true},
+		{"id": "u3", "rank": 1, "name": "amy", "flag": true},
+		{"id": "u4", "rank": 1, "name": "amy", "flag": false},
+	}}
+
+	err := h.Execute("s-multi", map[string]any{
+		"ordering": []map[string]any{
+			{"expression": "rank", "direction": "ASC"},
+			{"expression": "name", "direction": "ASC"},
+			{"expression": "flag", "direction": "DESC"},
+		},
+	}, state)
+	if err != nil {
+		t.Fatalf("sort execute failed: %v", err)
+	}
+	if len(state.Rows) != 4 {
+		t.Fatalf("expected 4 rows after sort, got %#v", state.Rows)
+	}
+	got := []any{state.Rows[0]["id"], state.Rows[1]["id"], state.Rows[2]["id"], state.Rows[3]["id"]}
+	if !reflect.DeepEqual(got, []any{"u3", "u4", "u2", "u1"}) {
+		t.Fatalf("unexpected multi-column scalar ordering: %#v", state.Rows)
+	}
+}
+
+func TestSortHandlerSortsTemporalDatesAndNullsAscending(t *testing.T) {
+	h := NewSortHandler()
+	state := &State{Rows: []map[string]any{
+		{"id": "u0", "d": nil},
+		{"id": "u1", "d": map[string]any{"__temporal_type": "date", "year": 1984, "month": 10, "day": 11}},
+		{"id": "u2", "d": map[string]any{"__temporal_type": "date", "year": 1984, "month": 10, "day": 10}},
+		{"id": "u3", "d": map[string]any{"__temporal_type": "date", "year": 1984, "month": 10, "day": 11}},
+	}}
+
+	err := h.Execute("s-temporal-date-null", map[string]any{
+		"ordering": []map[string]any{{"expression": "d", "direction": "ASC"}},
+	}, state)
+	if err != nil {
+		t.Fatalf("sort execute failed: %v", err)
+	}
+	if len(state.Rows) != 4 {
+		t.Fatalf("expected 4 rows after sort, got %#v", state.Rows)
+	}
+	got := []any{state.Rows[0]["id"], state.Rows[1]["id"], state.Rows[2]["id"], state.Rows[3]["id"]}
+	if !reflect.DeepEqual(got, []any{"u2", "u1", "u3", "u0"}) {
+		t.Fatalf("unexpected temporal date/null ordering: %#v", state.Rows)
+	}
+}
+
+func TestSortHandlerSortsDateTimeByAbsoluteInstantAcrossTimezones(t *testing.T) {
+	h := NewSortHandler()
+	state := &State{Rows: []map[string]any{
+		{"id": "u1", "dt": map[string]any{"__temporal_type": "datetime", "year": 1984, "month": 10, "day": 11, "hour": 10, "minute": 0, "second": 0, "timezone": "+01:00"}},
+		{"id": "u2", "dt": map[string]any{"__temporal_type": "datetime", "year": 1984, "month": 10, "day": 11, "hour": 9, "minute": 30, "second": 0, "timezone": "+00:00"}},
+		{"id": "u3", "dt": map[string]any{"__temporal_type": "datetime", "year": 1984, "month": 10, "day": 11, "hour": 9, "minute": 0, "second": 0, "timezone": "+00:00"}},
+	}}
+
+	err := h.Execute("s-temporal-datetime-tz", map[string]any{
+		"ordering": []map[string]any{{"expression": "dt", "direction": "ASC"}},
+	}, state)
+	if err != nil {
+		t.Fatalf("sort execute failed: %v", err)
+	}
+	got := []any{state.Rows[0]["id"], state.Rows[1]["id"], state.Rows[2]["id"]}
+	if !reflect.DeepEqual(got, []any{"u1", "u3", "u2"}) {
+		t.Fatalf("unexpected timezone-aware datetime ordering: %#v", state.Rows)
+	}
+}
+
+func TestSortHandlerSortsCanonicalDurationEqualityStably(t *testing.T) {
+	h := NewSortHandler()
+	state := &State{Rows: []map[string]any{
+		{"id": "u1", "dur": map[string]any{"__temporal_type": "duration", "minutes": 12, "seconds": 70}},
+		{"id": "u2", "dur": map[string]any{"__temporal_type": "duration", "minutes": 13, "seconds": 10}},
+		{"id": "u3", "dur": map[string]any{"__temporal_type": "duration", "minutes": 14}},
+	}}
+
+	err := h.Execute("s-temporal-duration", map[string]any{
+		"ordering": []map[string]any{{"expression": "dur", "direction": "ASC"}},
+	}, state)
+	if err != nil {
+		t.Fatalf("sort execute failed: %v", err)
+	}
+	got := []any{state.Rows[0]["id"], state.Rows[1]["id"], state.Rows[2]["id"]}
+	if !reflect.DeepEqual(got, []any{"u1", "u2", "u3"}) {
+		t.Fatalf("unexpected canonical duration ordering: %#v", state.Rows)
+	}
+}
+
+func TestSortHandlerSortsHeterogeneousCypherRanksAcrossMapListScalarAndNull(t *testing.T) {
+	h := NewSortHandler()
+	state := &State{Rows: []map[string]any{
+		{"id": "u-num", "v": 42},
+		{"id": "u-map", "v": map[string]any{"k": 1}},
+		{"id": "u-null", "v": nil},
+		{"id": "u-list", "v": []any{1}},
+		{"id": "u-string", "v": "alpha"},
+	}}
+
+	err := h.Execute("s-hetero-ranks", map[string]any{
+		"ordering": []map[string]any{{"expression": "v", "direction": "ASC"}},
+	}, state)
+	if err != nil {
+		t.Fatalf("sort execute failed: %v", err)
+	}
+	got := []any{state.Rows[0]["id"], state.Rows[1]["id"], state.Rows[2]["id"], state.Rows[3]["id"], state.Rows[4]["id"]}
+	if !reflect.DeepEqual(got, []any{"u-map", "u-list", "u-string", "u-num", "u-null"}) {
+		t.Fatalf("unexpected heterogeneous cypher-rank ordering: %#v", state.Rows)
+	}
+}
+
+func TestSortHandlerSortsNestedHeterogeneousListsLexicographically(t *testing.T) {
+	h := NewSortHandler()
+	state := &State{Rows: []map[string]any{
+		{"id": "u2", "v": []any{[]any{1}, 1}},
+		{"id": "u1", "v": []any{map[string]any{"a": 1}, 1}},
+		{"id": "u4", "v": []any{[]any{1}}},
+		{"id": "u3", "v": []any{[]any{1}, 0}},
+	}}
+
+	err := h.Execute("s-hetero-list", map[string]any{
+		"ordering": []map[string]any{{"expression": "v", "direction": "ASC"}},
+	}, state)
+	if err != nil {
+		t.Fatalf("sort execute failed: %v", err)
+	}
+	got := []any{state.Rows[0]["id"], state.Rows[1]["id"], state.Rows[2]["id"], state.Rows[3]["id"]}
+	if !reflect.DeepEqual(got, []any{"u1", "u4", "u3", "u2"}) {
+		t.Fatalf("unexpected nested heterogeneous list ordering: %#v", state.Rows)
+	}
+}
+
+func TestSortHandlerSortsDeepNestedListMapValuesDeterministically(t *testing.T) {
+	h := NewSortHandler()
+	deepValue := func(seed int) any {
+		var v any = seed
+		for i := 0; i < 64; i++ {
+			v = []any{map[string]any{"k": v}}
+		}
+		return v
+	}
+
+	state := &State{Rows: []map[string]any{
+		{"id": "u2", "v": deepValue(1)},
+		{"id": "u3", "v": deepValue(0)},
+		{"id": "u1", "v": deepValue(0)},
+	}}
+
+	err := h.Execute("s-deep-list-map", map[string]any{
+		"ordering": []map[string]any{{"expression": "v", "direction": "ASC"}},
+	}, state)
+	if err != nil {
+		t.Fatalf("sort execute failed: %v", err)
+	}
+	got := []any{state.Rows[0]["id"], state.Rows[1]["id"], state.Rows[2]["id"]}
+	if !reflect.DeepEqual(got, []any{"u3", "u1", "u2"}) {
+		t.Fatalf("unexpected deep nested list/map ordering: %#v", state.Rows)
+	}
+}
+
 func TestPaginationHandlerResolvesParametrizedSkipLimit(t *testing.T) {
 	h := NewPaginationHandler()
 	state := &State{
@@ -3640,6 +4041,29 @@ func TestSortHandlerResolvesOrderingByTerminalAlias(t *testing.T) {
 	}
 	if state.Rows[0]["count"] != 2 || state.Rows[1]["count"] != 5 || state.Rows[2]["count"] != 10 {
 		t.Fatalf("unexpected ORDER BY alias resolution order: %#v", state.Rows)
+	}
+}
+
+func TestSortHandlerOrdersNaNBeforeNumbersForDescendingMixedValues(t *testing.T) {
+	h := NewSortHandler()
+	state := &State{Rows: []map[string]any{
+		{"id": "number", "types": 1.5},
+		{"id": "nan", "types": math.NaN()},
+		{"id": "bool", "types": false},
+	}}
+
+	err := h.Execute("s-nan-desc", map[string]any{
+		"ordering": []map[string]any{{"expression": "types", "direction": "DESC"}},
+	}, state)
+	if err != nil {
+		t.Fatalf("sort execute failed: %v", err)
+	}
+	if len(state.Rows) != 3 {
+		t.Fatalf("expected 3 rows after sort, got %#v", state.Rows)
+	}
+	got := []any{state.Rows[0]["id"], state.Rows[1]["id"], state.Rows[2]["id"]}
+	if !reflect.DeepEqual(got, []any{"nan", "number", "bool"}) {
+		t.Fatalf("unexpected descending mixed-type NaN ordering: %#v", got)
 	}
 }
 

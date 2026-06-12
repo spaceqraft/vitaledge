@@ -15,6 +15,7 @@ import (
 	"unicode"
 
 	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/paegun/vitaledge/internal/graph/store/typedvalue"
 )
 
 var edgePatternRe = regexp.MustCompile(`^\s*\(([^)]*)\)\s*[-<]*\s*\[.*?:([A-Za-z_][A-Za-z0-9_]*)[^\]]*\]\s*[->]*\s*\(([^)]*)\)\s*$`)
@@ -622,7 +623,7 @@ func executeExpandVariantRows(nodeID string, attrs map[string]any, state *State,
 		if err != nil {
 			return err
 		}
-		sourceKey := stableRowKey(row)
+		sourceKey := projectionDistinctRowKeyObserved(state, row, "runtime.operator.optional_expand.row_key")
 		for _, expandedRow := range expanded {
 			out = append(out, expandedRow)
 			sourceRows = append(sourceRows, row)
@@ -635,11 +636,11 @@ func executeExpandVariantRows(nodeID string, attrs map[string]any, state *State,
 		if optional && len(out) > len(filtered) {
 			surviving := map[string]int{}
 			for _, row := range filtered {
-				surviving[stableRowKey(row)]++
+				surviving[projectionDistinctRowKeyObserved(state, row, "runtime.operator.optional_expand.row_key")]++
 			}
 			hasSurvivor := map[string]bool{}
 			for i, row := range out {
-				key := stableRowKey(row)
+				key := projectionDistinctRowKeyObserved(state, row, "runtime.operator.optional_expand.row_key")
 				if count := surviving[key]; count > 0 {
 					surviving[key] = count - 1
 					hasSurvivor[sourceKeys[i]] = true
@@ -2942,7 +2943,7 @@ func (h projectHandler) Execute(nodeID string, attrs map[string]any, state *Stat
 		if len(items) == 0 {
 			next := cloneRow(row)
 			if distinct {
-				key := stableRowKey(next)
+				key := projectionDistinctRowKeyObserved(state, next, "runtime.operator.project.distinct.row_key")
 				if _, ok := seen[key]; ok {
 					continue
 				}
@@ -3019,7 +3020,7 @@ func (h projectHandler) Execute(nodeID string, attrs map[string]any, state *Stat
 			}
 		}
 		if distinct {
-			key := stableRowKey(projected)
+			key := projectionDistinctRowKeyObserved(state, projected, "runtime.operator.project.distinct.row_key")
 			if _, ok := seen[key]; ok {
 				continue
 			}
@@ -3125,7 +3126,7 @@ func tryProjectGroupedAggregate(items []string, rows []map[string]any, state *St
 				groupRow[item.expr] = value
 			}
 		}
-		key := stableRowKey(groupRow)
+		key := projectionDistinctRowKeyObserved(state, groupRow, "runtime.operator.project.group.row_key")
 		group, exists := groups[key]
 		if !exists {
 			group = &aggregateGroup{groupRow: groupRow, rows: make([]map[string]any, 0, 1)}
@@ -3161,7 +3162,7 @@ func tryProjectGroupedAggregate(items []string, rows []map[string]any, state *St
 			}
 		}
 		if distinct {
-			outKey := stableRowKey(projected)
+			outKey := projectionDistinctRowKeyObserved(state, projected, "runtime.operator.project.distinct.row_key")
 			if _, ok := seen[outKey]; ok {
 				continue
 			}
@@ -3469,24 +3470,27 @@ func evalProjectionAggregateExpr(expr string, rows []map[string]any, state *Stat
 			if !distinct {
 				return len(rows), true
 			}
-			seen := map[string]struct{}{}
+			seen := make(map[string]struct{}, len(rows))
 			for _, row := range rows {
-				seen[stableRowKey(row)] = struct{}{}
+				seen[projectionDistinctRowKeyObserved(state, row, "runtime.operator.aggregate.count_distinct_star.row_key")] = struct{}{}
 			}
 			return len(seen), true
 		}
 		count := 0
-		seen := map[string]struct{}{}
+		var seen map[string]struct{}
+		if distinct {
+			seen = make(map[string]struct{}, len(rows))
+		}
 		for _, row := range rows {
 			if row == nil {
 				continue
 			}
-			value, ok := resolveProjectionExprValue(arg, row, state)
+			value, ok := resolveProjectionAggregateArgValue(arg, row, state)
 			if !ok || value == nil {
 				continue
 			}
 			if distinct {
-				key := stableRowKey(map[string]any{"value": value})
+				key := projectionDistinctValueKey(value)
 				if _, exists := seen[key]; exists {
 					continue
 				}
@@ -3506,17 +3510,20 @@ func evalProjectionAggregateExpr(expr string, rows []map[string]any, state *Stat
 			return []any{}, true
 		}
 		values := make([]any, 0, len(rows))
-		seen := map[string]struct{}{}
+		var seen map[string]struct{}
+		if distinct {
+			seen = make(map[string]struct{}, len(rows))
+		}
 		for _, row := range rows {
 			if row == nil {
 				continue
 			}
-			value, ok := resolveProjectionExprValue(arg, row, state)
+			value, ok := resolveProjectionAggregateArgValue(arg, row, state)
 			if !ok || value == nil {
 				continue
 			}
 			if distinct {
-				key := stableRowKey(map[string]any{"value": value})
+				key := projectionDistinctValueKey(value)
 				if _, exists := seen[key]; exists {
 					continue
 				}
@@ -3721,6 +3728,15 @@ func parseProjectionAggregateDistinctArg(raw string) (string, bool) {
 		return strings.TrimSpace(raw[len("DISTINCT"):]), true
 	}
 	return raw, false
+}
+
+func resolveProjectionAggregateArgValue(arg string, row map[string]any, state *State) (any, bool) {
+	if isSimpleOrderingReferenceExpression(arg) {
+		if value, exists := valueFromRowWithPresence(row, arg); exists {
+			return value, true
+		}
+	}
+	return resolveProjectionExprValue(arg, row, state)
 }
 
 func projectionPercentileAggregateValue(argList string, rows []map[string]any, state *State, discrete bool) (any, bool) {
@@ -11842,6 +11858,37 @@ func buildProjectionNodeValue(vertexID string, row map[string]any, state *State)
 }
 
 func decodeProjectionPropertyValue(encoded []byte) any {
+	if len(encoded) > 5 && encoded[0] == 0xFF && encoded[1] == 'T' && encoded[2] == 'V' && encoded[3] == 0x01 {
+		tag := typedvalue.TypeTag(encoded[4])
+		payload := encoded[5:]
+		switch tag {
+		case typedvalue.TypeBool:
+			if string(payload) == "true" {
+				return true
+			}
+			if string(payload) == "false" {
+				return false
+			}
+			return string(payload)
+		case typedvalue.TypeInt64:
+			if i, err := strconv.ParseInt(string(payload), 10, 64); err == nil {
+				if int64(int(i)) == i {
+					return int(i)
+				}
+				return i
+			}
+			return string(payload)
+		case typedvalue.TypeFloat64:
+			if f, err := strconv.ParseFloat(string(payload), 64); err == nil {
+				return f
+			}
+			return string(payload)
+		case typedvalue.TypeString, typedvalue.TypeBytes:
+			return string(payload)
+		default:
+			encoded = payload
+		}
+	}
 	text := string(encoded)
 	if text == "" {
 		return ""
@@ -12356,6 +12403,19 @@ func executeSort(nodeID string, attrs map[string]any, state *State, trimTopK boo
 	for idx, row := range state.Rows {
 		keys := make([]any, 0, len(ordering))
 		for _, ord := range ordering {
+			if isSimpleOrderingReferenceExpression(ord.expression) {
+				if v, exists := valueFromRowWithPresence(row, ord.expression); exists {
+					keys = append(keys, v)
+					continue
+				}
+				if sourceRows != nil {
+					if v, exists := valueFromRowWithPresence(sourceRows[idx], ord.expression); exists {
+						keys = append(keys, v)
+						continue
+					}
+				}
+			}
+
 			value, ok, err := resolveProjectionExprValueChecked(ord.expression, row, state)
 			if err != nil {
 				return err
@@ -12400,7 +12460,7 @@ func executeSort(nodeID string, attrs map[string]any, state *State, trimTopK boo
 			rv := right.keys[0]
 			left.keys = left.keys[1:]
 			right.keys = right.keys[1:]
-			cmp := compareScalarValues(lv, rv)
+			cmp := compareScalarValuesObserved(state, lv, rv)
 			if cmp == 0 {
 				continue
 			}
@@ -12584,6 +12644,7 @@ func (h writeHandler) Execute(nodeID string, attrs map[string]any, state *State)
 	base.Vertex, base.Edge = buildMutationPayloads(base.MutationType, kind, pattern, mergePattern, raw)
 	base.ResolvedParams = resolveWriteParams(state, raw, mergePattern, onCreate, onMatch)
 	base.ParamKeys = referencedParamKeys(raw, pattern, mergePattern, strings.Join(onCreate, " "), strings.Join(onMatch, " "))
+	writeEvents := expandWriteEventsForClause(base)
 
 	materialize := shouldMaterializeWriteBindings(state)
 	rows := state.Rows
@@ -12606,18 +12667,30 @@ func (h writeHandler) Execute(nodeID string, attrs map[string]any, state *State)
 				rowBatch = expanded
 			}
 		}
-		for _, expandedRow := range rowBatch {
-			event := base
-			event.Bindings = captureBindingsFromRow(expandedRow)
-			if materialize && expandedRow != nil {
-				materializeWriteBindings(expandedRow, event, state)
-				event.Bindings = captureBindingsFromRow(expandedRow)
+		preserveSequentialBindings := len(writeEvents) > 1
+		for _, eventTemplate := range writeEvents {
+			nextBatch := make([]map[string]any, 0, len(rowBatch))
+			for _, expandedRow := range rowBatch {
+				workingRow := expandedRow
+				if workingRow == nil {
+					workingRow = map[string]any{}
+				}
+				event := eventTemplate
+				event.Bindings = captureBindingsFromRow(workingRow)
+				if materialize || preserveSequentialBindings {
+					materializeWriteBindings(workingRow, event, state)
+					event.Bindings = captureBindingsFromRow(workingRow)
+				}
+				state.WriteEvents = append(state.WriteEvents, event)
+				if materialize {
+					workingRow["__write_event_count"] = len(state.WriteEvents)
+				}
+				nextBatch = append(nextBatch, workingRow)
 			}
-			state.WriteEvents = append(state.WriteEvents, event)
-			if materialize && expandedRow != nil {
-				expandedRow["__write_event_count"] = len(state.WriteEvents)
-				materializedRows = append(materializedRows, expandedRow)
-			}
+			rowBatch = nextBatch
+		}
+		if materialize {
+			materializedRows = append(materializedRows, rowBatch...)
 		}
 	}
 	if materialize {
@@ -12625,6 +12698,41 @@ func (h writeHandler) Execute(nodeID string, attrs map[string]any, state *State)
 	}
 
 	return nil
+}
+
+func expandWriteEventsForClause(base WriteEvent) []WriteEvent {
+	if !strings.EqualFold(strings.TrimSpace(base.Kind), "CREATE") {
+		return []WriteEvent{base}
+	}
+	body := strings.TrimSpace(base.Pattern)
+	if body == "" {
+		body = extractWritePatternFromRaw(base.Raw, base.Kind)
+	}
+	segments := writeSplitTopLevelComma(body)
+	if len(segments) <= 1 {
+		return []WriteEvent{base}
+	}
+	out := make([]WriteEvent, 0, len(segments))
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		event := base
+		event.Raw = strings.TrimSpace(base.Kind) + " " + segment
+		event.Pattern = segment
+		event.MergePattern = ""
+		event.MergeOnCreate = nil
+		event.MergeOnMatch = nil
+		event.MutationType = classifyMutationType(event.Kind, event.Pattern, event.MergePattern, event.Raw)
+		event.Vertex, event.Edge = buildMutationPayloads(event.MutationType, event.Kind, event.Pattern, event.MergePattern, event.Raw)
+		event.ParamKeys = referencedParamKeys(event.Raw, event.Pattern, event.MergePattern, "", "")
+		out = append(out, event)
+	}
+	if len(out) == 0 {
+		return []WriteEvent{base}
+	}
+	return out
 }
 
 func expandUnconstrainedMergeVertexRowsForMaterialization(state *State, row map[string]any, event WriteEvent) []map[string]any {
@@ -13986,6 +14094,10 @@ func materializeCreatePatternBindings(row map[string]any, event WriteEvent, stat
 				bindings[varName] = row[varName]
 				bindings[varName+".id"] = row[varName+".id"]
 			}
+			if idValue, hasID := props["id"]; hasID {
+				row[varName+".id"] = idValue
+				bindings[varName+".id"] = idValue
+			}
 			for key, value := range props {
 				key = strings.TrimSpace(key)
 				if key == "" {
@@ -14918,7 +15030,7 @@ func writePatternPropertyMapBody(pattern string) (string, bool) {
 }
 
 func writeSplitTopLevelComma(raw string) []string {
-	raw = strings.TrimSpace(raw)
+	raw = strings.TrimSpace(writeStripLineComments(raw))
 	if raw == "" {
 		return nil
 	}
@@ -14975,6 +15087,54 @@ func writeSplitTopLevelComma(raw string) []string {
 	}
 	parts = append(parts, strings.TrimSpace(raw[start:]))
 	return parts
+}
+
+func writeStripLineComments(raw string) string {
+	if !strings.Contains(raw, "//") {
+		return raw
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	inSingle := false
+	inDouble := false
+	inLineComment := false
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if inLineComment {
+			if ch == '\n' || ch == '\r' {
+				inLineComment = false
+				b.WriteByte(ch)
+			}
+			continue
+		}
+		if ch == '\'' && !inDouble {
+			if inSingle && i+1 < len(raw) && raw[i+1] == '\'' {
+				b.WriteByte(ch)
+				i++
+				b.WriteByte(raw[i])
+				continue
+			}
+			inSingle = !inSingle
+			b.WriteByte(ch)
+			continue
+		}
+		if ch == '"' && !inSingle {
+			if i > 0 && raw[i-1] == '\\' {
+				b.WriteByte(ch)
+				continue
+			}
+			inDouble = !inDouble
+			b.WriteByte(ch)
+			continue
+		}
+		if !inSingle && !inDouble && ch == '/' && i+1 < len(raw) && raw[i+1] == '/' {
+			inLineComment = true
+			i++
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
 }
 
 func writeSplitTopLevelKeyValue(raw string) (string, string, bool) {
@@ -15351,20 +15511,294 @@ func stableRowKey(row map[string]any) string {
 	if row == nil {
 		return "{}"
 	}
-	keys := make([]string, 0, len(row))
+	var b strings.Builder
+	b.Grow(len(row) * 24)
+	b.WriteString("rk:{")
+	appendStableRowKeyMap(&b, row)
+	b.WriteByte('}')
+	return b.String()
+}
+
+func projectionDistinctRowKey(row map[string]any) string {
+	if typedKey, ok := projectionTypedScalarRowKey(row); ok {
+		return typedKey
+	}
+	return stableRowKey(row)
+}
+
+func projectionDistinctRowKeyObserved(state *State, row map[string]any, prefix string) string {
+	if typedKey, ok := projectionTypedScalarRowKey(row); ok {
+		observeRuntimeCounter(state, prefix+".typed", 1)
+		return typedKey
+	}
+	observeRuntimeCounter(state, prefix+".fallback", 1)
+	return stableRowKey(row)
+}
+
+func projectionTypedScalarRowKey(row map[string]any) (string, bool) {
+	if row == nil {
+		return "{}", true
+	}
+	var small [8]string
+	keys := small[:0]
+	if len(row) > len(small) {
+		keys = make([]string, 0, len(row))
+	}
 	for key := range row {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	pairs := make([][2]any, 0, len(keys))
+	var b strings.Builder
+	b.Grow(len(keys) * 16)
+	b.WriteString("ts:")
 	for _, key := range keys {
-		pairs = append(pairs, [2]any{key, stableRowKeyValue(row[key])})
+		if !appendProjectionTypedScalarDistinctKey(&b, row[key]) {
+			return "", false
+		}
+		writeBuilderInt(&b, len(key))
+		b.WriteByte(':')
+		b.WriteString(key)
+		b.WriteByte(';')
 	}
-	encoded, err := json.Marshal(pairs)
-	if err != nil {
-		return fmt.Sprint(pairs)
+	return b.String(), true
+}
+
+func projectionDistinctValueKey(value any) string {
+	if key, ok := projectionTypedScalarDistinctKey(value); ok {
+		return key
 	}
-	return string(encoded)
+	var b strings.Builder
+	b.Grow(24)
+	b.Reset()
+	b.WriteString("v:")
+	appendStableRowKeyValue(&b, value)
+	return b.String()
+}
+
+func projectionTypedScalarDistinctKey(value any) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return "s:" + typed, true
+	case bool:
+		if typed {
+			return "b:1", true
+		}
+		return "b:0", true
+	case int:
+		return "i:" + strconv.FormatInt(int64(typed), 10), true
+	case int8:
+		return "i:" + strconv.FormatInt(int64(typed), 10), true
+	case int16:
+		return "i:" + strconv.FormatInt(int64(typed), 10), true
+	case int32:
+		return "i:" + strconv.FormatInt(int64(typed), 10), true
+	case int64:
+		return "i:" + strconv.FormatInt(typed, 10), true
+	case uint:
+		return "u:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint8:
+		return "u:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint16:
+		return "u:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint32:
+		return "u:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint64:
+		return "u:" + strconv.FormatUint(typed, 10), true
+	case float32:
+		return "f:" + strconv.FormatFloat(float64(typed), 'g', -1, 32), true
+	case float64:
+		return "f:" + strconv.FormatFloat(typed, 'g', -1, 64), true
+	case json.Number:
+		return "n:" + typed.String(), true
+	default:
+		return "", false
+	}
+}
+
+func appendProjectionTypedScalarDistinctKey(b *strings.Builder, value any) bool {
+	switch typed := value.(type) {
+	case string:
+		b.WriteString("s:")
+		b.WriteString(typed)
+		return true
+	case bool:
+		if typed {
+			b.WriteString("b:1")
+		} else {
+			b.WriteString("b:0")
+		}
+		return true
+	case int:
+		b.WriteString("i:")
+		writeBuilderInt64(b, int64(typed))
+		return true
+	case int8:
+		b.WriteString("i:")
+		writeBuilderInt64(b, int64(typed))
+		return true
+	case int16:
+		b.WriteString("i:")
+		writeBuilderInt64(b, int64(typed))
+		return true
+	case int32:
+		b.WriteString("i:")
+		writeBuilderInt64(b, int64(typed))
+		return true
+	case int64:
+		b.WriteString("i:")
+		writeBuilderInt64(b, typed)
+		return true
+	case uint:
+		b.WriteString("u:")
+		writeBuilderUint64(b, uint64(typed))
+		return true
+	case uint8:
+		b.WriteString("u:")
+		writeBuilderUint64(b, uint64(typed))
+		return true
+	case uint16:
+		b.WriteString("u:")
+		writeBuilderUint64(b, uint64(typed))
+		return true
+	case uint32:
+		b.WriteString("u:")
+		writeBuilderUint64(b, uint64(typed))
+		return true
+	case uint64:
+		b.WriteString("u:")
+		writeBuilderUint64(b, typed)
+		return true
+	case float32:
+		b.WriteString("f:")
+		writeBuilderFloat64(b, float64(typed), 32)
+		return true
+	case float64:
+		b.WriteString("f:")
+		writeBuilderFloat64(b, typed, 64)
+		return true
+	case json.Number:
+		b.WriteString("n:")
+		b.WriteString(typed.String())
+		return true
+	default:
+		return false
+	}
+}
+
+func appendStableRowKeyMap(b *strings.Builder, value map[string]any) {
+	var small [8]string
+	keys := small[:0]
+	if len(value) > len(small) {
+		keys = make([]string, 0, len(value))
+	}
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		writeBuilderInt(b, len(key))
+		b.WriteByte(':')
+		b.WriteString(key)
+		b.WriteByte('=')
+		appendStableRowKeyValue(b, value[key])
+		b.WriteByte(';')
+	}
+}
+
+func appendStableRowKeyValue(b *strings.Builder, value any) {
+	if appendProjectionTypedScalarDistinctKey(b, value) {
+		return
+	}
+	switch typed := value.(type) {
+	case nil:
+		b.WriteString("n")
+	case projectionPathValue:
+		b.WriteString("p{")
+		b.WriteString("nodes=[")
+		for _, node := range typed.nodes {
+			id := ""
+			if resolved, ok := projectionPathNodeID(node); ok {
+				id = resolved
+			} else {
+				id = strings.TrimSpace(fmt.Sprint(node))
+			}
+			appendStableRowKeyValue(b, id)
+			b.WriteByte(',')
+		}
+		b.WriteString("];rels=[")
+		for _, rel := range typed.relationships {
+			id := projectionRelationshipID(rel)
+			if id == "" {
+				id = strings.TrimSpace(fmt.Sprint(rel))
+			}
+			appendStableRowKeyValue(b, id)
+			b.WriteByte(',')
+		}
+		b.WriteString("]}")
+	case []any:
+		b.WriteByte('[')
+		for _, item := range typed {
+			appendStableRowKeyValue(b, item)
+			b.WriteByte(',')
+		}
+		b.WriteByte(']')
+	case map[string]any:
+		b.WriteByte('{')
+		appendStableRowKeyMap(b, typed)
+		b.WriteByte('}')
+	case map[string]string:
+		converted := make(map[string]any, len(typed))
+		for key, item := range typed {
+			converted[key] = item
+		}
+		b.WriteByte('{')
+		appendStableRowKeyMap(b, converted)
+		b.WriteByte('}')
+	case *graph.Vertex:
+		if typed == nil {
+			b.WriteString("nv")
+			return
+		}
+		b.WriteString("vertex:")
+		b.WriteString(strings.TrimSpace(typed.ID))
+	case graph.Vertex:
+		b.WriteString("vertex:")
+		b.WriteString(strings.TrimSpace(typed.ID))
+	case *graph.Edge:
+		if typed == nil {
+			b.WriteString("ne")
+			return
+		}
+		b.WriteString("edge:")
+		b.WriteString(strings.TrimSpace(typed.ID))
+	case graph.Edge:
+		b.WriteString("edge:")
+		b.WriteString(strings.TrimSpace(typed.ID))
+	default:
+		text := strings.TrimSpace(fmt.Sprint(stableRowKeyValue(typed)))
+		writeBuilderInt(b, len(text))
+		b.WriteByte(':')
+		b.WriteString(text)
+	}
+}
+
+func writeBuilderInt(b *strings.Builder, value int) {
+	writeBuilderInt64(b, int64(value))
+}
+
+func writeBuilderInt64(b *strings.Builder, value int64) {
+	var digits [32]byte
+	b.Write(strconv.AppendInt(digits[:0], value, 10))
+}
+
+func writeBuilderUint64(b *strings.Builder, value uint64) {
+	var digits [32]byte
+	b.Write(strconv.AppendUint(digits[:0], value, 10))
+}
+
+func writeBuilderFloat64(b *strings.Builder, value float64, bitSize int) {
+	var digits [64]byte
+	b.Write(strconv.AppendFloat(digits[:0], value, 'g', -1, bitSize))
 }
 
 func stableRowKeyValue(value any) any {
@@ -16233,8 +16667,95 @@ func valueFromRowWithPresence(row map[string]any, key string) (any, bool) {
 	return nil, false
 }
 
+func isSimpleOrderingReferenceExpression(expr string) bool {
+	expr = strings.TrimSpace(expr)
+	if expr == "" || strings.HasPrefix(expr, "$") {
+		return false
+	}
+	hasIdentifierRune := false
+	for _, ch := range expr {
+		switch {
+		case ch == '_' || ch == '.':
+		case ch >= '0' && ch <= '9':
+		case (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'):
+			hasIdentifierRune = true
+		default:
+			return false
+		}
+	}
+	return hasIdentifierRune
+}
+
 func compareScalarValues(left, right any) int {
+	if cmp, ok := compareTypedScalarValues(left, right); ok {
+		return cmp
+	}
 	return compareCypherOrderValues(left, right)
+}
+
+func compareScalarValuesObserved(state *State, left, right any) int {
+	if cmp, ok := compareTypedScalarValues(left, right); ok {
+		observeRuntimeCounter(state, "runtime.operator.sort.scalar_compare.typed", 1)
+		return cmp
+	}
+	observeRuntimeCounter(state, "runtime.operator.sort.scalar_compare.fallback", 1)
+	return compareCypherOrderValues(left, right)
+}
+
+func observeRuntimeCounter(state *State, name string, delta int64) {
+	if state == nil || state.Metrics == nil || strings.TrimSpace(name) == "" || delta == 0 {
+		return
+	}
+	state.Metrics.ObserveRuntimeCounter(name, delta)
+}
+
+func compareTypedScalarValues(left, right any) (int, bool) {
+	if left == nil && right == nil {
+		return 0, true
+	}
+	if ln, lok := numericValue(left); lok {
+		rn, rok := numericValue(right)
+		if !rok {
+			return 0, false
+		}
+		leftNaN := math.IsNaN(ln)
+		rightNaN := math.IsNaN(rn)
+		if leftNaN || rightNaN {
+			switch {
+			case leftNaN && rightNaN:
+				return 0, true
+			case leftNaN:
+				return 1, true
+			default:
+				return -1, true
+			}
+		}
+		switch {
+		case ln < rn:
+			return -1, true
+		case ln > rn:
+			return 1, true
+		default:
+			return 0, true
+		}
+	}
+	ls, lok := left.(string)
+	rs, rok := right.(string)
+	if lok && rok {
+		return strings.Compare(ls, rs), true
+	}
+	lb, lok := left.(bool)
+	rb, rok := right.(bool)
+	if lok && rok {
+		if lb == rb {
+			return 0, true
+		}
+		if !lb && rb {
+			return -1, true
+		}
+		return 1, true
+	}
+	return 0, false
 }
 
 func compareCypherOrderValues(left, right any) int {

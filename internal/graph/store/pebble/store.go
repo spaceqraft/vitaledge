@@ -54,6 +54,7 @@ type tx struct {
 	batch                *cpebble.Batch
 	locks                map[string]func()
 	vertexCache          map[string]*graph.Vertex
+	edgeMetaCache        map[string]edgeMeta
 	counterBase          map[string]int
 	counterBasePresent   map[string]bool
 	counterDeltas        map[string]int
@@ -68,6 +69,12 @@ type propertyStatsTarget struct {
 	entityClass string
 	schema      string
 	property    string
+}
+
+type edgeMeta struct {
+	edgeType string
+	srcID    string
+	dstID    string
 }
 
 const outAdjDstValuePrefix = "d:"
@@ -988,6 +995,10 @@ func (t *tx) vertexCacheKey(tenant, vertexID string) string {
 	return tenant + "\x00" + vertexID
 }
 
+func (t *tx) edgeMetaCacheKey(tenant, edgeID string) string {
+	return tenant + "\x00" + edgeID
+}
+
 func (t *tx) vertexFromCache(tenant, vertexID string) *graph.Vertex {
 	if t == nil || len(t.vertexCache) == 0 {
 		return nil
@@ -1011,6 +1022,31 @@ func (t *tx) dropVertexCache(tenant, vertexID string) {
 		return
 	}
 	delete(t.vertexCache, t.vertexCacheKey(tenant, vertexID))
+}
+
+func (t *tx) edgeMetaFromCache(tenant, edgeID string) (edgeMeta, bool) {
+	if t == nil || len(t.edgeMetaCache) == 0 {
+		return edgeMeta{}, false
+	}
+	meta, ok := t.edgeMetaCache[t.edgeMetaCacheKey(tenant, edgeID)]
+	return meta, ok
+}
+
+func (t *tx) cacheEdgeMeta(tenant, edgeID, edgeType, srcID, dstID string) {
+	if t == nil || tenant == "" || edgeID == "" {
+		return
+	}
+	if t.edgeMetaCache == nil {
+		t.edgeMetaCache = map[string]edgeMeta{}
+	}
+	t.edgeMetaCache[t.edgeMetaCacheKey(tenant, edgeID)] = edgeMeta{edgeType: edgeType, srcID: srcID, dstID: dstID}
+}
+
+func (t *tx) dropEdgeMetaCache(tenant, edgeID string) {
+	if t == nil || t.edgeMetaCache == nil {
+		return
+	}
+	delete(t.edgeMetaCache, t.edgeMetaCacheKey(tenant, edgeID))
 }
 
 func cloneVertex(vertex *graph.Vertex) *graph.Vertex {
@@ -1058,6 +1094,10 @@ func (t *tx) loadEdgeByID(ctx context.Context, tenant, edgeID string) (*graph.Ed
 }
 
 func (t *tx) loadEdgeTypeAndEndpoints(ctx context.Context, tenant, edgeID string) (edgeType, srcID, dstID string, err error) {
+	if cached, ok := t.edgeMetaFromCache(tenant, edgeID); ok {
+		return cached.edgeType, cached.srcID, cached.dstID, nil
+	}
+
 	prefix := keyspace.EdgeTypePrefix(tenant, edgeID)
 	iter, err := t.reader.NewIter(&cpebble.IterOptions{LowerBound: prefix, UpperBound: prefixUpperBound(prefix)})
 	if err != nil {
@@ -1087,6 +1127,7 @@ func (t *tx) loadEdgeTypeAndEndpoints(ctx context.Context, tenant, edgeID string
 	if !ok {
 		return "", "", "", graph.NewError(graph.ErrKindStorage, "decode type edge endpoints", nil)
 	}
+	t.cacheEdgeMeta(tenant, edgeID, edgeType, srcID, dstID)
 	return edgeType, srcID, dstID, nil
 }
 
@@ -1158,13 +1199,13 @@ func (t *tx) loadVertexProperties(ctx context.Context, tenant, vertexID string) 
 			continue
 		}
 		if schema == vertexPropertySchema {
-			stored := append([]byte(nil), iter.Value()...)
+			stored := decodeStoredPropertyValueBytes(iter.Value())
 			if len(stored) > 0 {
 				properties[property] = stored
 				continue
 			}
 		}
-		properties[property] = encodedValue
+		properties[property] = decodeStoredPropertyValueBytes(encodedValue)
 	}
 	if err := iter.Error(); err != nil {
 		return nil, graph.NewError(graph.ErrKindStorage, "scan vertex properties", err)
@@ -1209,7 +1250,7 @@ func (t *tx) deleteVertexPropertiesBySchema(ctx context.Context, tenant, vertexI
 		if schema == vertexPropertySchema && len(item.value) > 0 {
 			encodedValue = append([]byte(nil), item.value...)
 		}
-		if err := t.delete(keyspace.PropertyIndexKey(tenant, schema, property, encodedValue, vertexID), "delete property index for vertex"); err != nil {
+		if err := t.delete(keyspace.PropertyIndexKey(tenant, schema, property, storedPropertyIndexTypeSegment(encodedValue), encodedValue, vertexID), "delete property index for vertex"); err != nil {
 			return err
 		}
 		if orderedValue, ok := numericOrderedValueFromEncoded(encodedValue); ok {
@@ -1246,10 +1287,11 @@ func (t *tx) writeVertexProperties(vertex *graph.Vertex) error {
 			continue
 		}
 		valueCopy := append([]byte(nil), encodedValue...)
-		if err := t.set(keyspace.VertexPropertyKey(vertex.Tenant, vertex.ID, vertexPropertySchema, property, valueCopy), valueCopy, "write vertex property forward index"); err != nil {
+		storedValue := encodeStoredPropertyValue(valueCopy)
+		if err := t.set(keyspace.VertexPropertyKey(vertex.Tenant, vertex.ID, vertexPropertySchema, property, storedValue), storedValue, "write vertex property forward index"); err != nil {
 			return err
 		}
-		if err := t.set(keyspace.PropertyVertexKey(vertex.Tenant, vertexPropertySchema, property, valueCopy, vertex.ID), []byte(vertex.ID), "write property vertex reverse index"); err != nil {
+		if err := t.set(keyspace.PropertyVertexKey(vertex.Tenant, vertexPropertySchema, property, storedValue, vertex.ID), []byte(vertex.ID), "write property vertex reverse index"); err != nil {
 			return err
 		}
 	}
@@ -1276,7 +1318,7 @@ func (t *tx) loadEdgeProperties(ctx context.Context, tenant, edgeID string) (gra
 		if _, exists := properties[property]; exists {
 			continue
 		}
-		properties[property] = encodedValue
+		properties[property] = decodeStoredPropertyValueBytes(encodedValue)
 	}
 	if err := iter.Error(); err != nil {
 		return nil, graph.NewError(graph.ErrKindStorage, "scan edge properties", err)
@@ -1317,7 +1359,7 @@ func (t *tx) deleteEdgePropertiesBySchema(ctx context.Context, tenant, edgeID, s
 		if !ok {
 			continue
 		}
-		if err := t.delete(keyspace.PropertyIndexKey(tenant, schema, property, encodedValue, edgeID), "delete property index for edge"); err != nil {
+		if err := t.delete(keyspace.PropertyIndexKey(tenant, schema, property, storedPropertyIndexTypeSegment(encodedValue), encodedValue, edgeID), "delete property index for edge"); err != nil {
 			return err
 		}
 		if orderedValue, ok := numericOrderedValueFromEncoded(encodedValue); ok {
@@ -1354,10 +1396,11 @@ func (t *tx) writeEdgeProperties(edge *graph.Edge) error {
 			continue
 		}
 		valueCopy := append([]byte(nil), encodedValue...)
-		if err := t.set(keyspace.EdgePropertyKey(edge.Tenant, edge.ID, edge.Type, property, valueCopy), []byte(edge.ID), "write edge property forward index"); err != nil {
+		storedValue := encodeStoredPropertyValue(valueCopy)
+		if err := t.set(keyspace.EdgePropertyKey(edge.Tenant, edge.ID, edge.Type, property, storedValue), storedValue, "write edge property forward index"); err != nil {
 			return err
 		}
-		if err := t.set(keyspace.PropertyEdgeKey(edge.Tenant, edge.Type, property, valueCopy, edge.ID), []byte(edge.ID), "write property edge reverse index"); err != nil {
+		if err := t.set(keyspace.PropertyEdgeKey(edge.Tenant, edge.Type, property, storedValue, edge.ID), []byte(edge.ID), "write property edge reverse index"); err != nil {
 			return err
 		}
 	}
@@ -1841,6 +1884,7 @@ func (t *tx) PutEdge(ctx context.Context, edge *graph.Edge) (err error) {
 	if err := t.adjustUndirectedEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, 1); err != nil {
 		return err
 	}
+	t.cacheEdgeMeta(edge.Tenant, edge.ID, edge.Type, edge.SrcID, edge.DstID)
 	t.queueTenantStatsRefresh(edge.Tenant)
 	return nil
 }
@@ -1892,6 +1936,7 @@ func (t *tx) PutEdgeNew(ctx context.Context, edge *graph.Edge) (err error) {
 	if err := t.adjustUndirectedEndpointPairCount(edge.Tenant, edge.SrcID, edge.Type, edge.DstID, 1); err != nil {
 		return err
 	}
+	t.cacheEdgeMeta(edge.Tenant, edge.ID, edge.Type, edge.SrcID, edge.DstID)
 	t.queueTenantStatsRefresh(edge.Tenant)
 	return nil
 }
@@ -1954,6 +1999,7 @@ func (t *tx) DeleteEdge(ctx context.Context, tenant, edgeID string) (err error) 
 	if err := t.adjustUndirectedEndpointPairCount(tenant, srcID, edgeType, dstID, -1); err != nil {
 		return err
 	}
+	t.dropEdgeMetaCache(tenant, edgeID)
 	t.queueTenantStatsRefresh(tenant)
 	return nil
 }
@@ -2245,7 +2291,7 @@ func (t *tx) ScanOutEdgeProperty(ctx context.Context, tenant, srcID, edgeType, p
 		if err != nil {
 			return err
 		}
-		if !hasValue || !bytes.Equal(value, encodedValue) {
+		if !hasValue || !bytes.Equal(value, encodeStoredPropertyValue(encodedValue)) {
 			return nil
 		}
 		entry := &graph.PropertyIndexEntry{
@@ -2296,6 +2342,7 @@ func (t *tx) ScanOutEdgePropertyNumericRange(ctx context.Context, tenant, srcID,
 		if !hasValue {
 			return nil
 		}
+		value = decodeStoredPropertyValueBytes(value)
 		numeric, ok := parseNumericPropertyValue(value)
 		if !ok || !numericValueInRange(numeric, lower, lowerSet, lowerInclusive, upper, upperSet, upperInclusive) {
 			return nil
@@ -2672,7 +2719,8 @@ func (t *tx) ScanPropertyIndex(ctx context.Context, tenant, schema, property str
 	if tenant == "" || schema == "" || property == "" || fn == nil {
 		return graph.NewError(graph.ErrKindInvalidInput, "tenant, schema, property, and callback are required", nil)
 	}
-	return t.scanPropertyIndex(ctx, keyspace.PropertyIndexValuePrefix(tenant, schema, property, encodedValue), tenant, schema, property, limit, fn)
+	storedValue := encodeStoredPropertyValue(encodedValue)
+	return t.scanPropertyIndex(ctx, keyspace.PropertyIndexValuePrefix(tenant, schema, property, storedPropertyIndexTypeSegment(storedValue), storedValue), tenant, schema, property, limit, fn)
 }
 
 func (t *tx) ScanPropertyIndexAll(ctx context.Context, tenant, schema, property string, limit int, fn func(*graph.PropertyIndexEntry) error) (err error) {
@@ -2838,39 +2886,40 @@ func (t *tx) PutPropertyIndex(ctx context.Context, entry *graph.PropertyIndexEnt
 	if err := validatePropertyEntry(entry); err != nil {
 		return err
 	}
-	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID)
+	storedValue := encodeStoredPropertyValue(entry.Value)
+	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, storedPropertyIndexTypeSegment(storedValue), storedValue, entry.EntityID)
 	if err := t.set(key, propertyIndexPayload(entry), "write property index"); err != nil {
 		return err
 	}
 	if strings.EqualFold(entry.EntityClass, "vertex") {
-		if err := t.set(keyspace.VertexPropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, entry.Value), []byte(entry.EntityID), "write vertex property forward index"); err != nil {
+		if err := t.set(keyspace.VertexPropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, storedValue), storedValue, "write vertex property forward index"); err != nil {
 			return err
 		}
-		if err := t.set(keyspace.PropertyVertexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID), []byte(entry.EntityID), "write property vertex reverse index"); err != nil {
+		if err := t.set(keyspace.PropertyVertexKey(entry.Tenant, entry.Schema, entry.Property, storedValue, entry.EntityID), []byte(entry.EntityID), "write property vertex reverse index"); err != nil {
 			return err
 		}
 	}
 	if strings.EqualFold(entry.EntityClass, "edge") {
-		if err := t.set(keyspace.EdgePropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, entry.Value), []byte(entry.EntityID), "write edge property forward index"); err != nil {
+		if err := t.set(keyspace.EdgePropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, storedValue), storedValue, "write edge property forward index"); err != nil {
 			return err
 		}
-		if err := t.set(keyspace.PropertyEdgeKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID), []byte(entry.EntityID), "write property edge reverse index"); err != nil {
+		if err := t.set(keyspace.PropertyEdgeKey(entry.Tenant, entry.Schema, entry.Property, storedValue, entry.EntityID), []byte(entry.EntityID), "write property edge reverse index"); err != nil {
 			return err
 		}
 	}
-	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
+	if orderedValue, ok := numericOrderedValueFromEncoded(storedValue); ok {
 		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.set(numericKey, numericPropertyIndexPayload(entry), "write numeric property index"); err != nil {
 			return err
 		}
 	}
-	if orderedValue, ok := booleanOrderedValueFromEncoded(entry.Value); ok {
+	if orderedValue, ok := booleanOrderedValueFromEncoded(storedValue); ok {
 		booleanKey := keyspace.PropertyIndexBooleanKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.set(booleanKey, numericPropertyIndexPayload(entry), "write boolean property index"); err != nil {
 			return err
 		}
 	}
-	if orderedValue, ok := datetimeOrderedValueFromEncoded(entry.Value); ok {
+	if orderedValue, ok := datetimeOrderedValueFromEncoded(storedValue); ok {
 		datetimeKey := keyspace.PropertyIndexDateTimeKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.set(datetimeKey, numericPropertyIndexPayload(entry), "write datetime property index"); err != nil {
 			return err
@@ -2890,39 +2939,40 @@ func (t *tx) DeletePropertyIndex(ctx context.Context, entry *graph.PropertyIndex
 	if err := validatePropertyEntry(entry); err != nil {
 		return err
 	}
-	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID)
+	storedValue := encodeStoredPropertyValue(entry.Value)
+	key := keyspace.PropertyIndexKey(entry.Tenant, entry.Schema, entry.Property, storedPropertyIndexTypeSegment(storedValue), storedValue, entry.EntityID)
 	if err := t.delete(key, "delete property index"); err != nil {
 		return err
 	}
 	if strings.EqualFold(entry.EntityClass, "vertex") {
-		if err := t.delete(keyspace.VertexPropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, entry.Value), "delete vertex property forward index"); err != nil {
+		if err := t.delete(keyspace.VertexPropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, storedValue), "delete vertex property forward index"); err != nil {
 			return err
 		}
-		if err := t.delete(keyspace.PropertyVertexKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID), "delete property vertex reverse index"); err != nil {
+		if err := t.delete(keyspace.PropertyVertexKey(entry.Tenant, entry.Schema, entry.Property, storedValue, entry.EntityID), "delete property vertex reverse index"); err != nil {
 			return err
 		}
 	}
 	if strings.EqualFold(entry.EntityClass, "edge") {
-		if err := t.delete(keyspace.EdgePropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, entry.Value), "delete edge property forward index"); err != nil {
+		if err := t.delete(keyspace.EdgePropertyKey(entry.Tenant, entry.EntityID, entry.Schema, entry.Property, storedValue), "delete edge property forward index"); err != nil {
 			return err
 		}
-		if err := t.delete(keyspace.PropertyEdgeKey(entry.Tenant, entry.Schema, entry.Property, entry.Value, entry.EntityID), "delete property edge reverse index"); err != nil {
+		if err := t.delete(keyspace.PropertyEdgeKey(entry.Tenant, entry.Schema, entry.Property, storedValue, entry.EntityID), "delete property edge reverse index"); err != nil {
 			return err
 		}
 	}
-	if orderedValue, ok := numericOrderedValueFromEncoded(entry.Value); ok {
+	if orderedValue, ok := numericOrderedValueFromEncoded(storedValue); ok {
 		numericKey := keyspace.PropertyIndexNumericKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.delete(numericKey, "delete numeric property index"); err != nil {
 			return err
 		}
 	}
-	if orderedValue, ok := booleanOrderedValueFromEncoded(entry.Value); ok {
+	if orderedValue, ok := booleanOrderedValueFromEncoded(storedValue); ok {
 		booleanKey := keyspace.PropertyIndexBooleanKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.delete(booleanKey, "delete boolean property index"); err != nil {
 			return err
 		}
 	}
-	if orderedValue, ok := datetimeOrderedValueFromEncoded(entry.Value); ok {
+	if orderedValue, ok := datetimeOrderedValueFromEncoded(storedValue); ok {
 		datetimeKey := keyspace.PropertyIndexDateTimeKey(entry.Tenant, entry.Schema, entry.Property, orderedValue, entry.EntityID)
 		if err := t.delete(datetimeKey, "delete datetime property index"); err != nil {
 			return err
@@ -4128,9 +4178,10 @@ func (t *tx) collectPropertyStats(ctx context.Context, tenant, entityClass, sche
 			continue
 		}
 		summary.IndexedEntries++
-		value := string(entry.Value)
+		decodedValue := decodeStoredPropertyValueBytes(entry.Value)
+		value := string(decodedValue)
 		seenValues[value] = struct{}{}
-		kind := propertyValueKind(entry.Value)
+		kind := propertyValueKind(decodedValue)
 		if valueCountsByKind[kind] == nil {
 			valueCountsByKind[kind] = map[string]int{}
 		}
@@ -4626,7 +4677,7 @@ func vertexIDFromKey(key []byte) string {
 
 func propertyIndexEntryFromKey(key, value []byte, tenant, schema, property string) (*graph.PropertyIndexEntry, error) {
 	parts := bytes.Split(key, []byte{'/'})
-	if len(parts) < 6 {
+	if len(parts) < 7 {
 		return nil, graph.NewError(graph.ErrKindStorage, "malformed property index key", nil)
 	}
 	entityID := string(parts[len(parts)-1])
@@ -4643,7 +4694,7 @@ func propertyIndexEntryFromKey(key, value []byte, tenant, schema, property strin
 		Tenant:      tenant,
 		Schema:      schema,
 		Property:    property,
-		Value:       decodedValue,
+		Value:       decodeStoredPropertyValueBytes(decodedValue),
 		EntityID:    entityID,
 		EntityClass: entityClass,
 		EdgeSrcID:   edgeSrcID,
@@ -4653,7 +4704,7 @@ func propertyIndexEntryFromKey(key, value []byte, tenant, schema, property strin
 
 func numericPropertyIndexEntryFromKey(key, payload []byte, tenant, schema, property string) (*graph.PropertyIndexEntry, error) {
 	parts := bytes.Split(key, []byte{'/'})
-	if len(parts) < 6 {
+	if len(parts) < 7 {
 		return nil, graph.NewError(graph.ErrKindStorage, "malformed numeric property index key", nil)
 	}
 	entityID := string(parts[len(parts)-1])
@@ -4665,7 +4716,7 @@ func numericPropertyIndexEntryFromKey(key, payload []byte, tenant, schema, prope
 		Tenant:      tenant,
 		Schema:      schema,
 		Property:    property,
-		Value:       rawValue,
+		Value:       decodeStoredPropertyValueBytes(rawValue),
 		EntityID:    entityID,
 		EntityClass: entityClass,
 		EdgeSrcID:   edgeSrcID,
@@ -4833,6 +4884,7 @@ func parseNumericPropertyIndexPayload(payload []byte) (string, string, string, [
 }
 
 func numericOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
+	raw = decodeStoredPropertyValueBytes(raw)
 	text := string(raw)
 	if text == "" {
 		return nil, false
@@ -4845,6 +4897,7 @@ func numericOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
 }
 
 func booleanOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
+	raw = decodeStoredPropertyValueBytes(raw)
 	text := string(raw)
 	switch text {
 	case "false":
@@ -4857,6 +4910,7 @@ func booleanOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
 }
 
 func datetimeOrderedValueFromEncoded(raw []byte) ([]byte, bool) {
+	raw = decodeStoredPropertyValueBytes(raw)
 	temporal, ok := parseStoredMapString(string(raw))
 	if !ok {
 		return nil, false

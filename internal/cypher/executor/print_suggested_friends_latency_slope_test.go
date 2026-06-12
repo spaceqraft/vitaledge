@@ -119,3 +119,43 @@ func seedPrintSuggestedFriendsGraph(ctx context.Context, store graph.GraphStore,
 		return nil
 	})
 }
+
+// BenchmarkCollectDistinctSuggestedFriendsLargeGraph measures collect(DISTINCT)
+// query latency and allocation behavior as graph size scales.
+func BenchmarkCollectDistinctSuggestedFriendsLargeGraph(b *testing.B) {
+	ctx := context.Background()
+	query := "MATCH (a:Person)-[:SUGGESTED_FRIEND]->(suggested:Person) RETURN a.name AS person, collect(DISTINCT suggested.name) AS suggested_friends ORDER BY person"
+	stmt, err := parser.ParseStatement(query)
+	if err != nil {
+		b.Fatalf("parse print_suggested_friends query failed: %v", err)
+	}
+
+	for _, count := range []int{10000, 25000} {
+		count := count
+		b.Run(fmt.Sprintf("vertices_%d", count), func(b *testing.B) {
+			store := openBenchmarkStore(b)
+			defer func() { _ = store.Close() }()
+
+			if err := seedPrintSuggestedFriendsGraph(ctx, store, benchmarkTenant, count); err != nil {
+				b.Fatalf("seed print_suggested_friends graph failed for count=%d: %v", count, err)
+			}
+
+			exec := New(store, Options{})
+			params := Params{"tenant": benchmarkTenant}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res, err := exec.ExecuteStatement(ctx, stmt, params)
+				if err != nil {
+					b.Fatalf("execute print_suggested_friends failed for count=%d: %v", count, err)
+				}
+				if len(res.Rows) != count {
+					b.Fatalf("expected %d rows, got %d", count, len(res.Rows))
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(count)/b.Elapsed().Seconds(), "rows/s")
+		})
+	}
+}

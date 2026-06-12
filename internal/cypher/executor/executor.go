@@ -17,6 +17,7 @@ import (
 	"github.com/paegun/vitaledge/internal/cypher/ast"
 	"github.com/paegun/vitaledge/internal/cypher/parser"
 	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/paegun/vitaledge/internal/graph/store/typedvalue"
 )
 
 const stage1TopKPushdownImplementation = "fast_target_shared_peer_topk_pushdown_clause_triplet"
@@ -278,6 +279,13 @@ func (e *Executor) ExecuteStatement(ctx context.Context, stmt ast.Statement, par
 		}
 		e.metrics.ObserveRowsReturned(len(res.Rows))
 		return res, nil
+	case *ast.ProfileStatement:
+		res, execErr := e.executeProfileStatement(ctx, s, params)
+		if execErr != nil {
+			return nil, execErr
+		}
+		e.metrics.ObserveRowsReturned(len(res.Rows))
+		return res, nil
 	case *ast.MatchQueryStatement:
 		runtimeRes, _, execErr := e.tryExecuteViaRuntimePipeline(ctx, s, params)
 		if execErr != nil {
@@ -468,9 +476,36 @@ func evalVertexField(v *graph.Vertex, field string) (any, error) {
 	}
 }
 
+func evalVertexTypedScalarField(v *graph.Vertex, field string) (any, bool, error) {
+	if v == nil || v.Properties == nil {
+		return nil, false, nil
+	}
+	raw, ok := v.Properties[field]
+	if !ok {
+		return nil, false, nil
+	}
+	return decodeTypedScalarProperty(raw)
+}
+
+func evalEdgeTypedScalarField(e *graph.Edge, field string) (any, bool, error) {
+	if e == nil || e.Properties == nil {
+		return nil, false, nil
+	}
+	raw, ok := e.Properties[field]
+	if !ok {
+		return nil, false, nil
+	}
+	return decodeTypedScalarProperty(raw)
+}
+
 func evalEdgeField(e *graph.Edge, field string) (any, error) {
 	if e == nil {
 		return nil, nil
+	}
+	if typedScalar, ok, err := evalEdgeTypedScalarField(e, field); err != nil {
+		return nil, err
+	} else if ok {
+		return typedScalar, nil
 	}
 	if e.Properties != nil {
 		if val, ok := e.Properties[field]; ok {
@@ -499,6 +534,26 @@ func evalEdgeField(e *graph.Edge, field string) (any, error) {
 	}
 }
 
+func decodeTypedScalarProperty(raw []byte) (any, bool, error) {
+	if len(raw) <= 5 {
+		return nil, false, nil
+	}
+	if raw[0] != 0xFF || raw[1] != 'T' || raw[2] != 'V' || raw[3] != 0x01 {
+		return nil, false, nil
+	}
+	tag := typedvalue.TypeTag(raw[4])
+	switch tag {
+	case typedvalue.TypeBool, typedvalue.TypeInt64, typedvalue.TypeFloat64, typedvalue.TypeString:
+		decoded, err := typedvalue.Decode(tag, raw[5:])
+		if err != nil {
+			return nil, false, err
+		}
+		return decoded, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
 func shouldExposeEntityID(id string) bool {
 	if strings.HasPrefix(id, "auto-") {
 		return false
@@ -510,6 +565,13 @@ func shouldExposeEntityID(id string) bool {
 }
 
 func decodeStoredPropertyValue(raw []byte) any {
+	if len(raw) > 4 && raw[0] == 0xFF && raw[1] == 'T' && raw[2] == 'V' && raw[3] == 0x01 {
+		tag := typedvalue.TypeTag(raw[4])
+		decoded, err := typedvalue.Decode(tag, raw[5:])
+		if err == nil {
+			return decoded
+		}
+	}
 	text := string(raw)
 	if text == "" {
 		return ""

@@ -376,6 +376,45 @@ func TestParseStatementExplainRequiresInnerQuery(t *testing.T) {
 	}
 }
 
+func TestParseStatementProfileWrapsInnerStatement(t *testing.T) {
+	stmt, err := ParseStatement("PROFILE MATCH (n:Person) RETURN n.name AS name")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+
+	profile, ok := stmt.(*ast.ProfileStatement)
+	if !ok {
+		t.Fatalf("expected *ast.ProfileStatement, got %T", stmt)
+	}
+	if profile.Kind() != ast.StatementKindProfile {
+		t.Fatalf("expected PROFILE kind, got %s", profile.Kind())
+	}
+	if strings.TrimSpace(profile.Query) != "MATCH (n:Person) RETURN n.name AS name" {
+		t.Fatalf("unexpected profile query payload: %q", profile.Query)
+	}
+	if profile.Statement == nil {
+		t.Fatalf("expected wrapped statement")
+	}
+	if profile.Statement.Kind() != ast.StatementKindMatchQuery {
+		t.Fatalf("expected wrapped MATCH_QUERY statement, got %s", profile.Statement.Kind())
+	}
+}
+
+func TestParseStatementProfileRequiresInnerQuery(t *testing.T) {
+	_, err := ParseStatement("PROFILE")
+	if err == nil {
+		t.Fatalf("expected semantic parse error")
+	}
+
+	var parseErr *ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected ParseError, got %T", err)
+	}
+	if parseErr.Kind != ParseErrorSemantic {
+		t.Fatalf("expected semantic parse error kind, got %s", parseErr.Kind)
+	}
+}
+
 func TestParseStatementVariableTypeConflictWithMatchVertex(t *testing.T) {
 	_, err := ParseStatement("WITH 1 AS n MATCH (n) RETURN n")
 	if err == nil {

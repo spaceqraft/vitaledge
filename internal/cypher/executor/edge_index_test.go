@@ -17,6 +17,32 @@ import (
 	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
 )
 
+func explainIndexDecisionsFromPayload(t *testing.T, explain map[string]any) []map[string]any {
+	t.Helper()
+	raw, ok := explain["indexDecisions"]
+	if !ok {
+		t.Fatalf("expected indexDecisions in explain payload")
+	}
+	decisions, ok := raw.([]map[string]any)
+	if !ok {
+		t.Fatalf("expected indexDecisions as []map[string]any, got %T", raw)
+	}
+	return decisions
+}
+
+func profileIndexDecisionsFromPayload(t *testing.T, profile map[string]any) []map[string]any {
+	t.Helper()
+	raw, ok := profile["indexDecisions"]
+	if !ok {
+		t.Fatalf("expected indexDecisions in profile payload")
+	}
+	decisions, ok := raw.([]map[string]any)
+	if !ok {
+		t.Fatalf("expected indexDecisions as []map[string]any, got %T", raw)
+	}
+	return decisions
+}
+
 func TestCreateEdgePropertyIndexBackfillsExistingEdges(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()
@@ -781,6 +807,30 @@ func TestExplainRelationshipUsesEdgePropertyIndexAccessPath(t *testing.T) {
 	if !ok || len(physicalNodes) == 0 {
 		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physical["nodes"])
 	}
+	decisions := explainIndexDecisionsFromPayload(t, explain)
+	if len(decisions) == 0 {
+		t.Fatalf("expected index decisions in explain payload")
+	}
+	decision := decisions[0]
+	if got, _ := decision["typeDomain"].(string); got != "numeric" {
+		t.Fatalf("expected numeric type domain for rating, got %#v", decision)
+	}
+	if got, _ := decision["typedSeekStrategy"].(string); got != "typed_property_index_seek" {
+		t.Fatalf("expected typed_property_index_seek strategy, got %#v", decision)
+	}
+	plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected plannerTypedDecision map, got %#v", decision)
+	}
+	if got, _ := plannerTypedDecision["state"].(string); got != "typed_seek_guarded" {
+		t.Fatalf("expected typed_seek_guarded planner state for sparse sample, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["rule"].(string); got != "guardrail_if_stats_sample_sparse" {
+		t.Fatalf("expected guardrail_if_stats_sample_sparse planner rule, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["dominantKind"].(string); got != "numeric" {
+		t.Fatalf("expected numeric dominant kind, got %#v", plannerTypedDecision)
+	}
 }
 
 func TestExplainRelationshipRangeWhereUsesEdgePropertyIndexAccessPath(t *testing.T) {
@@ -836,6 +886,905 @@ func TestExplainRelationshipRangeWhereUsesEdgePropertyIndexAccessPath(t *testing
 	physicalNodes, ok := physical["nodes"].([]map[string]any)
 	if !ok || len(physicalNodes) == 0 {
 		t.Fatalf("expected non-empty physicalPlan.nodes, got %#v", physical["nodes"])
+	}
+	decisions := explainIndexDecisionsFromPayload(t, explain)
+	if len(decisions) == 0 {
+		t.Fatalf("expected index decisions in explain payload")
+	}
+	decision := decisions[0]
+	if got, _ := decision["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected range predicate class in explain decision, got %#v", decision)
+	}
+	if got, _ := decision["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected range_predicate boundary in explain decision, got %#v", decision)
+	}
+	plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected plannerTypedDecision map for range predicate, got %#v", decision)
+	}
+	if got, _ := plannerTypedDecision["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected range predicate class in plannerTypedDecision, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected range_predicate boundary in plannerTypedDecision, got %#v", plannerTypedDecision)
+	}
+}
+
+func TestExplainVertexPropertyIndexFallsBackForMixedTypeDomain(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: map[string][]byte{"code": valueToBytes(7)}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"code": valueToBytes("alpha")}}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "code")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (u:User {code: 7}) RETURN u.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute explain failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected explain output row")
+	}
+
+	explain, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	decisions := explainIndexDecisionsFromPayload(t, explain)
+	if len(decisions) == 0 {
+		t.Fatalf("expected index decisions in explain payload")
+	}
+	decision := decisions[0]
+	if got, _ := decision["typeDomain"].(string); got != "mixed" {
+		t.Fatalf("expected mixed type domain for code, got %#v", decision)
+	}
+	if got, _ := decision["typedSeekStrategy"].(string); got != "mixed_type_fallback" {
+		t.Fatalf("expected mixed_type_fallback strategy, got %#v", decision)
+	}
+	plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected plannerTypedDecision map for mixed domain, got %#v", decision)
+	}
+	if got, _ := plannerTypedDecision["state"].(string); got != "fallback_preferred" {
+		t.Fatalf("expected fallback_preferred planner state for mixed domain, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["rule"].(string); got != "fallback_if_mixed_type_domain_weak_dominance" {
+		t.Fatalf("expected fallback_if_mixed_type_domain_weak_dominance planner rule, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["strategy"].(string); got != "mixed_type_fallback" {
+		t.Fatalf("expected mixed_type_fallback planner strategy, got %#v", plannerTypedDecision)
+	}
+	if runtimeStats, ok := explain["runtimeStats"].(map[string]any); ok {
+		indexStats, _ := runtimeStats["index"].(map[string]any)
+		if got, _ := indexStats["mixedFallbacks"].(int); got == 0 {
+			t.Fatalf("expected mixedFallbacks runtime stat to be reported, got %#v", runtimeStats)
+		}
+	} else {
+		t.Fatalf("expected runtimeStats map, got %#v", explain["runtimeStats"])
+	}
+}
+
+func TestExplainVertexPropertyIndexUsesNullAbsentGuardrailMetadata(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 80; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-missing-%d", i), Labels: []string{"User"}}); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < 20; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-score-%d", i), Labels: []string{"User"}, Properties: map[string][]byte{"score": valueToBytes(fmt.Sprintf("band-%d", i%2))}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "score")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (u:User {score: 'band-1'}) RETURN u.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute explain failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected explain output row")
+	}
+
+	explain, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	decisions := explainIndexDecisionsFromPayload(t, explain)
+	if len(decisions) == 0 {
+		t.Fatalf("expected index decisions in explain payload")
+	}
+	plannerTypedDecision, ok := decisions[0]["plannerTypedDecision"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected plannerTypedDecision map, got %#v", decisions[0])
+	}
+	if got, _ := plannerTypedDecision["rule"].(string); got != "guardrail_if_null_or_absent_rate_high" {
+		t.Fatalf("expected null/absent guardrail rule, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["state"].(string); got != "typed_seek_guarded" {
+		t.Fatalf("expected typed_seek_guarded state for null/absent rates, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["predicateClass"].(string); got != "equality" {
+		t.Fatalf("expected equality predicate class, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["planBoundary"].(string); got != "equality_predicate" {
+		t.Fatalf("expected equality_predicate boundary, got %#v", plannerTypedDecision)
+	}
+	if nullRate, _ := plannerTypedDecision["nullRate"].(float64); nullRate != 0 {
+		t.Fatalf("expected nullRate=0 for absent-heavy categorical fixture, got %#v", plannerTypedDecision)
+	}
+	if absentRate, _ := plannerTypedDecision["absentRate"].(float64); absentRate < 0.60 {
+		t.Fatalf("expected absentRate >= 0.60, got %#v", plannerTypedDecision)
+	}
+}
+
+func TestExplainVertexWhereRangePredicateClassParity(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 40; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-%d", i), Labels: []string{"User"}, Properties: map[string][]byte{"age": valueToBytes(20 + i)}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "age")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	stmt, err := parser.ParseStatement("EXPLAIN MATCH (u:User) WHERE u.age >= 30 RETURN u.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute explain failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected explain output row")
+	}
+
+	explain, ok := res.Rows[0]["explain"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+	}
+	decisions := explainIndexDecisionsFromPayload(t, explain)
+	if len(decisions) == 0 {
+		t.Fatalf("expected index decisions in explain payload")
+	}
+	decision := decisions[0]
+	if got, _ := decision["schema"].(string); got != "User" {
+		t.Fatalf("expected User schema decision, got %#v", decision)
+	}
+	if got, _ := decision["property"].(string); got != "age" {
+		t.Fatalf("expected age property decision, got %#v", decision)
+	}
+	if got, _ := decision["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected range predicate class for vertex WHERE range, got %#v", decision)
+	}
+	if got, _ := decision["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected range_predicate boundary for vertex WHERE range, got %#v", decision)
+	}
+	plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected plannerTypedDecision map, got %#v", decision)
+	}
+	if got, _ := plannerTypedDecision["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected range predicateClass in plannerTypedDecision, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected range planBoundary in plannerTypedDecision, got %#v", plannerTypedDecision)
+	}
+}
+
+func TestExplainGuardrailReasonFamiliesDeterministicAcrossRuns(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 80; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-missing-%d", i), Labels: []string{"User"}}); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < 20; i++ {
+			props := map[string][]byte{"score": valueToBytes(fmt.Sprintf("band-%d", i%2))}
+			if i%2 == 0 {
+				props["code"] = valueToBytes(7)
+			} else {
+				props["code"] = valueToBytes("alpha")
+			}
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-present-%d", i), Labels: []string{"User"}, Properties: props}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "score")
+	catalog.AddPropertyIndex("acme", "User", "code")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	queryCases := []struct {
+		name         string
+		query        string
+		property     string
+		expectedRule string
+	}{
+		{name: "null absent guardrail", query: "EXPLAIN MATCH (u:User {score: 'band-1'}) RETURN u.id AS id", property: "score", expectedRule: "guardrail_if_null_or_absent_rate_high"},
+		{name: "weak dominance mixed fallback", query: "EXPLAIN MATCH (u:User {code: 7}) RETURN u.id AS id", property: "code", expectedRule: "fallback_if_mixed_type_domain_weak_dominance"},
+	}
+
+	for _, tc := range queryCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := parser.ParseStatement(tc.query)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+
+			fetchDecision := func() map[string]any {
+				res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+				if err != nil {
+					t.Fatalf("execute explain failed: %v", err)
+				}
+				if len(res.Rows) == 0 {
+					t.Fatalf("expected explain output row")
+				}
+				explain, ok := res.Rows[0]["explain"].(map[string]any)
+				if !ok {
+					t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+				}
+				decisions := explainIndexDecisionsFromPayload(t, explain)
+				for _, decision := range decisions {
+					if got, _ := decision["property"].(string); got == tc.property {
+						plannerDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+						if !ok {
+							t.Fatalf("expected plannerTypedDecision map, got %#v", decision)
+						}
+						return plannerDecision
+					}
+				}
+				t.Fatalf("expected index decision for property %s, got %#v", tc.property, decisions)
+				return nil
+			}
+
+			first := fetchDecision()
+			second := fetchDecision()
+
+			if got, _ := first["rule"].(string); got != tc.expectedRule {
+				t.Fatalf("expected rule %s, got %#v", tc.expectedRule, first)
+			}
+			if got, _ := second["rule"].(string); got != tc.expectedRule {
+				t.Fatalf("expected rule %s on second run, got %#v", tc.expectedRule, second)
+			}
+			firstReason, _ := first["reason"].(string)
+			secondReason, _ := second["reason"].(string)
+			if firstReason == "" || secondReason == "" || firstReason != secondReason {
+				t.Fatalf("expected deterministic reason text across runs, first=%q second=%q", firstReason, secondReason)
+			}
+			firstFingerprint, _ := first["fingerprint"].(string)
+			secondFingerprint, _ := second["fingerprint"].(string)
+			if firstFingerprint == "" || secondFingerprint == "" || firstFingerprint != secondFingerprint {
+				t.Fatalf("expected deterministic fingerprint across runs, first=%q second=%q", firstFingerprint, secondFingerprint)
+			}
+		})
+	}
+}
+
+func TestExplainPlannerTypedDecisionStaysScopedAcrossLabelsAndProperties(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 90; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-missing-%d", i), Labels: []string{"User"}}); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < 30; i++ {
+			props := map[string][]byte{
+				"score": valueToBytes(fmt.Sprintf("band-%d", i%3)),
+			}
+			if i < 18 {
+				props["code"] = valueToBytes(7)
+			} else {
+				props["code"] = valueToBytes(fmt.Sprintf("code-%d", i%4))
+			}
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-present-%d", i), Labels: []string{"User"}, Properties: props}); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < 60; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("m-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{
+				"score": valueToBytes(float64((i%5)+1) * 1.0),
+				"year":  valueToBytes(1990 + i),
+			}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "score")
+	catalog.AddPropertyIndex("acme", "User", "code")
+	catalog.AddPropertyIndex("acme", "Movie", "score")
+	catalog.AddPropertyIndex("acme", "Movie", "year")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	type queryExpectation struct {
+		name            string
+		query           string
+		schema          string
+		property        string
+		expectedState   string
+		expectedRule    string
+		expectedDomain  string
+		expectedScanPop int
+		expectedClass   string
+		expectedBound   string
+	}
+
+	queryCases := []queryExpectation{
+		{
+			name:            "user absent heavy string score",
+			query:           "EXPLAIN MATCH (u:User {score: 'band-1'}) RETURN u.id AS id",
+			schema:          "User",
+			property:        "score",
+			expectedState:   "typed_seek_guarded",
+			expectedRule:    "guardrail_if_null_or_absent_rate_high",
+			expectedDomain:  "categorical",
+			expectedScanPop: 120,
+			expectedClass:   "equality",
+			expectedBound:   "equality_predicate",
+		},
+		{
+			name:            "user mixed code fallback",
+			query:           "EXPLAIN MATCH (u:User {code: 7}) RETURN u.id AS id",
+			schema:          "User",
+			property:        "code",
+			expectedState:   "fallback_preferred",
+			expectedRule:    "fallback_if_mixed_type_domain_weak_dominance",
+			expectedDomain:  "mixed",
+			expectedScanPop: 120,
+			expectedClass:   "equality",
+			expectedBound:   "equality_predicate",
+		},
+		{
+			name:            "movie dense numeric score",
+			query:           "EXPLAIN MATCH (m:Movie {score: 4.0}) RETURN m.id AS id",
+			schema:          "Movie",
+			property:        "score",
+			expectedState:   "typed_seek_preferred",
+			expectedRule:    "typed_seek_if_single_known_domain",
+			expectedDomain:  "numeric",
+			expectedScanPop: 60,
+			expectedClass:   "equality",
+			expectedBound:   "equality_predicate",
+		},
+		{
+			name:            "movie dense numeric year range",
+			query:           "EXPLAIN MATCH (m:Movie) WHERE m.year <= 2010 RETURN m.id AS id",
+			schema:          "Movie",
+			property:        "year",
+			expectedState:   "typed_seek_preferred",
+			expectedRule:    "typed_seek_if_single_known_domain",
+			expectedDomain:  "numeric",
+			expectedScanPop: 60,
+			expectedClass:   "range",
+			expectedBound:   "range_predicate",
+		},
+	}
+
+	for _, tc := range queryCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := parser.ParseStatement(tc.query)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+			if err != nil {
+				t.Fatalf("execute explain failed: %v", err)
+			}
+			if len(res.Rows) == 0 {
+				t.Fatalf("expected explain output row")
+			}
+
+			explain, ok := res.Rows[0]["explain"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+			}
+			decisions := explainIndexDecisionsFromPayload(t, explain)
+			var matched map[string]any
+			for _, decision := range decisions {
+				if gotSchema, _ := decision["schema"].(string); gotSchema != tc.schema {
+					continue
+				}
+				if gotProperty, _ := decision["property"].(string); gotProperty != tc.property {
+					continue
+				}
+				matched = decision
+				break
+			}
+			if matched == nil {
+				t.Fatalf("expected decision for %s.%s, got %#v", tc.schema, tc.property, decisions)
+			}
+
+			if got, _ := matched["typeDomain"].(string); got != tc.expectedDomain {
+				t.Fatalf("expected domain %s, got %#v", tc.expectedDomain, matched)
+			}
+			if got, _ := matched["predicateClass"].(string); got != tc.expectedClass {
+				t.Fatalf("expected predicateClass %s, got %#v", tc.expectedClass, matched)
+			}
+			if got, _ := matched["planBoundary"].(string); got != tc.expectedBound {
+				t.Fatalf("expected planBoundary %s, got %#v", tc.expectedBound, matched)
+			}
+			if got, _ := matched["scanPopulation"].(int); got != tc.expectedScanPop {
+				t.Fatalf("expected scanPopulation %d, got %#v", tc.expectedScanPop, matched)
+			}
+
+			plannerTypedDecision, ok := matched["plannerTypedDecision"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected plannerTypedDecision map, got %#v", matched)
+			}
+			if got, _ := plannerTypedDecision["state"].(string); got != tc.expectedState {
+				t.Fatalf("expected planner state %s, got %#v", tc.expectedState, plannerTypedDecision)
+			}
+			if got, _ := plannerTypedDecision["rule"].(string); got != tc.expectedRule {
+				t.Fatalf("expected planner rule %s, got %#v", tc.expectedRule, plannerTypedDecision)
+			}
+			if got, _ := plannerTypedDecision["predicateClass"].(string); got != tc.expectedClass {
+				t.Fatalf("expected planner predicateClass %s, got %#v", tc.expectedClass, plannerTypedDecision)
+			}
+			if got, _ := plannerTypedDecision["planBoundary"].(string); got != tc.expectedBound {
+				t.Fatalf("expected planner planBoundary %s, got %#v", tc.expectedBound, plannerTypedDecision)
+			}
+		})
+	}
+}
+
+func TestExplainVertexWhereComparableFormsPreserveRangeParity(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 50; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-%d", i), Labels: []string{"User"}, Properties: map[string][]byte{"age": valueToBytes(20 + i)}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "age")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	queryCases := []struct {
+		name  string
+		query string
+	}{
+		{name: "less than or equal", query: "EXPLAIN MATCH (u:User) WHERE u.age <= 25 RETURN u.id AS id"},
+		{name: "reverse comparison", query: "EXPLAIN MATCH (u:User) WHERE 25 <= u.age RETURN u.id AS id"},
+		{name: "bounded conjunction same property", query: "EXPLAIN MATCH (u:User) WHERE u.age >= 25 AND u.age < 30 RETURN u.id AS id"},
+	}
+
+	for _, tc := range queryCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := parser.ParseStatement(tc.query)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+			if err != nil {
+				t.Fatalf("execute explain failed: %v", err)
+			}
+			if len(res.Rows) == 0 {
+				t.Fatalf("expected explain output row")
+			}
+
+			explain, ok := res.Rows[0]["explain"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+			}
+			decisions := explainIndexDecisionsFromPayload(t, explain)
+			ageDecisions := make([]map[string]any, 0, len(decisions))
+			for _, decision := range decisions {
+				if gotSchema, _ := decision["schema"].(string); gotSchema != "User" {
+					continue
+				}
+				if gotProperty, _ := decision["property"].(string); gotProperty != "age" {
+					continue
+				}
+				ageDecisions = append(ageDecisions, decision)
+			}
+			if len(ageDecisions) != 1 {
+				t.Fatalf("expected exactly one age decision for query shape, got %#v", ageDecisions)
+			}
+			decision := ageDecisions[0]
+			if got, _ := decision["predicateClass"].(string); got != "range" {
+				t.Fatalf("expected range predicateClass, got %#v", decision)
+			}
+			if got, _ := decision["planBoundary"].(string); got != "range_predicate" {
+				t.Fatalf("expected range_predicate planBoundary, got %#v", decision)
+			}
+			plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected plannerTypedDecision map, got %#v", decision)
+			}
+			if got, _ := plannerTypedDecision["predicateClass"].(string); got != "range" {
+				t.Fatalf("expected planner range predicateClass, got %#v", plannerTypedDecision)
+			}
+			if got, _ := plannerTypedDecision["planBoundary"].(string); got != "range_predicate" {
+				t.Fatalf("expected planner range_predicate planBoundary, got %#v", plannerTypedDecision)
+			}
+		})
+	}
+}
+
+func TestExplainVertexWhereDisjunctiveComparableFormsPreserveRangeParity(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 80; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-%d", i), Labels: []string{"User"}, Properties: map[string][]byte{"age": valueToBytes(18 + i), "score": valueToBytes(i % 5)}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "age")
+	catalog.AddPropertyIndex("acme", "User", "score")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	type queryExpectation struct {
+		name            string
+		query           string
+		wantAgeDecision bool
+	}
+
+	queryCases := []queryExpectation{
+		{name: "simple same property disjunction", query: "EXPLAIN MATCH (u:User) WHERE u.age < 25 OR u.age >= 70 RETURN u.id AS id", wantAgeDecision: true},
+		{name: "bounded branch disjunction", query: "EXPLAIN MATCH (u:User) WHERE (u.age >= 20 AND u.age < 25) OR (u.age >= 70 AND u.age < 75) RETURN u.id AS id", wantAgeDecision: true},
+		{name: "mixed equality and range disjunction", query: "EXPLAIN MATCH (u:User) WHERE u.age = 30 OR u.age > 60 RETURN u.id AS id", wantAgeDecision: true},
+		{name: "mixed property disjunction suppressed", query: "EXPLAIN MATCH (u:User) WHERE u.age > 60 OR u.score = 4 RETURN u.id AS id", wantAgeDecision: false},
+	}
+
+	for _, tc := range queryCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := parser.ParseStatement(tc.query)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+			if err != nil {
+				t.Fatalf("execute explain failed: %v", err)
+			}
+			if len(res.Rows) == 0 {
+				t.Fatalf("expected explain output row")
+			}
+
+			explain, ok := res.Rows[0]["explain"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected explain payload map, got %T", res.Rows[0]["explain"])
+			}
+			decisions := explainIndexDecisionsFromPayload(t, explain)
+			ageDecisions := make([]map[string]any, 0, len(decisions))
+			for _, decision := range decisions {
+				if gotSchema, _ := decision["schema"].(string); gotSchema != "User" {
+					continue
+				}
+				if gotProperty, _ := decision["property"].(string); gotProperty != "age" {
+					continue
+				}
+				ageDecisions = append(ageDecisions, decision)
+			}
+			if !tc.wantAgeDecision {
+				if len(ageDecisions) != 0 {
+					t.Fatalf("expected no age decision for unsupported mixed-property OR shape, got %#v", ageDecisions)
+				}
+				return
+			}
+			if len(ageDecisions) != 1 {
+				t.Fatalf("expected exactly one age decision for disjunctive shape, got %#v", ageDecisions)
+			}
+			decision := ageDecisions[0]
+			if got, _ := decision["predicateClass"].(string); got != "range" {
+				t.Fatalf("expected range predicateClass for disjunctive age decision, got %#v", decision)
+			}
+			if got, _ := decision["planBoundary"].(string); got != "range_predicate" {
+				t.Fatalf("expected range_predicate planBoundary for disjunctive age decision, got %#v", decision)
+			}
+			plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected plannerTypedDecision map, got %#v", decision)
+			}
+			if got, _ := plannerTypedDecision["predicateClass"].(string); got != "range" {
+				t.Fatalf("expected planner range predicateClass for disjunctive shape, got %#v", plannerTypedDecision)
+			}
+			if got, _ := plannerTypedDecision["planBoundary"].(string); got != "range_predicate" {
+				t.Fatalf("expected planner range_predicate planBoundary for disjunctive shape, got %#v", plannerTypedDecision)
+			}
+		})
+	}
+}
+
+func TestProfileVertexWhereRangePredicateClassParity(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 40; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-%d", i), Labels: []string{"User"}, Properties: map[string][]byte{"age": valueToBytes(20 + i)}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "age")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	stmt, err := parser.ParseStatement("PROFILE MATCH (u:User) WHERE u.age >= 30 RETURN u.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute profile failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected profile output row")
+	}
+
+	profile, ok := res.Rows[0]["profile"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected profile payload map, got %T", res.Rows[0]["profile"])
+	}
+	if got, _ := profile["version"].(string); got != "v1-profile" {
+		t.Fatalf("expected v1-profile payload version, got %#v", profile)
+	}
+	decisions := profileIndexDecisionsFromPayload(t, profile)
+	if len(decisions) == 0 {
+		t.Fatalf("expected index decisions in profile payload")
+	}
+	decision := decisions[0]
+	if got, _ := decision["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected range predicate class in profile decision, got %#v", decision)
+	}
+	if got, _ := decision["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected range_predicate boundary in profile decision, got %#v", decision)
+	}
+	plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected plannerTypedDecision map for profile payload, got %#v", decision)
+	}
+	if got, _ := plannerTypedDecision["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected range predicate class in profile plannerTypedDecision, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected range_predicate boundary in profile plannerTypedDecision, got %#v", plannerTypedDecision)
+	}
+	resultBlock, ok := profile["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected result block in profile payload, got %#v", profile["result"])
+	}
+	if got, _ := resultBlock["rowsReturned"].(int); got == 0 {
+		t.Fatalf("expected non-zero rowsReturned in profile result block, got %#v", resultBlock)
+	}
+}
+
+func TestProfilePlannerTypedDecisionGuardrailReasonFamiliesParity(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 80; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-missing-%d", i), Labels: []string{"User"}}); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < 20; i++ {
+			props := map[string][]byte{"score": valueToBytes(fmt.Sprintf("band-%d", i%2))}
+			if i%2 == 0 {
+				props["code"] = valueToBytes(7)
+			} else {
+				props["code"] = valueToBytes("alpha")
+			}
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-present-%d", i), Labels: []string{"User"}, Properties: props}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "score")
+	catalog.AddPropertyIndex("acme", "User", "code")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	queryCases := []struct {
+		name          string
+		query         string
+		property      string
+		expectedRule  string
+		expectedState string
+	}{
+		{name: "null absent guardrail", query: "PROFILE MATCH (u:User {score: 'band-1'}) RETURN u.id AS id", property: "score", expectedRule: "guardrail_if_null_or_absent_rate_high", expectedState: "typed_seek_guarded"},
+		{name: "weak dominance mixed fallback", query: "PROFILE MATCH (u:User {code: 7}) RETURN u.id AS id", property: "code", expectedRule: "fallback_if_mixed_type_domain_weak_dominance", expectedState: "fallback_preferred"},
+	}
+
+	for _, tc := range queryCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := parser.ParseStatement(tc.query)
+			if err != nil {
+				t.Fatalf("parse failed: %v", err)
+			}
+			res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+			if err != nil {
+				t.Fatalf("execute profile failed: %v", err)
+			}
+			if len(res.Rows) == 0 {
+				t.Fatalf("expected profile output row")
+			}
+
+			profile, ok := res.Rows[0]["profile"].(map[string]any)
+			if !ok {
+				t.Fatalf("expected profile payload map, got %T", res.Rows[0]["profile"])
+			}
+			decisions := profileIndexDecisionsFromPayload(t, profile)
+			for _, decision := range decisions {
+				if got, _ := decision["property"].(string); got != tc.property {
+					continue
+				}
+				plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+				if !ok {
+					t.Fatalf("expected plannerTypedDecision map, got %#v", decision)
+				}
+				if got, _ := plannerTypedDecision["rule"].(string); got != tc.expectedRule {
+					t.Fatalf("expected planner rule %s, got %#v", tc.expectedRule, plannerTypedDecision)
+				}
+				if got, _ := plannerTypedDecision["state"].(string); got != tc.expectedState {
+					t.Fatalf("expected planner state %s, got %#v", tc.expectedState, plannerTypedDecision)
+				}
+				if reason, _ := plannerTypedDecision["reason"].(string); strings.TrimSpace(reason) == "" {
+					t.Fatalf("expected non-empty planner reason, got %#v", plannerTypedDecision)
+				}
+				return
+			}
+			t.Fatalf("expected profile index decision for property %s, got %#v", tc.property, decisions)
+		})
+	}
+}
+
+func TestProfileVertexWhereDisjunctiveComparableFormsPreserveRangeParity(t *testing.T) {
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+	if err := store.Update(ctx, func(tx graph.Tx) error {
+		for i := 0; i < 80; i++ {
+			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("u-%d", i), Labels: []string{"User"}, Properties: map[string][]byte{"age": valueToBytes(18 + i), "score": valueToBytes(i % 5)}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	catalog := indexschema.NewCatalog()
+	catalog.AddPropertyIndex("acme", "User", "age")
+	catalog.AddPropertyIndex("acme", "User", "score")
+	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
+
+	stmt, err := parser.ParseStatement("PROFILE MATCH (u:User) WHERE (u.age >= 20 AND u.age < 25) OR (u.age >= 70 AND u.age < 75) RETURN u.id AS id")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute profile failed: %v", err)
+	}
+	if len(res.Rows) == 0 {
+		t.Fatalf("expected profile output row")
+	}
+
+	profile, ok := res.Rows[0]["profile"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected profile payload map, got %T", res.Rows[0]["profile"])
+	}
+	decisions := profileIndexDecisionsFromPayload(t, profile)
+	ageDecisions := make([]map[string]any, 0, len(decisions))
+	for _, decision := range decisions {
+		if gotSchema, _ := decision["schema"].(string); gotSchema != "User" {
+			continue
+		}
+		if gotProperty, _ := decision["property"].(string); gotProperty != "age" {
+			continue
+		}
+		ageDecisions = append(ageDecisions, decision)
+	}
+	if len(ageDecisions) != 1 {
+		t.Fatalf("expected exactly one age decision for profile disjunctive shape, got %#v", ageDecisions)
+	}
+	decision := ageDecisions[0]
+	if got, _ := decision["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected range predicateClass for profile disjunctive age decision, got %#v", decision)
+	}
+	if got, _ := decision["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected range_predicate planBoundary for profile disjunctive age decision, got %#v", decision)
+	}
+	plannerTypedDecision, ok := decision["plannerTypedDecision"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected plannerTypedDecision map, got %#v", decision)
+	}
+	if got, _ := plannerTypedDecision["predicateClass"].(string); got != "range" {
+		t.Fatalf("expected planner range predicateClass for profile disjunctive shape, got %#v", plannerTypedDecision)
+	}
+	if got, _ := plannerTypedDecision["planBoundary"].(string); got != "range_predicate" {
+		t.Fatalf("expected planner range_predicate planBoundary for profile disjunctive shape, got %#v", plannerTypedDecision)
 	}
 }
 

@@ -14,15 +14,36 @@ var antiProbeWhereUndirectedRe = regexp.MustCompile(`(?i)NOT\s*\(\s*\(([A-Za-z_]
 var antiProbeWhereDirectedOutRe = regexp.MustCompile(`(?i)NOT\s*\(\s*\(([A-Za-z_][A-Za-z0-9_]*)[^)]*\)\s*-\s*\[[^\]]*?(?::([A-Za-z_][A-Za-z0-9_]*))?[^\]]*\]\s*->\s*\(([A-Za-z_][A-Za-z0-9_]*)[^)]*\)\s*\)`)
 var antiProbeWhereDirectedInRe = regexp.MustCompile(`(?i)NOT\s*\(\s*\(([A-Za-z_][A-Za-z0-9_]*)[^)]*\)\s*<-\s*\[[^\]]*?(?::([A-Za-z_][A-Za-z0-9_]*))?[^\]]*\]\s*-\s*\(([A-Za-z_][A-Za-z0-9_]*)[^)]*\)\s*\)`)
 var patternUndirectedRe = regexp.MustCompile(`\)\s*-\s*\[[^\]]*\]\s*-\s*\(`)
+var leadingVertexPatternWithPropsRe = regexp.MustCompile(`\(\s*([A-Za-z_][A-Za-z0-9_]*)?\s*(?::\s*([A-Za-z_][A-Za-z0-9_]*)\s*)?\{([^}]*)\}`)
+
+// PropertyDomainHint captures planner-facing typed-domain summary for one property.
+type PropertyDomainHint struct {
+	EntityClass    string
+	Schema         string
+	Property       string
+	TypeDomain     string
+	Strategy       string
+	GuardrailState string
+	GuardrailRule  string
+	Reason         string
+	DominantKind   string
+	DominantShare  float64
+	SampleSize     int
+	NullRate       float64
+	AbsentRate     float64
+	EqualitySel    float64
+	RangeSel       float64
+}
 
 // StatsHints carries optional persisted stats for physical rewrite decisions.
 type StatsHints struct {
-	EdgeTypeCounts     map[string]int
-	EdgeSourceCounts   map[string]int
-	EdgeAvgOutDegree   map[string]float64
-	AntiProbeHitRateBy map[string]float64
-	HasEdgeTotal       bool
-	EdgeTotal          int
+	EdgeTypeCounts      map[string]int
+	EdgeSourceCounts    map[string]int
+	EdgeAvgOutDegree    map[string]float64
+	AntiProbeHitRateBy  map[string]float64
+	PropertyDomainHints map[string]PropertyDomainHint
+	HasEdgeTotal        bool
+	EdgeTotal           int
 }
 
 // Build constructs a deterministic physical plan from a logical plan.
@@ -144,14 +165,22 @@ func lowerLogicalNode(logicalOp string, logicalAttrs map[string]any, hints Stats
 	switch logicalOp {
 	case "MATCH":
 		pattern, _ := attrs["pattern"].(string)
+		whereExpr, _ := attrs["where"].(string)
 		accessPath := expandAccessPathForPattern(pattern, hints, false)
 		attrs["accessPath"] = accessPath
+		if guardrail, ok := typedDomainGuardrailForPattern(pattern, whereExpr, hints); ok {
+			attrs["typedDomainGuardrail"] = guardrail
+		}
 		attrs["variant"] = expandVariantForAccessPath(accessPath)
 		return "PHY_EXPAND_MATCH", attrs
 	case "OPTIONAL_MATCH":
 		pattern, _ := attrs["pattern"].(string)
+		whereExpr, _ := attrs["where"].(string)
 		accessPath := expandAccessPathForPattern(pattern, hints, true)
 		attrs["accessPath"] = accessPath
+		if guardrail, ok := typedDomainGuardrailForPattern(pattern, whereExpr, hints); ok {
+			attrs["typedDomainGuardrail"] = guardrail
+		}
 		attrs["variant"] = expandVariantForAccessPath(accessPath)
 		return "PHY_EXPAND_OPTIONAL", attrs
 	case "WRITE":
@@ -482,6 +511,150 @@ func antiProbeAttrsFromWhere(attrs map[string]any, hints StatsHints) []map[strin
 		})
 	}
 	return out
+}
+
+func propertyDomainHintKey(entityClass, schema, property string) string {
+	return strings.ToLower(strings.TrimSpace(entityClass)) + "|" + strings.ToUpper(strings.TrimSpace(schema)) + "|" + strings.ToLower(strings.TrimSpace(property))
+}
+
+func typedDomainGuardrailForPattern(pattern string, whereExpr string, hints StatsHints) (map[string]any, bool) {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return nil, false
+	}
+	m := leadingVertexPatternWithPropsRe.FindStringSubmatch(pattern)
+	if len(m) != 4 {
+		return nil, false
+	}
+	patternVar := strings.TrimSpace(m[1])
+	schema := strings.TrimSpace(m[2])
+	propsRaw := strings.TrimSpace(m[3])
+	if schema == "" || propsRaw == "" {
+		return nil, false
+	}
+	properties := extractPatternPropertyKeys(propsRaw)
+	if len(properties) == 0 {
+		return nil, false
+	}
+	predicateClass := predicateClassForProperty(patternVar, properties[0], whereExpr)
+	planBoundary := "equality_predicate"
+	if predicateClass == "range" {
+		planBoundary = "range_predicate"
+	}
+	if hints.PropertyDomainHints == nil {
+		property := properties[0]
+		return map[string]any{
+			"entityClass":    "vertex",
+			"schema":         schema,
+			"property":       property,
+			"state":          "fallback_preferred",
+			"rule":           "fallback_if_type_domain_unknown",
+			"reason":         "property domain hints are unavailable",
+			"typeDomain":     "unknown",
+			"strategy":       "unknown",
+			"predicateClass": predicateClass,
+			"planBoundary":   planBoundary,
+		}, true
+	}
+
+	best := PropertyDomainHint{GuardrailState: "typed_seek_preferred"}
+	found := false
+	severity := map[string]int{"typed_seek_preferred": 0, "typed_seek_guarded": 1, "fallback_preferred": 2}
+	for _, property := range properties {
+		key := propertyDomainHintKey("vertex", schema, property)
+		hint, ok := hints.PropertyDomainHints[key]
+		if !ok {
+			hint = PropertyDomainHint{
+				EntityClass:    "vertex",
+				Schema:         schema,
+				Property:       property,
+				TypeDomain:     "unknown",
+				Strategy:       "unknown",
+				GuardrailState: "fallback_preferred",
+				GuardrailRule:  "fallback_if_type_domain_unknown",
+				Reason:         "property stats summary is unavailable",
+			}
+		}
+		if !found || severity[hint.GuardrailState] > severity[best.GuardrailState] {
+			best = hint
+			found = true
+		}
+	}
+	if !found {
+		return nil, false
+	}
+	return map[string]any{
+		"entityClass":    best.EntityClass,
+		"schema":         best.Schema,
+		"property":       best.Property,
+		"state":          best.GuardrailState,
+		"rule":           best.GuardrailRule,
+		"reason":         best.Reason,
+		"typeDomain":     best.TypeDomain,
+		"strategy":       best.Strategy,
+		"dominantKind":   best.DominantKind,
+		"dominantShare":  best.DominantShare,
+		"sampleSize":     best.SampleSize,
+		"nullRate":       best.NullRate,
+		"absentRate":     best.AbsentRate,
+		"equalitySel":    best.EqualitySel,
+		"rangeSel":       best.RangeSel,
+		"predicateClass": predicateClass,
+		"planBoundary":   planBoundary,
+	}, true
+}
+
+func predicateClassForProperty(patternVar string, property string, whereExpr string) string {
+	whereExpr = strings.TrimSpace(whereExpr)
+	if whereExpr == "" {
+		return "equality"
+	}
+	property = strings.ToLower(strings.TrimSpace(property))
+	if property == "" {
+		return "equality"
+	}
+	varName := strings.TrimSpace(patternVar)
+	ref := ""
+	if varName != "" {
+		ref = regexp.QuoteMeta(varName) + `\.` + regexp.QuoteMeta(property)
+	} else {
+		ref = `[A-Za-z_][A-Za-z0-9_]*\.` + regexp.QuoteMeta(property)
+	}
+	rangeRe := regexp.MustCompile(`(?i)` + ref + `\s*(<=|>=|<|>)`)
+	if rangeRe.MatchString(whereExpr) {
+		return "range"
+	}
+	equalityRe := regexp.MustCompile(`(?i)` + ref + `\s*=`)
+	if equalityRe.MatchString(whereExpr) {
+		return "equality"
+	}
+	return "equality"
+}
+
+func extractPatternPropertyKeys(raw string) []string {
+	parts := strings.Split(raw, ",")
+	keys := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(part, ":")
+		if idx <= 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(part[:idx]))
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func antiProbeVariantFromHints(edgeType string, hints StatsHints) string {

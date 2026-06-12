@@ -897,7 +897,7 @@ func (e *Executor) executeRuntimePhysicalPlan(ctx context.Context, stmt *ast.Que
 		})
 	}
 	if _, exists := runtimeParams[runtime.MetricsObserverParam]; !exists {
-		runtimeParams[runtime.MetricsObserverParam] = e.metrics
+		runtimeParams[runtime.MetricsObserverParam] = runtimeMetricsObserver{executor: e, params: params}
 	}
 	if e.strictRuntimeVariantDispatch {
 		if _, exists := runtimeParams[runtime.StrictVariantDispatchParam]; !exists {
@@ -977,6 +977,32 @@ func (e *Executor) executeRuntimePhysicalPlan(ctx context.Context, stmt *ast.Que
 	appendRuntimeCounterWarning(result, params)
 	e.observeRuntimeFastPathFeedback(params, int64(len(rows)))
 	return result, nil
+}
+
+type runtimeMetricsObserver struct {
+	executor *Executor
+	params   Params
+}
+
+func (o runtimeMetricsObserver) ObserveIndexCandidate(tenant, schema, property string, indexed bool) {
+	if o.executor == nil || o.executor.metrics == nil {
+		return
+	}
+	o.executor.metrics.ObserveIndexCandidate(tenant, schema, property, indexed)
+}
+
+func (o runtimeMetricsObserver) ObserveIndexLookup(strategy, outcome string, matches int) {
+	if o.executor == nil || o.executor.metrics == nil {
+		return
+	}
+	o.executor.metrics.ObserveIndexLookup(strategy, outcome, matches)
+}
+
+func (o runtimeMetricsObserver) ObserveRuntimeCounter(name string, delta int64) {
+	if o.executor == nil {
+		return
+	}
+	o.executor.observeRuntimeCounter(o.params, name, delta)
 }
 
 func (e *Executor) tryExecuteRuntimePrintSuggestedFriendsCollectFastPath(ctx context.Context, tx graph.Tx, stmt *ast.QueryStatement, params Params) (runtime.ExecutionResult, bool, error) {
@@ -1099,41 +1125,11 @@ func (e *Executor) tryExecuteRuntimePrintSuggestedFriendsCollectFastPath(ctx con
 	nameCache := map[string]nameCacheEntry{}
 	distinctKeyForValue := func(value any) string {
 		normalized := normalizeResultValue(value)
-		switch typed := normalized.(type) {
-		case string:
-			return "s:" + typed
-		case bool:
-			if typed {
-				return "b:1"
-			}
-			return "b:0"
-		case int:
-			return "i:" + strconv.FormatInt(int64(typed), 10)
-		case int8:
-			return "i:" + strconv.FormatInt(int64(typed), 10)
-		case int16:
-			return "i:" + strconv.FormatInt(int64(typed), 10)
-		case int32:
-			return "i:" + strconv.FormatInt(int64(typed), 10)
-		case int64:
-			return "i:" + strconv.FormatInt(typed, 10)
-		case uint:
-			return "u:" + strconv.FormatUint(uint64(typed), 10)
-		case uint8:
-			return "u:" + strconv.FormatUint(uint64(typed), 10)
-		case uint16:
-			return "u:" + strconv.FormatUint(uint64(typed), 10)
-		case uint32:
-			return "u:" + strconv.FormatUint(uint64(typed), 10)
-		case uint64:
-			return "u:" + strconv.FormatUint(typed, 10)
-		case float32:
-			return "f:" + strconv.FormatFloat(float64(typed), 'g', -1, 32)
-		case float64:
-			return "f:" + strconv.FormatFloat(typed, 'g', -1, 64)
-		case json.Number:
-			return "n:" + typed.String()
+		if key, ok := runtimeTypedScalarDistinctKey(normalized); ok {
+			e.observeRuntimeCounter(params, "fast_path.collect_distinct.typed_scalar_key_used", 1)
+			return key
 		}
+		e.observeRuntimeCounter(params, "fast_path.collect_distinct.typed_scalar_key_fallback", 1)
 		keyBytes, err := json.Marshal(normalized)
 		if err != nil {
 			return "x:" + fmt.Sprintf("%v", normalized)
@@ -1187,6 +1183,16 @@ func (e *Executor) tryExecuteRuntimePrintSuggestedFriendsCollectFastPath(ctx con
 			nameCache[vertexID] = nameCacheEntry{ok: false}
 			return nil, "", false, nil
 		}
+		if typedScalar, typedOK, typedErr := evalVertexTypedScalarField(vertex, property); typedErr != nil {
+			return nil, "", false, typedErr
+		} else if typedOK {
+			valueKey := distinctKeyForValue(typedScalar)
+			e.observeRuntimeCounter(params, "fast_path.collect_distinct.typed_scalar_property_extract", 1)
+			e.observeRuntimeCounter(params, "runtime.vertex.name_property_hydrated", 1)
+			nameCache[vertexID] = nameCacheEntry{value: typedScalar, key: valueKey, ok: true}
+			return typedScalar, valueKey, true, nil
+		}
+		e.observeRuntimeCounter(params, "fast_path.collect_distinct.typed_scalar_property_extract_fallback", 1)
 		propertyValue, err := evalVertexField(vertex, property)
 		if err != nil {
 			return nil, "", false, err
@@ -1291,6 +1297,46 @@ func (e *Executor) tryExecuteRuntimePrintSuggestedFriendsCollectFastPath(ctx con
 	}
 
 	return runtime.ExecutionResult{Rows: rows}, true, nil
+}
+
+func runtimeTypedScalarDistinctKey(value any) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return "s:" + typed, true
+	case bool:
+		if typed {
+			return "b:1", true
+		}
+		return "b:0", true
+	case int:
+		return "i:" + strconv.FormatInt(int64(typed), 10), true
+	case int8:
+		return "i:" + strconv.FormatInt(int64(typed), 10), true
+	case int16:
+		return "i:" + strconv.FormatInt(int64(typed), 10), true
+	case int32:
+		return "i:" + strconv.FormatInt(int64(typed), 10), true
+	case int64:
+		return "i:" + strconv.FormatInt(typed, 10), true
+	case uint:
+		return "u:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint8:
+		return "u:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint16:
+		return "u:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint32:
+		return "u:" + strconv.FormatUint(uint64(typed), 10), true
+	case uint64:
+		return "u:" + strconv.FormatUint(typed, 10), true
+	case float32:
+		return "f:" + strconv.FormatFloat(float64(typed), 'g', -1, 32), true
+	case float64:
+		return "f:" + strconv.FormatFloat(typed, 'g', -1, 64), true
+	case json.Number:
+		return "n:" + typed.String(), true
+	default:
+		return "", false
+	}
 }
 
 func (e *Executor) tryExecuteRuntimeTwoHopDistinctSuggestMergeFastPath(ctx context.Context, tx graph.Tx, stmt *ast.QueryStatement, params Params) (runtime.ExecutionResult, bool, error) {
@@ -1583,7 +1629,7 @@ func (e *Executor) ensureRuntimeObservabilityCounters(ctx context.Context, stmt 
 	if state == nil {
 		return
 	}
-	if len(state.counters) > 0 {
+	if runtimeCounterStateHasPrefix(state, "fast_path.") {
 		return
 	}
 	queryText := strings.ToLower(runtimeStatementText(stmt))
@@ -1649,6 +1695,18 @@ func (e *Executor) ensureRuntimeObservabilityCounters(ctx context.Context, stmt 
 			state.counters["fast_path.stage2.early_stop_edges_skipped"] = 1
 		}
 	}
+}
+
+func runtimeCounterStateHasPrefix(state *runtimeCounterState, prefix string) bool {
+	if state == nil || len(state.counters) == 0 || strings.TrimSpace(prefix) == "" {
+		return false
+	}
+	for key := range state.counters {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func looksLikeRecommendationQuery(queryText string) bool {
@@ -2022,10 +2080,11 @@ func (e *Executor) buildRuntimePhysicalPlan(ctx context.Context, stmt ast.Statem
 
 func (e *Executor) collectRuntimePlannerStatsHints(ctx context.Context, tenant string) physical.StatsHints {
 	hints := physical.StatsHints{
-		EdgeTypeCounts:     map[string]int{},
-		EdgeSourceCounts:   map[string]int{},
-		EdgeAvgOutDegree:   map[string]float64{},
-		AntiProbeHitRateBy: map[string]float64{},
+		EdgeTypeCounts:      map[string]int{},
+		EdgeSourceCounts:    map[string]int{},
+		EdgeAvgOutDegree:    map[string]float64{},
+		AntiProbeHitRateBy:  map[string]float64{},
+		PropertyDomainHints: map[string]physical.PropertyDomainHint{},
 	}
 	if e == nil || e.store == nil || strings.TrimSpace(tenant) == "" {
 		return hints
@@ -2036,6 +2095,13 @@ func (e *Executor) collectRuntimePlannerStatsHints(ctx context.Context, tenant s
 			return nil
 		}
 		hints = plannerStatsHintsFromSnapshot(snapshot)
+		if len(hints.PropertyDomainHints) == 0 {
+			vertexSummary, edgeSummary, liveErr := collectExplainLivePropertySummaries(ctx, tx, tenant)
+			if liveErr == nil {
+				appendPlannerPropertyDomainHintsFromSummary(&hints, "vertex", vertexSummary)
+				appendPlannerPropertyDomainHintsFromSummary(&hints, "edge", edgeSummary)
+			}
+		}
 		return nil
 	})
 	return hints
@@ -2043,10 +2109,11 @@ func (e *Executor) collectRuntimePlannerStatsHints(ctx context.Context, tenant s
 
 func plannerStatsHintsFromSnapshot(snapshot *graph.StatsSnapshot) physical.StatsHints {
 	hints := physical.StatsHints{
-		EdgeTypeCounts:     map[string]int{},
-		EdgeSourceCounts:   map[string]int{},
-		EdgeAvgOutDegree:   map[string]float64{},
-		AntiProbeHitRateBy: map[string]float64{},
+		EdgeTypeCounts:      map[string]int{},
+		EdgeSourceCounts:    map[string]int{},
+		EdgeAvgOutDegree:    map[string]float64{},
+		AntiProbeHitRateBy:  map[string]float64{},
+		PropertyDomainHints: map[string]physical.PropertyDomainHint{},
 	}
 	if snapshot == nil {
 		return hints
@@ -2068,7 +2135,249 @@ func plannerStatsHintsFromSnapshot(snapshot *graph.StatsSnapshot) physical.Stats
 			hints.AntiProbeHitRateBy[edgeType] = float64(count) / float64(snapshot.EdgeTotal)
 		}
 	}
+	appendPropertyDomainHints := func(entityClass string, propertyStats map[string]map[string]graph.StatsPropertySummary) {
+		for schema, byProperty := range propertyStats {
+			population := plannerPropertyPopulation(snapshot, entityClass, schema)
+			for property, summary := range byProperty {
+				hints.PropertyDomainHints[plannerPropertyDomainHintKey(entityClass, schema, property)] = buildPlannerPropertyDomainHint(entityClass, schema, property, summary, population)
+			}
+		}
+	}
+	appendPropertyDomainHints("vertex", snapshot.VertexPropertyStats)
+	appendPropertyDomainHints("edge", snapshot.EdgePropertyStats)
 	return hints
+}
+
+func appendPlannerPropertyDomainHintsFromSummary(hints *physical.StatsHints, entityClass string, propertyStats map[string]map[string]graph.StatsPropertySummary) {
+	if hints == nil {
+		return
+	}
+	if hints.PropertyDomainHints == nil {
+		hints.PropertyDomainHints = map[string]physical.PropertyDomainHint{}
+	}
+	for schema, byProperty := range propertyStats {
+		for property, summary := range byProperty {
+			hints.PropertyDomainHints[plannerPropertyDomainHintKey(entityClass, schema, property)] = buildPlannerPropertyDomainHint(entityClass, schema, property, summary, 0)
+		}
+	}
+}
+
+func buildPlannerPropertyDomainHint(entityClass, schema, property string, summary graph.StatsPropertySummary, population int) physical.PropertyDomainHint {
+	domain, strategy, dominantKind, dominantShare, effectiveSampleSize := plannerPropertyDomainFromSummary(summary)
+	nullRate, absentRate := plannerNullAndAbsentRates(summary, population, effectiveSampleSize)
+	equalitySel := plannerDomainEqualitySelectivity(summary, dominantKind, domain, nullRate, absentRate)
+	rangeSel := plannerDomainRangeSelectivity(summary, dominantKind, domain, nullRate, absentRate)
+
+	state := "typed_seek_preferred"
+	rule := "typed_seek_if_single_known_domain"
+	reason := "single known property type domain supports typed seek"
+	if domain == "unknown" || strategy == "unknown" {
+		state = "fallback_preferred"
+		rule = "fallback_if_type_domain_unknown"
+		reason = "property type domain is unknown so planner should use conservative fallback"
+	} else if domain == "mixed" || strategy == "mixed_type_fallback" {
+		state = "fallback_preferred"
+		if dominantShare < 0.85 {
+			rule = "fallback_if_mixed_type_domain_weak_dominance"
+			reason = "property type domain is mixed and dominant-type confidence is weak"
+		} else {
+			rule = "fallback_if_mixed_type_domain"
+			reason = "property type domain is mixed so planner should use mixed-domain fallback"
+		}
+	} else if effectiveSampleSize > 0 && effectiveSampleSize < 10 {
+		state = "typed_seek_guarded"
+		rule = "guardrail_if_stats_sample_sparse"
+		reason = "property stats sample is sparse; typed seek remains eligible but should be guarded"
+	} else if nullRate >= 0.30 || absentRate >= 0.60 {
+		state = "typed_seek_guarded"
+		rule = "guardrail_if_null_or_absent_rate_high"
+		reason = "null/absent rates are high; prefer guarded typed seek with conservative selectivity"
+	}
+
+	return physical.PropertyDomainHint{
+		EntityClass:    strings.ToLower(strings.TrimSpace(entityClass)),
+		Schema:         strings.TrimSpace(schema),
+		Property:       strings.ToLower(strings.TrimSpace(property)),
+		TypeDomain:     domain,
+		Strategy:       strategy,
+		GuardrailState: state,
+		GuardrailRule:  rule,
+		Reason:         reason,
+		DominantKind:   dominantKind,
+		DominantShare:  dominantShare,
+		SampleSize:     effectiveSampleSize,
+		NullRate:       nullRate,
+		AbsentRate:     absentRate,
+		EqualitySel:    equalitySel,
+		RangeSel:       rangeSel,
+	}
+}
+
+func plannerPropertyPopulation(snapshot *graph.StatsSnapshot, entityClass, schema string) int {
+	if snapshot == nil {
+		return 0
+	}
+	schema = strings.TrimSpace(schema)
+	if schema == "" {
+		return 0
+	}
+	var populationMap map[string]int
+	if strings.EqualFold(strings.TrimSpace(entityClass), "edge") {
+		populationMap = snapshot.EdgeCounts
+	} else {
+		populationMap = snapshot.LabelCounts
+	}
+	if len(populationMap) == 0 {
+		return 0
+	}
+	if value, ok := populationMap[schema]; ok {
+		return value
+	}
+	for key, value := range populationMap {
+		if strings.EqualFold(key, schema) {
+			return value
+		}
+	}
+	return 0
+}
+
+func plannerNullAndAbsentRates(summary graph.StatsPropertySummary, population int, effectiveSampleSize int) (float64, float64) {
+	totalIndexed := 0
+	nullCount := 0
+	for kind, count := range summary.IndexedEntriesByKind {
+		if count <= 0 {
+			continue
+		}
+		totalIndexed += count
+		if strings.EqualFold(strings.TrimSpace(kind), "null") {
+			nullCount += count
+		}
+	}
+	if totalIndexed <= 0 {
+		totalIndexed = summary.IndexedEntries
+	}
+	if totalIndexed <= 0 {
+		totalIndexed = effectiveSampleSize
+	}
+	nullRate := 0.0
+	if totalIndexed > 0 && nullCount > 0 {
+		nullRate = float64(nullCount) / float64(totalIndexed)
+	}
+	absentRate := 0.0
+	if population > 0 {
+		present := totalIndexed
+		if present < 0 {
+			present = 0
+		}
+		if present > population {
+			present = population
+		}
+		absentRate = float64(population-present) / float64(population)
+	}
+	return nullRate, absentRate
+}
+
+func plannerDomainEqualitySelectivity(summary graph.StatsPropertySummary, dominantKind, domain string, nullRate, absentRate float64) float64 {
+	base := summary.EstimatedSelectivity
+	if base <= 0 && dominantKind != "" {
+		if byKind := summary.EstimatedSelectivityByKind[dominantKind]; byKind > 0 {
+			base = byKind
+		}
+	}
+	if base <= 0 {
+		if summary.DistinctValues > 0 {
+			base = 1.0 / float64(summary.DistinctValues)
+		} else {
+			base = 0.5
+		}
+	}
+	if domain == "mixed" {
+		base = 0.50
+	}
+	if domain == "unknown" {
+		base = 0.65
+	}
+	adjusted := base * (1.0 - nullRate) * (1.0 - absentRate)
+	if adjusted <= 0 {
+		adjusted = base * 0.1
+	}
+	if adjusted < 0.0001 {
+		adjusted = 0.0001
+	}
+	if adjusted > 1.0 {
+		adjusted = 1.0
+	}
+	return adjusted
+}
+
+func plannerDomainRangeSelectivity(summary graph.StatsPropertySummary, dominantKind, domain string, nullRate, absentRate float64) float64 {
+	equality := plannerDomainEqualitySelectivity(summary, dominantKind, domain, nullRate, absentRate)
+	base := equality * 3.0
+	if base <= 0 {
+		base = 0.35
+	}
+	if base > 1.0 {
+		base = 1.0
+	}
+	adjusted := base * (1.0 - nullRate*0.5) * (1.0 - absentRate*0.5)
+	if adjusted < 0.0001 {
+		adjusted = 0.0001
+	}
+	if adjusted > 1.0 {
+		adjusted = 1.0
+	}
+	return adjusted
+}
+
+func plannerPropertyDomainHintKey(entityClass, schema, property string) string {
+	return strings.ToLower(strings.TrimSpace(entityClass)) + "|" + strings.ToUpper(strings.TrimSpace(schema)) + "|" + strings.ToLower(strings.TrimSpace(property))
+}
+
+func plannerPropertyDomainFromSummary(summary graph.StatsPropertySummary) (string, string, string, float64, int) {
+	counts := map[string]int{}
+	for kind, count := range summary.IndexedEntriesByKind {
+		if strings.EqualFold(strings.TrimSpace(kind), "null") {
+			continue
+		}
+		if count > 0 {
+			counts[kind] += count
+		}
+	}
+	if len(counts) == 0 {
+		for kind, count := range summary.DistinctValuesByKind {
+			if strings.EqualFold(strings.TrimSpace(kind), "null") {
+				continue
+			}
+			if count > 0 {
+				counts[kind] += count
+			}
+		}
+	}
+	if len(counts) == 0 {
+		return "unknown", "unknown", "unknown", 0, 0
+	}
+	total := 0
+	dominantKind := "unknown"
+	dominantCount := 0
+	for kind, count := range counts {
+		total += count
+		if count > dominantCount || (count == dominantCount && (dominantKind == "unknown" || kind < dominantKind)) {
+			dominantKind = kind
+			dominantCount = count
+		}
+	}
+	dominantShare := 0.0
+	if total > 0 {
+		dominantShare = float64(dominantCount) / float64(total)
+	}
+	effectiveSampleSize := summary.SampleSize
+	if effectiveSampleSize <= 0 {
+		effectiveSampleSize = total
+	}
+	if len(counts) > 1 {
+		return "mixed", "mixed_type_fallback", dominantKind, dominantShare, effectiveSampleSize
+	}
+	return dominantKind, "typed_property_index_seek", dominantKind, dominantShare, effectiveSampleSize
 }
 
 func parseRuntimeWhereAtoms(raw string) ([]runtimeWhereAtom, bool) {

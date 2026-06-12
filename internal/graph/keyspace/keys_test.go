@@ -57,20 +57,20 @@ func TestAdjacencyPrefixes(t *testing.T) {
 }
 
 func TestPropertyIndexKey(t *testing.T) {
-	key := string(PropertyIndexKey("t1", "Person", "email", []byte("a@b"), "v1"))
-	if key != "pi/t1/Person/email/614062/v1" {
+	key := string(PropertyIndexKey("t1", "Person", "email", "string", []byte("a@b"), "v1"))
+	if key != "pi/t1/Person/email/string/614062/v1" {
 		t.Fatalf("unexpected property index key: %s", key)
 	}
 }
 
 func TestPropertyIndexNumericKeys(t *testing.T) {
-	if got := string(PropertyIndexNumericPrefix("t1", "RATED", "rating")); got != "pn/t1/RATED/rating/" {
+	if got := string(PropertyIndexNumericPrefix("t1", "RATED", "rating")); got != "pn/t1/RATED/rating/numeric/" {
 		t.Fatalf("unexpected numeric property index prefix: %s", got)
 	}
-	if got := string(PropertyIndexNumericKey("t1", "RATED", "rating", []byte{0x01, 0xff}, "e1")); got != "pn/t1/RATED/rating/01ff/e1" {
+	if got := string(PropertyIndexNumericKey("t1", "RATED", "rating", []byte{0x01, 0xff}, "e1")); got != "pn/t1/RATED/rating/numeric/01ff/e1" {
 		t.Fatalf("unexpected numeric property index key: %s", got)
 	}
-	if got := string(PropertyIndexNumericValuePrefix("t1", "RATED", "rating", []byte{0x01, 0xff})); got != "pn/t1/RATED/rating/01ff/" {
+	if got := string(PropertyIndexNumericValuePrefix("t1", "RATED", "rating", []byte{0x01, 0xff})); got != "pn/t1/RATED/rating/numeric/01ff/" {
 		t.Fatalf("unexpected numeric property index value prefix: %s", got)
 	}
 }

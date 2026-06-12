@@ -61,6 +61,19 @@ func parseSegment(seg statementSegment, fullQuery string) (ast.Statement, error)
 		}
 		return &ast.ExplainStatement{Raw: strings.TrimSpace(seg.text), Query: strings.TrimSpace(inner), Statement: innerStmt, SourceSpan: innerStmt.Span()}, nil
 	}
+	if inner, offset, ok := splitProfilePrefix(seg.text); ok {
+		if strings.TrimSpace(inner) == "" {
+			return nil, &ParseError{Kind: ParseErrorSemantic, Message: "PROFILE requires a query", Statement: seg.index}
+		}
+		innerSeg := seg
+		innerSeg.text = inner
+		innerSeg.startOffset += offset
+		innerStmt, err := parseSegment(innerSeg, fullQuery)
+		if err != nil {
+			return nil, err
+		}
+		return &ast.ProfileStatement{Raw: strings.TrimSpace(seg.text), Query: strings.TrimSpace(inner), Statement: innerStmt, SourceSpan: innerStmt.Span()}, nil
+	}
 
 	existsRewrite := rewriteExistsBlocks(seg.text)
 	reduceRewrite := rewriteReduceCalls(existsRewrite.text)
@@ -99,17 +112,25 @@ func parseSegment(seg statementSegment, fullQuery string) (ast.Statement, error)
 }
 
 func splitExplainPrefix(raw string) (inner string, offset int, ok bool) {
+	return splitStatementPrefix(raw, "EXPLAIN")
+}
+
+func splitProfilePrefix(raw string) (inner string, offset int, ok bool) {
+	return splitStatementPrefix(raw, "PROFILE")
+}
+
+func splitStatementPrefix(raw string, keyword string) (inner string, offset int, ok bool) {
 	start := 0
 	for start < len(raw) && unicode.IsSpace(rune(raw[start])) {
 		start++
 	}
-	if start+len("EXPLAIN") > len(raw) {
+	if start+len(keyword) > len(raw) {
 		return "", 0, false
 	}
-	if !strings.EqualFold(raw[start:start+len("EXPLAIN")], "EXPLAIN") {
+	if !strings.EqualFold(raw[start:start+len(keyword)], keyword) {
 		return "", 0, false
 	}
-	end := start + len("EXPLAIN")
+	end := start + len(keyword)
 	if end < len(raw) {
 		r := rune(raw[end])
 		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {

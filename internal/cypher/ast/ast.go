@@ -8,6 +8,7 @@ const (
 	StatementKindQuery      StatementKind = "QUERY"
 	StatementKindCall       StatementKind = "CALL"
 	StatementKindExplain    StatementKind = "EXPLAIN"
+	StatementKindProfile    StatementKind = "PROFILE"
 )
 
 // ClauseKind identifies a normalized top-level clause.
@@ -198,4 +199,22 @@ func (*ExplainStatement) Kind() StatementKind {
 
 func (e *ExplainStatement) Span() Span {
 	return e.SourceSpan
+}
+
+// ProfileStatement wraps another statement for plan-plus-execution output.
+type ProfileStatement struct {
+	Raw        string
+	Query      string
+	Statement  Statement
+	SourceSpan Span
+}
+
+func (*ProfileStatement) statementNode() {}
+
+func (*ProfileStatement) Kind() StatementKind {
+	return StatementKindProfile
+}
+
+func (p *ProfileStatement) Span() Span {
+	return p.SourceSpan
 }

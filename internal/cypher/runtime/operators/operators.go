@@ -64,6 +64,7 @@ type ExistsSubqueryEvaluator func(ctx context.Context, tx graph.Tx, body string,
 type MetricsObserver interface {
 	ObserveIndexCandidate(tenant, schema, property string, indexed bool)
 	ObserveIndexLookup(strategy, outcome string, matches int)
+	ObserveRuntimeCounter(name string, delta int64)
 }
 
 // State is mutable execution state shared across operator handlers.

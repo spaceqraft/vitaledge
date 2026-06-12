@@ -685,6 +685,179 @@ func TestCollectRuntimePlannerStatsHintsDerivesAntiProbeSelectivityFromSnapshot(
 	}
 }
 
+func TestCollectRuntimePlannerStatsHintsIncludesPropertyDomainGuardrails(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		vertexes := []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: map[string][]byte{"age": valueToBytes(30), "code": valueToBytes(7)}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"age": valueToBytes(35), "code": valueToBytes("alpha")}},
+		}
+		for _, vertex := range vertexes {
+			if err := tx.PutVertex(ctx, vertex); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	hints := exec.collectRuntimePlannerStatsHints(ctx, "acme")
+
+	ageHint, ok := hints.PropertyDomainHints["vertex|USER|age"]
+	if !ok {
+		t.Fatalf("expected age property domain hint, got %#v", hints.PropertyDomainHints)
+	}
+	if ageHint.GuardrailState != "typed_seek_guarded" {
+		t.Fatalf("expected sparse-sample guarded state for age, got %#v", ageHint)
+	}
+	if ageHint.GuardrailRule != "guardrail_if_stats_sample_sparse" {
+		t.Fatalf("expected sparse-sample guardrail rule for age, got %#v", ageHint)
+	}
+
+	codeHint, ok := hints.PropertyDomainHints["vertex|USER|code"]
+	if !ok {
+		t.Fatalf("expected code property domain hint, got %#v", hints.PropertyDomainHints)
+	}
+	if codeHint.GuardrailState != "fallback_preferred" {
+		t.Fatalf("expected mixed-domain fallback-preferred state for code, got %#v", codeHint)
+	}
+	if codeHint.GuardrailRule != "fallback_if_mixed_type_domain_weak_dominance" {
+		t.Fatalf("expected mixed-domain weak-dominance fallback rule for code, got %#v", codeHint)
+	}
+}
+
+func TestBuildRuntimePhysicalPlanAnnotatesTypedDomainGuardrailForWeakMixedDominance(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: map[string][]byte{"code": valueToBytes(7)}}); err != nil {
+			return err
+		}
+		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"code": valueToBytes("alpha")}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	exec := New(store, Options{})
+	stmt, err := parser.ParseStatement("MATCH (u:User {code: 7}) RETURN u.id AS uid")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+
+	_, physicalPlan, err := exec.buildRuntimePhysicalPlan(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan failed: %v", err)
+	}
+	if len(physicalPlan.Nodes) == 0 {
+		t.Fatalf("expected physical plan nodes")
+	}
+	guardrail, ok := physicalPlan.Nodes[0].Attrs["typedDomainGuardrail"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected typedDomainGuardrail attr on first node, got %#v", physicalPlan.Nodes[0].Attrs)
+	}
+	if got, _ := guardrail["state"].(string); got != "fallback_preferred" {
+		t.Fatalf("expected fallback_preferred guardrail state for mixed domain, got %#v", guardrail)
+	}
+	if got, _ := guardrail["rule"].(string); got != "fallback_if_mixed_type_domain_weak_dominance" {
+		t.Fatalf("expected fallback_if_mixed_type_domain_weak_dominance guardrail rule, got %#v", guardrail)
+	}
+
+	stmtUnknown, err := parser.ParseStatement("MATCH (u:User {missing: 1}) RETURN u.id AS uid")
+	if err != nil {
+		t.Fatalf("parse unknown-domain query failed: %v", err)
+	}
+	_, physicalPlanUnknown, err := exec.buildRuntimePhysicalPlan(ctx, stmtUnknown, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("build runtime physical plan for unknown-domain query failed: %v", err)
+	}
+	if len(physicalPlanUnknown.Nodes) == 0 {
+		t.Fatalf("expected physical plan nodes for unknown-domain query")
+	}
+	unknownGuardrail, ok := physicalPlanUnknown.Nodes[0].Attrs["typedDomainGuardrail"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected typedDomainGuardrail attr for unknown-domain query, got %#v", physicalPlanUnknown.Nodes[0].Attrs)
+	}
+	if got, _ := unknownGuardrail["state"].(string); got != "fallback_preferred" {
+		t.Fatalf("expected fallback_preferred guardrail state for unknown domain, got %#v", unknownGuardrail)
+	}
+	if got, _ := unknownGuardrail["rule"].(string); got != "fallback_if_type_domain_unknown" {
+		t.Fatalf("expected fallback_if_type_domain_unknown guardrail rule, got %#v", unknownGuardrail)
+	}
+}
+
+func TestPlannerStatsHintsUsesNullAbsentAndDominanceThresholdGuardrails(t *testing.T) {
+	snapshot := &graph.StatsSnapshot{
+		LabelCounts: map[string]int{"User": 100},
+		VertexPropertyStats: map[string]map[string]graph.StatsPropertySummary{
+			"User": {
+				"score": {
+					IndexedEntriesByKind:       map[string]int{"numeric": 12, "null": 6},
+					EstimatedSelectivityByKind: map[string]float64{"numeric": 0.08},
+					SampleSize:                 18,
+				},
+				"code": {
+					IndexedEntriesByKind: map[string]int{"numeric": 11, "categorical": 12},
+					SampleSize:           23,
+				},
+				"status": {
+					IndexedEntriesByKind: map[string]int{"categorical": 92, "numeric": 8},
+					SampleSize:           100,
+				},
+			},
+		},
+	}
+
+	hints := plannerStatsHintsFromSnapshot(snapshot)
+
+	scoreHint, ok := hints.PropertyDomainHints["vertex|USER|score"]
+	if !ok {
+		t.Fatalf("expected score hint, got %#v", hints.PropertyDomainHints)
+	}
+	if scoreHint.GuardrailRule != "guardrail_if_null_or_absent_rate_high" {
+		t.Fatalf("expected null/absent guardrail rule for score, got %#v", scoreHint)
+	}
+	if scoreHint.GuardrailState != "typed_seek_guarded" {
+		t.Fatalf("expected guarded state for score, got %#v", scoreHint)
+	}
+	if scoreHint.NullRate <= 0 || scoreHint.AbsentRate <= 0 {
+		t.Fatalf("expected positive null and absent rates for score, got %#v", scoreHint)
+	}
+
+	weakHint, ok := hints.PropertyDomainHints["vertex|USER|code"]
+	if !ok {
+		t.Fatalf("expected code hint, got %#v", hints.PropertyDomainHints)
+	}
+	if weakHint.GuardrailRule != "fallback_if_mixed_type_domain_weak_dominance" {
+		t.Fatalf("expected weak-dominance fallback rule for code, got %#v", weakHint)
+	}
+
+	skewedHint, ok := hints.PropertyDomainHints["vertex|USER|status"]
+	if !ok {
+		t.Fatalf("expected status hint, got %#v", hints.PropertyDomainHints)
+	}
+	if skewedHint.GuardrailRule != "fallback_if_mixed_type_domain" {
+		t.Fatalf("expected mixed fallback rule for skewed dominant status, got %#v", skewedHint)
+	}
+	if skewedHint.DominantShare < 0.85 {
+		t.Fatalf("expected skewed dominant share >= 0.85, got %#v", skewedHint)
+	}
+	if skewedHint.EqualitySel <= 0 || skewedHint.RangeSel <= 0 {
+		t.Fatalf("expected positive selectivity signals for skewed hint, got %#v", skewedHint)
+	}
+}
+
 type acceptedRuntimeExecutionCase struct {
 	name      string
 	query     string
@@ -2575,6 +2748,39 @@ func TestTryExecuteViaRuntimePipelineDeleteWithPaginationPreservesSideEffects(t 
 	}
 	if remaining != 0 {
 		t.Fatalf("expected all rows deleted despite pagination, got remaining=%d", remaining)
+	}
+}
+
+func TestExecuteCreateWithInlineCommentsSeedsAllVertices(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	exec := New(store, Options{})
+	seedStmt, err := parser.ParseStatement(`CREATE (:A {num: 1, num2: 4}), //num + num2 = 5
+       (:A {num: 5, num2: 2}), //num + num2 = 7
+       (:A {num: 9, num2: 0})  //num + num2 = 9`)
+	if err != nil {
+		t.Fatalf("seed parse failed: %v", err)
+	}
+	if _, err := exec.ExecuteStatement(ctx, seedStmt, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("seed execute failed: %v", err)
+	}
+
+	stmt, err := parser.ParseStatement("MATCH (a:A) RETURN a.num + a.num2 AS sum ORDER BY sum ASC")
+	if err != nil {
+		t.Fatalf("parse query failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, stmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("execute query failed: %v", err)
+	}
+	if len(res.Rows) != 3 {
+		t.Fatalf("expected 3 seeded A rows, got %#v", res.Rows)
+	}
+	got := []any{res.Rows[0]["sum"], res.Rows[1]["sum"], res.Rows[2]["sum"]}
+	if !reflect.DeepEqual(got, []any{5, 7, 9}) {
+		t.Fatalf("unexpected sums from inline-comment create seed: %#v", got)
 	}
 }
 

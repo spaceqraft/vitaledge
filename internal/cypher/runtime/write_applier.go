@@ -1675,17 +1675,11 @@ func shouldWriteCreatePatternVertex(vertex createVertexPattern, bindings map[str
 	}
 	if value, ok := bindings[vertex.varName]; ok {
 		id := strings.TrimSpace(scalarString(value))
-		if strings.HasPrefix(id, "__ve_write_v_") {
-			return true
-		}
-		return false
+		return id == ""
 	}
 	if value, ok := bindings[vertex.varName+".id"]; ok {
 		id := strings.TrimSpace(scalarString(value))
-		if strings.HasPrefix(id, "__ve_write_v_") {
-			return true
-		}
-		return false
+		return id == ""
 	}
 	return true
 }

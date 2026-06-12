@@ -13,10 +13,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/executor"
-	"github.com/paegun/vitaledge/internal/cypher/indexschema"
-	"github.com/paegun/vitaledge/internal/graph"
-	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
+	"github.com/spaceqraft/vitaledge/internal/cypher/executor"
+	"github.com/spaceqraft/vitaledge/internal/cypher/indexschema"
+	"github.com/spaceqraft/vitaledge/internal/graph"
+	pebblestore "github.com/spaceqraft/vitaledge/internal/graph/store/pebble"
 	"google.golang.org/grpc"
 )
 

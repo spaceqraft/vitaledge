@@ -1,6 +1,6 @@
 package physical
 
-import "github.com/paegun/vitaledge/internal/cypher/pipeline"
+import "github.com/spaceqraft/vitaledge/internal/cypher/pipeline"
 
 // Plan aliases the pipeline physical plan contract.
 type Plan = pipeline.PhysicalPlan

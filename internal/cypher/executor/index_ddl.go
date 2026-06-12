@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 type propertyIndexEntryRecord struct {

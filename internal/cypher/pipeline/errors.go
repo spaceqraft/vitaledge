@@ -3,7 +3,7 @@ package pipeline
 import (
 	"fmt"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
 )
 
 // ErrUnsupportedStatement reports that a statement kind is not yet supported

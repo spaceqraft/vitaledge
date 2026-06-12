@@ -3,8 +3,8 @@ package cypher
 import (
 	"fmt"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
 )
 
 type Command interface {

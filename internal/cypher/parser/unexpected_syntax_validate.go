@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
 )
 
 var supportedExpressionFunctions = map[string]struct{}{

@@ -6,9 +6,9 @@ import (
 	"math"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	"github.com/paegun/vitaledge/internal/cypher/physical"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/physical"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 func stage2TestPattern() directedRelationshipPattern {

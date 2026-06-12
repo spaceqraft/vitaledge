@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/paegun/vitaledge/internal/cypher/runtime/operators"
-	runtimestorage "github.com/paegun/vitaledge/internal/cypher/runtime/storage"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/runtime/operators"
+	runtimestorage "github.com/spaceqraft/vitaledge/internal/cypher/runtime/storage"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 type recordingTx struct {

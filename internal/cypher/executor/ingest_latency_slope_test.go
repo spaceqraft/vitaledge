@@ -6,9 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/indexschema"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/indexschema"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 // TestIngestPairLatencySlopeBounded guards against hidden graph-size-dependent

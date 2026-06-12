@@ -1,6 +1,6 @@
 package logical
 
-import "github.com/paegun/vitaledge/internal/cypher/pipeline"
+import "github.com/spaceqraft/vitaledge/internal/cypher/pipeline"
 
 // Plan aliases the pipeline logical plan contract.
 type Plan = pipeline.LogicalPlan

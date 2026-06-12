@@ -4,10 +4,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/logical"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/cypher/physical"
-	"github.com/paegun/vitaledge/internal/cypher/semantic"
+	"github.com/spaceqraft/vitaledge/internal/cypher/logical"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/cypher/physical"
+	"github.com/spaceqraft/vitaledge/internal/cypher/semantic"
 )
 
 func TestRenderPipelineDeterministic(t *testing.T) {

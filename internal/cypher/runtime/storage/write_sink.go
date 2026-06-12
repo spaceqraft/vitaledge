@@ -3,7 +3,7 @@ package storage
 import (
 	"context"
 
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 // WriteSink captures the runtime write primitives needed by write-apply.

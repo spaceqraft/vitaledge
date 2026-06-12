@@ -3,8 +3,8 @@ package semantic
 import (
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	"github.com/paegun/vitaledge/internal/cypher/pipeline"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/pipeline"
 )
 
 // Build constructs a semantic model from a parsed statement.

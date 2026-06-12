@@ -3,7 +3,7 @@ package operators
 import (
 	"context"
 
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 type MutationType string

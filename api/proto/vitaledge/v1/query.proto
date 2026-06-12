@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package vitaledge.v1;
 
-option go_package = "github.com/paegun/vitaledge/api/proto/vitaledge/v1;v1";
+option go_package = "github.com/spaceqraft/vitaledge/api/proto/vitaledge/v1;v1";
 
 service QueryService {
   rpc Execute(QueryRequest) returns (QueryResponse);

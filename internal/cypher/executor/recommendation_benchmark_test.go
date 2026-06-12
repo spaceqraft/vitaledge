@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/indexschema"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/indexschema"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 const recommendationBenchmarkQuery = "MATCH (target:User {user_id: 1})-[r1:RATED]->(shared:Movie)<-[r2:RATED]-(peer:User) WHERE peer <> target AND abs(r1.rating - r2.rating) <= 1.5 WITH target, peer, count(shared) AS shared_count, avg(abs(r1.rating - r2.rating)) AS avg_diff WHERE shared_count >= 3 WITH target, peer, shared_count * (1.0 / (1.0 + avg_diff)) AS similarity ORDER BY similarity DESC LIMIT 30 MATCH (peer)-[rp:RATED]->(candidate:Movie) WHERE rp.rating >= 4.0 AND NOT (target)-[:RATED]->(candidate) RETURN candidate.movie_id AS movie_id, candidate.title AS title, candidate.year AS year, coalesce(candidate.base_score, 0.0) AS base_score, avg(rp.rating) AS peer_avg, count(rp) AS peer_count, sum(similarity) AS total_sim ORDER BY total_sim DESC LIMIT 10"

@@ -6,7 +6,7 @@ import (
 	"net"
 	"strings"
 
-	cypherparser "github.com/paegun/vitaledge/internal/cypher/parser"
+	cypherparser "github.com/spaceqraft/vitaledge/internal/cypher/parser"
 )
 
 const (

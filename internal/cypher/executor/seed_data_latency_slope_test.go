@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
 )
 
 // TestSeedDataLatencySlopeBounded guards the friend-suggestion seed workload

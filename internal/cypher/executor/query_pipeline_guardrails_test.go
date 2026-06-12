@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
 )
 
 // Query Pipeline guardrail checklist (QP-0 baseline):
@@ -624,7 +624,7 @@ func TestExplainNonLiteralRouteValue(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			src := "package executor\nimport (\"testing\"; \"github.com/paegun/vitaledge/internal/cypher/parser\")\n" + tc.snippet
+			src := "package executor\nimport (\"testing\"; \"github.com/spaceqraft/vitaledge/internal/cypher/parser\")\n" + tc.snippet
 			fset := token.NewFileSet()
 			parsedFile, err := goparser.ParseFile(fset, "snippet_test.go", src, goparser.ParseComments)
 			if err != nil {

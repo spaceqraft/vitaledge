@@ -19,8 +19,8 @@ import (
 
 	cpebble "github.com/cockroachdb/pebble"
 
-	"github.com/paegun/vitaledge/internal/graph"
-	"github.com/paegun/vitaledge/internal/graph/keyspace"
+	"github.com/spaceqraft/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/graph/keyspace"
 )
 
 type Store struct {

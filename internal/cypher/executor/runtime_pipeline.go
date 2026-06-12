@@ -9,14 +9,14 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	"github.com/paegun/vitaledge/internal/cypher/logical"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/cypher/physical"
-	"github.com/paegun/vitaledge/internal/cypher/runtime"
-	"github.com/paegun/vitaledge/internal/cypher/runtime/operators"
-	"github.com/paegun/vitaledge/internal/cypher/semantic"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/logical"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/cypher/physical"
+	"github.com/spaceqraft/vitaledge/internal/cypher/runtime"
+	"github.com/spaceqraft/vitaledge/internal/cypher/runtime/operators"
+	"github.com/spaceqraft/vitaledge/internal/cypher/semantic"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 var runtimeSimpleWhereRE = regexp.MustCompile(`^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(=|!=|<>|<=|>=|<|>)\s*(.+?)\s*$`)

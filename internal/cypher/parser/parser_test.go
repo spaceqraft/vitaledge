@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
 )
 
 func TestParseBatchMatchWhereReturn(t *testing.T) {

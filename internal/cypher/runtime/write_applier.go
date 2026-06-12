@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/paegun/vitaledge/internal/cypher/runtime/operators"
-	runtimestorage "github.com/paegun/vitaledge/internal/cypher/runtime/storage"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/runtime/operators"
+	runtimestorage "github.com/spaceqraft/vitaledge/internal/cypher/runtime/storage"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 // ApplyWriteEvents applies runtime write events through the graph transaction boundary.

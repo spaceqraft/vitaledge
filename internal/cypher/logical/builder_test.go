@@ -4,8 +4,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/cypher/semantic"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/cypher/semantic"
 )
 
 func TestBuildLogicalPlanForMatchQuery(t *testing.T) {

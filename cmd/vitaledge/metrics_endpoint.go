@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/paegun/vitaledge/internal/cypher/executor"
+	"github.com/spaceqraft/vitaledge/internal/cypher/executor"
 )
 
 func startMetricsServer(listenAddress string, collector *executor.Collector) (*http.Server, error) {

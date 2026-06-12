@@ -1,4 +1,4 @@
-module github.com/paegun/vitaledge
+module github.com/spaceqraft/vitaledge
 
 require github.com/antlr4-go/antlr/v4 v4.13.1
 

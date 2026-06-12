@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/logical"
+	"github.com/spaceqraft/vitaledge/internal/cypher/logical"
 )
 
 var antiProbeWhereUndirectedRe = regexp.MustCompile(`(?i)NOT\s*\(\s*\(([A-Za-z_][A-Za-z0-9_]*)[^)]*\)\s*-\s*\[[^\]]*?(?::([A-Za-z_][A-Za-z0-9_]*))?[^\]]*\]\s*-\s*\(([A-Za-z_][A-Za-z0-9_]*)[^)]*\)\s*\)`)

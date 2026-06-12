@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/runtime/operators"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/runtime/operators"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 // Engine executes physical plans.

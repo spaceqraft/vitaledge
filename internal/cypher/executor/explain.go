@@ -13,10 +13,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	cypherexplain "github.com/paegun/vitaledge/internal/cypher/explain"
-	"github.com/paegun/vitaledge/internal/cypher/semantic"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	cypherexplain "github.com/spaceqraft/vitaledge/internal/cypher/explain"
+	"github.com/spaceqraft/vitaledge/internal/cypher/semantic"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 type explainAnalysis struct {

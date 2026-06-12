@@ -17,9 +17,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
-	"github.com/paegun/vitaledge/internal/cypher"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
+	v1 "github.com/spaceqraft/vitaledge/api/proto/vitaledge/v1"
+	"github.com/spaceqraft/vitaledge/internal/cypher"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

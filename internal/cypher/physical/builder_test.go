@@ -5,10 +5,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/logical"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	runtimeoperators "github.com/paegun/vitaledge/internal/cypher/runtime/operators"
-	"github.com/paegun/vitaledge/internal/cypher/semantic"
+	"github.com/spaceqraft/vitaledge/internal/cypher/logical"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	runtimeoperators "github.com/spaceqraft/vitaledge/internal/cypher/runtime/operators"
+	"github.com/spaceqraft/vitaledge/internal/cypher/semantic"
 )
 
 func assertPlannerVariantsRuntimeSupported(t *testing.T, physicalPlan Plan) {

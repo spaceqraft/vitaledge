@@ -6,13 +6,13 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/logical"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/cypher/physical"
-	"github.com/paegun/vitaledge/internal/cypher/pipeline"
-	"github.com/paegun/vitaledge/internal/cypher/runtime/operators"
-	"github.com/paegun/vitaledge/internal/cypher/semantic"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/logical"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/cypher/physical"
+	"github.com/spaceqraft/vitaledge/internal/cypher/pipeline"
+	"github.com/spaceqraft/vitaledge/internal/cypher/runtime/operators"
+	"github.com/spaceqraft/vitaledge/internal/cypher/semantic"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 type recordingHandler struct {

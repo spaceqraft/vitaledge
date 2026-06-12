@@ -1,6 +1,6 @@
 package semantic
 
-import "github.com/paegun/vitaledge/internal/cypher/pipeline"
+import "github.com/spaceqraft/vitaledge/internal/cypher/pipeline"
 
 // Model is the semantic output consumed by logical planning.
 type Model = pipeline.SemanticModel

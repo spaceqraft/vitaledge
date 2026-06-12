@@ -1387,7 +1387,7 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"\aExecute\x12\x1a.vitaledge.v1.QueryRequest\x1a\x1b.vitaledge.v1.QueryResponse\x12D\n" +
 	"\aExplain\x12\x1a.vitaledge.v1.QueryRequest\x1a\x1d.vitaledge.v1.ExplainResponse\x12X\n" +
 	"\x0fGetCapabilities\x12!.vitaledge.v1.CapabilitiesRequest\x1a\".vitaledge.v1.CapabilitiesResponse\x12j\n" +
-	"\x13CreatePropertyIndex\x12(.vitaledge.v1.CreatePropertyIndexRequest\x1a).vitaledge.v1.CreatePropertyIndexResponseB7Z5github.com/paegun/vitaledge/api/proto/vitaledge/v1;v1b\x06proto3"
+	"\x13CreatePropertyIndex\x12(.vitaledge.v1.CreatePropertyIndexRequest\x1a).vitaledge.v1.CreatePropertyIndexResponseB;Z9github.com/spaceqraft/vitaledge/api/proto/vitaledge/v1;v1b\x06proto3"
 
 var (
 	file_api_proto_vitaledge_v1_query_proto_rawDescOnce sync.Once

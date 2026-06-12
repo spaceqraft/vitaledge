@@ -8,7 +8,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/paegun/vitaledge/internal/bench"
+	"github.com/spaceqraft/vitaledge/internal/bench"
 )
 
 func main() {

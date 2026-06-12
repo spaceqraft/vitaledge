@@ -3,9 +3,9 @@ package semantic
 import (
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/cypher/pipeline"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/cypher/pipeline"
 )
 
 func TestBuildMatchQuerySemanticModel(t *testing.T) {

@@ -14,8 +14,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/paegun/vitaledge/internal/graph"
-	"github.com/paegun/vitaledge/internal/graph/store/typedvalue"
+	"github.com/spaceqraft/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/graph/store/typedvalue"
 )
 
 var edgePatternRe = regexp.MustCompile(`^\s*\(([^)]*)\)\s*[-<]*\s*\[.*?:([A-Za-z_][A-Za-z0-9_]*)[^\]]*\]\s*[->]*\s*\(([^)]*)\)\s*$`)

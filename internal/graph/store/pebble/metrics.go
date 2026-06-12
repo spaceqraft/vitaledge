@@ -5,7 +5,7 @@ import (
 
 	cpebble "github.com/cockroachdb/pebble"
 
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 // Metrics captures store-level observability signals.

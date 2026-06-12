@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
 )
 
 var standaloneVertexPatternWhereRE = regexp.MustCompile(`^\(\s*(?:[A-Za-z_][A-Za-z0-9_]*)?\s*(?::!?[A-Za-z_][A-Za-z0-9_]*(?:\s*(?::|\|:?)\s*!?[A-Za-z_][A-Za-z0-9_]*)*)?\s*(?:\{[^{}]*\})?\s*\)$`)

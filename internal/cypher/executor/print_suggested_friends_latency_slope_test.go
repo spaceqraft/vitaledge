@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 // TestPrintSuggestedFriendsScanWorkSlopeBounded guards the print_suggested_friends

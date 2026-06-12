@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/paegun/vitaledge/internal/graph"
-	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
+	"github.com/spaceqraft/vitaledge/internal/graph"
+	pebblestore "github.com/spaceqraft/vitaledge/internal/graph/store/pebble"
 )
 
 type antiProbeCountingTx struct {

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 const (

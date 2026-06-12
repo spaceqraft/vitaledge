@@ -1,6 +1,6 @@
 package pipeline
 
-import "github.com/paegun/vitaledge/internal/cypher/ast"
+import "github.com/spaceqraft/vitaledge/internal/cypher/ast"
 
 // ParseOutput is the explicit handoff contract from parse to semantic validation.
 //

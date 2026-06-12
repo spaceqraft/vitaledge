@@ -7,8 +7,8 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	"github.com/paegun/vitaledge/internal/graph"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/graph"
 )
 
 type callSpec struct {

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
 )
 
 func TestCollectorSnapshot(t *testing.T) {

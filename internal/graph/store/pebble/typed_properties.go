@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/paegun/vitaledge/internal/graph/store/typedvalue"
+	"github.com/spaceqraft/vitaledge/internal/graph/store/typedvalue"
 )
 
 var typedPropertyEnvelopePrefix = []byte{0xFF, 'T', 'V', 0x01}

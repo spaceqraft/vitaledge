@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	v1 "github.com/paegun/vitaledge/api/proto/vitaledge/v1"
-	"github.com/paegun/vitaledge/internal/cypher"
+	v1 "github.com/spaceqraft/vitaledge/api/proto/vitaledge/v1"
+	"github.com/spaceqraft/vitaledge/internal/cypher"
 	"google.golang.org/grpc"
 )
 

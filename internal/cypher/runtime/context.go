@@ -1,8 +1,8 @@
 package runtime
 
 import (
-	"github.com/paegun/vitaledge/internal/cypher/pipeline"
-	"github.com/paegun/vitaledge/internal/cypher/runtime/operators"
+	"github.com/spaceqraft/vitaledge/internal/cypher/pipeline"
+	"github.com/spaceqraft/vitaledge/internal/cypher/runtime/operators"
 )
 
 // ExecutionContext is the runtime input contract for physical plan execution.

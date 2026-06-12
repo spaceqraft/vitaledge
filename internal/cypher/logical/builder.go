@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	"github.com/paegun/vitaledge/internal/cypher/pipeline"
-	"github.com/paegun/vitaledge/internal/cypher/semantic"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/pipeline"
+	"github.com/spaceqraft/vitaledge/internal/cypher/semantic"
 )
 
 // Build constructs a deterministic logical plan from semantic output.

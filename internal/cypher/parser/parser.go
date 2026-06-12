@@ -6,8 +6,8 @@ import (
 	"unicode"
 
 	"github.com/antlr4-go/antlr/v4"
-	"github.com/paegun/vitaledge/internal/cypher/ast"
-	cyphergen "github.com/paegun/vitaledge/internal/cypher/grammar/generated"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
+	cyphergen "github.com/spaceqraft/vitaledge/internal/cypher/grammar/generated"
 )
 
 const GrammarVersion = "openCypher M23"

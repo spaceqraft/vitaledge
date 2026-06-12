@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/paegun/vitaledge/internal/cypher/ast"
+	"github.com/spaceqraft/vitaledge/internal/cypher/ast"
 )
 
 type StatementMetricKey struct {

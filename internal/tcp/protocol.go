@@ -1,7 +1,7 @@
 package tcp
 
 import (
-	"github.com/paegun/vitaledge/internal/cypher"
+	"github.com/spaceqraft/vitaledge/internal/cypher"
 )
 
 func parseCommand(data []byte) (cypher.Command, error) {

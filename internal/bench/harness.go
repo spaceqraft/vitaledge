@@ -9,10 +9,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/paegun/vitaledge/internal/cypher/executor"
-	"github.com/paegun/vitaledge/internal/cypher/parser"
-	"github.com/paegun/vitaledge/internal/graph"
-	pebblestore "github.com/paegun/vitaledge/internal/graph/store/pebble"
+	"github.com/spaceqraft/vitaledge/internal/cypher/executor"
+	"github.com/spaceqraft/vitaledge/internal/cypher/parser"
+	"github.com/spaceqraft/vitaledge/internal/graph"
+	pebblestore "github.com/spaceqraft/vitaledge/internal/graph/store/pebble"
 )
 
 // Config is benchmark run configuration.

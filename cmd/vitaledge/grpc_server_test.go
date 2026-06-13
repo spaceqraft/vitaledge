@@ -527,7 +527,7 @@ func TestGRPCProtoParamsToExecutorParamsBoundaryIDValidation(t *testing.T) {
 
 	t.Run("rejects non-string edgeId", func(t *testing.T) {
 		_, err := grpcProtoParamsToExecutorParams(map[string]*v1.Value{
-			"edgeId": {Kind: &v1.Value_IntValue{IntValue: 7}},
+			"edgeId": {Kind: &v1.Value_DoubleValue{DoubleValue: 2.14}},
 		})
 		if err == nil || !strings.Contains(err.Error(), "string identifier") {
 			t.Fatalf("expected string identifier validation error, got %v", err)
@@ -557,7 +557,7 @@ func TestGRPCProtoParamsToExecutorParamsBoundaryIDValidation(t *testing.T) {
 			"edgeIds": {
 				Kind: &v1.Value_ListValue{ListValue: &v1.ListValue{Values: []*v1.Value{
 					{Kind: &v1.Value_StringValue{StringValue: "e-1"}},
-					{Kind: &v1.Value_IntValue{IntValue: 2}},
+					{Kind: &v1.Value_DoubleValue{DoubleValue: 2.14}},
 				}}},
 			},
 		})

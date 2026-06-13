@@ -60,6 +60,35 @@ func TestParseBatchMatchWhereReturn(t *testing.T) {
 	}
 }
 
+func TestParseStatementAllowsReservedWordParameterNameInLimit(t *testing.T) {
+	stmtAny, err := ParseStatement("MATCH (m:Movie) RETURN m.title AS title ORDER BY title DESC LIMIT $limit")
+	if err != nil {
+		t.Fatalf("ParseStatement() unexpected error: %v", err)
+	}
+
+	stmt, ok := stmtAny.(*ast.MatchQueryStatement)
+	if !ok {
+		t.Fatalf("expected *ast.MatchQueryStatement, got %T", stmtAny)
+	}
+	if stmt.Return.Limit == nil {
+		t.Fatalf("expected LIMIT expression")
+	}
+	if strings.TrimSpace(stmt.Return.Limit.Raw) != "$limit" {
+		t.Fatalf("expected LIMIT raw expression to be $limit, got %q", stmt.Return.Limit.Raw)
+	}
+
+	found := false
+	for _, p := range stmt.Parameters {
+		if p.Name == "limit" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected statement parameters to include limit")
+	}
+}
+
 func TestParseBatchSemicolonSeparated(t *testing.T) {
 	query := "MATCH (n) RETURN n; MATCH (m) RETURN m;"
 	batch, err := ParseBatch(query)

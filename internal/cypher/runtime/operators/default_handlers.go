@@ -3733,6 +3733,9 @@ func parseProjectionAggregateDistinctArg(raw string) (string, bool) {
 func resolveProjectionAggregateArgValue(arg string, row map[string]any, state *State) (any, bool) {
 	if isSimpleOrderingReferenceExpression(arg) {
 		if value, exists := valueFromRowWithPresence(row, arg); exists {
+			if hydrated, hydratedOK := hydrateProjectionIdentifierValue(arg, value, row, state); hydratedOK {
+				return hydrated, true
+			}
 			return value, true
 		}
 	}

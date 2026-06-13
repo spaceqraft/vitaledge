@@ -3031,6 +3031,35 @@ func TestProjectHandlerEvaluatesDistinctAggregatesOnEmptyInput(t *testing.T) {
 	}
 }
 
+func TestProjectHandlerAggregateIdentifierFallsBackToIDBinding(t *testing.T) {
+	h := NewProjectHandler()
+	state := &State{Rows: []map[string]any{{"n": nil, "n.id": "v1"}}}
+
+	err := h.Execute("p10b-agg-id-fallback", map[string]any{
+		"items": []string{"count(n) AS c", "collect(n) AS ns"},
+	}, state)
+	if err != nil {
+		t.Fatalf("project execute failed: %v", err)
+	}
+	if len(state.Rows) != 1 {
+		t.Fatalf("expected one aggregate row, got %#v", state.Rows)
+	}
+	if got := state.Rows[0]["c"]; got != 1 {
+		t.Fatalf("expected count(n)=1 when n.id is bound, got %#v", state.Rows[0])
+	}
+	ns, ok := state.Rows[0]["ns"].([]any)
+	if !ok || len(ns) != 1 {
+		t.Fatalf("expected collect(n) to contain hydrated id binding, got %#v", state.Rows[0]["ns"])
+	}
+	entry, ok := ns[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected collect(n) entry to be a map fallback, got %#v", ns[0])
+	}
+	if id := entry["id"]; id != "v1" {
+		t.Fatalf("expected collect(n)[0].id to be v1, got %#v", entry)
+	}
+}
+
 func TestProjectHandlerEvaluatesDistinctAggregatesWithNullAndMixedTypes(t *testing.T) {
 	h := NewProjectHandler()
 	state := &State{Rows: []map[string]any{

@@ -503,8 +503,8 @@ type parameterCollector struct {
 
 func (p *parameterCollector) EnterOC_Parameter(c *cyphergen.OC_ParameterContext) {
 	name := ""
-	if c.OC_SymbolicName() != nil {
-		name = c.OC_SymbolicName().GetText()
+	if c.OC_SchemaName() != nil {
+		name = c.OC_SchemaName().GetText()
 	} else if c.DecimalInteger() != nil {
 		name = c.DecimalInteger().GetText()
 	}

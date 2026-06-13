@@ -563,7 +563,7 @@ oC_PropertyKeyName
                :  oC_SchemaName ;
 
 oC_Parameter
-         :  '$' ( oC_SymbolicName | DecimalInteger ) ;
+         :  '$' ( oC_SchemaName | DecimalInteger ) ;
 
 oC_SchemaName
           :  oC_SymbolicName

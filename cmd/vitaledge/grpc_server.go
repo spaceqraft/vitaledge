@@ -444,6 +444,8 @@ func grpcValidateBoundaryParam(path, key string, value any) error {
 			return fmt.Errorf("parameter %q must not include surrounding whitespace", path)
 		}
 		return nil
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return nil
 	case []any:
 		for idx, item := range typed {
 			if err := grpcValidateBoundaryParam(fmt.Sprintf("%s[%d]", path, idx), key, item); err != nil {

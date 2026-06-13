@@ -858,7 +858,7 @@ func cypherParserInit() {
 		1567, 1, 0, 0, 0, 1567, 1570, 1, 0, 0, 0, 1568, 1566, 1, 0, 0, 0, 1569,
 		1536, 1, 0, 0, 0, 1569, 1570, 1, 0, 0, 0, 1570, 1571, 1, 0, 0, 0, 1571,
 		1572, 5, 26, 0, 0, 1572, 189, 1, 0, 0, 0, 1573, 1574, 3, 194, 97, 0, 1574,
-		191, 1, 0, 0, 0, 1575, 1578, 5, 27, 0, 0, 1576, 1579, 3, 198, 99, 0, 1577,
+		191, 1, 0, 0, 0, 1575, 1578, 5, 27, 0, 0, 1576, 1579, 3, 194, 97, 0, 1577,
 		1579, 5, 97, 0, 0, 1578, 1576, 1, 0, 0, 0, 1578, 1577, 1, 0, 0, 0, 1579,
 		193, 1, 0, 0, 0, 1580, 1583, 3, 198, 99, 0, 1581, 1583, 3, 196, 98, 0,
 		1582, 1580, 1, 0, 0, 0, 1582, 1581, 1, 0, 0, 0, 1583, 195, 1, 0, 0, 0,
@@ -22924,7 +22924,7 @@ type IOC_ParameterContext interface {
 	GetParser() antlr.Parser
 
 	// Getter signatures
-	OC_SymbolicName() IOC_SymbolicNameContext
+	OC_SchemaName() IOC_SchemaNameContext
 	DecimalInteger() antlr.TerminalNode
 
 	// IsOC_ParameterContext differentiates from other interfaces.
@@ -22963,10 +22963,10 @@ func NewOC_ParameterContext(parser antlr.Parser, parent antlr.ParserRuleContext,
 
 func (s *OC_ParameterContext) GetParser() antlr.Parser { return s.parser }
 
-func (s *OC_ParameterContext) OC_SymbolicName() IOC_SymbolicNameContext {
+func (s *OC_ParameterContext) OC_SchemaName() IOC_SchemaNameContext {
 	var t antlr.RuleContext
 	for _, ctx := range s.GetChildren() {
-		if _, ok := ctx.(IOC_SymbolicNameContext); ok {
+		if _, ok := ctx.(IOC_SchemaNameContext); ok {
 			t = ctx.(antlr.RuleContext)
 			break
 		}
@@ -22976,7 +22976,7 @@ func (s *OC_ParameterContext) OC_SymbolicName() IOC_SymbolicNameContext {
 		return nil
 	}
 
-	return t.(IOC_SymbolicNameContext)
+	return t.(IOC_SchemaNameContext)
 }
 
 func (s *OC_ParameterContext) DecimalInteger() antlr.TerminalNode {
@@ -23032,10 +23032,10 @@ func (p *CypherParser) OC_Parameter() (localctx IOC_ParameterContext) {
 	}
 
 	switch p.GetTokenStream().LA(1) {
-	case CypherParserCOUNT, CypherParserANY, CypherParserNONE, CypherParserSINGLE, CypherParserHexLetter, CypherParserFILTER, CypherParserEXTRACT, CypherParserUnescapedSymbolicName, CypherParserEscapedSymbolicName:
+	case CypherParserUNION, CypherParserALL, CypherParserOPTIONAL, CypherParserMATCH, CypherParserUNWIND, CypherParserAS, CypherParserMERGE, CypherParserON, CypherParserCREATE, CypherParserSET, CypherParserDETACH, CypherParserDELETE, CypherParserREMOVE, CypherParserWITH, CypherParserRETURN, CypherParserDISTINCT, CypherParserORDER, CypherParserBY, CypherParserL_SKIP, CypherParserLIMIT, CypherParserASCENDING, CypherParserASC, CypherParserDESCENDING, CypherParserDESC, CypherParserWHERE, CypherParserOR, CypherParserXOR, CypherParserAND, CypherParserNOT, CypherParserSTARTS, CypherParserENDS, CypherParserCONTAINS, CypherParserIN, CypherParserIS, CypherParserNULL, CypherParserCOUNT, CypherParserCASE, CypherParserELSE, CypherParserEND, CypherParserWHEN, CypherParserTHEN, CypherParserANY, CypherParserNONE, CypherParserSINGLE, CypherParserEXISTS, CypherParserTRUE, CypherParserFALSE, CypherParserHexLetter, CypherParserCONSTRAINT, CypherParserDO, CypherParserFOR, CypherParserREQUIRE, CypherParserUNIQUE, CypherParserMANDATORY, CypherParserSCALAR, CypherParserOF, CypherParserADD, CypherParserDROP, CypherParserFILTER, CypherParserEXTRACT, CypherParserUnescapedSymbolicName, CypherParserEscapedSymbolicName:
 		{
 			p.SetState(1576)
-			p.OC_SymbolicName()
+			p.OC_SchemaName()
 		}
 
 	case CypherParserDecimalInteger:

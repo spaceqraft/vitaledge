@@ -24,7 +24,12 @@ const (
 	grpcSupportedIRVersion     = "query-pipeline-v1"
 )
 
-type grpcQueryHandler struct {
+type grpcDdlHandler struct {
+	executor      *executor.Executor
+	defaultTenant string
+}
+
+type grpcDmlHandler struct {
 	executor                     *executor.Executor
 	defaultTenant                string
 	configuredMaxWriteBatchBytes int64
@@ -33,14 +38,15 @@ type grpcQueryHandler struct {
 	executeStatementHook         func(context.Context, string, string, executor.Params) (*executor.Result, error)
 }
 
-func startGRPCServer(listenAddress string, handler v1.QueryServiceServer) (*grpc.Server, net.Listener, error) {
+func startGRPCServer(listenAddress string, ddlHandler v1.DdlServiceServer, dmlHandler v1.DmlServiceServer) (*grpc.Server, net.Listener, error) {
 	ln, err := net.Listen("tcp", strings.TrimSpace(listenAddress))
 	if err != nil {
 		return nil, nil, err
 	}
 
 	srv := grpc.NewServer()
-	v1.RegisterQueryServiceServer(srv, handler)
+	v1.RegisterDdlServiceServer(srv, ddlHandler)
+	v1.RegisterDmlServiceServer(srv, dmlHandler)
 
 	go func() {
 		_ = srv.Serve(ln)
@@ -48,7 +54,7 @@ func startGRPCServer(listenAddress string, handler v1.QueryServiceServer) (*grpc
 
 	return srv, ln, nil
 }
-func (h *grpcQueryHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*v1.QueryResponse, error) {
+func (h *grpcDmlHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*v1.QueryResponse, error) {
 	tenant, query, err := grpcExtractTenantAndQuery(req, h.defaultTenant)
 	if err != nil {
 		return nil, err
@@ -97,7 +103,7 @@ func (h *grpcQueryHandler) Execute(ctx context.Context, req *v1.QueryRequest) (*
 	return resp, nil
 }
 
-func (h *grpcQueryHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*v1.ExplainResponse, error) {
+func (h *grpcDmlHandler) Explain(ctx context.Context, req *v1.QueryRequest) (*v1.ExplainResponse, error) {
 	tenant, query, err := grpcExtractTenantAndQuery(req, h.defaultTenant)
 	if err != nil {
 		return nil, err
@@ -175,7 +181,7 @@ func grpcEffectiveWriteBatchBytes(maxWriteBatchBytes int64) int64 {
 	return int64(pebblestore.DefaultMaxWriteBatchBytes)
 }
 
-func (h *grpcQueryHandler) GetCapabilities(_ context.Context, _ *v1.CapabilitiesRequest) (*v1.CapabilitiesResponse, error) {
+func (h *grpcDmlHandler) GetCapabilities(_ context.Context, _ *v1.CapabilitiesRequest) (*v1.CapabilitiesResponse, error) {
 	maxWriteBatchBytes := h.maxWriteBatchBytes
 	configuredMaxWriteBatchBytes := grpcConfiguredWriteBatchBytes(h.configuredMaxWriteBatchBytes, maxWriteBatchBytes)
 	maxWriteBatchBytes = grpcEffectiveWriteBatchBytes(maxWriteBatchBytes)
@@ -194,7 +200,7 @@ func (h *grpcQueryHandler) GetCapabilities(_ context.Context, _ *v1.Capabilities
 	}, nil
 }
 
-func (h *grpcQueryHandler) CreatePropertyIndex(ctx context.Context, req *v1.CreatePropertyIndexRequest) (*v1.CreatePropertyIndexResponse, error) {
+func (h *grpcDdlHandler) CreateVertexPropertyIndex(ctx context.Context, req *v1.CreateVertexPropertyIndexRequest) (*v1.CreateVertexPropertyIndexResponse, error) {
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request is required")
 	}
@@ -227,13 +233,52 @@ func (h *grpcQueryHandler) CreatePropertyIndex(ctx context.Context, req *v1.Crea
 		return nil, status.Error(codes.Unknown, err.Error())
 	}
 
-	return &v1.CreatePropertyIndexResponse{
+	return &v1.CreateVertexPropertyIndexResponse{
 		Created:         created,
 		IndexedEntities: int64(indexedEntities),
 	}, nil
 }
 
-func (h *grpcQueryHandler) executeStatement(ctx context.Context, tenant, query string, params executor.Params) (*executor.Result, error) {
+func (h *grpcDdlHandler) CreateEdgePropertyIndex(ctx context.Context, req *v1.CreateEdgePropertyIndexRequest) (*v1.CreateEdgePropertyIndexResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+	if h == nil || h.executor == nil {
+		return nil, status.Error(codes.FailedPrecondition, "executor is not configured")
+	}
+
+	tenant := strings.TrimSpace(h.defaultTenant)
+	if override := strings.TrimSpace(req.GetTenant()); override != "" {
+		tenant = override
+	}
+	if tenant == "" {
+		return nil, status.Error(codes.InvalidArgument, "tenant is required")
+	}
+
+	created, indexedEntities, err := h.executor.CreateEdgePropertyIndexAsync(
+		ctx,
+		tenant,
+		strings.TrimSpace(req.GetSchema()),
+		strings.TrimSpace(req.GetProperty()),
+		req.GetIfNotExists(),
+	)
+	if err != nil {
+		if graph.IsKind(err, graph.ErrKindInvalidInput) {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		if graph.IsKind(err, graph.ErrKindConflict) {
+			return nil, status.Error(codes.AlreadyExists, err.Error())
+		}
+		return nil, status.Error(codes.Unknown, err.Error())
+	}
+
+	return &v1.CreateEdgePropertyIndexResponse{
+		Created:         created,
+		IndexedEntities: int64(indexedEntities),
+	}, nil
+}
+
+func (h *grpcDmlHandler) executeStatement(ctx context.Context, tenant, query string, params executor.Params) (*executor.Result, error) {
 	if h != nil && h.executeStatementHook != nil {
 		return h.executeStatementHook(ctx, tenant, query, params)
 	}

@@ -3948,7 +3948,10 @@ func resolveWritePropertyValueWithBindings(expr string, params map[string]any, b
 	if strings.Contains(expr, ".") || strings.Contains(expr, "[") {
 		return nil, false
 	}
-	return expr, true
+	if value, ok := evalWriteCaseExpression(expr, params, bindings); ok {
+		return value, true
+	}
+	return nil, false
 }
 
 func resolveWriteBinaryValueWithBindings(expr string, params map[string]any, bindings map[string]any) (any, bool) {
@@ -3975,6 +3978,350 @@ func resolveWriteBinaryValueWithBindings(expr string, params map[string]any, bin
 		return applyWriteBinaryValue(op, left, right)
 	}
 	return nil, false
+}
+
+// findWriteTopLevelKeyword returns the byte index of the first top-level
+// (depth-0, outside string literals) occurrence of keyword in text where the
+// keyword is surrounded by non-identifier characters (word boundary). Returns
+// -1 if not found.
+func findWriteTopLevelKeyword(text, keyword string) int {
+	kw := strings.ToUpper(strings.TrimSpace(keyword))
+	if kw == "" {
+		return -1
+	}
+	upper := strings.ToUpper(text)
+	if len(upper) < len(kw) {
+		return -1
+	}
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i <= len(upper)-len(kw); i++ {
+		ch := text[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth == 0 && strings.HasPrefix(upper[i:], kw) {
+			afterEnd := i + len(kw)
+			beforeOK := i == 0 || !isCreateIdentChar(text[i-1], false)
+			afterOK := afterEnd >= len(text) || !isCreateIdentChar(text[afterEnd], false)
+			if beforeOK && afterOK {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// evalWriteCaseExpression evaluates a Cypher CASE ... END expression using
+// write-context value resolution (bindings + params). Returns (value, true)
+// when the expression is a recognised CASE form; (nil, false) otherwise.
+func evalWriteCaseExpression(expr string, params map[string]any, bindings map[string]any) (any, bool) {
+	expr = strings.TrimSpace(expr)
+	upper := strings.ToUpper(expr)
+	if !strings.HasPrefix(upper, "CASE") || !strings.HasSuffix(upper, "END") {
+		return nil, false
+	}
+	// Require "CASE" to be a whole keyword (not CASExxx).
+	if len(upper) > 4 && isCreateIdentChar(upper[4], false) {
+		return nil, false
+	}
+	// Require "END" to be a whole keyword (not xxxEND).
+	endStart := len(expr) - 3
+	if endStart > 0 && isCreateIdentChar(expr[endStart-1], false) {
+		return nil, false
+	}
+	body := strings.TrimSpace(expr[4:endStart])
+	if body == "" {
+		return nil, false
+	}
+
+	// Determine generic CASE (body starts with WHEN keyword) vs simple CASE
+	// (body starts with an expression before the first WHEN).
+	comparisonExpr := ""
+	remaining := body
+	bodyUpper := strings.ToUpper(body)
+	startsWithWhen := strings.HasPrefix(bodyUpper, "WHEN") &&
+		(len(bodyUpper) == 4 || !isCreateIdentChar(bodyUpper[4], false))
+	if !startsWithWhen {
+		whenIdx := findWriteTopLevelKeyword(remaining, "WHEN")
+		if whenIdx <= 0 {
+			return nil, false
+		}
+		comparisonExpr = strings.TrimSpace(remaining[:whenIdx])
+		remaining = strings.TrimSpace(remaining[whenIdx:])
+	}
+
+	var testValue any
+	if comparisonExpr != "" {
+		val, ok := resolveWritePropertyValueWithBindings(comparisonExpr, params, bindings)
+		if !ok {
+			return nil, false
+		}
+		testValue = val
+	}
+
+	for {
+		remainingUpper := strings.ToUpper(remaining)
+		isWhen := strings.HasPrefix(remainingUpper, "WHEN") &&
+			(len(remainingUpper) == 4 || !isCreateIdentChar(remainingUpper[4], false))
+		if !isWhen {
+			break
+		}
+		remaining = strings.TrimSpace(remaining[4:]) // strip "WHEN"
+
+		thenIdx := findWriteTopLevelKeyword(remaining, "THEN")
+		if thenIdx < 0 {
+			return nil, false
+		}
+		whenExpr := strings.TrimSpace(remaining[:thenIdx])
+		afterThen := strings.TrimSpace(remaining[thenIdx+4:]) // skip "THEN"
+
+		nextWhenIdx := findWriteTopLevelKeyword(afterThen, "WHEN")
+		elseIdx := findWriteTopLevelKeyword(afterThen, "ELSE")
+		resultExpr := afterThen
+		remaining = ""
+		if nextWhenIdx >= 0 && (elseIdx < 0 || nextWhenIdx < elseIdx) {
+			resultExpr = strings.TrimSpace(afterThen[:nextWhenIdx])
+			remaining = strings.TrimSpace(afterThen[nextWhenIdx:])
+		} else if elseIdx >= 0 {
+			resultExpr = strings.TrimSpace(afterThen[:elseIdx])
+			remaining = strings.TrimSpace(afterThen[elseIdx:])
+		}
+
+		matched := false
+		if comparisonExpr == "" {
+			cond, ok := evalWriteConditionBool(whenExpr, params, bindings)
+			if !ok {
+				return nil, false
+			}
+			matched = cond
+		} else {
+			whenVal, ok := resolveWritePropertyValueWithBindings(whenExpr, params, bindings)
+			if !ok {
+				return nil, false
+			}
+			matched = writeSimpleCaseValuesMatch(testValue, whenVal)
+		}
+
+		if matched {
+			val, _ := resolveWritePropertyValueWithBindings(resultExpr, params, bindings)
+			return val, true
+		}
+	}
+
+	// Handle ELSE branch.
+	remainingUpper := strings.ToUpper(remaining)
+	isElse := strings.HasPrefix(remainingUpper, "ELSE") &&
+		(len(remainingUpper) == 4 || !isCreateIdentChar(remainingUpper[4], false))
+	if isElse {
+		elseExpr := strings.TrimSpace(remaining[4:])
+		if elseExpr == "" {
+			return nil, true
+		}
+		val, _ := resolveWritePropertyValueWithBindings(elseExpr, params, bindings)
+		return val, true
+	}
+	return nil, true
+}
+
+// evalWriteConditionBool evaluates a boolean condition expression in a
+// write/SET context. Handles comparison operators (>=, <=, <>, !=, >, <, =)
+// and direct boolean value resolution.
+func evalWriteConditionBool(expr string, params map[string]any, bindings map[string]any) (bool, bool) {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return false, false
+	}
+	for _, op := range []string{">=", "<=", "<>", "!=", ">", "<", "="} {
+		lhs, rhs, ok := splitWriteComparisonOp(expr, op)
+		if !ok {
+			continue
+		}
+		leftVal, leftOK := resolveWritePropertyValueWithBindings(lhs, params, bindings)
+		if !leftOK {
+			return false, false
+		}
+		rightVal, rightOK := resolveWritePropertyValueWithBindings(rhs, params, bindings)
+		if !rightOK {
+			return false, false
+		}
+		return applyWriteComparisonOp(op, leftVal, rightVal)
+	}
+	val, ok := resolveWritePropertyValueWithBindings(expr, params, bindings)
+	if !ok {
+		return false, false
+	}
+	b, isBool := val.(bool)
+	return b, isBool
+}
+
+// splitWriteComparisonOp splits expr on the given comparison operator at
+// top-level (depth 0, outside string literals). Returns (lhs, rhs, true) on
+// success. Single-character operators are validated so they are not matched as
+// part of a longer operator (e.g., > is not matched in >=).
+func splitWriteComparisonOp(expr, op string) (string, string, bool) {
+	expr = strings.TrimSpace(expr)
+	if len(expr) < len(op)+2 {
+		return "", "", false
+	}
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i <= len(expr)-len(op); i++ {
+		ch := expr[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle || inDouble {
+			continue
+		}
+		switch ch {
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		if !strings.HasPrefix(expr[i:], op) {
+			continue
+		}
+		afterIdx := i + len(op)
+		if len(op) == 1 {
+			var next, prev byte
+			if afterIdx < len(expr) {
+				next = expr[afterIdx]
+			}
+			if i > 0 {
+				prev = expr[i-1]
+			}
+			switch op {
+			case ">":
+				if next == '=' {
+					continue // part of >=
+				}
+			case "<":
+				if next == '=' || next == '>' {
+					continue // part of <= or <>
+				}
+			case "=":
+				if prev == '!' || prev == '<' || prev == '>' {
+					continue // part of !=, <=, >=
+				}
+			}
+		}
+		lhs := strings.TrimSpace(expr[:i])
+		rhs := strings.TrimSpace(expr[afterIdx:])
+		if lhs == "" || rhs == "" {
+			continue
+		}
+		return lhs, rhs, true
+	}
+	return "", "", false
+}
+
+// applyWriteComparisonOp applies a comparison operator to two resolved values.
+// Follows Cypher null semantics: null comparisons always yield false.
+func applyWriteComparisonOp(op string, left, right any) (bool, bool) {
+	if left == nil || right == nil {
+		return false, true
+	}
+	lf, leftNum := writeToFloat64(left)
+	rf, rightNum := writeToFloat64(right)
+	if leftNum && rightNum {
+		switch op {
+		case ">=":
+			return lf >= rf, true
+		case "<=":
+			return lf <= rf, true
+		case ">":
+			return lf > rf, true
+		case "<":
+			return lf < rf, true
+		case "=":
+			return lf == rf, true
+		case "<>", "!=":
+			return lf != rf, true
+		}
+	}
+	ls, leftStr := left.(string)
+	rs, rightStr := right.(string)
+	if leftStr && rightStr {
+		switch op {
+		case "=":
+			return ls == rs, true
+		case "<>", "!=":
+			return ls != rs, true
+		case ">=":
+			return ls >= rs, true
+		case "<=":
+			return ls <= rs, true
+		case ">":
+			return ls > rs, true
+		case "<":
+			return ls < rs, true
+		}
+	}
+	lb, leftBool := left.(bool)
+	rb, rightBool := right.(bool)
+	if leftBool && rightBool {
+		switch op {
+		case "=":
+			return lb == rb, true
+		case "<>", "!=":
+			return lb != rb, true
+		}
+	}
+	return false, false
+}
+
+// writeSimpleCaseValuesMatch compares test and when values for simple CASE
+// matching (CASE <expr> WHEN <val> THEN ...).
+func writeSimpleCaseValuesMatch(testValue, whenValue any) bool {
+	if testValue == nil || whenValue == nil {
+		return false
+	}
+	lf, leftNum := writeToFloat64(testValue)
+	rf, rightNum := writeToFloat64(whenValue)
+	if leftNum && rightNum {
+		return lf == rf
+	}
+	if ls, ok := testValue.(string); ok {
+		rs, ok2 := whenValue.(string)
+		return ok2 && ls == rs
+	}
+	if lb, ok := testValue.(bool); ok {
+		rb, ok2 := whenValue.(bool)
+		return ok2 && lb == rb
+	}
+	return fmt.Sprint(testValue) == fmt.Sprint(whenValue)
 }
 
 func splitWriteTopLevelBinary(expr string, ops string) (string, string, string, bool) {

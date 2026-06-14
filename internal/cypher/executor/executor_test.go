@@ -7570,6 +7570,82 @@ func TestSetCaseMultiProperty(t *testing.T) {
 	}
 }
 
+// TestSetCaseWithRowAliasConditionPersisted verifies that a CASE WHEN expression
+// whose condition references a WITH-projected alias (not a vertex property path)
+// is correctly evaluated and persisted to storage — not stored as a literal
+// expression string. Reproduces the bug reported in advanced_cyber_threat_detection.py
+// where f.detected_malicious was stored as the raw CASE string.
+func TestSetCaseWithRowAliasConditionPersisted(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	defer func() { _ = store.Close() }()
+
+	setup, err := parser.ParseStatement(
+		"CREATE (f:Flow {id:'f1', bytes_sent: 1000.0})")
+	if err != nil {
+		t.Fatalf("setup parse failed: %v", err)
+	}
+	exec := New(store, Options{})
+	if _, err := exec.ExecuteStatement(ctx, setup, Params{"tenant": "acme"}); err != nil {
+		t.Fatalf("setup execute failed: %v", err)
+	}
+
+	// Phase 1: SET with CASE WHEN over a WITH-projected alias + parameter.
+	// threat_score is a computed alias, $threshold is a param — no dot in condition.
+	setStmt, err := parser.ParseStatement(
+		"MATCH (f:Flow {id:'f1'}) " +
+			"WITH f, 3.5 AS threat_score " +
+			"SET f.detected_malicious = CASE WHEN threat_score >= $threshold THEN true ELSE false END, " +
+			"    f.threat_score = threat_score " +
+			"RETURN count(f) AS updated")
+	if err != nil {
+		t.Fatalf("set parse failed: %v", err)
+	}
+	res, err := exec.ExecuteStatement(ctx, setStmt, Params{"tenant": "acme", "threshold": 2.0})
+	if err != nil {
+		t.Fatalf("set execute failed: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row from SET, got %d", len(res.Rows))
+	}
+
+	// Phase 2: read back from storage in a fresh query to verify values were
+	// persisted correctly (not stored as literal CASE expression strings).
+	readStmt, err := parser.ParseStatement(
+		"MATCH (f:Flow {id:'f1'}) RETURN f.detected_malicious AS dm, f.threat_score AS ts")
+	if err != nil {
+		t.Fatalf("read parse failed: %v", err)
+	}
+	readRes, err := exec.ExecuteStatement(ctx, readStmt, Params{"tenant": "acme"})
+	if err != nil {
+		t.Fatalf("read execute failed: %v", err)
+	}
+	if len(readRes.Rows) != 1 {
+		t.Fatalf("expected 1 row from read, got %d", len(readRes.Rows))
+	}
+	row := readRes.Rows[0]
+
+	// detected_malicious must be the boolean true, not the literal CASE string.
+	dm := row["dm"]
+	if dmBool, ok := dm.(bool); !ok || !dmBool {
+		t.Fatalf("expected f.detected_malicious = true (bool), got %T(%v)", dm, dm)
+	}
+
+	// threat_score must be a numeric value, not a string alias name.
+	ts := row["ts"]
+	switch tv := ts.(type) {
+	case float64:
+		if tv != 3.5 {
+			t.Fatalf("expected f.threat_score = 3.5, got %v", tv)
+		}
+	default:
+		// json.Number is also acceptable
+		if fmt.Sprint(ts) != "3.5" {
+			t.Fatalf("expected f.threat_score = 3.5, got %T(%v)", ts, ts)
+		}
+	}
+}
+
 func TestExecuteUnionDistinct(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

@@ -89,13 +89,18 @@ func (s *Server) Start() error {
 		s.metricsSV = metricsServer
 		log.Printf("Metrics endpoint is listening on %s/metrics", s.MetricsListenAddress)
 	}
-	grpcServer, grpcListener, err := startGRPCServer(s.GRPCListenAddress, &grpcQueryHandler{
-		executor:                     s.executor,
-		defaultTenant:                s.DefaultTenant,
-		configuredMaxWriteBatchBytes: int64(s.ConfiguredMaxWriteBatchBytes),
-		maxWriteBatchBytes:           int64(s.MaxWriteBatchBytes),
-		maxWriteBatchBytesTuned:      s.MaxWriteBatchBytesAutoTuned,
-	})
+	grpcServer, grpcListener, err := startGRPCServer(s.GRPCListenAddress,
+		&grpcDdlHandler{
+			executor:      s.executor,
+			defaultTenant: s.DefaultTenant,
+		},
+		&grpcDmlHandler{
+			executor:                     s.executor,
+			defaultTenant:                s.DefaultTenant,
+			configuredMaxWriteBatchBytes: int64(s.ConfiguredMaxWriteBatchBytes),
+			maxWriteBatchBytes:           int64(s.MaxWriteBatchBytes),
+			maxWriteBatchBytesTuned:      s.MaxWriteBatchBytesAutoTuned,
+		})
 	if err != nil {
 		if s.metricsSV != nil {
 			_ = s.metricsSV.Close()

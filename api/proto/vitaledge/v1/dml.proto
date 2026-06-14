@@ -4,11 +4,10 @@ package vitaledge.v1;
 
 option go_package = "github.com/spaceqraft/vitaledge/api/proto/vitaledge/v1;v1";
 
-service QueryService {
+service DmlService {
   rpc Execute(QueryRequest) returns (QueryResponse);
   rpc Explain(QueryRequest) returns (ExplainResponse);
   rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
-  rpc CreatePropertyIndex(CreatePropertyIndexRequest) returns (CreatePropertyIndexResponse);
 }
 
 message QueryRequest {
@@ -88,18 +87,6 @@ message CapabilitiesResponse {
   int64 effective_max_write_batch_bytes = 9;
   bool max_write_batch_bytes_tuned = 10;
   bool strict_variant_dispatch_supported = 11;
-}
-
-message CreatePropertyIndexRequest {
-  string tenant = 1;
-  string schema = 2;
-  string property = 3;
-  bool if_not_exists = 4;
-}
-
-message CreatePropertyIndexResponse {
-  bool created = 1;
-  int64 indexed_entities = 2;
 }
 
 message Row {

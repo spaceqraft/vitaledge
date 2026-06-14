@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        (unknown)
-// source: api/proto/vitaledge/v1/query.proto
+// source: api/proto/vitaledge/v1/dml.proto
 
 package v1
 
@@ -34,7 +34,7 @@ type QueryRequest struct {
 
 func (x *QueryRequest) Reset() {
 	*x = QueryRequest{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[0]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -46,7 +46,7 @@ func (x *QueryRequest) String() string {
 func (*QueryRequest) ProtoMessage() {}
 
 func (x *QueryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[0]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -59,7 +59,7 @@ func (x *QueryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryRequest.ProtoReflect.Descriptor instead.
 func (*QueryRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{0}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *QueryRequest) GetTenant() string {
@@ -110,7 +110,7 @@ type QueryInput struct {
 
 func (x *QueryInput) Reset() {
 	*x = QueryInput{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[1]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -122,7 +122,7 @@ func (x *QueryInput) String() string {
 func (*QueryInput) ProtoMessage() {}
 
 func (x *QueryInput) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[1]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -135,7 +135,7 @@ func (x *QueryInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryInput.ProtoReflect.Descriptor instead.
 func (*QueryInput) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{1}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *QueryInput) GetKind() isQueryInput_Kind {
@@ -192,7 +192,7 @@ type PreparedQuery struct {
 
 func (x *PreparedQuery) Reset() {
 	*x = PreparedQuery{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[2]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -204,7 +204,7 @@ func (x *PreparedQuery) String() string {
 func (*PreparedQuery) ProtoMessage() {}
 
 func (x *PreparedQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[2]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -217,7 +217,7 @@ func (x *PreparedQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PreparedQuery.ProtoReflect.Descriptor instead.
 func (*PreparedQuery) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{2}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *PreparedQuery) GetParserVersion() string {
@@ -268,7 +268,7 @@ type RequestOptions struct {
 
 func (x *RequestOptions) Reset() {
 	*x = RequestOptions{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[3]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -280,7 +280,7 @@ func (x *RequestOptions) String() string {
 func (*RequestOptions) ProtoMessage() {}
 
 func (x *RequestOptions) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[3]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -293,7 +293,7 @@ func (x *RequestOptions) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RequestOptions.ProtoReflect.Descriptor instead.
 func (*RequestOptions) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{3}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *RequestOptions) GetReadOnly() bool {
@@ -342,7 +342,7 @@ type ClientContext struct {
 
 func (x *ClientContext) Reset() {
 	*x = ClientContext{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[4]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -354,7 +354,7 @@ func (x *ClientContext) String() string {
 func (*ClientContext) ProtoMessage() {}
 
 func (x *ClientContext) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[4]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -367,7 +367,7 @@ func (x *ClientContext) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClientContext.ProtoReflect.Descriptor instead.
 func (*ClientContext) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{4}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ClientContext) GetSdkLanguage() string {
@@ -403,7 +403,7 @@ type QueryResponse struct {
 
 func (x *QueryResponse) Reset() {
 	*x = QueryResponse{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[5]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -415,7 +415,7 @@ func (x *QueryResponse) String() string {
 func (*QueryResponse) ProtoMessage() {}
 
 func (x *QueryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[5]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -428,7 +428,7 @@ func (x *QueryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryResponse.ProtoReflect.Descriptor instead.
 func (*QueryResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{5}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *QueryResponse) GetColumns() []string {
@@ -470,7 +470,7 @@ type ExplainResponse struct {
 
 func (x *ExplainResponse) Reset() {
 	*x = ExplainResponse{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[6]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -482,7 +482,7 @@ func (x *ExplainResponse) String() string {
 func (*ExplainResponse) ProtoMessage() {}
 
 func (x *ExplainResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[6]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -495,7 +495,7 @@ func (x *ExplainResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExplainResponse.ProtoReflect.Descriptor instead.
 func (*ExplainResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{6}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ExplainResponse) GetExplainJson() []byte {
@@ -532,7 +532,7 @@ type QueryStats struct {
 
 func (x *QueryStats) Reset() {
 	*x = QueryStats{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[7]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -544,7 +544,7 @@ func (x *QueryStats) String() string {
 func (*QueryStats) ProtoMessage() {}
 
 func (x *QueryStats) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[7]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -557,7 +557,7 @@ func (x *QueryStats) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryStats.ProtoReflect.Descriptor instead.
 func (*QueryStats) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{7}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *QueryStats) GetRowsReturned() int64 {
@@ -605,7 +605,7 @@ type Diagnostic struct {
 
 func (x *Diagnostic) Reset() {
 	*x = Diagnostic{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[8]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -617,7 +617,7 @@ func (x *Diagnostic) String() string {
 func (*Diagnostic) ProtoMessage() {}
 
 func (x *Diagnostic) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[8]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -630,7 +630,7 @@ func (x *Diagnostic) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Diagnostic.ProtoReflect.Descriptor instead.
 func (*Diagnostic) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{8}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *Diagnostic) GetCode() string {
@@ -655,7 +655,7 @@ type CapabilitiesRequest struct {
 
 func (x *CapabilitiesRequest) Reset() {
 	*x = CapabilitiesRequest{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[9]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -667,7 +667,7 @@ func (x *CapabilitiesRequest) String() string {
 func (*CapabilitiesRequest) ProtoMessage() {}
 
 func (x *CapabilitiesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[9]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -680,7 +680,7 @@ func (x *CapabilitiesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapabilitiesRequest.ProtoReflect.Descriptor instead.
 func (*CapabilitiesRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{9}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{9}
 }
 
 type CapabilitiesResponse struct {
@@ -702,7 +702,7 @@ type CapabilitiesResponse struct {
 
 func (x *CapabilitiesResponse) Reset() {
 	*x = CapabilitiesResponse{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[10]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -714,7 +714,7 @@ func (x *CapabilitiesResponse) String() string {
 func (*CapabilitiesResponse) ProtoMessage() {}
 
 func (x *CapabilitiesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[10]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -727,7 +727,7 @@ func (x *CapabilitiesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapabilitiesResponse.ProtoReflect.Descriptor instead.
 func (*CapabilitiesResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{10}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *CapabilitiesResponse) GetProtocolVersion() string {
@@ -807,126 +807,6 @@ func (x *CapabilitiesResponse) GetStrictVariantDispatchSupported() bool {
 	return false
 }
 
-type CreatePropertyIndexRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Tenant        string                 `protobuf:"bytes,1,opt,name=tenant,proto3" json:"tenant,omitempty"`
-	Schema        string                 `protobuf:"bytes,2,opt,name=schema,proto3" json:"schema,omitempty"`
-	Property      string                 `protobuf:"bytes,3,opt,name=property,proto3" json:"property,omitempty"`
-	IfNotExists   bool                   `protobuf:"varint,4,opt,name=if_not_exists,json=ifNotExists,proto3" json:"if_not_exists,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *CreatePropertyIndexRequest) Reset() {
-	*x = CreatePropertyIndexRequest{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[11]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *CreatePropertyIndexRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*CreatePropertyIndexRequest) ProtoMessage() {}
-
-func (x *CreatePropertyIndexRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[11]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use CreatePropertyIndexRequest.ProtoReflect.Descriptor instead.
-func (*CreatePropertyIndexRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{11}
-}
-
-func (x *CreatePropertyIndexRequest) GetTenant() string {
-	if x != nil {
-		return x.Tenant
-	}
-	return ""
-}
-
-func (x *CreatePropertyIndexRequest) GetSchema() string {
-	if x != nil {
-		return x.Schema
-	}
-	return ""
-}
-
-func (x *CreatePropertyIndexRequest) GetProperty() string {
-	if x != nil {
-		return x.Property
-	}
-	return ""
-}
-
-func (x *CreatePropertyIndexRequest) GetIfNotExists() bool {
-	if x != nil {
-		return x.IfNotExists
-	}
-	return false
-}
-
-type CreatePropertyIndexResponse struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Created         bool                   `protobuf:"varint,1,opt,name=created,proto3" json:"created,omitempty"`
-	IndexedEntities int64                  `protobuf:"varint,2,opt,name=indexed_entities,json=indexedEntities,proto3" json:"indexed_entities,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
-}
-
-func (x *CreatePropertyIndexResponse) Reset() {
-	*x = CreatePropertyIndexResponse{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[12]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *CreatePropertyIndexResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*CreatePropertyIndexResponse) ProtoMessage() {}
-
-func (x *CreatePropertyIndexResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[12]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use CreatePropertyIndexResponse.ProtoReflect.Descriptor instead.
-func (*CreatePropertyIndexResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{12}
-}
-
-func (x *CreatePropertyIndexResponse) GetCreated() bool {
-	if x != nil {
-		return x.Created
-	}
-	return false
-}
-
-func (x *CreatePropertyIndexResponse) GetIndexedEntities() int64 {
-	if x != nil {
-		return x.IndexedEntities
-	}
-	return 0
-}
-
 type Row struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Values        map[string]*Value      `protobuf:"bytes,1,rep,name=values,proto3" json:"values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
@@ -936,7 +816,7 @@ type Row struct {
 
 func (x *Row) Reset() {
 	*x = Row{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[13]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -948,7 +828,7 @@ func (x *Row) String() string {
 func (*Row) ProtoMessage() {}
 
 func (x *Row) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[13]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -961,7 +841,7 @@ func (x *Row) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Row.ProtoReflect.Descriptor instead.
 func (*Row) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{13}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *Row) GetValues() map[string]*Value {
@@ -990,7 +870,7 @@ type Value struct {
 
 func (x *Value) Reset() {
 	*x = Value{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[14]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1002,7 +882,7 @@ func (x *Value) String() string {
 func (*Value) ProtoMessage() {}
 
 func (x *Value) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[14]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1015,7 +895,7 @@ func (x *Value) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Value.ProtoReflect.Descriptor instead.
 func (*Value) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{14}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *Value) GetKind() isValue_Kind {
@@ -1158,7 +1038,7 @@ type ListValue struct {
 
 func (x *ListValue) Reset() {
 	*x = ListValue{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[15]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1170,7 +1050,7 @@ func (x *ListValue) String() string {
 func (*ListValue) ProtoMessage() {}
 
 func (x *ListValue) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[15]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1183,7 +1063,7 @@ func (x *ListValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListValue.ProtoReflect.Descriptor instead.
 func (*ListValue) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{15}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ListValue) GetValues() []*Value {
@@ -1202,7 +1082,7 @@ type MapValue struct {
 
 func (x *MapValue) Reset() {
 	*x = MapValue{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[16]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1214,7 +1094,7 @@ func (x *MapValue) String() string {
 func (*MapValue) ProtoMessage() {}
 
 func (x *MapValue) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[16]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1227,7 +1107,7 @@ func (x *MapValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MapValue.ProtoReflect.Descriptor instead.
 func (*MapValue) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{16}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *MapValue) GetValues() map[string]*Value {
@@ -1245,7 +1125,7 @@ type NullValue struct {
 
 func (x *NullValue) Reset() {
 	*x = NullValue{}
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[17]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1257,7 +1137,7 @@ func (x *NullValue) String() string {
 func (*NullValue) ProtoMessage() {}
 
 func (x *NullValue) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_vitaledge_v1_query_proto_msgTypes[17]
+	mi := &file_api_proto_vitaledge_v1_dml_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1270,14 +1150,14 @@ func (x *NullValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NullValue.ProtoReflect.Descriptor instead.
 func (*NullValue) Descriptor() ([]byte, []int) {
-	return file_api_proto_vitaledge_v1_query_proto_rawDescGZIP(), []int{17}
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP(), []int{15}
 }
 
-var File_api_proto_vitaledge_v1_query_proto protoreflect.FileDescriptor
+var File_api_proto_vitaledge_v1_dml_proto protoreflect.FileDescriptor
 
-const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
+const file_api_proto_vitaledge_v1_dml_proto_rawDesc = "" +
 	"\n" +
-	"\"api/proto/vitaledge/v1/query.proto\x12\fvitaledge.v1\"\xe3\x02\n" +
+	" api/proto/vitaledge/v1/dml.proto\x12\fvitaledge.v1\"\xe3\x02\n" +
 	"\fQueryRequest\x12\x16\n" +
 	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x12.\n" +
 	"\x05input\x18\x02 \x01(\v2\x18.vitaledge.v1.QueryInputR\x05input\x126\n" +
@@ -1348,14 +1228,6 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"\x1bmax_write_batch_bytes_tuned\x18\n" +
 	" \x01(\bR\x17maxWriteBatchBytesTuned\x12I\n" +
 	"!strict_variant_dispatch_supported\x18\v \x01(\bR\x1estrictVariantDispatchSupported\"\x8c\x01\n" +
-	"\x1aCreatePropertyIndexRequest\x12\x16\n" +
-	"\x06tenant\x18\x01 \x01(\tR\x06tenant\x12\x16\n" +
-	"\x06schema\x18\x02 \x01(\tR\x06schema\x12\x1a\n" +
-	"\bproperty\x18\x03 \x01(\tR\bproperty\x12\"\n" +
-	"\rif_not_exists\x18\x04 \x01(\bR\vifNotExists\"b\n" +
-	"\x1bCreatePropertyIndexResponse\x12\x18\n" +
-	"\acreated\x18\x01 \x01(\bR\acreated\x12)\n" +
-	"\x10indexed_entities\x18\x02 \x01(\x03R\x0findexedEntities\"\x8c\x01\n" +
 	"\x03Row\x125\n" +
 	"\x06values\x18\x01 \x03(\v2\x1d.vitaledge.v1.Row.ValuesEntryR\x06values\x1aN\n" +
 	"\vValuesEntry\x12\x10\n" +
@@ -1382,94 +1254,90 @@ const file_api_proto_vitaledge_v1_query_proto_rawDesc = "" +
 	"\vValuesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12)\n" +
 	"\x05value\x18\x02 \x01(\v2\x13.vitaledge.v1.ValueR\x05value:\x028\x01\"\v\n" +
-	"\tNullValue2\xde\x02\n" +
-	"\fQueryService\x12B\n" +
+	"\tNullValue2\xf0\x01\n" +
+	"\n" +
+	"DmlService\x12B\n" +
 	"\aExecute\x12\x1a.vitaledge.v1.QueryRequest\x1a\x1b.vitaledge.v1.QueryResponse\x12D\n" +
 	"\aExplain\x12\x1a.vitaledge.v1.QueryRequest\x1a\x1d.vitaledge.v1.ExplainResponse\x12X\n" +
-	"\x0fGetCapabilities\x12!.vitaledge.v1.CapabilitiesRequest\x1a\".vitaledge.v1.CapabilitiesResponse\x12j\n" +
-	"\x13CreatePropertyIndex\x12(.vitaledge.v1.CreatePropertyIndexRequest\x1a).vitaledge.v1.CreatePropertyIndexResponseB;Z9github.com/spaceqraft/vitaledge/api/proto/vitaledge/v1;v1b\x06proto3"
+	"\x0fGetCapabilities\x12!.vitaledge.v1.CapabilitiesRequest\x1a\".vitaledge.v1.CapabilitiesResponseB;Z9github.com/spaceqraft/vitaledge/api/proto/vitaledge/v1;v1b\x06proto3"
 
 var (
-	file_api_proto_vitaledge_v1_query_proto_rawDescOnce sync.Once
-	file_api_proto_vitaledge_v1_query_proto_rawDescData []byte
+	file_api_proto_vitaledge_v1_dml_proto_rawDescOnce sync.Once
+	file_api_proto_vitaledge_v1_dml_proto_rawDescData []byte
 )
 
-func file_api_proto_vitaledge_v1_query_proto_rawDescGZIP() []byte {
-	file_api_proto_vitaledge_v1_query_proto_rawDescOnce.Do(func() {
-		file_api_proto_vitaledge_v1_query_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_api_proto_vitaledge_v1_query_proto_rawDesc), len(file_api_proto_vitaledge_v1_query_proto_rawDesc)))
+func file_api_proto_vitaledge_v1_dml_proto_rawDescGZIP() []byte {
+	file_api_proto_vitaledge_v1_dml_proto_rawDescOnce.Do(func() {
+		file_api_proto_vitaledge_v1_dml_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_api_proto_vitaledge_v1_dml_proto_rawDesc), len(file_api_proto_vitaledge_v1_dml_proto_rawDesc)))
 	})
-	return file_api_proto_vitaledge_v1_query_proto_rawDescData
+	return file_api_proto_vitaledge_v1_dml_proto_rawDescData
 }
 
-var file_api_proto_vitaledge_v1_query_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
-var file_api_proto_vitaledge_v1_query_proto_goTypes = []any{
-	(*QueryRequest)(nil),                // 0: vitaledge.v1.QueryRequest
-	(*QueryInput)(nil),                  // 1: vitaledge.v1.QueryInput
-	(*PreparedQuery)(nil),               // 2: vitaledge.v1.PreparedQuery
-	(*RequestOptions)(nil),              // 3: vitaledge.v1.RequestOptions
-	(*ClientContext)(nil),               // 4: vitaledge.v1.ClientContext
-	(*QueryResponse)(nil),               // 5: vitaledge.v1.QueryResponse
-	(*ExplainResponse)(nil),             // 6: vitaledge.v1.ExplainResponse
-	(*QueryStats)(nil),                  // 7: vitaledge.v1.QueryStats
-	(*Diagnostic)(nil),                  // 8: vitaledge.v1.Diagnostic
-	(*CapabilitiesRequest)(nil),         // 9: vitaledge.v1.CapabilitiesRequest
-	(*CapabilitiesResponse)(nil),        // 10: vitaledge.v1.CapabilitiesResponse
-	(*CreatePropertyIndexRequest)(nil),  // 11: vitaledge.v1.CreatePropertyIndexRequest
-	(*CreatePropertyIndexResponse)(nil), // 12: vitaledge.v1.CreatePropertyIndexResponse
-	(*Row)(nil),                         // 13: vitaledge.v1.Row
-	(*Value)(nil),                       // 14: vitaledge.v1.Value
-	(*ListValue)(nil),                   // 15: vitaledge.v1.ListValue
-	(*MapValue)(nil),                    // 16: vitaledge.v1.MapValue
-	(*NullValue)(nil),                   // 17: vitaledge.v1.NullValue
-	nil,                                 // 18: vitaledge.v1.QueryRequest.ParametersEntry
-	nil,                                 // 19: vitaledge.v1.Row.ValuesEntry
-	nil,                                 // 20: vitaledge.v1.MapValue.ValuesEntry
+var file_api_proto_vitaledge_v1_dml_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_api_proto_vitaledge_v1_dml_proto_goTypes = []any{
+	(*QueryRequest)(nil),         // 0: vitaledge.v1.QueryRequest
+	(*QueryInput)(nil),           // 1: vitaledge.v1.QueryInput
+	(*PreparedQuery)(nil),        // 2: vitaledge.v1.PreparedQuery
+	(*RequestOptions)(nil),       // 3: vitaledge.v1.RequestOptions
+	(*ClientContext)(nil),        // 4: vitaledge.v1.ClientContext
+	(*QueryResponse)(nil),        // 5: vitaledge.v1.QueryResponse
+	(*ExplainResponse)(nil),      // 6: vitaledge.v1.ExplainResponse
+	(*QueryStats)(nil),           // 7: vitaledge.v1.QueryStats
+	(*Diagnostic)(nil),           // 8: vitaledge.v1.Diagnostic
+	(*CapabilitiesRequest)(nil),  // 9: vitaledge.v1.CapabilitiesRequest
+	(*CapabilitiesResponse)(nil), // 10: vitaledge.v1.CapabilitiesResponse
+	(*Row)(nil),                  // 11: vitaledge.v1.Row
+	(*Value)(nil),                // 12: vitaledge.v1.Value
+	(*ListValue)(nil),            // 13: vitaledge.v1.ListValue
+	(*MapValue)(nil),             // 14: vitaledge.v1.MapValue
+	(*NullValue)(nil),            // 15: vitaledge.v1.NullValue
+	nil,                          // 16: vitaledge.v1.QueryRequest.ParametersEntry
+	nil,                          // 17: vitaledge.v1.Row.ValuesEntry
+	nil,                          // 18: vitaledge.v1.MapValue.ValuesEntry
 }
-var file_api_proto_vitaledge_v1_query_proto_depIdxs = []int32{
+var file_api_proto_vitaledge_v1_dml_proto_depIdxs = []int32{
 	1,  // 0: vitaledge.v1.QueryRequest.input:type_name -> vitaledge.v1.QueryInput
 	3,  // 1: vitaledge.v1.QueryRequest.options:type_name -> vitaledge.v1.RequestOptions
 	4,  // 2: vitaledge.v1.QueryRequest.client:type_name -> vitaledge.v1.ClientContext
-	18, // 3: vitaledge.v1.QueryRequest.parameters:type_name -> vitaledge.v1.QueryRequest.ParametersEntry
+	16, // 3: vitaledge.v1.QueryRequest.parameters:type_name -> vitaledge.v1.QueryRequest.ParametersEntry
 	2,  // 4: vitaledge.v1.QueryInput.prepared:type_name -> vitaledge.v1.PreparedQuery
-	13, // 5: vitaledge.v1.QueryResponse.rows:type_name -> vitaledge.v1.Row
+	11, // 5: vitaledge.v1.QueryResponse.rows:type_name -> vitaledge.v1.Row
 	7,  // 6: vitaledge.v1.QueryResponse.stats:type_name -> vitaledge.v1.QueryStats
 	8,  // 7: vitaledge.v1.QueryResponse.warnings:type_name -> vitaledge.v1.Diagnostic
 	7,  // 8: vitaledge.v1.ExplainResponse.stats:type_name -> vitaledge.v1.QueryStats
 	8,  // 9: vitaledge.v1.ExplainResponse.warnings:type_name -> vitaledge.v1.Diagnostic
-	19, // 10: vitaledge.v1.Row.values:type_name -> vitaledge.v1.Row.ValuesEntry
-	15, // 11: vitaledge.v1.Value.list_value:type_name -> vitaledge.v1.ListValue
-	16, // 12: vitaledge.v1.Value.map_value:type_name -> vitaledge.v1.MapValue
-	17, // 13: vitaledge.v1.Value.null_value:type_name -> vitaledge.v1.NullValue
-	14, // 14: vitaledge.v1.ListValue.values:type_name -> vitaledge.v1.Value
-	20, // 15: vitaledge.v1.MapValue.values:type_name -> vitaledge.v1.MapValue.ValuesEntry
-	14, // 16: vitaledge.v1.QueryRequest.ParametersEntry.value:type_name -> vitaledge.v1.Value
-	14, // 17: vitaledge.v1.Row.ValuesEntry.value:type_name -> vitaledge.v1.Value
-	14, // 18: vitaledge.v1.MapValue.ValuesEntry.value:type_name -> vitaledge.v1.Value
-	0,  // 19: vitaledge.v1.QueryService.Execute:input_type -> vitaledge.v1.QueryRequest
-	0,  // 20: vitaledge.v1.QueryService.Explain:input_type -> vitaledge.v1.QueryRequest
-	9,  // 21: vitaledge.v1.QueryService.GetCapabilities:input_type -> vitaledge.v1.CapabilitiesRequest
-	11, // 22: vitaledge.v1.QueryService.CreatePropertyIndex:input_type -> vitaledge.v1.CreatePropertyIndexRequest
-	5,  // 23: vitaledge.v1.QueryService.Execute:output_type -> vitaledge.v1.QueryResponse
-	6,  // 24: vitaledge.v1.QueryService.Explain:output_type -> vitaledge.v1.ExplainResponse
-	10, // 25: vitaledge.v1.QueryService.GetCapabilities:output_type -> vitaledge.v1.CapabilitiesResponse
-	12, // 26: vitaledge.v1.QueryService.CreatePropertyIndex:output_type -> vitaledge.v1.CreatePropertyIndexResponse
-	23, // [23:27] is the sub-list for method output_type
-	19, // [19:23] is the sub-list for method input_type
+	17, // 10: vitaledge.v1.Row.values:type_name -> vitaledge.v1.Row.ValuesEntry
+	13, // 11: vitaledge.v1.Value.list_value:type_name -> vitaledge.v1.ListValue
+	14, // 12: vitaledge.v1.Value.map_value:type_name -> vitaledge.v1.MapValue
+	15, // 13: vitaledge.v1.Value.null_value:type_name -> vitaledge.v1.NullValue
+	12, // 14: vitaledge.v1.ListValue.values:type_name -> vitaledge.v1.Value
+	18, // 15: vitaledge.v1.MapValue.values:type_name -> vitaledge.v1.MapValue.ValuesEntry
+	12, // 16: vitaledge.v1.QueryRequest.ParametersEntry.value:type_name -> vitaledge.v1.Value
+	12, // 17: vitaledge.v1.Row.ValuesEntry.value:type_name -> vitaledge.v1.Value
+	12, // 18: vitaledge.v1.MapValue.ValuesEntry.value:type_name -> vitaledge.v1.Value
+	0,  // 19: vitaledge.v1.DmlService.Execute:input_type -> vitaledge.v1.QueryRequest
+	0,  // 20: vitaledge.v1.DmlService.Explain:input_type -> vitaledge.v1.QueryRequest
+	9,  // 21: vitaledge.v1.DmlService.GetCapabilities:input_type -> vitaledge.v1.CapabilitiesRequest
+	5,  // 22: vitaledge.v1.DmlService.Execute:output_type -> vitaledge.v1.QueryResponse
+	6,  // 23: vitaledge.v1.DmlService.Explain:output_type -> vitaledge.v1.ExplainResponse
+	10, // 24: vitaledge.v1.DmlService.GetCapabilities:output_type -> vitaledge.v1.CapabilitiesResponse
+	22, // [22:25] is the sub-list for method output_type
+	19, // [19:22] is the sub-list for method input_type
 	19, // [19:19] is the sub-list for extension type_name
 	19, // [19:19] is the sub-list for extension extendee
 	0,  // [0:19] is the sub-list for field type_name
 }
 
-func init() { file_api_proto_vitaledge_v1_query_proto_init() }
-func file_api_proto_vitaledge_v1_query_proto_init() {
-	if File_api_proto_vitaledge_v1_query_proto != nil {
+func init() { file_api_proto_vitaledge_v1_dml_proto_init() }
+func file_api_proto_vitaledge_v1_dml_proto_init() {
+	if File_api_proto_vitaledge_v1_dml_proto != nil {
 		return
 	}
-	file_api_proto_vitaledge_v1_query_proto_msgTypes[1].OneofWrappers = []any{
+	file_api_proto_vitaledge_v1_dml_proto_msgTypes[1].OneofWrappers = []any{
 		(*QueryInput_Cypher)(nil),
 		(*QueryInput_Prepared)(nil),
 	}
-	file_api_proto_vitaledge_v1_query_proto_msgTypes[14].OneofWrappers = []any{
+	file_api_proto_vitaledge_v1_dml_proto_msgTypes[12].OneofWrappers = []any{
 		(*Value_BoolValue)(nil),
 		(*Value_IntValue)(nil),
 		(*Value_DoubleValue)(nil),
@@ -1483,17 +1351,17 @@ func file_api_proto_vitaledge_v1_query_proto_init() {
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_vitaledge_v1_query_proto_rawDesc), len(file_api_proto_vitaledge_v1_query_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_vitaledge_v1_dml_proto_rawDesc), len(file_api_proto_vitaledge_v1_dml_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   21,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_api_proto_vitaledge_v1_query_proto_goTypes,
-		DependencyIndexes: file_api_proto_vitaledge_v1_query_proto_depIdxs,
-		MessageInfos:      file_api_proto_vitaledge_v1_query_proto_msgTypes,
+		GoTypes:           file_api_proto_vitaledge_v1_dml_proto_goTypes,
+		DependencyIndexes: file_api_proto_vitaledge_v1_dml_proto_depIdxs,
+		MessageInfos:      file_api_proto_vitaledge_v1_dml_proto_msgTypes,
 	}.Build()
-	File_api_proto_vitaledge_v1_query_proto = out.File
-	file_api_proto_vitaledge_v1_query_proto_goTypes = nil
-	file_api_proto_vitaledge_v1_query_proto_depIdxs = nil
+	File_api_proto_vitaledge_v1_dml_proto = out.File
+	file_api_proto_vitaledge_v1_dml_proto_goTypes = nil
+	file_api_proto_vitaledge_v1_dml_proto_depIdxs = nil
 }

@@ -23,10 +23,10 @@ type capturedGRPCExecution struct {
 	params executor.Params
 }
 
-func newGRPCTestClient(t *testing.T, handler v1.QueryServiceServer) (v1.QueryServiceClient, func()) {
+func newGRPCTestClient(t *testing.T, ddlHandler v1.DdlServiceServer, dmlHandler v1.DmlServiceServer) (v1.DmlServiceClient, func()) {
 	t.Helper()
 
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", handler)
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", ddlHandler, dmlHandler)
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -44,7 +44,7 @@ func newGRPCTestClient(t *testing.T, handler v1.QueryServiceServer) (v1.QuerySer
 		_ = grpcLn.Close()
 	}
 
-	return v1.NewQueryServiceClient(conn), cleanup
+	return v1.NewDmlServiceClient(conn), cleanup
 }
 
 func cloneExecutionParams(params executor.Params) executor.Params {
@@ -64,7 +64,7 @@ func captureExecution(mu *sync.Mutex, captured *[]capturedGRPCExecution, query s
 type grpcBoundaryEndpointCase struct {
 	name          string
 	expectedQuery string
-	call          func(context.Context, v1.QueryServiceClient, map[string]*v1.Value, *v1.RequestOptions) error
+	call          func(context.Context, v1.DmlServiceClient, map[string]*v1.Value, *v1.RequestOptions) error
 }
 
 type grpcBoundaryScenarioCase struct {
@@ -100,7 +100,7 @@ func buildGRPCBoundaryEndpoints(
 		result = append(result, grpcBoundaryEndpointCase{
 			name:          endpoint,
 			expectedQuery: grpcExpectedQueryForEndpoint(endpoint, cypher),
-			call: func(ctx context.Context, client v1.QueryServiceClient, params map[string]*v1.Value, options *v1.RequestOptions) error {
+			call: func(ctx context.Context, client v1.DmlServiceClient, params map[string]*v1.Value, options *v1.RequestOptions) error {
 				req := buildRequest(endpoint, params, options)
 				if req == nil {
 					return status.Error(codes.Internal, "boundary request builder returned nil")
@@ -149,10 +149,14 @@ func runGRPCBoundaryMatrix(
 					}, nil
 				}
 
-				client, cleanup := newGRPCTestClient(t, &grpcQueryHandler{
-					defaultTenant:        "acme",
-					executeStatementHook: hook,
-				})
+				client, cleanup := newGRPCTestClient(t,
+					&grpcDdlHandler{
+						defaultTenant:        "acme",
+					},
+					&grpcDmlHandler{
+						defaultTenant:        "acme",
+						executeStatementHook: hook,
+					})
 				defer cleanup()
 
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -601,7 +605,14 @@ func TestGRPCExecuteIntegrationSerializesNumericAggregatesAndProperties(t *testi
 	}
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+					&grpcDdlHandler{
+						defaultTenant: "acme",
+					},
+					&grpcDmlHandler{
+						executor: exec,
+						 defaultTenant: "acme",
+					})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -617,7 +628,7 @@ func TestGRPCExecuteIntegrationSerializesNumericAggregatesAndProperties(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 
 	aggResp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",
@@ -712,7 +723,14 @@ func TestGRPCExecuteIntegrationSerializesIntegerOnlyAggregatesAndProperties(t *t
 	}
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+					&grpcDdlHandler{
+						defaultTenant:        "acme",
+					},
+					&grpcDmlHandler{
+						executor: exec,
+						 defaultTenant: "acme"
+					})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -728,7 +746,7 @@ func TestGRPCExecuteIntegrationSerializesIntegerOnlyAggregatesAndProperties(t *t
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 
 	aggResp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",
@@ -826,7 +844,15 @@ func TestGRPCExecuteIntegrationParameterizedThresholdAndLimit(t *testing.T) {
 	}
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+					&grpcDdlHandler{
+						defaultTenant:        "acme",
+					},
+					&grpcDmlHandler{
+						executor: exec,
+						 defaultTenant: "acme"
+					},
+	)
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -842,7 +868,7 @@ func TestGRPCExecuteIntegrationParameterizedThresholdAndLimit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 
 	thresholdResp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",

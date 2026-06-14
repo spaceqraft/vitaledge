@@ -175,7 +175,14 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{
+			executor:      exec,
+			defaultTenant: "acme",
+		})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -191,7 +198,7 @@ func TestGRPCQueryServiceExecuteAndCapabilities(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 	capResp, err := client.GetCapabilities(ctx, &v1.CapabilitiesRequest{})
 	if err != nil {
 		t.Fatalf("GetCapabilities failed: %v", err)
@@ -317,7 +324,15 @@ func TestGRPCQueryServiceExecuteRejectsReservedInternalParams(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{
+			executor:      exec,
+			defaultTenant: "acme",
+		},
+	)
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -333,7 +348,7 @@ func TestGRPCQueryServiceExecuteRejectsReservedInternalParams(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 	_, err = client.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",
 		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
@@ -361,7 +376,15 @@ func TestGRPCQueryServiceExplainRejectsReservedInternalParams(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{
+			executor:      exec,
+			defaultTenant: "acme",
+		},
+	)
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -377,7 +400,7 @@ func TestGRPCQueryServiceExplainRejectsReservedInternalParams(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 	_, err = client.Explain(ctx, &v1.QueryRequest{
 		Tenant: "acme",
 		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
@@ -407,13 +430,17 @@ func TestGRPCQueryServiceCapabilitiesReflectTunedMaxWriteBatch(t *testing.T) {
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	const configuredMaxWriteBatchBytes = int64(pebblestore.DefaultMaxWriteBatchBytes)
 	const effectiveMaxWriteBatchBytes = 32 * 1024 * 1024
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{
-		executor:                     exec,
-		defaultTenant:                "acme",
-		configuredMaxWriteBatchBytes: configuredMaxWriteBatchBytes,
-		maxWriteBatchBytes:           effectiveMaxWriteBatchBytes,
-		maxWriteBatchBytesTuned:      true,
-	})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{
+			executor:                     exec,
+			defaultTenant:                "acme",
+			configuredMaxWriteBatchBytes: configuredMaxWriteBatchBytes,
+			maxWriteBatchBytes:           effectiveMaxWriteBatchBytes,
+			maxWriteBatchBytesTuned:      true,
+		})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -429,7 +456,7 @@ func TestGRPCQueryServiceCapabilitiesReflectTunedMaxWriteBatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 	capResp, err := client.GetCapabilities(ctx, &v1.CapabilitiesRequest{})
 	if err != nil {
 		t.Fatalf("GetCapabilities failed: %v", err)
@@ -475,13 +502,17 @@ func TestGRPCQueryServiceExplainReportsWriteBatchSettings(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{
-		executor:                     exec,
-		defaultTenant:                "acme",
-		configuredMaxWriteBatchBytes: 123456,
-		maxWriteBatchBytes:           32 * 1024 * 1024,
-		maxWriteBatchBytesTuned:      true,
-	})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{
+			executor:                     exec,
+			defaultTenant:                "acme",
+			configuredMaxWriteBatchBytes: 123456,
+			maxWriteBatchBytes:           32 * 1024 * 1024,
+			maxWriteBatchBytesTuned:      true,
+		})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -497,7 +528,7 @@ func TestGRPCQueryServiceExplainReportsWriteBatchSettings(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 	explainResp, err := client.Explain(ctx, &v1.QueryRequest{
 		Tenant: "acme",
 		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "MATCH (n:Seed) RETURN n.id AS id"}},
@@ -688,7 +719,12 @@ func TestGRPCQueryServiceCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T
 	}
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: indexschema.NewCatalog()})
-	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0", &grpcQueryHandler{executor: exec, defaultTenant: "acme"})
+	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{executor: exec, defaultTenant: "acme"},
+	)
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -704,8 +740,9 @@ func TestGRPCQueryServiceCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	client := v1.NewQueryServiceClient(conn)
-	createResp, err := client.CreatePropertyIndex(ctx, &v1.CreatePropertyIndexRequest{
+	ddlClient := v1.NewDdlServiceClient(conn)
+	dmlClient := v1.NewDmlServiceClient(conn)
+	createResp, err := ddlClient.CreateVertexPropertyIndex(ctx, &v1.CreateVertexPropertyIndexRequest{
 		Tenant:      "acme",
 		Schema:      "User",
 		Property:    "email",
@@ -721,7 +758,7 @@ func TestGRPCQueryServiceCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T
 		t.Fatalf("expected indexed_entities=0 for async enqueue, got %d", createResp.GetIndexedEntities())
 	}
 
-	processResp, err := client.Execute(ctx, &v1.QueryRequest{
+	processResp, err := dmlClient.Execute(ctx, &v1.QueryRequest{
 		Tenant: "acme",
 		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: "CALL db.index.processPropertyBuildJobs() YIELD processed, pending RETURN processed, pending"}},
 	})
@@ -752,7 +789,7 @@ func TestGRPCQueryServiceCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T
 		t.Fatalf("verify property index failed: %v", err)
 	}
 
-	idempotentResp, err := client.CreatePropertyIndex(ctx, &v1.CreatePropertyIndexRequest{
+	idempotentResp, err := ddlClient.CreateVertexPropertyIndex(ctx, &v1.CreateVertexPropertyIndexRequest{
 		Tenant:      "acme",
 		Schema:      "User",
 		Property:    "email",
@@ -765,7 +802,7 @@ func TestGRPCQueryServiceCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T
 		t.Fatalf("expected created=false when index already exists")
 	}
 
-	_, err = client.CreatePropertyIndex(ctx, &v1.CreatePropertyIndexRequest{
+	_, err = ddlClient.CreateVertexPropertyIndex(ctx, &v1.CreateVertexPropertyIndexRequest{
 		Tenant:      "acme",
 		Schema:      "User",
 		Property:    "email",

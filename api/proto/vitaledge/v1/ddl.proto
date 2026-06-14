@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package vitaledge.v1;
+
+option go_package = "github.com/spaceqraft/vitaledge/api/proto/vitaledge/v1;v1";
+
+service DdlService {
+  rpc CreateVertexPropertyIndex(CreateVertexPropertyIndexRequest) returns (CreateVertexPropertyIndexResponse);
+  rpc CreateEdgePropertyIndex(CreateEdgePropertyIndexRequest) returns (CreateEdgePropertyIndexResponse);
+}
+
+message CreateVertexPropertyIndexRequest {
+  string tenant = 1;
+  string schema = 2;
+  string property = 3;
+  bool if_not_exists = 4;
+}
+
+message CreateVertexPropertyIndexResponse {
+  bool created = 1;
+  int64 indexed_entities = 2;
+}
+
+message CreateEdgePropertyIndexRequest {
+  string tenant = 1;
+  string schema = 2;
+  string property = 3;
+  bool if_not_exists = 4;
+}
+
+message CreateEdgePropertyIndexResponse {
+  bool created = 1;
+  int64 indexed_entities = 2;
+}

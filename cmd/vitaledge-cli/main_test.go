@@ -21,6 +21,11 @@ type stubQueryServiceClient struct {
 	explainFunc func(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.ExplainResponse, error)
 }
 
+// CreateEdgePropertyIndex implements [v1.QueryServiceClient].
+func (s *stubQueryServiceClient) CreateEdgePropertyIndex(ctx context.Context, in *v1.CreateEdgePropertyIndexRequest, opts ...grpc.CallOption) (*v1.CreateEdgePropertyIndexResponse, error) {
+	panic("unimplemented")
+}
+
 func (s *stubQueryServiceClient) Execute(ctx context.Context, in *v1.QueryRequest, opts ...grpc.CallOption) (*v1.QueryResponse, error) {
 	if s.executeFunc != nil {
 		return s.executeFunc(ctx, in, opts...)
@@ -210,8 +215,8 @@ func (s *stubQueryServiceClient) GetCapabilities(ctx context.Context, in *v1.Cap
 	return &v1.CapabilitiesResponse{}, nil
 }
 
-func (s *stubQueryServiceClient) CreatePropertyIndex(ctx context.Context, in *v1.CreatePropertyIndexRequest, opts ...grpc.CallOption) (*v1.CreatePropertyIndexResponse, error) {
-	return &v1.CreatePropertyIndexResponse{}, nil
+func (s *stubQueryServiceClient) CreateVertexPropertyIndex(ctx context.Context, in *v1.CreateVertexPropertyIndexRequest, opts ...grpc.CallOption) (*v1.CreateVertexPropertyIndexResponse, error) {
+	return &v1.CreateVertexPropertyIndexResponse{}, nil
 }
 
 func TestHandleCLICommandSetListUnset(t *testing.T) {

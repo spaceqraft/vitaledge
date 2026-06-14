@@ -43,65 +43,6 @@ func profileIndexDecisionsFromPayload(t *testing.T, profile map[string]any) []ma
 	return decisions
 }
 
-func TestCreateEdgePropertyIndexBackfillsExistingEdges(t *testing.T) {
-	store := openStore(t)
-	defer func() { _ = store.Close() }()
-
-	ctx := context.Background()
-	if err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
-			return err
-		}
-		return tx.PutEdge(ctx, &graph.Edge{
-			Tenant: "acme",
-			ID:     "e1",
-			Type:   "RATED",
-			SrcID:  "u1",
-			DstID:  "m1",
-			Properties: map[string][]byte{
-				"rating": valueToBytes(5.0),
-			},
-		})
-	}); err != nil {
-		t.Fatalf("seed failed: %v", err)
-	}
-
-	catalog := indexschema.NewCatalog()
-	exec := New(store, Options{Metrics: NewCollector(), IndexCatalog: catalog})
-
-	created, indexed, err := exec.CreateEdgePropertyIndex(ctx, "acme", "RATED", "rating", false)
-	if err != nil {
-		t.Fatalf("CreateEdgePropertyIndex failed: %v", err)
-	}
-	if !created {
-		t.Fatalf("expected index to be created")
-	}
-	if indexed != 1 {
-		t.Fatalf("expected one indexed edge, got %d", indexed)
-	}
-	if !catalog.HasEdgePropertyIndex("acme", "RATED", "rating") {
-		t.Fatalf("expected edge property index in catalog")
-	}
-
-	found := false
-	if err := store.View(ctx, func(tx graph.Tx) error {
-		return tx.ScanPropertyIndex(ctx, "acme", "RATED", "rating", valueToBytes(5.0), 0, func(entry *graph.PropertyIndexEntry) error {
-			if entry != nil && entry.EntityClass == "edge" && entry.EntityID == "e1" {
-				found = true
-			}
-			return nil
-		})
-	}); err != nil {
-		t.Fatalf("scan property index failed: %v", err)
-	}
-	if !found {
-		t.Fatalf("expected backfilled edge index entry for e1")
-	}
-}
-
 func TestCallCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T) {
 	store := openStore(t)
 	defer func() { _ = store.Close() }()

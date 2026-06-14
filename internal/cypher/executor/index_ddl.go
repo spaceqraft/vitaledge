@@ -135,45 +135,6 @@ func (e *Executor) CreatePropertyIndexAsync(ctx context.Context, tenant, schema,
 	return true, 0, nil
 }
 
-// CreateEdgePropertyIndex registers an edge-property index in the runtime catalog and
-// backfills matching edges into the persistent property-index keyspace.
-func (e *Executor) CreateEdgePropertyIndex(ctx context.Context, tenant, edgeType, property string, ifNotExists bool) (created bool, indexedEntities int, err error) {
-	if e == nil || e.store == nil {
-		return false, 0, graph.NewError(graph.ErrKindInvalidInput, "executor requires a graph store", nil)
-	}
-	if e.indexCatalog == nil {
-		return false, 0, graph.NewError(graph.ErrKindInvalidInput, "index catalog is not configured", nil)
-	}
-
-	tenant = strings.TrimSpace(tenant)
-	edgeType = strings.TrimSpace(edgeType)
-	property = strings.TrimSpace(property)
-	if tenant == "" || edgeType == "" || property == "" {
-		return false, 0, graph.NewError(graph.ErrKindInvalidInput, "tenant, edge type, and property are required", nil)
-	}
-
-	if e.indexCatalog.HasEdgePropertyIndex(tenant, edgeType, property) {
-		if ifNotExists {
-			return false, 0, nil
-		}
-		return false, 0, graph.NewError(graph.ErrKindConflict, "edge property index already exists", nil)
-	}
-	if !e.indexCatalog.AddEdgePropertyIndex(tenant, edgeType, property) {
-		if ifNotExists {
-			return false, 0, nil
-		}
-		return false, 0, graph.NewError(graph.ErrKindConflict, "edge property index already exists", nil)
-	}
-
-	count, buildErr := e.BackfillEdgePropertyIndex(ctx, tenant, edgeType, property)
-	if buildErr != nil {
-		e.indexCatalog.RemoveEdgePropertyIndex(tenant, edgeType, property)
-		return false, 0, buildErr
-	}
-
-	return true, count, nil
-}
-
 // DropEdgePropertyIndex removes an edge-property index from the runtime catalog,
 // deletes persisted entries, and marks pending build jobs completed.
 func (e *Executor) DropEdgePropertyIndex(ctx context.Context, tenant, edgeType, property string, ifExists bool) (dropped bool, deletedEntities int, err error) {

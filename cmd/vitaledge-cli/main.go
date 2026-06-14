@@ -110,7 +110,7 @@ func run(cfg cliConfig, in io.Reader, out io.Writer, stderr io.Writer) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	client := v1.NewQueryServiceClient(conn)
+	client := v1.NewDmlServiceClient(conn)
 	state := cliState{variables: map[string]any{}}
 
 	if strings.TrimSpace(cfg.loadMode) != "" {
@@ -137,7 +137,7 @@ func run(cfg cliConfig, in io.Reader, out io.Writer, stderr io.Writer) error {
 	return runInteractiveLoop(client, cfg, &state, in, out, stderr)
 }
 
-func runInteractiveLoop(client v1.QueryServiceClient, cfg cliConfig, state *cliState, in io.Reader, out io.Writer, stderr io.Writer) error {
+func runInteractiveLoop(client v1.DmlServiceClient, cfg cliConfig, state *cliState, in io.Reader, out io.Writer, stderr io.Writer) error {
 	scanner := bufio.NewScanner(in)
 	buf := make([]byte, 0, 1024)
 	scanner.Buffer(buf, 1024*1024)
@@ -213,7 +213,7 @@ func runInteractiveLoop(client v1.QueryServiceClient, cfg cliConfig, state *cliS
 	}
 }
 
-func runStatement(parent context.Context, client v1.QueryServiceClient, cfg cliConfig, state cliState, query string, out io.Writer, stderr io.Writer) error {
+func runStatement(parent context.Context, client v1.DmlServiceClient, cfg cliConfig, state cliState, query string, out io.Writer, stderr io.Writer) error {
 	ready, _ := statementReady(query, state.variables)
 	if !ready {
 		return errors.New("statement is incomplete; check for unclosed quotes, comments, or delimiters")
@@ -237,7 +237,7 @@ func runStatement(parent context.Context, client v1.QueryServiceClient, cfg cliC
 	return runExecute(ctx, client, cfg.tenant, boundQuery, cfg.maxColumnWidth, out, stderr)
 }
 
-func runLoadLoop(client v1.QueryServiceClient, cfg cliConfig, out io.Writer, stderr io.Writer) error {
+func runLoadLoop(client v1.DmlServiceClient, cfg cliConfig, out io.Writer, stderr io.Writer) error {
 	mode := strings.ToLower(strings.TrimSpace(cfg.loadMode))
 	switch mode {
 	case "write", "noop-write", "read":
@@ -321,7 +321,7 @@ func nextLoadQuery(cfg cliConfig, mode string, opIndex int, rng *rand.Rand, stat
 	}
 }
 
-func runExecute(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, maxColumnWidth int, out io.Writer, stderr io.Writer) error {
+func runExecute(ctx context.Context, client v1.DmlServiceClient, tenant string, query string, maxColumnWidth int, out io.Writer, stderr io.Writer) error {
 	resp, err := executeCypher(ctx, client, tenant, query)
 	if err != nil {
 		return err
@@ -392,7 +392,7 @@ func renderRuntimeCounters(out io.Writer, counters map[string]float64) {
 	}
 }
 
-func executeCypher(ctx context.Context, client v1.QueryServiceClient, tenant string, query string) (*v1.QueryResponse, error) {
+func executeCypher(ctx context.Context, client v1.DmlServiceClient, tenant string, query string) (*v1.QueryResponse, error) {
 	resp, err := client.Execute(ctx, &v1.QueryRequest{
 		Tenant: tenant,
 		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: query}},
@@ -408,7 +408,7 @@ func executeCypher(ctx context.Context, client v1.QueryServiceClient, tenant str
 	return resp, nil
 }
 
-func runExplain(ctx context.Context, client v1.QueryServiceClient, tenant string, query string, out io.Writer) error {
+func runExplain(ctx context.Context, client v1.DmlServiceClient, tenant string, query string, out io.Writer) error {
 	resp, err := client.Explain(ctx, &v1.QueryRequest{
 		Tenant: tenant,
 		Input:  &v1.QueryInput{Kind: &v1.QueryInput_Cypher{Cypher: query}},
@@ -1725,7 +1725,7 @@ func isValidCypherIdentifier(s string) bool {
 // after each batch.  It uses countQuery round-trips to determine when all vertices
 // have been removed, so it always terminates correctly regardless of whether
 // concurrent writers are active.
-func runPurge(parent context.Context, client v1.QueryServiceClient, cfg cliConfig, labelExpr string, batchSize int, out io.Writer, _ io.Writer) error {
+func runPurge(parent context.Context, client v1.DmlServiceClient, cfg cliConfig, labelExpr string, batchSize int, out io.Writer, _ io.Writer) error {
 	if batchSize <= 0 {
 		batchSize = 1000
 	}

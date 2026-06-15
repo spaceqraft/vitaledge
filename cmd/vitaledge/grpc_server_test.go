@@ -151,7 +151,7 @@ func runGRPCBoundaryMatrix(
 
 				client, cleanup := newGRPCTestClient(t,
 					&grpcDdlHandler{
-						defaultTenant:        "acme",
+						defaultTenant: "acme",
 					},
 					&grpcDmlHandler{
 						defaultTenant:        "acme",
@@ -606,13 +606,13 @@ func TestGRPCExecuteIntegrationSerializesNumericAggregatesAndProperties(t *testi
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
-					&grpcDdlHandler{
-						defaultTenant: "acme",
-					},
-					&grpcDmlHandler{
-						executor: exec,
-						 defaultTenant: "acme",
-					})
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{
+			executor:      exec,
+			defaultTenant: "acme",
+		})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -724,13 +724,13 @@ func TestGRPCExecuteIntegrationSerializesIntegerOnlyAggregatesAndProperties(t *t
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
-					&grpcDdlHandler{
-						defaultTenant:        "acme",
-					},
-					&grpcDmlHandler{
-						executor: exec,
-						 defaultTenant: "acme"
-					})
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{
+			executor:      exec,
+			defaultTenant: "acme",
+		})
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)
 	}
@@ -845,13 +845,13 @@ func TestGRPCExecuteIntegrationParameterizedThresholdAndLimit(t *testing.T) {
 
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
-					&grpcDdlHandler{
-						defaultTenant:        "acme",
-					},
-					&grpcDmlHandler{
-						executor: exec,
-						 defaultTenant: "acme"
-					},
+		&grpcDdlHandler{
+			defaultTenant: "acme",
+		},
+		&grpcDmlHandler{
+			executor:      exec,
+			defaultTenant: "acme",
+		},
 	)
 	if err != nil {
 		t.Fatalf("startGRPCServer failed: %v", err)

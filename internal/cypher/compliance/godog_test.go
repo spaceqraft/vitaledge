@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cucumber/godog"
 	"github.com/spaceqraft/vitaledge/internal/cypher/executor"
@@ -1078,6 +1079,22 @@ func TestRenderTCKValuePreservesNewlinesAndTabs(t *testing.T) {
 	}
 }
 
+func TestRenderTCKValueRendersTemporalMaps(t *testing.T) {
+	localDateTime := map[string]any{"__temporal_type": "localdatetime", "year": 1912}
+	if got := renderTCKValue(localDateTime); got != "'1912-01-01T00:00'" {
+		t.Fatalf("renderTCKValue(localdatetime) = %q, want %q", got, "'1912-01-01T00:00'")
+	}
+
+	dateTime := map[string]any{"__temporal_type": "datetime", "year": 1912}
+	if got := renderTCKValue(dateTime); got != "'1912-01-01T00:00Z'" {
+		t.Fatalf("renderTCKValue(datetime) = %q, want %q", got, "'1912-01-01T00:00Z'")
+	}
+
+	if got := renderTCKValue([]any{map[string]any{"__temporal_type": "localdatetime", "year": 1913}}); got != "['1913-01-01T00:00']" {
+		t.Fatalf("renderTCKValue([]localdatetime) = %q, want %q", got, "['1913-01-01T00:00']")
+	}
+}
+
 func TestNormalizeSideEffectKey(t *testing.T) {
 	tests := []struct {
 		in   string
@@ -1171,6 +1188,9 @@ func renderTCKValue(value any) string {
 		}
 		return "[" + strings.Join(items, ", ") + "]"
 	case map[string]any:
+		if rendered, ok := renderTemporalTCKValue(typed); ok {
+			return quoteString(rendered)
+		}
 		if isVertexValue(typed) {
 			return renderVertexValue(typed)
 		}
@@ -1198,6 +1218,176 @@ func renderTCKValue(value any) string {
 		}
 		return rendered
 	}
+}
+
+func renderTemporalTCKValue(temporal map[string]any) (string, bool) {
+	typeName := strings.ToLower(strings.TrimSpace(fmt.Sprint(temporal["__temporal_type"])))
+	if typeName == "" {
+		return "", false
+	}
+
+	year, _ := temporalInt(temporal["year"])
+	month, monthOK := temporalInt(temporal["month"])
+	day, dayOK := temporalInt(temporal["day"])
+	if !monthOK {
+		month = 1
+	}
+	if !dayOK {
+		day = 1
+	}
+
+	hour, _ := temporalInt(temporal["hour"])
+	minute, _ := temporalInt(temporal["minute"])
+	second, _ := temporalInt(temporal["second"])
+	nano := temporalNanos(temporal)
+
+	switch typeName {
+	case "date":
+		if year == 0 {
+			return "", false
+		}
+		return fmt.Sprintf("%04d-%02d-%02d", year, month, day), true
+	case "localtime":
+		return temporalClockString(hour, minute, second, nano), true
+	case "time":
+		tz := temporalString(temporal["timezone"])
+		if tz == "" {
+			tz = "Z"
+		}
+		if offset, ok := temporalParseOffsetSeconds(tz); ok {
+			tz = temporalFormatOffset(offset)
+		}
+		return temporalClockString(hour, minute, second, nano) + tz, true
+	case "localdatetime":
+		if year == 0 {
+			return "", false
+		}
+		return fmt.Sprintf("%04d-%02d-%02dT%s", year, month, day, temporalClockString(hour, minute, second, nano)), true
+	case "datetime":
+		if year == 0 {
+			return "", false
+		}
+		tz := temporalString(temporal["timezone"])
+		if tz == "" {
+			tz = "Z"
+		}
+		clock := temporalClockString(hour, minute, second, nano)
+		if offset, ok := temporalParseOffsetSeconds(tz); ok {
+			return fmt.Sprintf("%04d-%02d-%02dT%s%s", year, month, day, clock, temporalFormatOffset(offset)), true
+		}
+		if loc, err := time.LoadLocation(tz); err == nil {
+			t := time.Date(year, time.Month(month), day, hour, minute, second, nano, loc)
+			_, offset := t.Zone()
+			return fmt.Sprintf("%04d-%02d-%02dT%s%s[%s]", year, month, day, clock, temporalFormatOffset(offset), tz), true
+		}
+		return fmt.Sprintf("%04d-%02d-%02dT%s%s", year, month, day, clock, tz), true
+	case "duration":
+		if rendered := strings.TrimSpace(fmt.Sprint(temporal["raw"])); rendered != "" {
+			return rendered, true
+		}
+	}
+
+	return "", false
+}
+
+func temporalInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case int32:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case float32:
+		return int(typed), true
+	case json.Number:
+		if i, err := typed.Int64(); err == nil {
+			return int(i), true
+		}
+		if f, err := typed.Float64(); err == nil {
+			return int(f), true
+		}
+	case string:
+		if i, err := strconv.Atoi(strings.TrimSpace(typed)); err == nil {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+func temporalString(value any) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func temporalNanos(temporal map[string]any) int {
+	nano, _ := temporalInt(temporal["nanosecond"])
+	if nano != 0 {
+		return nano
+	}
+	micro, _ := temporalInt(temporal["microsecond"])
+	milli, _ := temporalInt(temporal["millisecond"])
+	if micro != 0 {
+		return micro * 1000
+	}
+	if milli != 0 {
+		return milli * 1_000_000
+	}
+	return 0
+}
+
+func temporalClockString(hour, minute, second, nano int) string {
+	base := fmt.Sprintf("%02d:%02d", hour, minute)
+	if second == 0 && nano == 0 {
+		return base
+	}
+	base = fmt.Sprintf("%s:%02d", base, second)
+	if nano == 0 {
+		return base
+	}
+	fraction := strings.TrimRight(fmt.Sprintf("%09d", nano), "0")
+	if fraction == "" {
+		return base
+	}
+	return base + "." + fraction
+}
+
+func temporalParseOffsetSeconds(raw string) (int, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "Z" || trimmed == "+00:00" || trimmed == "-00:00" {
+		return 0, true
+	}
+	if len(trimmed) != 6 || (trimmed[0] != '+' && trimmed[0] != '-') || trimmed[3] != ':' {
+		return 0, false
+	}
+	hours, errH := strconv.Atoi(trimmed[1:3])
+	minutes, errM := strconv.Atoi(trimmed[4:6])
+	if errH != nil || errM != nil {
+		return 0, false
+	}
+	offset := hours*3600 + minutes*60
+	if trimmed[0] == '-' {
+		offset = -offset
+	}
+	return offset, true
+}
+
+func temporalFormatOffset(offset int) string {
+	if offset == 0 {
+		return "Z"
+	}
+	sign := '+'
+	if offset < 0 {
+		sign = '-'
+		offset = -offset
+	}
+	hours := offset / 3600
+	minutes := (offset % 3600) / 60
+	return fmt.Sprintf("%c%02d:%02d", sign, hours, minutes)
 }
 
 func renderFloatLikeStringValue(rendered string) (string, bool) {

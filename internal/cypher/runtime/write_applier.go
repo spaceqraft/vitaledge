@@ -4812,9 +4812,26 @@ func numericValueRuntime(v any) (float64, bool) {
 
 func resolveDateFromTemporalMap(value map[string]any) (int, int, int, bool) {
 	y, yOK := mapIntRuntime(value, "year")
-	m, mOK := mapIntRuntime(value, "month")
-	d, dOK := mapIntRuntime(value, "day")
-	if !yOK || !mOK || !dOK {
+	if !yOK {
+		return 0, 0, 0, false
+	}
+	m := 1
+	if _, ok := value["month"]; ok {
+		var mOK bool
+		m, mOK = mapIntRuntime(value, "month")
+		if !mOK {
+			return 0, 0, 0, false
+		}
+	}
+	d := 1
+	if _, ok := value["day"]; ok {
+		var dOK bool
+		d, dOK = mapIntRuntime(value, "day")
+		if !dOK {
+			return 0, 0, 0, false
+		}
+	}
+	if y == 0 && value["year"] == nil {
 		return 0, 0, 0, false
 	}
 	return y, m, d, true

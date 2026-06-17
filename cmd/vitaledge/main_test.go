@@ -721,6 +721,7 @@ func TestGRPCQueryServiceCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T
 	exec := executor.New(store, executor.Options{Metrics: executor.NewCollector(), IndexCatalog: indexschema.NewCatalog()})
 	grpcSrv, grpcLn, err := startGRPCServer("127.0.0.1:0",
 		&grpcDdlHandler{
+			executor:      exec,
 			defaultTenant: "acme",
 		},
 		&grpcDmlHandler{executor: exec, defaultTenant: "acme"},

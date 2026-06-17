@@ -471,6 +471,46 @@ func TestApplyWriteEventsPersistsTemporalCreateProperties(t *testing.T) {
 	}
 }
 
+func TestApplyWriteEventsPersistsYearOnlyLocalDateTimeCreateProperty(t *testing.T) {
+	tx := &recordingTx{}
+	err := ApplyWriteEvents(context.Background(), tx, "acme", []operators.WriteEvent{{
+		MutationType: operators.MutationTypeVertex,
+		Kind:         "CREATE",
+		Vertex: &operators.VertexMutation{
+			Pattern: "(:Event {created: localdatetime({year: 1912})})",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("apply write events failed: %v", err)
+	}
+	if len(tx.vertexes) != 1 {
+		t.Fatalf("expected one vertex write, got %#v", tx.vertexes)
+	}
+	if got := string(tx.vertexes[0].Properties["created"]); got != "1912-01-01T00:00" {
+		t.Fatalf("expected rendered localdatetime property, got %q", got)
+	}
+}
+
+func TestApplyWriteEventsPersistsYearOnlyDateTimeArrayCreateProperty(t *testing.T) {
+	tx := &recordingTx{}
+	err := ApplyWriteEvents(context.Background(), tx, "acme", []operators.WriteEvent{{
+		MutationType: operators.MutationTypeVertex,
+		Kind:         "CREATE",
+		Vertex: &operators.VertexMutation{
+			Pattern: "(:Event {created: [datetime({year: 1913})]})",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("apply write events failed: %v", err)
+	}
+	if len(tx.vertexes) != 1 {
+		t.Fatalf("expected one vertex write, got %#v", tx.vertexes)
+	}
+	if got := string(tx.vertexes[0].Properties["created"]); got != "[1913-01-01T00:00Z]" {
+		t.Fatalf("expected rendered datetime array property, got %q", got)
+	}
+}
+
 func TestApplyWriteEventsSkipsWhitespaceOnlyEdgeType(t *testing.T) {
 	tx := &recordingTx{}
 	err := ApplyWriteEvents(context.Background(), tx, "acme", []operators.WriteEvent{{

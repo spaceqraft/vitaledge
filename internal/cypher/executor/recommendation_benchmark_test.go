@@ -201,40 +201,40 @@ func seedRecommendationBenchmarkGraph(ctx context.Context, store graph.GraphStor
 	}
 
 	return store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: "u-1", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1), "cohort": valueToBytes(1)}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: "u-1", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1), "cohort": valueToBytes(1)}}}); err != nil {
 			return err
 		}
 		for p := 2; p <= peerCount; p++ {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("u-%d", p), Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(p), "cohort": valueToBytes(0)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: fmt.Sprintf("u-%d", p), Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(p), "cohort": valueToBytes(0)}}}); err != nil {
 				return err
 			}
 		}
 
 		for i := 1; i <= sharedMovieCount; i++ {
 			movieID := fmt.Sprintf("m-shared-%d", i)
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: movieID, Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(100 + i), "title": valueToBytes(fmt.Sprintf("Shared %d", i)), "year": valueToBytes(2000 + i), "base_score": valueToBytes(0.2)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: movieID, Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(100 + i), "title": valueToBytes(fmt.Sprintf("Shared %d", i)), "year": valueToBytes(2000 + i), "base_score": valueToBytes(0.2)}}}); err != nil {
 				return err
 			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: "u-1", DstID: movieID, Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: "u-1", DstID: movieID, Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 				return err
 			}
 		}
 
 		for i := 1; i <= candidateMovieCount; i++ {
 			movieID := fmt.Sprintf("m-candidate-%d", i)
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: movieID, Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(1000 + i), "title": valueToBytes(fmt.Sprintf("Candidate %d", i)), "year": valueToBytes(1990 + (i % 25)), "base_score": valueToBytes(0.7)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: movieID, Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(1000 + i), "title": valueToBytes(fmt.Sprintf("Candidate %d", i)), "year": valueToBytes(1990 + (i % 25)), "base_score": valueToBytes(0.7)}}}); err != nil {
 				return err
 			}
 		}
 
 		for _, peerID := range []string{"u-2", "u-3"} {
 			for i := 1; i <= sharedMovieCount; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 					return err
 				}
 			}
 			for i := 1; i <= 20; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-candidate-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-candidate-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 					return err
 				}
 			}
@@ -242,12 +242,12 @@ func seedRecommendationBenchmarkGraph(ctx context.Context, store graph.GraphStor
 
 		for _, peerID := range []string{"u-4", "u-5", "u-6"} {
 			for i := 1; i <= 10; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}}); err != nil {
 					return err
 				}
 			}
 			for i := 21; i <= 30; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-candidate-%d", i), Properties: map[string][]byte{"rating": valueToBytes(4.0)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-candidate-%d", i), Properties: map[string][]byte{"rating": valueToBytes(4.0)}}}); err != nil {
 					return err
 				}
 			}
@@ -271,48 +271,48 @@ func seedRecommendationBenchmarkRangePredicateActivationGraph(ctx context.Contex
 	}
 
 	return store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: "u-1", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1), "cohort": valueToBytes(1)}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: "u-1", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1), "cohort": valueToBytes(1)}}}); err != nil {
 			return err
 		}
 		for p := 2; p <= 6; p++ {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("u-%d", p), Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(p), "cohort": valueToBytes(1)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: fmt.Sprintf("u-%d", p), Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(p), "cohort": valueToBytes(1)}}}); err != nil {
 				return err
 			}
 		}
 
 		for i := 1; i <= 6; i++ {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("m-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i), "title": valueToBytes(fmt.Sprintf("Anchor %d", i)), "year": valueToBytes(2000 + i), "base_score": valueToBytes(0.5)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: fmt.Sprintf("m-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i), "title": valueToBytes(fmt.Sprintf("Anchor %d", i)), "year": valueToBytes(2000 + i), "base_score": valueToBytes(0.5)}}}); err != nil {
 				return err
 			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: "u-1", DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: "u-1", DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 				return err
 			}
 		}
 
 		for i := 101; i <= 110; i++ {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("m-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i), "title": valueToBytes(fmt.Sprintf("Candidate %d", i)), "year": valueToBytes(1990 + (i % 20)), "base_score": valueToBytes(0.8)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: fmt.Sprintf("m-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i), "title": valueToBytes(fmt.Sprintf("Candidate %d", i)), "year": valueToBytes(1990 + (i % 20)), "base_score": valueToBytes(0.8)}}}); err != nil {
 				return err
 			}
 		}
 		for i := noiseCandidateStart; i < noiseCandidateStart+noiseCandidateCount; i++ {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("m-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i), "title": valueToBytes(fmt.Sprintf("Noise %d", i)), "year": valueToBytes(1980 + (i % 30)), "base_score": valueToBytes(0.1)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: fmt.Sprintf("m-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i), "title": valueToBytes(fmt.Sprintf("Noise %d", i)), "year": valueToBytes(1980 + (i % 30)), "base_score": valueToBytes(0.1)}}}); err != nil {
 				return err
 			}
 		}
 
 		for _, peerID := range []string{"u-2", "u-3"} {
 			for i := 1; i <= 6; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 					return err
 				}
 			}
 			for i := 101; i <= 102; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 					return err
 				}
 			}
 			for i := noiseCandidateStart; i < noiseCandidateStart+noiseCandidateCount; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}}); err != nil {
 					return err
 				}
 			}
@@ -320,20 +320,20 @@ func seedRecommendationBenchmarkRangePredicateActivationGraph(ctx context.Contex
 
 		for _, peerID := range []string{"u-4", "u-5", "u-6"} {
 			for i := 1; i <= 6; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}}); err != nil {
 					return err
 				}
 			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: "m-105", Properties: map[string][]byte{"rating": valueToBytes(4.0)}}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: "m-105", Properties: map[string][]byte{"rating": valueToBytes(4.0)}}}); err != nil {
 				return err
 			}
 			if peerID == "u-4" {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: "m-106", Properties: map[string][]byte{"rating": valueToBytes(4.0)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: "m-106", Properties: map[string][]byte{"rating": valueToBytes(4.0)}}}); err != nil {
 					return err
 				}
 			}
 			for i := noiseCandidateStart; i < noiseCandidateStart+noiseCandidateCount; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}}); err != nil {
 					return err
 				}
 			}
@@ -357,21 +357,21 @@ func seedRecommendationBenchmarkGraphStage2Activation(ctx context.Context, store
 	}
 
 	return store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: "u-1", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1), "cohort": valueToBytes(1)}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: "u-1", Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(1), "cohort": valueToBytes(1)}}}); err != nil {
 			return err
 		}
 
 		for i := 1; i <= sharedMovieCount; i++ {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("m-shared-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(100 + i), "title": valueToBytes(fmt.Sprintf("Shared %d", i)), "year": valueToBytes(2000 + i), "base_score": valueToBytes(0.2)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: fmt.Sprintf("m-shared-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(100 + i), "title": valueToBytes(fmt.Sprintf("Shared %d", i)), "year": valueToBytes(2000 + i), "base_score": valueToBytes(0.2)}}}); err != nil {
 				return err
 			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: "u-1", DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: "u-1", DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 				return err
 			}
 		}
 
 		for i := 1; i <= topCandidateCount; i++ {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: fmt.Sprintf("m-top-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i), "title": valueToBytes(fmt.Sprintf("Top %d", i)), "year": valueToBytes(2010 + i), "base_score": valueToBytes(0.9)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: fmt.Sprintf("m-top-%d", i), Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(i), "title": valueToBytes(fmt.Sprintf("Top %d", i)), "year": valueToBytes(2010 + i), "base_score": valueToBytes(0.9)}}}); err != nil {
 				return err
 			}
 		}
@@ -380,19 +380,19 @@ func seedRecommendationBenchmarkGraphStage2Activation(ctx context.Context, store
 		weakPeers := []string{"u-3", "u-4", "u-5", "u-6"}
 		allPeers := append(append([]string{}, strongPeers...), weakPeers...)
 		for idx, peerID := range allPeers {
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: peerID, Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(idx + 2), "cohort": valueToBytes(0)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: peerID, Labels: []string{"User"}, Properties: map[string][]byte{"user_id": valueToBytes(idx + 2), "cohort": valueToBytes(0)}}}); err != nil {
 				return err
 			}
 		}
 
 		for _, peerID := range strongPeers {
 			for i := 1; i <= sharedMovieCount; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 					return err
 				}
 			}
 			for i := 1; i <= topCandidateCount; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-top-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-top-%d", i), Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 					return err
 				}
 			}
@@ -400,15 +400,15 @@ func seedRecommendationBenchmarkGraphStage2Activation(ctx context.Context, store
 
 		for _, peerID := range weakPeers {
 			for i := 1; i <= 3; i++ {
-				if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}); err != nil {
+				if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: fmt.Sprintf("m-shared-%d", i), Properties: map[string][]byte{"rating": valueToBytes(3.5)}}}); err != nil {
 					return err
 				}
 			}
 			noiseID := fmt.Sprintf("m-weak-noise-%s", peerID)
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: noiseID, Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(2000 + edgeSeq), "title": valueToBytes(noiseID), "year": valueToBytes(2021), "base_score": valueToBytes(0.1)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: tenant, ID: noiseID, Labels: []string{"Movie"}, Properties: map[string][]byte{"movie_id": valueToBytes(2000 + edgeSeq), "title": valueToBytes(noiseID), "year": valueToBytes(2021), "base_score": valueToBytes(0.1)}}}); err != nil {
 				return err
 			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: noiseID, Properties: map[string][]byte{"rating": valueToBytes(5.0)}}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "RATED", SrcID: peerID, DstID: noiseID, Properties: map[string][]byte{"rating": valueToBytes(5.0)}}}); err != nil {
 				return err
 			}
 		}

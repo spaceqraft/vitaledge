@@ -44,7 +44,7 @@ func openTestStore(t *testing.T) graph.GraphStore {
 	}
 
 	if err := store.Update(context.Background(), func(tx graph.Tx) error {
-		return tx.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "seed", Labels: []string{"Seed"}})
+		return tx.PutVertexBatch(context.Background(), []*graph.Vertex{{Tenant: "acme", ID: "seed", Labels: []string{"Seed"}}})
 	}); err != nil {
 		t.Fatalf("seed store failed: %v", err)
 	}
@@ -58,27 +58,31 @@ func TestApplyIndexMigrationsBackfillsConfiguredIndexes(t *testing.T) {
 
 	ctx := context.Background()
 	if err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{
-			Tenant: "acme",
-			ID:     "u1",
-			Labels: []string{"User"},
-			Properties: map[string][]byte{
-				"email": []byte("alice@example.com"),
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{
+				Tenant: "acme",
+				ID:     "u1",
+				Labels: []string{"User"},
+				Properties: map[string][]byte{
+					"email": []byte("alice@example.com"),
+				},
+			},
+			{
+				Tenant: "acme", ID: "m1", Labels: []string{"Movie"},
 			},
 		}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
-			return err
-		}
-		return tx.PutEdge(ctx, &graph.Edge{
-			Tenant: "acme",
-			ID:     "e1",
-			Type:   "RATED",
-			SrcID:  "u1",
-			DstID:  "m1",
-			Properties: map[string][]byte{
-				"rating": []byte("5"),
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{
+			{
+				Tenant: "acme",
+				ID:     "e1",
+				Type:   "RATED",
+				SrcID:  "u1",
+				DstID:  "m1",
+				Properties: map[string][]byte{
+					"rating": []byte("5"),
+				},
 			},
 		})
 	}); err != nil {
@@ -565,7 +569,7 @@ func TestOpenGraphStoreAcceptsConfiguredBatchLimit(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err = store.Update(context.Background(), func(tx graph.Tx) error {
-		return tx.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "ok"})
+		return tx.PutVertexBatch(context.Background(), []*graph.Vertex{{Tenant: "acme", ID: "ok"}})
 	})
 	if err != nil {
 		t.Fatalf("expected write under limit to succeed, got: %v", err)
@@ -709,7 +713,7 @@ func TestGRPCQueryServiceCreatePropertyIndexEnqueuesBackgroundBuild(t *testing.T
 			{Tenant: "acme", ID: "u3", Labels: []string{"Device"}, Properties: graph.PropertyMap{"email": []byte("ignored@example.com")}},
 		}
 		for _, vertex := range seed {
-			if err := tx.PutVertex(context.Background(), vertex); err != nil {
+			if err := tx.PutVertexBatch(context.Background(), []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}

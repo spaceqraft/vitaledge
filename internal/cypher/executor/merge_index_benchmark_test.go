@@ -110,7 +110,7 @@ func seedBenchmarkGraph(ctx context.Context, store graph.GraphStore, indexed boo
 		for i := 0; i < benchmarkBaselineMovies; i++ {
 			vertexID := fmt.Sprintf("movie-%d", i)
 			movieID := strconv.Itoa(i)
-			if err := tx.PutVertex(ctx, &graph.Vertex{
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{
 				Tenant: benchmarkTenant,
 				ID:     vertexID,
 				Labels: []string{"Movie"},
@@ -119,7 +119,7 @@ func seedBenchmarkGraph(ctx context.Context, store graph.GraphStore, indexed boo
 					"title":    []byte(fmt.Sprintf("Movie %d", i)),
 					"year":     []byte(strconv.Itoa(1980 + (i % 40))),
 				},
-			}); err != nil {
+			}}); err != nil {
 				return err
 			}
 			if indexed {
@@ -139,14 +139,14 @@ func seedBenchmarkGraph(ctx context.Context, store graph.GraphStore, indexed boo
 		for i := 0; i < benchmarkBaselineUsers; i++ {
 			vertexID := fmt.Sprintf("user-%d", i)
 			userID := strconv.Itoa(i)
-			if err := tx.PutVertex(ctx, &graph.Vertex{
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{
 				Tenant: benchmarkTenant,
 				ID:     vertexID,
 				Labels: []string{"User"},
 				Properties: graph.PropertyMap{
 					"user_id": []byte(userID),
 				},
-			}); err != nil {
+			}}); err != nil {
 				return err
 			}
 			if indexed {
@@ -166,14 +166,14 @@ func seedBenchmarkGraph(ctx context.Context, store graph.GraphStore, indexed boo
 		for i := 0; i < benchmarkGenreCount; i++ {
 			vertexID := fmt.Sprintf("genre-%d", i)
 			genre := fmt.Sprintf("Genre-%02d", i)
-			if err := tx.PutVertex(ctx, &graph.Vertex{
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{
 				Tenant: benchmarkTenant,
 				ID:     vertexID,
 				Labels: []string{"Genre"},
 				Properties: graph.PropertyMap{
 					"genre": []byte(genre),
 				},
-			}); err != nil {
+			}}); err != nil {
 				return err
 			}
 			if indexed {

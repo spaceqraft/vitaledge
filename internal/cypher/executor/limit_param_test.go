@@ -189,19 +189,13 @@ func TestEvalWhereExpressionDisjunctivePatternPredicateDirect(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	if err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a0", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("0")}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "a0", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("0")}}, {Tenant: "acme", ID: "b1", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("1")}}, {Tenant: "acme", ID: "c2", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("2")}}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("1")}}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a0", DstID: "b1"}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c2", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("2")}}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a0", DstID: "b1"}); err != nil {
-			return err
-		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "T", SrcID: "b1", DstID: "c2"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e2", Type: "T", SrcID: "b1", DstID: "c2"}})
 	}); err != nil {
 		t.Fatalf("seed failed: %v", err)
 	}
@@ -227,19 +221,13 @@ func TestExecuteStatementDisjunctivePatternPredicateJoin(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	if err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "a0", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("0")}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "a0", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("0")}}, {Tenant: "acme", ID: "b1", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("1")}}, {Tenant: "acme", ID: "c2", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("2")}}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "b1", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("1")}}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a0", DstID: "b1"}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "c2", Labels: []string{"TheLabel"}, Properties: graph.PropertyMap{"id": []byte("2")}}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "T", SrcID: "a0", DstID: "b1"}); err != nil {
-			return err
-		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "T", SrcID: "b1", DstID: "c2"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e2", Type: "T", SrcID: "b1", DstID: "c2"}})
 	}); err != nil {
 		t.Fatalf("seed failed: %v", err)
 	}

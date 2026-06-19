@@ -82,7 +82,7 @@ func seedSuggestFriendsGraph(ctx context.Context, store graph.GraphStore, tenant
 					"name": valueToBytes(fmt.Sprintf("Person %d", i)),
 				},
 			}
-			if err := tx.PutVertex(ctx, v); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{v}); err != nil {
 				return err
 			}
 		}
@@ -99,10 +99,10 @@ func seedSuggestFriendsGraph(ctx context.Context, store graph.GraphStore, tenant
 			dst1 := fmt.Sprintf("p-%d", (i+1)%count)
 			dst2 := fmt.Sprintf("p-%d", (i+2)%count)
 
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "KNOWS", SrcID: src, DstID: dst1}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "KNOWS", SrcID: src, DstID: dst1}}); err != nil {
 				return err
 			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: nextEdgeID(), Type: "KNOWS", SrcID: src, DstID: dst2}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: tenant, ID: nextEdgeID(), Type: "KNOWS", SrcID: src, DstID: dst2}}); err != nil {
 				return err
 			}
 		}

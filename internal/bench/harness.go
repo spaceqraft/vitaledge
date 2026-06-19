@@ -95,24 +95,6 @@ func runSmoke(ctx context.Context, cfg Config) (Result, error) {
 	}, nil
 }
 
-func runSkeleton(ctx context.Context, cfg Config) (Result, error) {
-	_ = cfg
-	start := time.Now()
-	select {
-	case <-ctx.Done():
-		return Result{}, ctx.Err()
-	default:
-	}
-	return Result{
-		Scenario:   "skeleton",
-		Operations: 0,
-		Duration:   time.Since(start),
-		Metrics: map[string]float64{
-			"ops_per_sec": 0,
-		},
-	}, nil
-}
-
 func runThreat(ctx context.Context, cfg Config) (Result, error) {
 	iters := cfg.Iterations
 	if iters <= 0 {
@@ -126,7 +108,7 @@ func runThreat(ctx context.Context, cfg Config) (Result, error) {
 	defer cleanup()
 
 	if err := store.Update(ctx, func(tx graph.Tx) error {
-		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "bench", ID: "source", Labels: []string{"Service"}})
+		return tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "bench", ID: "source", Labels: []string{"Service"}}})
 	}); err != nil {
 		return Result{}, err
 	}
@@ -141,10 +123,10 @@ func runThreat(ctx context.Context, cfg Config) (Result, error) {
 			}
 			dstID := "event-" + strconv.Itoa(i)
 			edgeID := "ingest-" + strconv.Itoa(i)
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "bench", ID: dstID, Labels: []string{"Event"}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "bench", ID: dstID, Labels: []string{"Event"}}}); err != nil {
 				return err
 			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "bench", ID: edgeID, Type: "EMITS", SrcID: "source", DstID: dstID}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "bench", ID: edgeID, Type: "EMITS", SrcID: "source", DstID: dstID}}); err != nil {
 				return err
 			}
 		}
@@ -360,22 +342,22 @@ func seedReBACGraph(ctx context.Context, store graph.GraphStore, fanout int) err
 		fanout = 10
 	}
 	return store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "bench", ID: "user-0", Labels: []string{"User"}, Properties: graph.PropertyMap{"id": []byte("user-0")}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "bench", ID: "user-0", Labels: []string{"User"}, Properties: graph.PropertyMap{"id": []byte("user-0")}}}); err != nil {
 			return err
 		}
 		for i := 0; i < fanout; i++ {
 			groupID := "group-" + strconv.Itoa(i)
 			resourceID := "resource-" + strconv.Itoa(i)
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "bench", ID: groupID, Labels: []string{"Group"}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{
+				{Tenant: "bench", ID: groupID, Labels: []string{"Group"}},
+				{Tenant: "bench", ID: resourceID, Labels: []string{"Resource"}},
+			}); err != nil {
 				return err
 			}
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "bench", ID: resourceID, Labels: []string{"Resource"}}); err != nil {
-				return err
-			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "bench", ID: "m-" + strconv.Itoa(i), Type: "MEMBER_OF", SrcID: "user-0", DstID: groupID}); err != nil {
-				return err
-			}
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "bench", ID: "a-" + strconv.Itoa(i), Type: "CAN_ACCESS", SrcID: groupID, DstID: resourceID}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{
+				{Tenant: "bench", ID: "m-" + strconv.Itoa(i), Type: "MEMBER_OF", SrcID: "user-0", DstID: groupID},
+				{Tenant: "bench", ID: "a-" + strconv.Itoa(i), Type: "CAN_ACCESS", SrcID: groupID, DstID: resourceID},
+			}); err != nil {
 				return err
 			}
 		}
@@ -390,14 +372,14 @@ func seedDenseResearchGraph(ctx context.Context, store graph.GraphStore, papers 
 	return store.Update(ctx, func(tx graph.Tx) error {
 		for i := 0; i < papers; i++ {
 			paperID := "paper-" + strconv.Itoa(i)
-			if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "bench", ID: paperID, Labels: []string{"Paper"}, Properties: graph.PropertyMap{"id": []byte(paperID)}}); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "bench", ID: paperID, Labels: []string{"Paper"}, Properties: graph.PropertyMap{"id": []byte(paperID)}}}); err != nil {
 				return err
 			}
 			if i == 0 {
 				continue
 			}
 			edgeID := "cite-" + strconv.Itoa(i)
-			if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "bench", ID: edgeID, Type: "CITES", SrcID: paperID, DstID: "paper-0"}); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "bench", ID: edgeID, Type: "CITES", SrcID: paperID, DstID: "paper-0"}}); err != nil {
 				return err
 			}
 		}

@@ -55,6 +55,9 @@ func applyWriteEventsToSink(ctx context.Context, sink runtimestorage.WriteSink, 
 			collectDeletedEntityIDsFromEventWithLookup(ctx, lookup, tenant, event, deletedVertexIDs, deletedEdgeIDs)
 		}
 	}
+	if allDeleteWriteEvents(events) {
+		return applyDeleteWriteEventsBatch(ctx, lookup, sink, tenant, events)
+	}
 	for i := 0; i < len(events); i++ {
 		event := events[i]
 		kind := strings.ToUpper(strings.TrimSpace(event.Kind))
@@ -122,6 +125,150 @@ func applyWriteEventsToSink(ctx context.Context, sink runtimestorage.WriteSink, 
 	return nil
 }
 
+func putVertexBatchSingle(ctx context.Context, sink runtimestorage.WriteSink, vertex *graph.Vertex) error {
+	if vertex == nil {
+		return nil
+	}
+	return sink.PutVertexBatch(ctx, []*graph.Vertex{vertex})
+}
+
+func putEdgeBatchSingle(ctx context.Context, sink runtimestorage.WriteSink, edge *graph.Edge) error {
+	if edge == nil {
+		return nil
+	}
+	return sink.PutEdgeBatch(ctx, []*graph.Edge{edge})
+}
+
+func allDeleteWriteEvents(events []operators.WriteEvent) bool {
+	if len(events) == 0 {
+		return false
+	}
+	for _, event := range events {
+		kind := strings.ToUpper(strings.TrimSpace(event.Kind))
+		if kind != "DELETE" && kind != "DETACH DELETE" {
+			return false
+		}
+	}
+	return true
+}
+
+func applyDeleteWriteEventsBatch(ctx context.Context, lookup writeLookupTx, sink runtimestorage.WriteSink, tenant string, events []operators.WriteEvent) error {
+	seen := map[string]struct{}{}
+	edgeIDs := map[string]struct{}{}
+	detachVertexIDs := map[string]struct{}{}
+	strictVertexIDs := map[string]struct{}{}
+	type pendingOtherDelete struct {
+		binding any
+		detach  bool
+	}
+	otherDeletes := make([]pendingOtherDelete, 0)
+
+	for _, event := range events {
+		detach := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(event.Raw)), "DETACHDELETE") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(event.Raw)), "DETACH DELETE")
+		body, ok := extractWriteClauseBody(event.Raw, event.Kind)
+		if !ok || strings.TrimSpace(body) == "" {
+			body = strings.TrimSpace(event.Pattern)
+		}
+		if strings.TrimSpace(body) == "" {
+			if event.Vertex != nil {
+				if name := strings.TrimSpace(event.Vertex.Var); name != "" {
+					body = name
+				}
+			}
+		}
+		if strings.TrimSpace(body) == "" {
+			continue
+		}
+		for _, item := range splitTopLevelByComma(body) {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			bindings := resolveDeleteWriteBindings(event, item)
+			for _, binding := range bindings {
+				key, ok, err := deleteWriteBindingKey(ctx, lookup, tenant, binding)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					otherDeletes = append(otherDeletes, pendingOtherDelete{binding: binding, detach: detach})
+					continue
+				}
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				switch {
+				case strings.HasPrefix(key, "edge|"):
+					edgeID := strings.TrimSpace(strings.TrimPrefix(key, "edge|"))
+					if edgeID != "" {
+						edgeIDs[edgeID] = struct{}{}
+					}
+				case strings.HasPrefix(key, "vertex|"):
+					vertexID := strings.TrimSpace(strings.TrimPrefix(key, "vertex|"))
+					if vertexID == "" {
+						continue
+					}
+					if detach {
+						detachVertexIDs[vertexID] = struct{}{}
+					} else {
+						strictVertexIDs[vertexID] = struct{}{}
+					}
+				default:
+					otherDeletes = append(otherDeletes, pendingOtherDelete{binding: binding, detach: detach})
+				}
+			}
+		}
+	}
+
+	if len(edgeIDs) > 0 {
+		ids := make([]string, 0, len(edgeIDs))
+		for id := range edgeIDs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		if err := sink.DeleteEdgeBatch(ctx, tenant, ids); err != nil {
+			return err
+		}
+	}
+
+	if len(strictVertexIDs) > 0 {
+		ids := make([]string, 0, len(strictVertexIDs))
+		for id := range strictVertexIDs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		if lookup != nil {
+			if err := lookup.DeleteVertexBatch(ctx, tenant, ids); err != nil {
+				return err
+			}
+		} else {
+			if err := sink.DeleteVertexDetachBatch(ctx, tenant, ids); err != nil {
+				return err
+			}
+		}
+	}
+
+	if len(detachVertexIDs) > 0 {
+		ids := make([]string, 0, len(detachVertexIDs))
+		for id := range detachVertexIDs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		if err := sink.DeleteVertexDetachBatch(ctx, tenant, ids); err != nil {
+			return err
+		}
+	}
+
+	for _, pending := range otherDeletes {
+		if err := deleteWriteBinding(ctx, lookup, sink, tenant, pending.binding, pending.detach); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func tryApplySimpleDirectedMergeEdgeFastPath(ctx context.Context, sink runtimestorage.WriteSink, tenant string, event operators.WriteEvent, hasDeleteClause bool, existsCache map[string]bool) (bool, error) {
 	if hasDeleteClause || event.Edge == nil {
 		return false, nil
@@ -178,7 +325,7 @@ func tryApplySimpleDirectedMergeEdgeFastPath(ctx context.Context, sink runtimest
 			return true, err
 		}
 	} else {
-		if err := sink.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID}); err != nil {
+		if err := putEdgeBatchSingle(ctx, sink, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID}); err != nil {
 			return true, err
 		}
 	}
@@ -325,12 +472,12 @@ func applyMergeEdgeWriteEvent(ctx context.Context, sink runtimestorage.WriteSink
 		}
 	}
 	if len(event.Edge.LeftLabels) > 0 {
-		if err := sink.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: leftID, Labels: append([]string(nil), event.Edge.LeftLabels...)}); err != nil {
+		if err := putVertexBatchSingle(ctx, sink, &graph.Vertex{Tenant: tenant, ID: leftID, Labels: append([]string(nil), event.Edge.LeftLabels...)}); err != nil {
 			return false, "", err
 		}
 	}
 	if len(event.Edge.RightLabels) > 0 {
-		if err := sink.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: rightID, Labels: append([]string(nil), event.Edge.RightLabels...)}); err != nil {
+		if err := putVertexBatchSingle(ctx, sink, &graph.Vertex{Tenant: tenant, ID: rightID, Labels: append([]string(nil), event.Edge.RightLabels...)}); err != nil {
 			return false, "", err
 		}
 	}
@@ -341,7 +488,7 @@ func applyMergeEdgeWriteEvent(ctx context.Context, sink runtimestorage.WriteSink
 		}
 		return false, edgeID, nil
 	}
-	if err := sink.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID, Properties: props}); err != nil {
+	if err := putEdgeBatchSingle(ctx, sink, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID, Properties: props}); err != nil {
 		return false, "", err
 	}
 	return false, edgeID, nil
@@ -452,7 +599,7 @@ func applyMergeVertexWriteEvent(ctx context.Context, sink runtimestorage.WriteSi
 	if vertexID == "" {
 		vertexID, _ = allocateAnonymousVertexIDForTenantWithReserved(ctx, sink, tenant, nextAutoVertexID, deletedVertexIDs)
 	}
-	if err := sink.PutVertex(ctx, &graph.Vertex{
+	if err := putVertexBatchSingle(ctx, sink, &graph.Vertex{
 		Tenant:     tenant,
 		ID:         vertexID,
 		Labels:     append([]string(nil), event.Vertex.Labels...),
@@ -762,9 +909,8 @@ var writeRemovePropertyAssignmentRE = regexp.MustCompile(`^\(?\s*([A-Za-z_][A-Za
 type writeLookupTx interface {
 	GetVertex(context.Context, string, string) (*graph.Vertex, error)
 	GetEdge(context.Context, string, string) (*graph.Edge, error)
-	DeleteVertex(context.Context, string, string) error
-	DeleteVertexDetach(context.Context, string, string) error
-	DeleteEdge(context.Context, string, string) error
+	DeleteVertexBatch(context.Context, string, []string) error
+	DeleteVertexDetachBatch(context.Context, string, []string) error
 	PatchVertexProperties(context.Context, string, string, graph.PropertyMap, []string) error
 	PatchEdgeProperties(context.Context, string, string, graph.PropertyMap, []string) error
 }
@@ -1107,7 +1253,7 @@ func putCreatePatternEdge(ctx context.Context, sink runtimestorage.WriteSink, te
 			Properties: clonePropertyMap(edge.props),
 		})
 	}
-	return sink.PutEdge(ctx, &graph.Edge{
+	return putEdgeBatchSingle(ctx, sink, &graph.Edge{
 		Tenant:     tenant,
 		ID:         edgeID,
 		Type:       edgeType,
@@ -1730,7 +1876,7 @@ func putCreateLikeVertex(ctx context.Context, sink runtimestorage.WriteSink, ten
 			mergedProps = mergePropertyMaps(existing.Properties, props)
 		}
 	}
-	return sink.PutVertex(ctx, &graph.Vertex{
+	return putVertexBatchSingle(ctx, sink, &graph.Vertex{
 		Tenant:     tenant,
 		ID:         vertexID,
 		Labels:     mergedLabels,
@@ -2298,8 +2444,8 @@ func applyDeleteWriteEvent(ctx context.Context, sink runtimestorage.WriteSink, t
 	detach := strings.HasPrefix(strings.ToUpper(strings.TrimSpace(event.Raw)), "DETACHDELETE") || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(event.Raw)), "DETACH DELETE")
 	lookup, _ := sink.(writeLookupTx)
 	seen := map[string]struct{}{}
-	edgeBindings := make([]any, 0)
-	vertexBindings := make([]any, 0)
+	edgeIDs := map[string]struct{}{}
+	vertexIDs := map[string]struct{}{}
 	otherBindings := make([]any, 0)
 	for _, item := range splitTopLevelByComma(body) {
 		item = strings.TrimSpace(item)
@@ -2321,22 +2467,48 @@ func applyDeleteWriteEvent(ctx context.Context, sink runtimestorage.WriteSink, t
 			seen[key] = struct{}{}
 			switch {
 			case strings.HasPrefix(key, "edge|"):
-				edgeBindings = append(edgeBindings, binding)
+				id := strings.TrimSpace(strings.TrimPrefix(key, "edge|"))
+				if id != "" {
+					edgeIDs[id] = struct{}{}
+				}
 			case strings.HasPrefix(key, "vertex|"):
-				vertexBindings = append(vertexBindings, binding)
+				id := strings.TrimSpace(strings.TrimPrefix(key, "vertex|"))
+				if id != "" {
+					vertexIDs[id] = struct{}{}
+				}
 			default:
 				otherBindings = append(otherBindings, binding)
 			}
 		}
 	}
-	for _, binding := range edgeBindings {
-		if err := deleteWriteBinding(ctx, lookup, sink, tenant, binding, detach); err != nil {
+	if len(edgeIDs) > 0 {
+		ids := make([]string, 0, len(edgeIDs))
+		for id := range edgeIDs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		if err := sink.DeleteEdgeBatch(ctx, tenant, ids); err != nil {
 			return err
 		}
 	}
-	for _, binding := range vertexBindings {
-		if err := deleteWriteBinding(ctx, lookup, sink, tenant, binding, detach); err != nil {
-			return err
+	if len(vertexIDs) > 0 {
+		ids := make([]string, 0, len(vertexIDs))
+		for id := range vertexIDs {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		if detach {
+			if err := sink.DeleteVertexDetachBatch(ctx, tenant, ids); err != nil {
+				return err
+			}
+		} else if lookup != nil {
+			if err := lookup.DeleteVertexBatch(ctx, tenant, ids); err != nil {
+				return err
+			}
+		} else {
+			if err := sink.DeleteVertexDetachBatch(ctx, tenant, ids); err != nil {
+				return err
+			}
 		}
 	}
 	for _, binding := range otherBindings {
@@ -3200,7 +3372,7 @@ func addWriteBindingLabels(ctx context.Context, lookup writeLookupTx, sink runti
 	}
 	updated := *vertex
 	updated.Labels = next
-	return sink.PutVertex(ctx, &updated)
+	return putVertexBatchSingle(ctx, sink, &updated)
 }
 
 func removeWriteBindingLabels(ctx context.Context, lookup writeLookupTx, sink runtimestorage.WriteSink, tenant string, binding any, labels []string) error {
@@ -3231,7 +3403,7 @@ func removeWriteBindingLabels(ctx context.Context, lookup writeLookupTx, sink ru
 	}
 	updated := *vertex
 	updated.Labels = next
-	return sink.PutVertex(ctx, &updated)
+	return putVertexBatchSingle(ctx, sink, &updated)
 }
 
 func deleteWriteBinding(ctx context.Context, lookup writeLookupTx, sink runtimestorage.WriteSink, tenant string, binding any, detach bool) error {
@@ -3241,37 +3413,37 @@ func deleteWriteBinding(ctx context.Context, lookup writeLookupTx, sink runtimes
 	}
 	if vertex != nil {
 		if !detach && lookup != nil {
-			return lookup.DeleteVertex(ctx, tenant, id)
+			return lookup.DeleteVertexBatch(ctx, tenant, []string{id})
 		}
-		return sink.DeleteVertexDetach(ctx, tenant, id)
+		return sink.DeleteVertexDetachBatch(ctx, tenant, []string{id})
 	}
 	if edge != nil {
-		return sink.DeleteEdge(ctx, tenant, id)
+		return sink.DeleteEdgeBatch(ctx, tenant, []string{id})
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil
 	}
 	if detach {
-		if err := sink.DeleteVertexDetach(ctx, tenant, id); err == nil {
+		if err := sink.DeleteVertexDetachBatch(ctx, tenant, []string{id}); err == nil {
 			return nil
 		} else if !graph.IsKind(err, graph.ErrKindNotFound) {
 			return err
 		}
-		err = sink.DeleteEdge(ctx, tenant, id)
+		err = sink.DeleteEdgeBatch(ctx, tenant, []string{id})
 		if err == nil || graph.IsKind(err, graph.ErrKindNotFound) {
 			return nil
 		}
 		return err
 	}
 	if lookup != nil {
-		if err := lookup.DeleteVertex(ctx, tenant, id); err == nil {
+		if err := lookup.DeleteVertexBatch(ctx, tenant, []string{id}); err == nil {
 			return nil
 		} else if !graph.IsKind(err, graph.ErrKindNotFound) {
 			return err
 		}
 	}
-	err = sink.DeleteEdge(ctx, tenant, id)
+	err = sink.DeleteEdgeBatch(ctx, tenant, []string{id})
 	if err == nil || graph.IsKind(err, graph.ErrKindNotFound) {
 		return nil
 	}
@@ -5146,12 +5318,12 @@ func applyEdgeWriteEvent(ctx context.Context, sink runtimestorage.WriteSink, ten
 		}
 	}
 	if len(event.Edge.LeftLabels) > 0 || leftAllocated {
-		if err := sink.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: leftID, Labels: append([]string(nil), event.Edge.LeftLabels...)}); err != nil {
+		if err := putVertexBatchSingle(ctx, sink, &graph.Vertex{Tenant: tenant, ID: leftID, Labels: append([]string(nil), event.Edge.LeftLabels...)}); err != nil {
 			return err
 		}
 	}
 	if len(event.Edge.RightLabels) > 0 || rightAllocated {
-		if err := sink.PutVertex(ctx, &graph.Vertex{Tenant: tenant, ID: rightID, Labels: append([]string(nil), event.Edge.RightLabels...)}); err != nil {
+		if err := putVertexBatchSingle(ctx, sink, &graph.Vertex{Tenant: tenant, ID: rightID, Labels: append([]string(nil), event.Edge.RightLabels...)}); err != nil {
 			return err
 		}
 	}
@@ -5166,7 +5338,7 @@ func applyEdgeWriteEvent(ctx context.Context, sink runtimestorage.WriteSink, ten
 		lookup, _ := sink.(writeLookupTx)
 		edgeID = allocateCreateEdgeIDWithLookup(ctx, lookup, tenant, srcID, edgeType, dstID, createEdgeCounts)
 	}
-	return sink.PutEdge(ctx, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID})
+	return putEdgeBatchSingle(ctx, sink, &graph.Edge{Tenant: tenant, ID: edgeID, Type: edgeType, SrcID: srcID, DstID: dstID})
 }
 
 func findDirectedExistingEdgeID(ctx context.Context, sink runtimestorage.WriteSink, lookup writeLookupTx, tenant, srcID, dstID, edgeType string, props graph.PropertyMap, excluded map[string]struct{}) (string, error) {

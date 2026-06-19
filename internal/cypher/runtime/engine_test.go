@@ -202,11 +202,11 @@ func TestExecuteWithTxExpandMatchUsesAdjacency(t *testing.T) {
 			{Tenant: "acme", ID: "u2", Labels: []string{"User"}},
 			{Tenant: "acme", ID: "u3", Labels: []string{"User"}},
 		} {
-			if err := tx.PutVertex(ctx, v); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{v}); err != nil {
 				return err
 			}
 		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}})
 	})
 	if err != nil {
 		t.Fatalf("seed failed: %v", err)
@@ -261,7 +261,7 @@ func TestExecuteWithTxOptionalExpandPreservesRowWhenNoMatch(t *testing.T) {
 			{Tenant: "acme", ID: "u1", Labels: []string{"User"}},
 			{Tenant: "acme", ID: "u3", Labels: []string{"User"}},
 		} {
-			if err := tx.PutVertex(ctx, v); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{v}); err != nil {
 				return err
 			}
 		}
@@ -321,13 +321,13 @@ func TestExecuteWithTxExpandVariantControlsUndirectedUnboundBindingOrientation(t
 	defer store.Close()
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}},
+			{Tenant: "acme", ID: "u2", Labels: []string{"User"}},
+		}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}})
 	})
 	if err != nil {
 		t.Fatalf("seed failed: %v", err)
@@ -412,17 +412,17 @@ func TestExecuteWithTxAntiProbeFiltersBlockedRelationships(t *testing.T) {
 			{Tenant: "acme", ID: "u2", Labels: []string{"User"}},
 			{Tenant: "acme", ID: "u3", Labels: []string{"User"}},
 		} {
-			if err := tx.PutVertex(ctx, v); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{v}); err != nil {
 				return err
 			}
 		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "k1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "k1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}}); err != nil {
 			return err
 		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "k2", Type: "KNOWS", SrcID: "u1", DstID: "u3"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "k2", Type: "KNOWS", SrcID: "u1", DstID: "u3"}}); err != nil {
 			return err
 		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "b1", Type: "BLOCKED", SrcID: "u1", DstID: "u2"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "b1", Type: "BLOCKED", SrcID: "u1", DstID: "u2"}})
 	})
 	if err != nil {
 		t.Fatalf("seed failed: %v", err)

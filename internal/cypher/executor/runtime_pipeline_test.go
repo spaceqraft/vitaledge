@@ -407,13 +407,10 @@ func TestCollectRuntimePlannerStatsHintsIncludesSnapshotTotalsAndEdgeTypeCounts(
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}}, {Tenant: "acme", ID: "u2", Labels: []string{"User"}}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}})
 	})
 	if err != nil {
 		t.Fatalf("seed failed: %v", err)
@@ -444,10 +441,7 @@ func TestBuildRuntimePhysicalPlanUsesStatsHintsForZeroEdgeTenant(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}}, {Tenant: "acme", ID: "u2", Labels: []string{"User"}}}); err != nil {
 			return err
 		}
 		return nil
@@ -621,7 +615,7 @@ func TestCollectRuntimePlannerStatsHintsDerivesAntiProbeSelectivityFromSnapshot(
 			{Tenant: "acme", ID: "u4", Labels: []string{"User"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -632,7 +626,7 @@ func TestCollectRuntimePlannerStatsHintsDerivesAntiProbeSelectivityFromSnapshot(
 			{Tenant: "acme", ID: "e4", Type: "MUTED", SrcID: "u4", DstID: "u1"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -696,7 +690,7 @@ func TestCollectRuntimePlannerStatsHintsIncludesPropertyDomainGuardrails(t *test
 			{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"age": valueToBytes(35), "code": valueToBytes("alpha")}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -738,10 +732,7 @@ func TestBuildRuntimePhysicalPlanAnnotatesTypedDomainGuardrailForWeakMixedDomina
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: map[string][]byte{"code": valueToBytes(7)}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"code": valueToBytes("alpha")}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}, Properties: map[string][]byte{"code": valueToBytes(7)}}, {Tenant: "acme", ID: "u2", Labels: []string{"User"}, Properties: map[string][]byte{"code": valueToBytes("alpha")}}}); err != nil {
 			return err
 		}
 		return nil

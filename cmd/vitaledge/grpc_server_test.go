@@ -595,7 +595,7 @@ func TestGRPCExecuteIntegrationSerializesNumericAggregatesAndProperties(t *testi
 			{Tenant: "acme", ID: "n3", Labels: []string{"Metric"}, Properties: graph.PropertyMap{"value": []byte("4")}},
 		}
 		for _, vertex := range vertices {
-			if err := tx.PutVertex(context.Background(), vertex); err != nil {
+			if err := tx.PutVertexBatch(context.Background(), []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -713,7 +713,7 @@ func TestGRPCExecuteIntegrationSerializesIntegerOnlyAggregatesAndProperties(t *t
 			{Tenant: "acme", ID: "i3", Labels: []string{"IntMetric"}, Properties: graph.PropertyMap{"value": []byte("4")}},
 		}
 		for _, vertex := range vertices {
-			if err := tx.PutVertex(context.Background(), vertex); err != nil {
+			if err := tx.PutVertexBatch(context.Background(), []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -822,7 +822,7 @@ func TestGRPCExecuteIntegrationParameterizedThresholdAndLimit(t *testing.T) {
 			{Tenant: "acme", ID: "flow-4", Labels: []string{"Flow"}, Properties: graph.PropertyMap{"threat_score": []byte("0.40"), "detected_malicious": []byte("false")}},
 		}
 		for _, vertex := range vertices {
-			if err := tx.PutVertex(context.Background(), vertex); err != nil {
+			if err := tx.PutVertexBatch(context.Background(), []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -834,7 +834,7 @@ func TestGRPCExecuteIntegrationParameterizedThresholdAndLimit(t *testing.T) {
 			{Tenant: "acme", ID: "sent-4", Type: "SENT", SrcID: "host-2", DstID: "flow-4"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(context.Background(), edge); err != nil {
+			if err := tx.PutEdgeBatch(context.Background(), []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}

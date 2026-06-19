@@ -42,64 +42,102 @@ func (t *recordingTx) ScanVertices(context.Context, string, int, func(*graph.Ver
 func (t *recordingTx) ScanVerticesFrom(context.Context, string, string, int, func(*graph.Vertex) error) error {
 	return nil
 }
-func (t *recordingTx) PutVertex(_ context.Context, vertex *graph.Vertex) error {
+func (t *recordingTx) PutVertexBatch(_ context.Context, vertexes []*graph.Vertex) error {
 	if t.putVertexErr != nil {
 		return t.putVertexErr
 	}
-	copyVertex := *vertex
-	t.vertexes = append(t.vertexes, &copyVertex)
-	return nil
-}
-func (t *recordingTx) DeleteVertex(context.Context, string, string) error { return nil }
-func (t *recordingTx) GetStatsSnapshot(context.Context, string) (*graph.StatsSnapshot, error) {
-	return nil, nil
-}
-func (t *recordingTx) GetEdge(context.Context, string, string) (*graph.Edge, error) { return nil, nil }
-func (t *recordingTx) PutEdge(_ context.Context, edge *graph.Edge) error {
-	if t.putEdgeErr != nil {
-		return t.putEdgeErr
-	}
-	copyEdge := *edge
-	t.edges = append(t.edges, &copyEdge)
-	return nil
-}
-func (t *recordingTx) DeleteEdge(context.Context, string, string) error { return nil }
-func (t *recordingTx) PutVertexBatch(ctx context.Context, vertexes []*graph.Vertex) error {
 	for _, vertex := range vertexes {
 		if vertex == nil {
 			continue
 		}
-		if err := t.PutVertex(ctx, vertex); err != nil {
-			return err
-		}
+		copyVertex := *vertex
+		t.vertexes = append(t.vertexes, &copyVertex)
 	}
 	return nil
 }
-func (t *recordingTx) PutEdgeBatch(ctx context.Context, edges []*graph.Edge) error {
+
+func (t *recordingTx) DeleteVertexBatch(_ context.Context, _ string, vertexIDs []string) error {
+	for _, id := range vertexIDs {
+		t.vertexes = deleteVertexFromSlice(t.vertexes, id)
+	}
+	return nil
+}
+func (t *recordingTx) DeleteVertexDetachBatch(_ context.Context, _ string, vertexIDs []string) error {
+	for _, id := range vertexIDs {
+		t.vertexes = deleteVertexFromSlice(t.vertexes, id)
+	}
+	t.edges = deleteEdgesWithEndpoint(t.edges, vertexIDs)
+	return nil
+}
+func deleteVertexFromSlice(vertexes []*graph.Vertex, vertexID string) []*graph.Vertex {
+	for i, v := range vertexes {
+		if v != nil && v.ID == vertexID {
+			return append(vertexes[:i], vertexes[i+1:]...)
+		}
+	}
+	return vertexes
+}
+func deleteEdgesWithEndpoint(edges []*graph.Edge, vertexIDs []string) []*graph.Edge {
+	vertexIDSet := make(map[string]struct{}, len(vertexIDs))
+	for _, id := range vertexIDs {
+		vertexIDSet[id] = struct{}{}
+	}
+	var result []*graph.Edge
 	for _, edge := range edges {
 		if edge == nil {
 			continue
 		}
-		if err := t.PutEdge(ctx, edge); err != nil {
-			return err
+		if _, ok := vertexIDSet[edge.SrcID]; ok {
+			continue
 		}
+		if _, ok := vertexIDSet[edge.DstID]; ok {
+			continue
+		}
+		result = append(result, edge)
+	}
+	return result
+}
+func (t *recordingTx) GetStatsSnapshot(context.Context, string) (*graph.StatsSnapshot, error) {
+	return nil, nil
+}
+func (t *recordingTx) GetEdge(context.Context, string, string) (*graph.Edge, error) { return nil, nil }
+func (t *recordingTx) DeleteEdgeBatch(ctx context.Context, tenant string, edgeIDs []string) error {
+	_ = ctx
+	_ = tenant
+	for _, edgeID := range edgeIDs {
+		edgeID = strings.TrimSpace(edgeID)
+		if edgeID == "" {
+			continue
+		}
+		filtered := t.edges[:0]
+		for _, edge := range t.edges {
+			if edge == nil || strings.TrimSpace(edge.ID) == edgeID {
+				continue
+			}
+			filtered = append(filtered, edge)
+		}
+		t.edges = filtered
 	}
 	return nil
 }
-func (t *recordingTx) DeleteVertexDetach(ctx context.Context, tenant, vertexID string) error {
-	return t.DeleteVertex(ctx, tenant, vertexID)
+func (t *recordingTx) PutEdgeBatch(_ context.Context, edges []*graph.Edge) error {
+	if t.putEdgeErr != nil {
+		return t.putEdgeErr
+	}
+	for _, edge := range edges {
+		if edge == nil {
+			continue
+		}
+		copyEdge := *edge
+		t.edges = append(t.edges, &copyEdge)
+	}
+	return nil
 }
 func (t *recordingTx) PatchVertexProperties(context.Context, string, string, graph.PropertyMap, []string) error {
 	return nil
 }
 func (t *recordingTx) PatchEdgeProperties(context.Context, string, string, graph.PropertyMap, []string) error {
 	return nil
-}
-func (t *recordingTx) EnsureEdge(ctx context.Context, edge *graph.Edge) (bool, error) {
-	if err := t.PutEdge(ctx, edge); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 func (t *recordingTx) ScanOutEdges(context.Context, string, string, string, int, func(*graph.Edge) error) error {
 	return nil
@@ -576,6 +614,8 @@ type recordingSink struct {
 	deletedVertexIDs       []string
 	deletedEdgeIDs         []string
 	deletedVertexDetachIDs []string
+	edgeBatchIDBatches     [][]string
+	vertexBatchIDBatches   [][]string
 
 	vertexErr error
 	edgeErr   error
@@ -584,83 +624,75 @@ type recordingSink struct {
 var _ runtimestorage.WriteSink = (*recordingSink)(nil)
 var _ writeLookupTx = (*recordingSink)(nil)
 
-func (s *recordingSink) PutVertex(_ context.Context, vertex *graph.Vertex) error {
+func (s *recordingSink) PutVertexBatch(_ context.Context, vertexes []*graph.Vertex) error {
 	if s.vertexErr != nil {
 		return s.vertexErr
 	}
-	copyVertex := *vertex
-	copyVertex.Properties = clonePropertyMap(vertex.Properties)
-	s.vertexes = append(s.vertexes, &copyVertex)
-	if s.vertexByID == nil {
-		s.vertexByID = map[string]*graph.Vertex{}
-	}
-	s.vertexByID[copyVertex.ID] = &copyVertex
-	return nil
-}
-
-func (s *recordingSink) PutEdge(_ context.Context, edge *graph.Edge) error {
-	if s.edgeErr != nil {
-		return s.edgeErr
-	}
-	copyEdge := *edge
-	copyEdge.Properties = clonePropertyMap(edge.Properties)
-	s.edges = append(s.edges, &copyEdge)
-	if s.edgeByID == nil {
-		s.edgeByID = map[string]*graph.Edge{}
-	}
-	s.edgeByID[copyEdge.ID] = &copyEdge
-	return nil
-}
-
-func (s *recordingSink) PutVertexBatch(ctx context.Context, vertexes []*graph.Vertex) error {
 	for _, vertex := range vertexes {
 		if vertex == nil {
 			continue
 		}
-		if err := s.PutVertex(ctx, vertex); err != nil {
-			return err
+		copyVertex := *vertex
+		copyVertex.Properties = clonePropertyMap(vertex.Properties)
+		s.vertexes = append(s.vertexes, &copyVertex)
+		if s.vertexByID == nil {
+			s.vertexByID = map[string]*graph.Vertex{}
 		}
+		s.vertexByID[copyVertex.ID] = &copyVertex
 	}
 	return nil
 }
 
-func (s *recordingSink) PutEdgeBatch(ctx context.Context, edges []*graph.Edge) error {
+func (s *recordingSink) PutEdgeBatch(_ context.Context, edges []*graph.Edge) error {
+	if s.edgeErr != nil {
+		return s.edgeErr
+	}
 	for _, edge := range edges {
 		if edge == nil {
 			continue
 		}
-		if err := s.PutEdge(ctx, edge); err != nil {
-			return err
+		copyEdge := *edge
+		copyEdge.Properties = clonePropertyMap(edge.Properties)
+		s.edges = append(s.edges, &copyEdge)
+		if s.edgeByID == nil {
+			s.edgeByID = map[string]*graph.Edge{}
 		}
+		s.edgeByID[copyEdge.ID] = &copyEdge
 	}
 	return nil
 }
 
-func (s *recordingSink) DeleteVertexDetach(_ context.Context, _ string, id string) error {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return nil
+func (s *recordingSink) DeleteVertexDetachBatch(_ context.Context, _ string, ids []string) error {
+	batch := append([]string(nil), ids...)
+	s.vertexBatchIDBatches = append(s.vertexBatchIDBatches, batch)
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := s.vertexByID[id]; !ok {
+			return graph.NewError(graph.ErrKindNotFound, "vertex not found", nil)
+		}
+		s.deletedVertexDetachIDs = append(s.deletedVertexDetachIDs, id)
+		delete(s.vertexByID, id)
 	}
-	if _, ok := s.vertexByID[id]; !ok {
-		return graph.NewError(graph.ErrKindNotFound, "vertex not found", nil)
-	}
-	s.deletedVertexDetachIDs = append(s.deletedVertexDetachIDs, id)
-	delete(s.vertexByID, id)
 	return nil
 }
-func (s *recordingSink) DeleteVertex(_ context.Context, _ string, id string) error {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return nil
+func (s *recordingSink) DeleteVertexBatch(_ context.Context, _ string, ids []string) error {
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := s.vertexByID[id]; !ok {
+			return graph.NewError(graph.ErrKindNotFound, "vertex not found", nil)
+		}
+		s.deletedVertexIDs = append(s.deletedVertexIDs, id)
+		delete(s.vertexByID, id)
 	}
-	if _, ok := s.vertexByID[id]; !ok {
-		return graph.NewError(graph.ErrKindNotFound, "vertex not found", nil)
-	}
-	s.deletedVertexIDs = append(s.deletedVertexIDs, id)
-	delete(s.vertexByID, id)
 	return nil
 }
-func (s *recordingSink) DeleteEdge(_ context.Context, _ string, id string) error {
+func (s *recordingSink) deleteEdgeSingle(id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil
@@ -670,6 +702,18 @@ func (s *recordingSink) DeleteEdge(_ context.Context, _ string, id string) error
 	}
 	s.deletedEdgeIDs = append(s.deletedEdgeIDs, id)
 	delete(s.edgeByID, id)
+	return nil
+}
+func (s *recordingSink) DeleteEdgeBatch(ctx context.Context, tenant string, ids []string) error {
+	_ = ctx
+	_ = tenant
+	batch := append([]string(nil), ids...)
+	s.edgeBatchIDBatches = append(s.edgeBatchIDBatches, batch)
+	for _, id := range ids {
+		if err := s.deleteEdgeSingle(id); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 func (s *recordingSink) GetVertex(_ context.Context, _ string, id string) (*graph.Vertex, error) {
@@ -783,12 +827,6 @@ func (s *recordingSink) PatchEdgeProperties(_ context.Context, _ string, id stri
 		e.Properties[key] = append([]byte(nil), value...)
 	}
 	return nil
-}
-func (s *recordingSink) EnsureEdge(ctx context.Context, edge *graph.Edge) (bool, error) {
-	if err := s.PutEdge(ctx, edge); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 func (s *recordingSink) ScanAdjacencyLinks(_ context.Context, tenant string, vertexID string, direction graph.EdgeDirection, edgeType string, _ int, emit func(string, string) error) error {
 	if s == nil || emit == nil {
@@ -1117,6 +1155,33 @@ func TestApplyWriteEventsDeleteOperandListIndexParam(t *testing.T) {
 	}
 	if !reflect.DeepEqual(sink.deletedEdgeIDs, []string{"e1"}) {
 		t.Fatalf("expected parameterized list index to delete selected edge, got %#v", sink.deletedEdgeIDs)
+	}
+}
+
+func TestApplyWriteEventsDetachDeleteAcrossEventsUsesSingleVertexBatch(t *testing.T) {
+	sink := &recordingSink{
+		vertexByID: map[string]*graph.Vertex{
+			"u1": {Tenant: "acme", ID: "u1"},
+			"u2": {Tenant: "acme", ID: "u2"},
+			"u3": {Tenant: "acme", ID: "u3"},
+		},
+	}
+	err := applyWriteEventsToSink(context.Background(), sink, "acme", []operators.WriteEvent{
+		{Kind: "DETACH DELETE", Raw: "DETACH DELETE v", Bindings: map[string]any{"v": "u1"}},
+		{Kind: "DETACH DELETE", Raw: "DETACH DELETE v", Bindings: map[string]any{"v": "u2"}},
+		{Kind: "DETACH DELETE", Raw: "DETACH DELETE v", Bindings: map[string]any{"v": "u3"}},
+	})
+	if err != nil {
+		t.Fatalf("apply write events failed: %v", err)
+	}
+	if len(sink.vertexBatchIDBatches) != 1 {
+		t.Fatalf("expected one detach vertex batch call, got %#v", sink.vertexBatchIDBatches)
+	}
+	if !reflect.DeepEqual(sink.vertexBatchIDBatches[0], []string{"u1", "u2", "u3"}) {
+		t.Fatalf("expected one batched detach delete with all vertex ids, got %#v", sink.vertexBatchIDBatches)
+	}
+	if !reflect.DeepEqual(sink.deletedVertexDetachIDs, []string{"u1", "u2", "u3"}) {
+		t.Fatalf("expected all vertexes detach-deleted, got %#v", sink.deletedVertexDetachIDs)
 	}
 }
 
@@ -1548,7 +1613,7 @@ func TestApplyWriteEventsToSinkSplitsCreateChainAndPersistsEdgeProperties(t *tes
 
 func TestApplyWriteEventsToSinkMergeOnCreateSetMapForms(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{
 		Tenant: "acme",
 		ID:     "u1",
 		Labels: []string{"User"},
@@ -1556,7 +1621,7 @@ func TestApplyWriteEventsToSinkMergeOnCreateSetMapForms(t *testing.T) {
 			"name":  []byte("bar"),
 			"extra": []byte("1"),
 		},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed source vertex failed: %v", err)
 	}
 
@@ -1599,7 +1664,7 @@ func TestApplyWriteEventsToSinkMergeOnCreateSetMapForms(t *testing.T) {
 
 func TestApplyWriteEventsToSinkSetMapReplaceLiteralRemovesMissingAndNullKeys(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{
 		Tenant: "acme",
 		ID:     "u1",
 		Labels: []string{"X"},
@@ -1607,7 +1672,7 @@ func TestApplyWriteEventsToSinkSetMapReplaceLiteralRemovesMissingAndNullKeys(t *
 			"name":  []byte("A"),
 			"name2": []byte("B"),
 		},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 
@@ -1636,7 +1701,7 @@ func TestApplyWriteEventsToSinkSetMapReplaceLiteralRemovesMissingAndNullKeys(t *
 
 func TestApplyWriteEventsToSinkSetMapReplaceLiteralUsesPersistedEntityForRemoval(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{
 		Tenant: "acme",
 		ID:     "u1",
 		Labels: []string{"X"},
@@ -1644,7 +1709,7 @@ func TestApplyWriteEventsToSinkSetMapReplaceLiteralUsesPersistedEntityForRemoval
 			"name":  []byte("A"),
 			"name2": []byte("B"),
 		},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 
@@ -1670,7 +1735,7 @@ func TestApplyWriteEventsToSinkSetMapReplaceLiteralUsesPersistedEntityForRemoval
 
 func TestApplyWriteEventsToSinkSetMapAppendLiteralNullRemovesProperty(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{
 		Tenant: "acme",
 		ID:     "u1",
 		Labels: []string{"X"},
@@ -1678,7 +1743,7 @@ func TestApplyWriteEventsToSinkSetMapAppendLiteralNullRemovesProperty(t *testing
 			"name":  []byte("A"),
 			"name2": []byte("B"),
 		},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 
@@ -1719,7 +1784,7 @@ func TestResolveWritePropertyValueSupportsHexOctalAndUnicodeEscapes(t *testing.T
 
 func TestApplyWriteEventsToSinkMergeOnMatchSkipsOnCreateActions(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutEdge(context.Background(), &graph.Edge{
+	if err := putEdgeBatchSingle(context.Background(), sink, &graph.Edge{
 		Tenant: "acme",
 		ID:     "acme|u1|KNOWS|u2",
 		Type:   "KNOWS",
@@ -1765,14 +1830,14 @@ func TestApplyWriteEventsToSinkMergeOnMatchSkipsOnCreateActions(t *testing.T) {
 
 func TestApplyWriteEventsToSinkMergeOnCreateSetUsesBoundNodePropertyFromStore(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{
 		Tenant: "acme",
 		ID:     "person-1",
 		Labels: []string{"Person"},
 		Properties: graph.PropertyMap{
 			"bornIn": []byte("New York"),
 		},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed person vertex failed: %v", err)
 	}
 
@@ -1807,7 +1872,7 @@ func TestApplyWriteEventsToSinkMergeOnCreateSetUsesBoundNodePropertyFromStore(t 
 
 func TestApplyWriteEventsToSinkMergeEdgeMatchesByRelationshipProperties(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutEdge(context.Background(), &graph.Edge{
+	if err := putEdgeBatchSingle(context.Background(), sink, &graph.Edge{
 		Tenant: "acme",
 		ID:     "acme|u1|TYPE|u2",
 		Type:   "TYPE",
@@ -1819,7 +1884,7 @@ func TestApplyWriteEventsToSinkMergeEdgeMatchesByRelationshipProperties(t *testi
 	}); err != nil {
 		t.Fatalf("seed edge r1 failed: %v", err)
 	}
-	if err := sink.PutEdge(context.Background(), &graph.Edge{
+	if err := putEdgeBatchSingle(context.Background(), sink, &graph.Edge{
 		Tenant: "acme",
 		ID:     "acme|u1|TYPE|u2|auto-e-1",
 		Type:   "TYPE",
@@ -1854,7 +1919,7 @@ func TestApplyWriteEventsToSinkMergeEdgeMatchesByRelationshipProperties(t *testi
 
 func TestApplyWriteEventsToSinkMergeEdgeCreatesWhenRelationshipPropertiesDoNotMatch(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutEdge(context.Background(), &graph.Edge{
+	if err := putEdgeBatchSingle(context.Background(), sink, &graph.Edge{
 		Tenant: "acme",
 		ID:     "acme|u1|TYPE|u2",
 		Type:   "TYPE",
@@ -1923,7 +1988,7 @@ func TestApplyWriteEventsToSinkMergeVertexOnCreateAndOnMatchLabels(t *testing.T)
 
 	t.Run("on match", func(t *testing.T) {
 		sink := &recordingSink{}
-		if err := sink.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+		if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}}}); err != nil {
 			t.Fatalf("seed vertex failed: %v", err)
 		}
 		err := applyWriteEventsToSink(context.Background(), sink, "acme", []operators.WriteEvent{{
@@ -1952,7 +2017,7 @@ func TestApplyWriteEventsToSinkMergeVertexOnCreateAndOnMatchLabels(t *testing.T)
 
 func TestApplyWriteEventsToSinkRemoveVertexLabel(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Foo", "Bar"}}); err != nil {
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"Foo", "Bar"}}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 	err := applyWriteEventsToSink(context.Background(), sink, "acme", []operators.WriteEvent{{
@@ -1974,7 +2039,7 @@ func TestApplyWriteEventsToSinkRemoveVertexLabel(t *testing.T) {
 
 func TestApplyWriteEventsToSinkSetPropertyWithParenthesizedTarget(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"A"}}); err != nil {
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"A"}}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 	err := applyWriteEventsToSink(context.Background(), sink, "acme", []operators.WriteEvent{{
@@ -1996,7 +2061,7 @@ func TestApplyWriteEventsToSinkSetPropertyWithParenthesizedTarget(t *testing.T) 
 
 func TestApplyWriteEventsToSinkSetPropertyWithMapEntityBinding(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"A"}}); err != nil {
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"A"}}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 	err := applyWriteEventsToSink(context.Background(), sink, "acme", []operators.WriteEvent{{
@@ -2021,7 +2086,7 @@ func TestApplyWriteEventsToSinkSetPropertyWithMapEntityBinding(t *testing.T) {
 
 func TestApplyWriteEventsToSinkSetPropertyWithMapEntityBindingAndDottedID(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"A"}}); err != nil {
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"A"}}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 	err := applyWriteEventsToSink(context.Background(), sink, "acme", []operators.WriteEvent{{
@@ -2046,14 +2111,14 @@ func TestApplyWriteEventsToSinkSetPropertyWithMapEntityBindingAndDottedID(t *tes
 
 func TestApplyWriteEventsToSinkSetPropertyExpressionUsesBindings(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{
 		Tenant: "acme",
 		ID:     "u1",
 		Labels: []string{"A"},
 		Properties: graph.PropertyMap{
 			"name": []byte("Andres"),
 		},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 
@@ -2078,7 +2143,7 @@ func TestApplyWriteEventsToSinkSetPropertyExpressionUsesBindings(t *testing.T) {
 
 func TestApplyWriteEventsToSinkSetPropertyRejectsListOfMaps(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"A"}}); err != nil {
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"A"}}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 
@@ -2100,14 +2165,14 @@ func TestApplyWriteEventsToSinkSetPropertyRejectsListOfMaps(t *testing.T) {
 
 func TestApplyWriteEventsToSinkMergeAnonymousVertexMatchesExistingByLabelAndProps(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{
 		Tenant: "acme",
 		ID:     "u1",
 		Labels: []string{"User"},
 		Properties: graph.PropertyMap{
 			"name": []byte("alice"),
 		},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 	preWrites := len(sink.vertexes)
@@ -2138,14 +2203,14 @@ func TestApplyWriteEventsToSinkMergeAnonymousVertexMatchesExistingByLabelAndProp
 
 func TestFindAnonymousMergeVertexIDUsesPropertyIndexBeforeScan(t *testing.T) {
 	sink := &recordingSink{}
-	if err := sink.PutVertex(context.Background(), &graph.Vertex{
+	if err := sink.PutVertexBatch(context.Background(), []*graph.Vertex{{
 		Tenant: "acme",
 		ID:     "u1",
 		Labels: []string{"User"},
 		Properties: graph.PropertyMap{
 			"name": []byte("alice"),
 		},
-	}); err != nil {
+	}}); err != nil {
 		t.Fatalf("seed vertex failed: %v", err)
 	}
 	sink.propertyIndexEntries = []*graph.PropertyIndexEntry{{

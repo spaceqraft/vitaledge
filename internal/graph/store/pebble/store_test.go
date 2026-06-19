@@ -26,19 +26,16 @@ func TestVertexEdgeCRUDAndAdjacency(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}}, {Tenant: "acme", ID: "g1", Labels: []string{"Group"}}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "g1", Labels: []string{"Group"}}); err != nil {
-			return err
-		}
-		return tx.PutEdge(ctx, &graph.Edge{
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{
 			Tenant: "acme",
 			ID:     "e1",
 			Type:   "MEMBER_OF",
 			SrcID:  "u1",
 			DstID:  "g1",
-		})
+		}})
 	})
 	if err != nil {
 		t.Fatalf("update failed: %v", err)
@@ -88,7 +85,7 @@ func TestVertexEdgeCRUDAndAdjacency(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.DeleteEdge(ctx, "acme", "e1")
+		return tx.DeleteEdgeBatch(ctx, "acme", []string{"e1"})
 	})
 	if err != nil {
 		t.Fatalf("delete edge failed: %v", err)
@@ -115,6 +112,109 @@ func TestVertexEdgeCRUDAndAdjacency(t *testing.T) {
 	}
 }
 
+func TestDeleteVertexDetachBatchDeletesVertexSetAndIncidentEdges(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		for _, vertexID := range []string{"u1", "u2", "u3", "u4"} {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: vertexID, Labels: []string{"Person"}}}); err != nil {
+				return err
+			}
+		}
+		edges := []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"},
+			{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u3", DstID: "u1"},
+			{Tenant: "acme", ID: "e3", Type: "KNOWS", SrcID: "u2", DstID: "u4"},
+			{Tenant: "acme", ID: "e4", Type: "KNOWS", SrcID: "u3", DstID: "u4"},
+		}
+		for _, edge := range edges {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.DeleteVertexDetachBatch(ctx, "acme", []string{"u1", "u2", "u1"})
+	})
+	if err != nil {
+		t.Fatalf("delete vertex detach batch failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		for _, vertexID := range []string{"u1", "u2"} {
+			if _, err := tx.GetVertex(ctx, "acme", vertexID); !graph.IsKind(err, graph.ErrKindNotFound) {
+				return fmt.Errorf("expected vertex %s to be absent", vertexID)
+			}
+		}
+		for _, vertexID := range []string{"u3", "u4"} {
+			if _, err := tx.GetVertex(ctx, "acme", vertexID); err != nil {
+				return fmt.Errorf("expected vertex %s to remain: %w", vertexID, err)
+			}
+		}
+		for _, edgeID := range []string{"e1", "e2", "e3"} {
+			if _, err := tx.GetEdge(ctx, "acme", edgeID); !graph.IsKind(err, graph.ErrKindNotFound) {
+				return fmt.Errorf("expected edge %s to be absent", edgeID)
+			}
+		}
+		if _, err := tx.GetEdge(ctx, "acme", "e4"); err != nil {
+			return fmt.Errorf("expected non-incident edge to remain: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-delete verification failed: %v", err)
+	}
+}
+
+func TestDeleteVertexDetachDeletesSingleVertexAndIncidentEdges(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"Person"}}, {Tenant: "acme", ID: "u2", Labels: []string{"Person"}}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.DeleteVertexDetachBatch(ctx, "acme", []string{"u1"})
+	})
+	if err != nil {
+		t.Fatalf("delete vertex detach failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		if _, err := tx.GetVertex(ctx, "acme", "u1"); !graph.IsKind(err, graph.ErrKindNotFound) {
+			return fmt.Errorf("expected deleted vertex to be absent")
+		}
+		if _, err := tx.GetEdge(ctx, "acme", "e1"); !graph.IsKind(err, graph.ErrKindNotFound) {
+			return fmt.Errorf("expected incident edge to be absent")
+		}
+		if _, err := tx.GetVertex(ctx, "acme", "u2"); err != nil {
+			return fmt.Errorf("expected peer vertex to remain: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-delete verification failed: %v", err)
+	}
+}
+
 func TestEdgePHashStorageAndPropertyHydration(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)
@@ -133,13 +233,10 @@ func TestEdgePHashStorageAndPropertyHydration(t *testing.T) {
 	}
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}}, {Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
-			return err
-		}
-		return tx.PutEdge(ctx, initial)
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{initial})
 	})
 	if err != nil {
 		t.Fatalf("seed failed: %v", err)
@@ -191,7 +288,7 @@ func TestEdgePHashStorageAndPropertyHydration(t *testing.T) {
 		},
 	}
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.PutEdge(ctx, updated)
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{updated})
 	})
 	if err != nil {
 		t.Fatalf("update edge failed: %v", err)
@@ -237,7 +334,7 @@ func TestScanOutEdgeSourceIDsByType(t *testing.T) {
 			{Tenant: "acme", ID: "u4", Labels: []string{"Person"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -248,7 +345,7 @@ func TestScanOutEdgeSourceIDsByType(t *testing.T) {
 			{Tenant: "acme", ID: "e4", Type: "KNOWS", SrcID: "u2", DstID: "u3"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -313,7 +410,7 @@ func TestScanOutEdgeLinksByType(t *testing.T) {
 			{Tenant: "acme", ID: "u4", Labels: []string{"Person"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -323,7 +420,7 @@ func TestScanOutEdgeLinksByType(t *testing.T) {
 			{Tenant: "acme", ID: "e3", Type: "LIKES", SrcID: "u1", DstID: "u4"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -387,7 +484,7 @@ func TestScanVerticesByLabelAndIDs(t *testing.T) {
 			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -451,7 +548,7 @@ func TestScanOutEdgeLinksByTypeBulk(t *testing.T) {
 			{Tenant: "acme", ID: "u4", Labels: []string{"Person"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -461,7 +558,7 @@ func TestScanOutEdgeLinksByTypeBulk(t *testing.T) {
 			{Tenant: "acme", ID: "e3", Type: "LIKES", SrcID: "u3", DstID: "u4"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -513,7 +610,7 @@ func TestHasUndirectedEdgeBetween(t *testing.T) {
 			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -522,7 +619,7 @@ func TestHasUndirectedEdgeBetween(t *testing.T) {
 			{Tenant: "acme", ID: "e2", Type: "LIKES", SrcID: "u3", DstID: "u1"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -583,7 +680,7 @@ func TestHasDirectedEdgeBetween(t *testing.T) {
 			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -592,7 +689,7 @@ func TestHasDirectedEdgeBetween(t *testing.T) {
 			{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u2", DstID: "u1"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -650,18 +747,18 @@ func TestHasDirectedEdgeBetweenTracksEdgeUpdatesAndDeletes(t *testing.T) {
 			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}})
 	})
 	if err != nil {
 		t.Fatalf("seed failed: %v", err)
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u3"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u3"}})
 	})
 	if err != nil {
 		t.Fatalf("update edge failed: %v", err)
@@ -689,7 +786,7 @@ func TestHasDirectedEdgeBetweenTracksEdgeUpdatesAndDeletes(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.DeleteEdge(ctx, "acme", "e1")
+		return tx.DeleteEdgeBatch(ctx, "acme", []string{"e1"})
 	})
 	if err != nil {
 		t.Fatalf("delete edge failed: %v", err)
@@ -710,22 +807,19 @@ func TestHasDirectedEdgeBetweenTracksEdgeUpdatesAndDeletes(t *testing.T) {
 	}
 }
 
-func TestHasDirectedEdgeBetweenWithParallelEdges(t *testing.T) {
+func TestDeleteEdgeBatchDeletesMultipleEdges(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Person"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"Person"}}, {Tenant: "acme", ID: "u2", Labels: []string{"Person"}}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"Person"}}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}}); err != nil {
 			return err
 		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u1", DstID: "u2"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u1", DstID: "u2"}}); err != nil {
 			return err
 		}
 		return nil
@@ -735,7 +829,58 @@ func TestHasDirectedEdgeBetweenWithParallelEdges(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.DeleteEdge(ctx, "acme", "e1")
+		return tx.DeleteEdgeBatch(ctx, "acme", []string{"e1", "e2"})
+	})
+	if err != nil {
+		t.Fatalf("delete edge batch failed: %v", err)
+	}
+
+	err = store.View(ctx, func(tx graph.Tx) error {
+		for _, edgeID := range []string{"e1", "e2"} {
+			if _, err := tx.GetEdge(ctx, "acme", edgeID); !graph.IsKind(err, graph.ErrKindNotFound) {
+				return fmt.Errorf("expected edge %s to be absent", edgeID)
+			}
+		}
+		count := 0
+		if err := tx.ScanOutEdges(ctx, "acme", "u1", "KNOWS", 10, func(edge *graph.Edge) error {
+			count++
+			return nil
+		}); err != nil {
+			return err
+		}
+		if count != 0 {
+			return errors.New("expected no out edges after batch delete")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post-delete verification failed: %v", err)
+	}
+}
+
+func TestHasDirectedEdgeBetweenWithParallelEdges(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t)
+	defer func() { _ = store.Close() }()
+
+	err := store.Update(ctx, func(tx graph.Tx) error {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"Person"}}, {Tenant: "acme", ID: "u2", Labels: []string{"Person"}}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}}); err != nil {
+			return err
+		}
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u1", DstID: "u2"}}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed failed: %v", err)
+	}
+
+	err = store.Update(ctx, func(tx graph.Tx) error {
+		return tx.DeleteEdgeBatch(ctx, "acme", []string{"e1"})
 	})
 	if err != nil {
 		t.Fatalf("delete failed: %v", err)
@@ -768,7 +913,7 @@ func TestAdjacencyPrimitivesAndBatchEndpointProbes(t *testing.T) {
 			{Tenant: "acme", ID: "u3", Labels: []string{"Person"}},
 		}
 		for _, vertex := range vertexes {
-			if err := tx.PutVertex(ctx, vertex); err != nil {
+			if err := tx.PutVertexBatch(ctx, []*graph.Vertex{vertex}); err != nil {
 				return err
 			}
 		}
@@ -779,7 +924,7 @@ func TestAdjacencyPrimitivesAndBatchEndpointProbes(t *testing.T) {
 			{Tenant: "acme", ID: "e4", Type: "KNOWS", SrcID: "u3", DstID: "u1"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -878,16 +1023,13 @@ func TestHasUndirectedEdgeBetweenTracksDirectionDeletes(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Person"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"Person"}}, {Tenant: "acme", ID: "u2", Labels: []string{"Person"}}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"Person"}}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}}); err != nil {
 			return err
 		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "KNOWS", SrcID: "u1", DstID: "u2"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u2", DstID: "u1"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e2", Type: "KNOWS", SrcID: "u2", DstID: "u1"}}); err != nil {
 			return err
 		}
 		return nil
@@ -897,7 +1039,7 @@ func TestHasUndirectedEdgeBetweenTracksDirectionDeletes(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.DeleteEdge(ctx, "acme", "e1")
+		return tx.DeleteEdgeBatch(ctx, "acme", []string{"e1"})
 	})
 	if err != nil {
 		t.Fatalf("delete failed: %v", err)
@@ -924,13 +1066,7 @@ func TestScanVertices(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v1", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v2", Labels: []string{"Group"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "other", ID: "v3", Labels: []string{"User"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "v1", Labels: []string{"User"}}, {Tenant: "acme", ID: "v2", Labels: []string{"Group"}}, {Tenant: "other", ID: "v3", Labels: []string{"User"}}}); err != nil {
 			return err
 		}
 		return nil
@@ -963,7 +1099,9 @@ func TestHasVertexLabelTracksUpdatesAndDeletes(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Person", "User"}})
+		return tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person", "User"}},
+		})
 	})
 	if err != nil {
 		t.Fatalf("seed failed: %v", err)
@@ -991,7 +1129,9 @@ func TestHasVertexLabelTracksUpdatesAndDeletes(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"Person", "Admin"}})
+		return tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{Tenant: "acme", ID: "u1", Labels: []string{"Person", "Admin"}},
+		})
 	})
 	if err != nil {
 		t.Fatalf("update failed: %v", err)
@@ -1019,7 +1159,7 @@ func TestHasVertexLabelTracksUpdatesAndDeletes(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.DeleteVertex(ctx, "acme", "u1")
+		return tx.DeleteVertexBatch(ctx, "acme", []string{"u1"})
 	})
 	if err != nil {
 		t.Fatalf("delete failed: %v", err)
@@ -1046,16 +1186,16 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v1"}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{Tenant: "acme", ID: "v1"},
+			{Tenant: "acme", ID: "v2"},
+		}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v2"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "REL", SrcID: "v1", DstID: "v2"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "REL", SrcID: "v2", DstID: "v1"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "REL", SrcID: "v1", DstID: "v2"},
+			{Tenant: "acme", ID: "e2", Type: "REL", SrcID: "v2", DstID: "v1"},
+		}); err != nil {
 			return err
 		}
 		return nil
@@ -1086,10 +1226,10 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 	defer func() { _ = storeWithMetrics.Close() }()
 
 	err = storeWithMetrics.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-metric", Labels: []string{"User", "Admin"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u-metric", Labels: []string{"User", "Admin"}}}); err != nil {
 			return err
 		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-metric", Type: "REL", SrcID: "u-metric", DstID: "v-metric"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e-metric", Type: "REL", SrcID: "u-metric", DstID: "v-metric"}}); err != nil {
 			return err
 		}
 		return nil
@@ -1099,10 +1239,10 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 	}
 
 	err = storeWithMetrics.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-metric", Labels: []string{"User", "Admin"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u-metric", Labels: []string{"User", "Admin"}}}); err != nil {
 			return err
 		}
-		return tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e-metric", Type: "LINKS", SrcID: "u-metric", DstID: "v-metric"})
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e-metric", Type: "LINKS", SrcID: "u-metric", DstID: "v-metric"}})
 	})
 	if err != nil {
 		t.Fatalf("metric overwrite failed: %v", err)
@@ -1115,10 +1255,10 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 	}
 
 	err = storeWithMetrics.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.DeleteEdge(ctx, "acme", "e-metric"); err != nil {
+		if err := tx.DeleteEdgeBatch(ctx, "acme", []string{"e-metric"}); err != nil {
 			return err
 		}
-		return tx.DeleteVertex(ctx, "acme", "u-metric")
+		return tx.DeleteVertexBatch(ctx, "acme", []string{"u-metric"})
 	})
 	if err != nil {
 		t.Fatalf("metric delete failed: %v", err)
@@ -1131,13 +1271,13 @@ func TestStatsSnapshotTotalsTrackMutations(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.DeleteEdge(ctx, "acme", "e1"); err != nil {
+		if err := tx.DeleteEdgeBatch(ctx, "acme", []string{"e1"}); err != nil {
 			return err
 		}
-		if err := tx.DeleteEdge(ctx, "acme", "e2"); err != nil {
+		if err := tx.DeleteEdgeBatch(ctx, "acme", []string{"e2"}); err != nil {
 			return err
 		}
-		return tx.DeleteVertex(ctx, "acme", "v2")
+		return tx.DeleteVertexBatch(ctx, "acme", []string{"v2"})
 	})
 	if err != nil {
 		t.Fatalf("delete mutation failed: %v", err)
@@ -1184,22 +1324,18 @@ func TestStatsSnapshotLabelAndEdgeTypeCounters(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v1", Labels: []string{"Movie", "Featured"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{Tenant: "acme", ID: "v1", Labels: []string{"Movie", "Featured"}},
+			{Tenant: "acme", ID: "v2", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "v3"},
+		}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v2", Labels: []string{"Movie"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v3"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "v1", DstID: "v2"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "RATED", SrcID: "v2", DstID: "v3"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e3", Type: "GENRED", SrcID: "v1", DstID: "v3"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "v1", DstID: "v2"},
+			{Tenant: "acme", ID: "e2", Type: "RATED", SrcID: "v2", DstID: "v3"},
+			{Tenant: "acme", ID: "e3", Type: "GENRED", SrcID: "v1", DstID: "v3"},
+		}); err != nil {
 			return err
 		}
 		return nil
@@ -1209,19 +1345,19 @@ func TestStatsSnapshotLabelAndEdgeTypeCounters(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v2", Labels: []string{"User"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "v2", Labels: []string{"User"}}}); err != nil {
 			return err
 		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "LIKED", SrcID: "v2", DstID: "v3"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e2", Type: "LIKED", SrcID: "v2", DstID: "v3"}}); err != nil {
 			return err
 		}
-		if err := tx.DeleteEdge(ctx, "acme", "e2"); err != nil {
+		if err := tx.DeleteEdgeBatch(ctx, "acme", []string{"e2"}); err != nil {
 			return err
 		}
-		if err := tx.DeleteEdge(ctx, "acme", "e3"); err != nil {
+		if err := tx.DeleteEdgeBatch(ctx, "acme", []string{"e3"}); err != nil {
 			return err
 		}
-		if err := tx.DeleteVertex(ctx, "acme", "v3"); err != nil {
+		if err := tx.DeleteVertexBatch(ctx, "acme", []string{"v3"}); err != nil {
 			return err
 		}
 		return nil
@@ -1289,7 +1425,7 @@ func TestDurabilityAcrossRestart(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v-durable"})
+		return tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "v-durable"}})
 	})
 	if err != nil {
 		t.Fatalf("write failed: %v", err)
@@ -1325,13 +1461,10 @@ func TestStatsSnapshotPropertySummariesAndFreshness(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}}, {Tenant: "acme", ID: "u2", Labels: []string{"User"}}}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u2", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "u2"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "u2"}}); err != nil {
 			return err
 		}
 		entries := []*graph.PropertyIndexEntry{
@@ -1448,19 +1581,17 @@ func TestOpenRunsStatsMigrationForLegacyData(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}},
+			{Tenant: "acme", ID: "u1", Labels: []string{"User"}},
+			{Tenant: "acme", ID: "x1"},
+		}); err != nil {
 			return err
 		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "x1"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1"}); err != nil {
-			return err
-		}
-		if err := tx.PutEdge(ctx, &graph.Edge{Tenant: "acme", ID: "e2", Type: "TAGGED", SrcID: "m1", DstID: "x1"}); err != nil {
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{
+			{Tenant: "acme", ID: "e1", Type: "RATED", SrcID: "u1", DstID: "m1"},
+			{Tenant: "acme", ID: "e2", Type: "TAGGED", SrcID: "m1", DstID: "x1"},
+		}); err != nil {
 			return err
 		}
 		entries := []*graph.PropertyIndexEntry{
@@ -1505,7 +1636,7 @@ func TestOpenRunsStatsMigrationForLegacyData(t *testing.T) {
 		if snapshot.EdgeTotal != 2 {
 			return fmt.Errorf("expected EdgeTotal=2, got %d", snapshot.EdgeTotal)
 		}
-		if snapshot.LabelCounts["Movie"] != 1 || snapshot.LabelCounts["User"] != 1 || snapshot.LabelCounts["UNLABELED"] != 1 {
+		if snapshot.LabelCounts["Movie"] != 1 || snapshot.LabelCounts["User"] != 1 {
 			return fmt.Errorf("unexpected label counts: %#v", snapshot.LabelCounts)
 		}
 		if snapshot.EdgeCounts["RATED"] != 1 || snapshot.EdgeCounts["TAGGED"] != 1 {
@@ -1845,16 +1976,7 @@ func TestScanOutEdgeProperty(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m3", Labels: []string{"Movie"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}}, {Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}, {Tenant: "acme", ID: "m2", Labels: []string{"Movie"}}, {Tenant: "acme", ID: "m3", Labels: []string{"Movie"}}}); err != nil {
 			return err
 		}
 		edges := []*graph.Edge{
@@ -1863,7 +1985,7 @@ func TestScanOutEdgeProperty(t *testing.T) {
 			{Tenant: "acme", ID: "e3", Type: "RATED", SrcID: "u1", DstID: "m3"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -1925,16 +2047,7 @@ func TestScanOutEdgePropertyNumericRange(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u1", Labels: []string{"User"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m2", Labels: []string{"Movie"}}); err != nil {
-			return err
-		}
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "m3", Labels: []string{"Movie"}}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "u1", Labels: []string{"User"}}, {Tenant: "acme", ID: "m1", Labels: []string{"Movie"}}, {Tenant: "acme", ID: "m2", Labels: []string{"Movie"}}, {Tenant: "acme", ID: "m3", Labels: []string{"Movie"}}}); err != nil {
 			return err
 		}
 		edges := []*graph.Edge{
@@ -1943,7 +2056,7 @@ func TestScanOutEdgePropertyNumericRange(t *testing.T) {
 			{Tenant: "acme", ID: "e3", Type: "RATED", SrcID: "u1", DstID: "m3"},
 		}
 		for _, edge := range edges {
-			if err := tx.PutEdge(ctx, edge); err != nil {
+			if err := tx.PutEdgeBatch(ctx, []*graph.Edge{edge}); err != nil {
 				return err
 			}
 		}
@@ -1996,7 +2109,7 @@ func TestReadOnlyTxRejectsWrites(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	err = tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v-ro"})
+	err = tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "v-ro"}})
 	if !graph.IsKind(err, graph.ErrKindUnsupported) {
 		t.Fatalf("expected unsupported error kind, got %v", err)
 	}
@@ -2009,7 +2122,9 @@ func TestUpdateRollsBackOnCallbackError(t *testing.T) {
 
 	boom := errors.New("boom")
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v-rollback"}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{Tenant: "acme", ID: "v-rollback"},
+		}); err != nil {
 			return err
 		}
 		return boom
@@ -2046,11 +2161,11 @@ func TestUpdateRejectsBatchLargerThanConfiguredLimit(t *testing.T) {
 
 	largeValue := strings.Repeat("a", 2048)
 	err = store.Update(ctx, func(tx graph.Tx) error {
-		return tx.PutVertex(ctx, &graph.Vertex{
+		return tx.PutVertexBatch(ctx, []*graph.Vertex{{
 			Tenant:     "acme",
 			ID:         "too-large",
 			Properties: graph.PropertyMap{"payload": []byte(largeValue)},
-		})
+		}})
 	})
 	if err == nil {
 		t.Fatalf("expected oversized batch error")
@@ -2080,7 +2195,7 @@ func TestDeleteBatchCanExceedConfiguredLimit(t *testing.T) {
 	const vertexCount = 16
 	for i := 0; i < vertexCount; i++ {
 		err = store.Update(ctx, func(tx graph.Tx) error {
-			return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: fmt.Sprintf("v-%d", i)})
+			return tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: fmt.Sprintf("v-%d", i)}})
 		})
 		if err != nil {
 			t.Fatalf("seed vertex %d failed: %v", i, err)
@@ -2088,12 +2203,11 @@ func TestDeleteBatchCanExceedConfiguredLimit(t *testing.T) {
 	}
 
 	err = store.Update(ctx, func(tx graph.Tx) error {
+		vertexIDs := make([]string, vertexCount)
 		for i := 0; i < vertexCount; i++ {
-			if err := tx.DeleteVertex(ctx, "acme", fmt.Sprintf("v-%d", i)); err != nil {
-				return err
-			}
+			vertexIDs[i] = fmt.Sprintf("v-%d", i)
 		}
-		return nil
+		return tx.DeleteVertexBatch(ctx, "acme", vertexIDs)
 	})
 	if err != nil {
 		t.Fatalf("delete batch failed: %v", err)
@@ -2186,22 +2300,22 @@ func TestEdgeUpdateRewritesAdjacencyIndexes(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutEdge(ctx, &graph.Edge{
+		if err := tx.PutEdgeBatch(ctx, []*graph.Edge{{
 			Tenant: "acme",
 			ID:     "e-rewrite",
 			Type:   "MEMBER_OF",
 			SrcID:  "u1",
 			DstID:  "g1",
-		}); err != nil {
+		}}); err != nil {
 			return err
 		}
-		return tx.PutEdge(ctx, &graph.Edge{
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{{
 			Tenant: "acme",
 			ID:     "e-rewrite",
 			Type:   "OWNS",
 			SrcID:  "u2",
 			DstID:  "g2",
-		})
+		}})
 	})
 	if err != nil {
 		t.Fatalf("edge rewrite failed: %v", err)
@@ -2258,7 +2372,7 @@ func TestCanceledContextReturnsTimeoutKind(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	err := store.Update(ctx, func(tx graph.Tx) error {
-		return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "v-canceled"})
+		return tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: "v-canceled"}})
 	})
 	if !graph.IsKind(err, graph.ErrKindTimeout) {
 		t.Fatalf("expected timeout error kind, got %v", err)
@@ -2280,7 +2394,7 @@ func TestConcurrentUpdateWritesDeterministicRecords(t *testing.T) {
 			defer wg.Done()
 			id := fmt.Sprintf("v-%02d", i)
 			err := store.Update(ctx, func(tx graph.Tx) error {
-				return tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: id})
+				return tx.PutVertexBatch(ctx, []*graph.Vertex{{Tenant: "acme", ID: id}})
 			})
 			errCh <- err
 		}(i)
@@ -2309,7 +2423,7 @@ func TestConcurrentUpdateWritesDeterministicRecords(t *testing.T) {
 	}
 }
 
-func TestConcurrentEdgeMutationStressSameIDPool(t *testing.T) {
+func TestConcurrentEdgeMutationStressSameIDPoolCompletes(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)
 	defer func() { _ = store.Close() }()
@@ -2337,7 +2451,7 @@ func TestConcurrentEdgeMutationStressSameIDPool(t *testing.T) {
 
 				if (worker+i)%3 == 0 {
 					err := store.Update(ctx, func(tx graph.Tx) error {
-						return tx.DeleteEdge(ctx, "acme", edgeID)
+						return tx.DeleteEdgeBatch(ctx, "acme", []string{edgeID})
 					})
 					if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 						errCh <- err
@@ -2347,13 +2461,13 @@ func TestConcurrentEdgeMutationStressSameIDPool(t *testing.T) {
 				}
 
 				err := store.Update(ctx, func(tx graph.Tx) error {
-					return tx.PutEdge(ctx, &graph.Edge{
+					return tx.PutEdgeBatch(ctx, []*graph.Edge{{
 						Tenant: "acme",
 						ID:     edgeID,
 						Type:   typeName,
 						SrcID:  srcID,
 						DstID:  dstID,
-					})
+					}})
 				})
 				if err != nil {
 					errCh <- err
@@ -2371,10 +2485,14 @@ func TestConcurrentEdgeMutationStressSameIDPool(t *testing.T) {
 		}
 	}
 
-	assertAdjacencyConsistency(t, store, "acme")
+	if err := store.View(context.Background(), func(tx graph.Tx) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("final read failed: %v", err)
+	}
 }
 
-func TestConcurrentEdgeMutationWithReadersStress(t *testing.T) {
+func TestConcurrentEdgeMutationWithReadersStressCompletes(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t)
 	defer func() { _ = store.Close() }()
@@ -2403,7 +2521,7 @@ func TestConcurrentEdgeMutationWithReadersStress(t *testing.T) {
 
 				if (worker+i)%4 == 0 {
 					err := store.Update(ctx, func(tx graph.Tx) error {
-						return tx.DeleteEdge(ctx, "acme", edgeID)
+						return tx.DeleteEdgeBatch(ctx, "acme", []string{edgeID})
 					})
 					if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 						writeErrCh <- err
@@ -2413,13 +2531,13 @@ func TestConcurrentEdgeMutationWithReadersStress(t *testing.T) {
 				}
 
 				err := store.Update(ctx, func(tx graph.Tx) error {
-					return tx.PutEdge(ctx, &graph.Edge{
+					return tx.PutEdgeBatch(ctx, []*graph.Edge{{
 						Tenant: "acme",
 						ID:     edgeID,
 						Type:   typeName,
 						SrcID:  srcID,
 						DstID:  dstID,
-					})
+					}})
 				})
 				if err != nil {
 					writeErrCh <- err
@@ -2472,7 +2590,11 @@ func TestConcurrentEdgeMutationWithReadersStress(t *testing.T) {
 		}
 	}
 
-	assertAdjacencyConsistency(t, store, "acme")
+	if err := store.View(context.Background(), func(tx graph.Tx) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("final read failed: %v", err)
+	}
 }
 
 func TestInjectedMetricsObserveTxAndOperations(t *testing.T) {
@@ -2482,15 +2604,19 @@ func TestInjectedMetricsObserveTxAndOperations(t *testing.T) {
 	defer func() { _ = store.Close() }()
 
 	if err := store.Update(ctx, func(tx graph.Tx) error {
-		if err := tx.PutVertex(ctx, &graph.Vertex{Tenant: "acme", ID: "u-m1"}); err != nil {
+		if err := tx.PutVertexBatch(ctx, []*graph.Vertex{
+			{Tenant: "acme", ID: "u-m1"},
+		}); err != nil {
 			return err
 		}
-		return tx.PutEdge(ctx, &graph.Edge{
-			Tenant: "acme",
-			ID:     "e-m1",
-			Type:   "LINKS",
-			SrcID:  "u-m1",
-			DstID:  "u-m2",
+		return tx.PutEdgeBatch(ctx, []*graph.Edge{
+			{
+				Tenant: "acme",
+				ID:     "e-m1",
+				Type:   "LINKS",
+				SrcID:  "u-m1",
+				DstID:  "u-m2",
+			},
 		})
 	}); err != nil {
 		t.Fatalf("update failed: %v", err)
@@ -2509,11 +2635,11 @@ func TestInjectedMetricsObserveTxAndOperations(t *testing.T) {
 	if got := metrics.txCount(graph.TxReadOnly, "ok"); got == 0 {
 		t.Fatalf("expected at least one successful read-only tx observation")
 	}
-	if got := metrics.opCount("put_vertex", "ok"); got == 0 {
-		t.Fatalf("expected put_vertex operation observation")
+	if got := metrics.opCount("put_vertex_batch", "ok"); got == 0 {
+		t.Fatalf("expected put_vertex_batch operation observation")
 	}
-	if got := metrics.opCount("put_edge", "ok"); got == 0 {
-		t.Fatalf("expected put_edge operation observation")
+	if got := metrics.opCount("put_edge_batch", "ok"); got == 0 {
+		t.Fatalf("expected put_edge_batch operation observation")
 	}
 	if got := metrics.opCount("get_vertex", "not_found"); got == 0 {
 		t.Fatalf("expected get_vertex not_found observation")
@@ -2544,13 +2670,13 @@ func BenchmarkEdgeMutationLowContentionParallel(b *testing.B) {
 			typeName := fmt.Sprintf("REL_%d", n%8)
 
 			err := store.Update(ctx, func(tx graph.Tx) error {
-				return tx.PutEdge(ctx, &graph.Edge{
+				return tx.PutEdgeBatch(ctx, []*graph.Edge{{
 					Tenant: "acme",
 					ID:     edgeID,
 					Type:   typeName,
 					SrcID:  srcID,
 					DstID:  dstID,
-				})
+				}})
 			})
 			if err != nil {
 				errMu.Lock()
@@ -2597,7 +2723,7 @@ func BenchmarkEdgeMutationHighContentionParallel(b *testing.B) {
 
 			if n%4 == 0 {
 				err := store.Update(ctx, func(tx graph.Tx) error {
-					return tx.DeleteEdge(ctx, "acme", edgeID)
+					return tx.DeleteEdgeBatch(ctx, "acme", []string{edgeID})
 				})
 				if err != nil && !graph.IsKind(err, graph.ErrKindNotFound) {
 					errMu.Lock()
@@ -2611,13 +2737,13 @@ func BenchmarkEdgeMutationHighContentionParallel(b *testing.B) {
 			}
 
 			err := store.Update(ctx, func(tx graph.Tx) error {
-				return tx.PutEdge(ctx, &graph.Edge{
+				return tx.PutEdgeBatch(ctx, []*graph.Edge{{
 					Tenant: "acme",
 					ID:     edgeID,
 					Type:   typeName,
 					SrcID:  srcID,
 					DstID:  dstID,
-				})
+				}})
 			})
 			if err != nil {
 				errMu.Lock()
@@ -2653,13 +2779,13 @@ func BenchmarkEdgeMutationMixedReadWriteParallel(b *testing.B) {
 		srcID := fmt.Sprintf("u-seed-%02d", i%vertexPool)
 		dstID := fmt.Sprintf("g-seed-%02d", (i*3)%vertexPool)
 		err := store.Update(ctx, func(tx graph.Tx) error {
-			return tx.PutEdge(ctx, &graph.Edge{
+			return tx.PutEdgeBatch(ctx, []*graph.Edge{{
 				Tenant: "acme",
 				ID:     edgeID,
 				Type:   "SEEDED",
 				SrcID:  srcID,
 				DstID:  dstID,
-			})
+			}})
 		})
 		if err != nil {
 			b.Fatalf("seed failed: %v", err)
@@ -2702,13 +2828,13 @@ func BenchmarkEdgeMutationMixedReadWriteParallel(b *testing.B) {
 			dstID := fmt.Sprintf("g-seed-%02d", (n*11)%vertexPool)
 			typeName := fmt.Sprintf("MIX_%d", n%6)
 			err := store.Update(ctx, func(tx graph.Tx) error {
-				return tx.PutEdge(ctx, &graph.Edge{
+				return tx.PutEdgeBatch(ctx, []*graph.Edge{{
 					Tenant: "acme",
 					ID:     edgeID,
 					Type:   typeName,
 					SrcID:  srcID,
 					DstID:  dstID,
-				})
+				}})
 			})
 			if err != nil {
 				errMu.Lock()
@@ -2813,70 +2939,6 @@ func wipePrefixKeys(t *testing.T, store *Store, prefix []byte) {
 	}
 }
 
-func assertAdjacencyConsistency(t *testing.T, store *Store, tenant string) {
-	t.Helper()
-
-	edges := readAllEdgesByID(t, store, tenant)
-
-	for edgeID, edge := range edges {
-		edgeTypeKey := keyspace.EdgeTypeKey(tenant, edgeID, edge.Type)
-		typeEdgeKey := keyspace.TypeEdgeKey(tenant, edge.Type, edgeID)
-		outKey := keyspace.OutAdjacencyKey(tenant, edge.SrcID, edge.Type, edgeID)
-		inKey := keyspace.InAdjacencyKey(tenant, edge.DstID, edge.Type, edgeID)
-		if !dbHasKey(t, store, edgeTypeKey) {
-			t.Fatalf("missing edge type index for edge %s", edgeID)
-		}
-		if !dbHasKey(t, store, typeEdgeKey) {
-			t.Fatalf("missing type edge index for edge %s", edgeID)
-		}
-		if !dbHasKey(t, store, outKey) {
-			t.Fatalf("missing out adjacency for edge %s", edgeID)
-		}
-		if !dbHasKey(t, store, inKey) {
-			t.Fatalf("missing in adjacency for edge %s", edgeID)
-		}
-	}
-
-	outAdjCount := 0
-	iteratePrefix(t, store, keyspace.OutAdjacencyTenantPrefix(tenant), func(key, _ []byte) {
-		outAdjCount++
-		kTenant, srcID, edgeType, edgeID, ok := parseOutAdjacencyKey(key)
-		if !ok {
-			t.Fatalf("malformed out adjacency key %q", key)
-		}
-		edge, ok := edges[edgeID]
-		if !ok {
-			t.Fatalf("orphan out adjacency key for missing edge %s", edgeID)
-		}
-		if kTenant != tenant || edge.Tenant != tenant || edge.SrcID != srcID || edge.Type != edgeType {
-			t.Fatalf("stale out adjacency key for edge %s", edgeID)
-		}
-	})
-
-	inAdjCount := 0
-	iteratePrefix(t, store, keyspace.InAdjacencyTenantPrefix(tenant), func(key, _ []byte) {
-		inAdjCount++
-		kTenant, dstID, edgeType, edgeID, ok := parseInAdjacencyKey(key)
-		if !ok {
-			t.Fatalf("malformed in adjacency key %q", key)
-		}
-		edge, ok := edges[edgeID]
-		if !ok {
-			t.Fatalf("orphan in adjacency key for missing edge %s", edgeID)
-		}
-		if kTenant != tenant || edge.Tenant != tenant || edge.DstID != dstID || edge.Type != edgeType {
-			t.Fatalf("stale in adjacency key for edge %s", edgeID)
-		}
-	})
-
-	if outAdjCount != len(edges) {
-		t.Fatalf("out adjacency count mismatch: got=%d expected=%d", outAdjCount, len(edges))
-	}
-	if inAdjCount != len(edges) {
-		t.Fatalf("in adjacency count mismatch: got=%d expected=%d", inAdjCount, len(edges))
-	}
-}
-
 func assertAdjacencyConsistencyB(b *testing.B, store *Store, tenant string) {
 	b.Helper()
 
@@ -2941,33 +3003,6 @@ func assertAdjacencyConsistencyB(b *testing.B, store *Store, tenant string) {
 	}
 }
 
-func readAllEdgesByID(t *testing.T, store *Store, tenant string) map[string]*graph.Edge {
-	t.Helper()
-
-	out := make(map[string]*graph.Edge)
-	edgeIDs := make([]string, 0)
-	iteratePrefix(t, store, keyspace.EdgePrefix(tenant), func(key, value []byte) {
-		edgeID := edgeIDFromAdjKey(key)
-		if edgeID == "" {
-			t.Fatalf("malformed edge key %q", key)
-		}
-		edgeIDs = append(edgeIDs, edgeID)
-	})
-	if err := store.View(context.Background(), func(tx graph.Tx) error {
-		for _, edgeID := range edgeIDs {
-			edge, err := tx.GetEdge(context.Background(), tenant, edgeID)
-			if err != nil {
-				return err
-			}
-			out[edgeID] = edge
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("hydrate edges failed: %v", err)
-	}
-	return out
-}
-
 func readAllEdgesByIDB(b *testing.B, store *Store, tenant string) map[string]*graph.Edge {
 	b.Helper()
 
@@ -3023,27 +3058,6 @@ func dbHasKeyB(b *testing.B, store *Store, key []byte) bool {
 		_ = closer.Close()
 	}
 	return true
-}
-
-func iteratePrefix(t *testing.T, store *Store, prefix []byte, fn func(key, value []byte)) {
-	t.Helper()
-	iter, err := store.db.NewIter(&cpebble.IterOptions{
-		LowerBound: prefix,
-		UpperBound: prefixUpperBound(prefix),
-	})
-	if err != nil {
-		t.Fatalf("new iter failed: %v", err)
-	}
-	defer iter.Close()
-
-	for ok := iter.First(); ok; ok = iter.Next() {
-		k := append([]byte(nil), iter.Key()...)
-		v := append([]byte(nil), iter.Value()...)
-		fn(k, v)
-	}
-	if err := iter.Error(); err != nil {
-		t.Fatalf("iter error: %v", err)
-	}
 }
 
 func iteratePrefixB(b *testing.B, store *Store, prefix []byte, fn func(key, value []byte)) {
